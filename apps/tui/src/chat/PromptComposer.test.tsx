@@ -56,9 +56,9 @@ test("keeps the prompt cursor aligned after complex emoji input", async () => {
     });
     await app.renderOnce();
 
-    // The prompt starts at column 3 inside the bordered composer. The emoji is
-    // two cells wide, so the cursor should sit immediately after it at column 6.
-    expect(app.captureSpans().cursor).toEqual([6, 2]);
+    // The prompt starts after the border, padding, and two-cell prefix. The emoji
+    // is two cells wide, so the cursor should sit immediately after it at column 7.
+    expect(app.captureSpans().cursor).toEqual([7, 2]);
   } finally {
     app.renderer.destroy();
   }

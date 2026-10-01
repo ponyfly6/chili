@@ -34,6 +34,7 @@ export interface CliArgs {
     | "memory-show"
     | "memory-add"
     | "memory-reload"
+    | "store-doctor"
     | "mcp"
     | "help";
   prompt?: string;
@@ -41,7 +42,6 @@ export interface CliArgs {
   host: string;
   port: number;
   resume?: string;
-  threadId?: string;
   snapshotId?: string;
   taskId?: string;
   teamId?: string;
@@ -61,7 +61,7 @@ export interface CliArgs {
   mcpScopes?: string[];
   skillName?: string;
   skillScope?: "user" | "project";
-  taskStatus?: Extract<AgentTaskStatus, "completed" | "failed" | "cancelled">;
+  taskStatus?: Extract<AgentTaskStatus, "completed" | "incomplete" | "failed" | "cancelled">;
   timeoutMs?: number;
   staleAfterMs?: number;
   maxCycles?: number;
@@ -217,6 +217,12 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       parseMemoryCommand(result, args, prompt);
       continue;
     }
+    if (arg === "store") {
+      const action = requireValue(arg, args);
+      if (action !== "doctor") throw new Error(`Unknown store command: ${action}`);
+      result.command = "store-doctor";
+      continue;
+    }
     if (arg === "mcp") {
       parseMcpCommand(result, args);
       continue;
@@ -282,10 +288,6 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     }
     if (arg === "--resume" || arg === "-r") {
       result.resume = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "--thread") {
-      result.threadId = requireValue(arg, args);
       continue;
     }
     if (arg === "--provider") {
@@ -361,8 +363,8 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     }
     if (arg === "--status") {
       const status = requireValue(arg, args);
-      if (status !== "completed" && status !== "failed" && status !== "cancelled") {
-        throw new Error("--status must be completed, failed, or cancelled");
+      if (status !== "completed" && status !== "incomplete" && status !== "failed" && status !== "cancelled") {
+        throw new Error("--status must be completed, incomplete, failed, or cancelled");
       }
       result.taskStatus = status;
       continue;
@@ -420,6 +422,7 @@ export function usage(): string {
     "  bun run chili -- memory show",
     "  bun run chili -- memory add [--user|--project] \"remember this\"",
     "  bun run chili -- memory reload",
+    "  bun run chili -- store doctor [--json]",
     "  bun run chili -- mcp list [--json]",
     "  bun run chili -- mcp status [server-name] [--json]",
     "  bun run chili -- mcp reload [--json]",
@@ -427,7 +430,7 @@ export function usage(): string {
     "  bun run chili -- mcp remove <server-name>",
     "  bun run chili -- mcp auth <server-name>",
     "  bun run chili -- mcp logout <server-name>",
-    "  bun run chili -- prompt-debug [--resume <session-id>] [--thread <thread-id>] [--text <prompt>] [--content] [--json]",
+    "  bun run chili -- prompt-debug [--resume <session-id>] [--text <prompt>] [--content] [--json]",
     "  bun run chili -- consume <mailbox-message-id>",
     "  bun run chili -- task <task-id>",
     "  bun run chili -- followup <task-id> \"continue this task\"",
@@ -438,21 +441,23 @@ export function usage(): string {
     "  bun run chili -- --model fake \"hello\"",
     "  bun run chili -- --model deepseek \"hello\"",
     "  bun run chili -- --model kimi \"hello\"",
+    "  bun run chili -- --model glm-5.3 \"hello\"",
+    "  bun run chili -- --model grok \"hello\"",
+    "  bun run chili -- --model xai/grok-4.6:high \"hello\"",
     "  bun run chili -- --model codex \"hello\"",
-    "  bun run chili -- --provider openai-codex --model gpt-5.5 \"hello\"",
-    "  bun run chili -- --model openai-codex/gpt-5.3-codex \"hello\"",
-    "  bun run chili -- --model gpt-5.3-codex --thinking high \"hello\"",
-    "  bun run chili -- --model legacy-minimax \"hello\"",
+    "  bun run chili -- --model codex-api/gpt-5.6-sol \"hello\"",
+    "  bun run chili -- --provider openai-codex --model gpt-5.6-sol \"hello\"",
+    "  bun run chili -- --model openai-codex/gpt-5.6-terra \"hello\"",
+    "  bun run chili -- --model gpt-5.6-luna --thinking high \"hello\"",
     "",
     "Options:",
     "  --cwd <path>        Workspace directory, default current directory",
     "  --host <host>       Runtime server host, default 127.0.0.1",
     "  --port <port>       Runtime server port for serve, default 4777",
     "  --resume, -r <id>   Resume a session",
-    "  --thread <id>       Select a thread for prompt-debug",
-    "  --provider <name>   Provider name: minimax | deepseek | kimi | codex | openai-codex",
+    "  --provider <name>   Provider name: minimax | deepseek | kimi | zai | xai | grok | codex | openai-codex | codex-api",
     "  --model <pattern>   Provider alias, provider/model, or bare model id; default last selected model, then minimax",
-    "  --thinking <level>  Thinking level: off | minimal | low | medium | high | xhigh",
+    "  --thinking <level>  Thinking level: off | minimal | low | medium | high | xhigh | max | ultra",
     "  --reasoning <level> Alias for --thinking",
     "  --yes, -y           Auto-approve tool permissions",
     "  --mcp               Connect configured MCP servers for this CLI run",
@@ -466,9 +471,9 @@ export function usage(): string {
     "  --until-drained     Run team execution until drained, max cycles, or timeout",
     "  --max-turns <n>     Max automatic tool-use continuation turns before final answer, default 128",
     "  --max-cycles <n>    Max team execution runner cycles",
-    "  --max-concurrent-dispatches <n>  Max parallel team dispatch fan-out",
+    "  --max-concurrent-dispatches <n>  Team dispatch cap, default 3; live children also obey the runtime-wide cap",
     "  --max-concurrent-verifications <n>  Max parallel team verifier fan-out, 1-4",
-    "  --status <status>   Task close status: completed | failed | cancelled",
+    "  --status <status>   Task close status: completed | incomplete | failed | cancelled",
     "  --task <task-id>     Limit team merge to one task",
     "  --timeout-ms <n>    Task wait timeout in milliseconds",
     "  --stale-after-ms <n> Recover running background tasks older than this many milliseconds",
@@ -652,7 +657,7 @@ function parseModelValue(value: string): { model: CliModelName; reasoningLevel?:
 
 function parseReasoningLevel(value: string, flag: string): CliReasoningLevel {
   if (isReasoningLevel(value)) return value;
-  throw new Error(`${flag} must be off, minimal, low, medium, high, or xhigh`);
+  throw new Error(`${flag} must be off, minimal, low, medium, high, xhigh, max, or ultra`);
 }
 
 function isReasoningLevel(value: string): value is CliReasoningLevel {
@@ -661,7 +666,9 @@ function isReasoningLevel(value: string): value is CliReasoningLevel {
     || value === "low"
     || value === "medium"
     || value === "high"
-    || value === "xhigh";
+    || value === "xhigh"
+    || value === "max"
+    || value === "ultra";
 }
 
 function parseMemoryCommand(result: CliArgs, args: string[], prompt: string[]): void {

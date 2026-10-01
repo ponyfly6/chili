@@ -11,6 +11,8 @@ import type { ToolResultContent } from "./tool.js";
 
 export type MessageRole = "system" | "user" | "assistant" | "tool";
 
+export type AssistantMessagePhase = "commentary" | "final_answer";
+
 export interface Message {
   id: MessageId;
   sessionId: SessionId;
@@ -41,6 +43,7 @@ export interface BasePart {
 export interface TextPart extends BasePart {
   type: "text";
   text: string;
+  phase?: AssistantMessagePhase;
   displayText?: string;
   synthetic?: boolean;
 }
@@ -61,6 +64,14 @@ export interface ReasoningPart extends BasePart {
   type: "reasoning";
   text: string;
   redacted?: boolean;
+  modelOutput?: PersistedModelOutput;
+}
+
+/** Opaque provider output that must be replayed to continue a stateless response. */
+export interface PersistedModelOutput {
+  apiFamily: string;
+  outputIndex?: number;
+  item: Record<string, unknown>;
 }
 
 export interface ToolCallPart extends BasePart {
@@ -71,14 +82,53 @@ export interface ToolCallPart extends BasePart {
   status: "pending" | "running" | "completed" | "failed" | "cancelled";
 }
 
+export type ToolResultSandbox = "macos-seatbelt" | "none";
+
+export type ToolResultExecutionMode = "sandboxed" | "unsandboxed";
+
+export interface ToolResultExecutionContext {
+  sandbox?: ToolResultSandbox;
+  executionMode?: ToolResultExecutionMode;
+  exitCode?: number | null;
+  timedOut?: boolean;
+  aborted?: boolean;
+  signal?: string | null;
+}
+
 export interface ToolResultPart extends BasePart {
   type: "tool_result";
   callId: ToolCallId;
   output: string;
   content?: ToolResultContent[];
   error?: string;
+  executionContext?: ToolResultExecutionContext;
   synthetic?: boolean;
   artifactIds?: ArtifactId[];
+}
+
+export function formatToolResultForModel(
+  part: Pick<ToolResultPart, "output" | "error" | "executionContext">,
+): string {
+  const result = part.error
+    ? part.output
+      ? `${part.output}\n\nError: ${part.error}`
+      : `Error: ${part.error}`
+    : part.output;
+  const executionContext = formatToolResultExecutionContext(part.executionContext);
+  if (!executionContext) return result;
+  return result ? `${result}\n\n${executionContext}` : executionContext;
+}
+
+function formatToolResultExecutionContext(context: ToolResultExecutionContext | undefined): string {
+  if (!context) return "";
+  const lines: string[] = [];
+  if (context.sandbox !== undefined) lines.push(`sandbox: ${context.sandbox}`);
+  if (context.executionMode !== undefined) lines.push(`execution_mode: ${context.executionMode}`);
+  if (context.exitCode !== undefined) lines.push(`exit_code: ${context.exitCode ?? "null"}`);
+  if (context.timedOut !== undefined) lines.push(`timed_out: ${String(context.timedOut)}`);
+  if (context.aborted !== undefined) lines.push(`aborted: ${String(context.aborted)}`);
+  if (context.signal !== undefined) lines.push(`signal: ${context.signal ?? "null"}`);
+  return lines.length > 0 ? `[tool execution context]\n${lines.join("\n")}` : "";
 }
 
 export interface PatchPart extends BasePart {

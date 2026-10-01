@@ -1,0 +1,23 @@
+{
+  "name": "@chili/control-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Private HTTPS mobile control for existing Chili desktop tasks",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@chili/remote-control": "workspace:*",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "typescript": "^5.8.3",
+    "vite": "7.3.6"
+  }
+}

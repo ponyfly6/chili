@@ -1,4 +1,9 @@
-import type { ChatToolDisplayStatus, ChatToolInputSummary, RuntimeToolOutputDelta } from "@chili/sdk";
+import { homedir } from "node:os";
+import { isAbsolute, relative, resolve } from "node:path";
+import type { ChatToolDisplayStatus, ChatToolExecutionContext, ChatToolInputSummary, RuntimeToolOutputDelta } from "@chili/sdk";
+
+const TRANSCRIPT_HINT = "Ctrl+T for transcript";
+const MAX_COMPACT_LABEL_TARGET_LENGTH = 160;
 
 export interface ToolActivityDetail {
   label: string;
@@ -6,6 +11,7 @@ export interface ToolActivityDetail {
   tone: "muted" | "error";
   lineTones?: ("muted" | "error")[];
   truncated: boolean;
+  maxVisibleRows?: number;
 }
 
 export type ToolRenderMode = "inline" | "block";
@@ -31,7 +37,9 @@ export interface ToolRenderInput {
   input?: unknown;
   output?: string;
   error?: string;
+  executionContext?: ChatToolExecutionContext;
   liveOutput?: readonly RuntimeToolOutputDelta[];
+  cwd?: string;
   showToolDetails: boolean;
   source: "row" | "fallback";
 }
@@ -106,8 +114,19 @@ export function renderToolActivity(input: ToolRenderInput, registry = defaultToo
 const bashRenderer: ToolRenderer = {
   name: "bash",
   match: (toolName) => matchesTool(toolName, ["bash", "run_shell_command"]),
-  label: (input) => labelWithTarget(statusVerb(input.displayStatus, "Ran", "Running"), input.inputSummary.command ?? input.inputSummary.detail ?? input.inputSummary.title),
+  label: (input) => {
+    const label = labelWithTarget(
+      statusVerb(input.displayStatus, "Ran", "Running"),
+      input.inputSummary.command ?? input.inputSummary.detail ?? input.inputSummary.title,
+    );
+    const explicitCwd = stringFromInput(input.input, "cwd", "workingDirectory", "working_directory")
+      ?? input.inputSummary.scope;
+    return explicitCwd
+      ? `${label} · in ${displayToolPath(explicitCwd, input.cwd)}`
+      : label;
+  },
   details: (input) => defaultToolDetails(input, { maxOutputLines: 5, maxLiveOutputLines: 16 }),
+  compactErrorLines: (input) => bashCompactErrorLines(input),
 };
 
 const readRenderer: ToolRenderer = {
@@ -115,6 +134,7 @@ const readRenderer: ToolRenderer = {
   match: (toolName) => explorationToolKind(toolName) === "read",
   mode: () => "inline",
   label: (input) => labelWithTarget(statusVerb(input.displayStatus, "Read", "Reading"), displayPath(input.inputSummary.path ?? input.inputSummary.detail ?? input.inputSummary.scope ?? "file")),
+  compactErrorLines: (input) => explorationCompactErrorLines(input, "Read"),
 };
 
 const searchRenderer: ToolRenderer = {
@@ -127,6 +147,7 @@ const searchRenderer: ToolRenderer = {
       : input.inputSummary.detail ?? input.inputSummary.scope ?? "pattern";
     return labelWithTarget(statusVerb(input.displayStatus, "Searched", "Searching"), target);
   },
+  compactErrorLines: (input) => explorationCompactErrorLines(input, "Search"),
 };
 
 const listRenderer: ToolRenderer = {
@@ -139,6 +160,7 @@ const listRenderer: ToolRenderer = {
       : input.inputSummary.path ?? input.inputSummary.detail ?? input.inputSummary.scope ?? "paths";
     return labelWithTarget(statusVerb(input.displayStatus, "Listed", "Listing"), target);
   },
+  compactErrorLines: (input) => explorationCompactErrorLines(input, "List"),
 };
 
 const editRenderer: ToolRenderer = {
@@ -185,16 +207,27 @@ const taskRenderer: ToolRenderer = {
   name: "task",
   match: (toolName) => {
     const name = normalizeToolName(toolName);
-    return name === "task" || name === "agent" || name === "complete_task" || name.startsWith("task_");
+    return name === "task" || name === "agent" || name === "complete_task" || name.startsWith("task_") || name.startsWith("agent_message_");
+  },
+  mode: (input) => (normalizeToolName(input.toolName) === "task_batch" || normalizeToolName(input.toolName) === "task_wait_batch") && !input.showToolDetails ? "inline" : defaultToolMode(input),
+  summary: (input) => {
+    const name = normalizeToolName(input.toolName);
+    if (name === "task_batch") return taskBatchSummary(input.output);
+    if (name === "task_wait_batch") return taskWaitBatchSummary(input.output);
+    return defaultSummary(input);
   },
   label: (input) => {
     const name = normalizeToolName(input.toolName);
-    if (name === "task" || name === "agent") return labelWithTarget(statusVerb(input.displayStatus, "Started task", "Starting task"), stringFromInput(input.input, "description") ?? input.inputSummary.detail);
+    if (name === "task" || name === "agent") return labelWithTarget(statusVerb(input.displayStatus, "Started ad-hoc agent", "Starting ad-hoc agent"), stringFromInput(input.input, "description") ?? input.inputSummary.detail);
+    if (name === "task_batch") return taskBatchLabel(input);
     if (name === "complete_task") return labelWithTarget(statusVerb(input.displayStatus, "Completed task", "Completing task"), taskIdTarget(input));
-    if (name === "task_list") return labelWithTarget(statusVerb(input.displayStatus, "Listed tasks", "Listing tasks"), stringFromInput(input.input, "status") ?? input.inputSummary.detail);
-    if (name === "task_wait") return labelWithTarget(statusVerb(input.displayStatus, "Waited for task", "Waiting for task"), taskIdTarget(input));
-    if (name === "task_followup") return labelWithTarget(statusVerb(input.displayStatus, "Sent task follow-up", "Sending task follow-up"), taskIdTarget(input));
-    if (name === "task_close") return labelWithTarget(statusVerb(input.displayStatus, "Closed task", "Closing task"), taskIdTarget(input));
+    if (name === "task_list") return labelWithTarget(statusVerb(input.displayStatus, "Listed ad-hoc agents", "Listing ad-hoc agents"), stringFromInput(input.input, "status") ?? input.inputSummary.detail);
+    if (name === "task_wait") return labelWithTarget(statusVerb(input.displayStatus, "Waited for ad-hoc agent", "Waiting for ad-hoc agent"), taskIdTarget(input));
+    if (name === "task_wait_batch") return labelWithTarget(statusVerb(input.displayStatus, "Waited for", "Waiting for"), taskWaitBatchTarget(input.input));
+    if (name === "task_followup") return labelWithTarget(statusVerb(input.displayStatus, "Sent agent follow-up", "Sending agent follow-up"), taskIdTarget(input));
+    if (name === "task_close") return labelWithTarget(statusVerb(input.displayStatus, "Closed ad-hoc agent", "Closing ad-hoc agent"), taskIdTarget(input));
+    if (name === "agent_message_send") return labelWithTarget(statusVerb(input.displayStatus, "Sent agent message to", "Sending agent message to"), stringFromInput(input.input, "to", "target"));
+    if (name === "agent_message_list") return labelWithTarget(statusVerb(input.displayStatus, "Listed agent messages", "Listing agent messages"), stringFromInput(input.input, "status", "path", "from"));
     return labelWithTarget(statusVerb(input.displayStatus, `Ran ${input.inputSummary.title}`, `Running ${input.inputSummary.title}`), taskIdTarget(input) ?? input.inputSummary.detail);
   },
 };
@@ -207,13 +240,15 @@ const teamRenderer: ToolRenderer = {
   label: (input) => {
     const name = normalizeToolName(input.toolName);
     const target = teamTarget(input);
-    if (name === "team_create") return labelWithTarget(statusVerb(input.displayStatus, "Created team", "Creating team"), stringFromInput(input.input, "name") ?? target);
-    if (name === "team_list") return statusVerb(input.displayStatus, "Listed teams", "Listing teams");
-    if (name === "team_snapshot") return labelWithTarget(statusVerb(input.displayStatus, "Read team snapshot", "Reading team snapshot"), target);
-    if (name === "team_run_loop") return labelWithTarget(statusVerb(input.displayStatus, "Ran team loop", "Running team loop"), target);
+    if (name === "team_create") return labelWithTarget(statusVerb(input.displayStatus, "Created persistent team", "Creating persistent team"), stringFromInput(input.input, "name") ?? target);
+    if (name === "team_list") return statusVerb(input.displayStatus, "Listed persistent teams", "Listing persistent teams");
+    if (name === "team_snapshot") return labelWithTarget(statusVerb(input.displayStatus, "Read persistent team snapshot", "Reading persistent team snapshot"), target);
+    if (name === "team_run_loop") return labelWithTarget(statusVerb(input.displayStatus, "Ran persistent team loop", "Running persistent team loop"), target);
     if (name.startsWith("team_task_")) return labelWithTarget(statusVerb(input.displayStatus, teamTaskPastVerb(name), teamTaskActiveVerb(name)), stringFromInput(input.input, "title") ?? target);
     if (name.startsWith("team_message_")) return labelWithTarget(statusVerb(input.displayStatus, teamMessagePastVerb(name), teamMessageActiveVerb(name)), target);
-    if (name.startsWith("team_member_")) return labelWithTarget(statusVerb(input.displayStatus, "Updated team member", "Updating team member"), stringFromInput(input.input, "path", "name") ?? target);
+    if (name === "team_member_add") return labelWithTarget(statusVerb(input.displayStatus, "Added persistent team member", "Adding persistent team member"), stringFromInput(input.input, "name", "path") ?? target);
+    if (name === "team_member_list") return labelWithTarget(statusVerb(input.displayStatus, "Listed persistent team members", "Listing persistent team members"), target);
+    if (name.startsWith("team_member_")) return labelWithTarget(statusVerb(input.displayStatus, "Updated persistent team member", "Updating persistent team member"), stringFromInput(input.input, "path", "name") ?? target);
     return labelWithTarget(statusVerb(input.displayStatus, `Ran ${input.inputSummary.title}`, `Running ${input.inputSummary.title}`), target ?? input.inputSummary.detail);
   },
 };
@@ -285,26 +320,50 @@ export function normalizeToolName(toolName: string): string {
 function defaultToolDetails(input: ToolRenderInput, options: { maxOutputLines?: number; maxLiveOutputLines?: number } = {}): ToolActivityDetail[] {
   const details: ToolActivityDetail[] = [];
   if (input.input !== undefined) {
-    const preview = previewTextLines(formatInput(input.input), { maxLines: 8, maxLineLength: 180 });
-    details.push({ label: "input", tone: "muted", lines: preview.lines, truncated: preview.truncated });
+    const preview = previewTextLines(formatInput(input.input), { maxLines: 5, maxLineLength: 180, preserveTail: true });
+    details.push({ label: "input", tone: "muted", lines: preview.lines, truncated: preview.truncated, maxVisibleRows: 5 });
   }
+  const execution = executionContextDetail(input.executionContext);
+  if (execution) details.push(execution);
   const liveOutput = liveOutputDetail(input, options.maxLiveOutputLines ?? 16);
   if (liveOutput) details.push(liveOutput);
   if (input.error) {
-    const preview = previewTextLines(input.error, { maxLines: 5, maxLineLength: 180 });
-    details.push({ label: "error", tone: "error", lines: preview.lines, truncated: preview.truncated });
+    const preview = previewTextLines(input.error, { maxLines: 5, maxLineLength: 180, preserveTail: true });
+    details.push({ label: "error", tone: "error", lines: preview.lines, truncated: preview.truncated, maxVisibleRows: 5 });
   }
   if (input.output) {
+    const maxOutputLines = options.maxOutputLines ?? 5;
     const preview = previewTextLines(input.output, {
-      maxLines: options.maxOutputLines ?? 8,
+      maxLines: maxOutputLines,
       maxLineLength: 180,
+      preserveTail: true,
     });
-    details.push({ label: "output", tone: "muted", lines: preview.lines, truncated: preview.truncated });
+    details.push({
+      label: "output",
+      tone: "muted",
+      lines: preview.lines,
+      truncated: preview.truncated,
+      maxVisibleRows: maxOutputLines,
+    });
   }
   return details;
 }
 
+function executionContextDetail(context: ChatToolExecutionContext | undefined): ToolActivityDetail | undefined {
+  if (!context) return undefined;
+  const lines: string[] = [];
+  if (context.executionMode !== undefined) lines.push(`mode: ${context.executionMode}`);
+  if (context.sandbox !== undefined) lines.push(`sandbox: ${context.sandbox}`);
+  if (context.exitCode !== undefined) lines.push(`exit code: ${context.exitCode ?? "null"}`);
+  if (context.timedOut !== undefined) lines.push(`timed out: ${String(context.timedOut)}`);
+  if (context.aborted !== undefined) lines.push(`aborted: ${String(context.aborted)}`);
+  if (context.signal !== undefined) lines.push(`signal: ${context.signal ?? "null"}`);
+  if (lines.length === 0) return undefined;
+  return { label: "execution", tone: "muted", lines, truncated: false };
+}
+
 function compactLiveOutputDetails(input: ToolRenderInput): ToolActivityDetail[] {
+  if (isExplorationTool(input.toolName)) return [];
   const liveOutput = liveOutputDetail(input, 5);
   return liveOutput ? [liveOutput] : [];
 }
@@ -323,6 +382,7 @@ function liveOutputDetail(input: ToolRenderInput, maxLines: number): ToolActivit
     lines: preview.lines,
     lineTones: preview.lineTones,
     truncated: preview.truncated,
+    maxVisibleRows: maxLines,
   };
 }
 
@@ -361,23 +421,88 @@ function defaultSummary(input: ToolRenderInput): string | undefined {
 }
 
 function defaultOutputHint(input: ToolRenderInput): string | undefined {
+  if (input.displayStatus === "succeeded" && isNoMatchOutput(input.output)) return "No matches";
   if (input.error || !input.output || !isLargeOutput(input.output)) return undefined;
   const lines = Math.max(1, input.output.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").length);
   return `output hidden (${lines} ${plural(lines, "line", "lines")}, details available)`;
 }
 
+export function isNoMatchOutput(value: string | undefined): boolean {
+  return value?.trim() === "(no matches)";
+}
+
 function defaultCompactErrorLines(input: ToolRenderInput): string[] | undefined {
   const value = input.error ?? (input.displayStatus === "failed" ? input.output : undefined);
   if (!value) return undefined;
-  return previewTextLines(value, { maxLines: 4, maxLineLength: 180 }).lines;
+  return previewTextLines(value, { maxLines: 4, maxLineLength: 180, preserveTail: true }).lines;
 }
 
-function previewTextLines(value: string, options: { maxLines: number; maxLineLength: number }): { lines: string[]; truncated: boolean } {
+function bashCompactErrorLines(input: ToolRenderInput): string[] | undefined {
+  if (input.error) return defaultCompactErrorLines(input);
+  const context = input.executionContext;
+  if (context?.timedOut) return ["Command timed out"];
+  if (context?.aborted) return ["Command was interrupted"];
+  if (typeof context?.signal === "string" && context.signal) return [`Command stopped by ${context.signal}`];
+  if (typeof context?.exitCode === "number" && context.exitCode !== 0) {
+    return [`Command exited with code ${context.exitCode}`];
+  }
+  return defaultCompactErrorLines(input);
+}
+
+function explorationCompactErrorLines(input: ToolRenderInput, action: "Read" | "Search" | "List"): string[] | undefined {
+  if (!isFailedDisplayStatus(input.displayStatus) && !input.error) return undefined;
+  const target = displayToolPath(
+    input.inputSummary.path
+      ?? input.inputSummary.scope
+      ?? input.inputSummary.pattern
+      ?? input.inputSummary.detail
+      ?? "target",
+    input.cwd,
+  );
+  if (input.displayStatus === "rejected") return [`${action} rejected: ${target}`];
+  if (input.displayStatus === "cancelled") return [`${action} cancelled: ${target}`];
+
+  const error = input.error ?? input.output ?? "";
+  if (/\bENOENT\b|no such file or directory/i.test(error)) return [`File not found: ${target}`];
+  if (/\b(?:EACCES|EPERM)\b|permission denied/i.test(error)) return [`Permission denied: ${target}`];
+  if (/timed?\s*out|timeout/i.test(error)) return [`${action} timed out: ${target}`];
+  return [`${action} failed: ${target}`];
+}
+
+function previewTextLines(
+  value: string,
+  options: { maxLines: number; maxLineLength: number; preserveTail?: boolean },
+): { lines: string[]; truncated: boolean } {
   const normalized = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
   const sourceLines = normalized.length > 0 ? normalized.split("\n") : [""];
-  const lines = sourceLines.slice(0, options.maxLines).map((line) => shortenLine(line, options.maxLineLength));
-  const truncated = sourceLines.length > options.maxLines || lines.some((line, index) => line !== sourceLines[index]);
+  const selected = options.preserveTail === true
+    ? headTailLines(sourceLines, options.maxLines)
+    : sourceLines.slice(0, options.maxLines);
+  let lines = selected.map((line) => shortenLine(line, options.maxLineLength));
+  const sourceTruncated = sourceLines.length > options.maxLines;
+  const shortened = lines.some((line, index) => line !== selected[index]);
+  if (!sourceTruncated && shortened) {
+    const hint = `… output truncated (${TRANSCRIPT_HINT})`;
+    const budget = Math.max(1, Math.floor(options.maxLines));
+    lines = budget === 1
+      ? [hint]
+      : [...lines.slice(0, budget - 1), hint];
+  }
+  const truncated = sourceTruncated || shortened;
   return { lines, truncated };
+}
+
+function headTailLines(sourceLines: readonly string[], maxLines: number): string[] {
+  if (sourceLines.length <= maxLines) return [...sourceLines];
+  if (maxLines <= 1) return [`… +${sourceLines.length} lines (${TRANSCRIPT_HINT})`];
+  const headCount = Math.ceil((maxLines - 1) / 2);
+  const tailCount = Math.max(0, maxLines - headCount - 1);
+  const hiddenCount = sourceLines.length - headCount - tailCount;
+  return [
+    ...sourceLines.slice(0, headCount),
+    `… +${hiddenCount} lines (${TRANSCRIPT_HINT})`,
+    ...(tailCount > 0 ? sourceLines.slice(-tailCount) : []),
+  ];
 }
 
 function isLargeOutput(value: string): boolean {
@@ -393,10 +518,25 @@ function liveOutputPreview(
   options: { maxLines: number; maxLineLength: number; stderrTone: LiveOutputTone },
 ): { lines: string[]; lineTones: ("muted" | "error")[]; truncated: boolean } {
   const entries = liveOutputLineEntries(deltas, options.maxLineLength, options.stderrTone);
-  let truncated = deltas.some((delta) => delta.truncated === true);
-  if (entries.length > options.maxLines) truncated = true;
-  if (entries.some((entry) => entry.shortened)) truncated = true;
-  const visible = entries.slice(-options.maxLines);
+  const sourceTruncated = deltas.some((delta) => delta.truncated === true);
+  const shortened = entries.some((entry) => entry.shortened);
+  const budget = Number.isFinite(options.maxLines)
+    ? Math.max(1, Math.floor(options.maxLines))
+    : Math.max(1, entries.length);
+  const overflow = entries.length > budget;
+  const truncated = sourceTruncated || shortened || overflow;
+  let visible = entries.slice(-budget);
+  if (truncated) {
+    const contentBudget = Math.max(0, budget - 1);
+    const retained = contentBudget === 0 ? [] : entries.slice(-contentBudget);
+    const omission = overflow && !sourceTruncated && !shortened
+      ? `… +${entries.length - retained.length} lines (${TRANSCRIPT_HINT})`
+      : `… output truncated (${TRANSCRIPT_HINT})`;
+    visible = [
+      { line: omission, tone: "muted", shortened: false },
+      ...retained,
+    ];
+  }
   return {
     lines: visible.map((entry) => entry.line),
     lineTones: visible.map((entry) => entry.tone),
@@ -482,7 +622,7 @@ function statusVerb(status: ChatToolDisplayStatus, succeeded: string, active: st
 
 function labelWithTarget(verb: string, target: string | undefined): string {
   const trimmed = target?.replace(/\s+/g, " ").trim();
-  return trimmed ? `${verb} ${trimmed}` : verb;
+  return trimmed ? `${verb} ${middleElideText(trimmed, MAX_COMPACT_LABEL_TARGET_LENGTH)}` : verb;
 }
 
 function gitDiffTarget(input: ToolRenderInput): string | undefined {
@@ -507,6 +647,103 @@ function taskIdTarget(input: ToolRenderInput): string | undefined {
   return stringFromInput(input.input, "taskId", "task_id") ?? input.inputSummary.detail ?? input.inputSummary.scope;
 }
 
+function taskBatchTarget(input: unknown): string {
+  const record = recordValue(input);
+  const tasks = record?.tasks;
+  const count = Array.isArray(tasks) ? tasks.length : undefined;
+  return count === undefined ? "ad-hoc agents" : `${count} ${plural(count, "ad-hoc agent", "ad-hoc agents")}`;
+}
+
+function taskBatchLabel(input: ToolRenderInput): string {
+  const output = parseJsonObject(input.output);
+  const spawn = output ? taskBatchSpawnState(output) : undefined;
+  if (input.displayStatus === "succeeded" && spawn?.spawnFailureCount) {
+    if (spawn.spawnedCount === 0) {
+      const target = `${spawn.expected} ${plural(spawn.expected, "ad-hoc agent", "ad-hoc agents")}`;
+      return `Failed to spawn ${target}`;
+    }
+    if (spawn.spawnedCount !== undefined) {
+      const target = `${spawn.spawnedCount} of ${spawn.expected} ad-hoc agents`;
+      return `Started ${target} (${spawn.spawnFailureCount} failed to spawn)`;
+    }
+  }
+  return labelWithTarget(statusVerb(input.displayStatus, "Started", "Starting"), taskBatchTarget(input.input));
+}
+
+function taskWaitBatchTarget(input: unknown): string {
+  const record = recordValue(input);
+  const taskIds = record?.taskIds ?? record?.task_ids;
+  const count = Array.isArray(taskIds) ? taskIds.length : undefined;
+  const waitFor = firstString(record ?? {}, ["waitFor", "wait_for"]) ?? "all";
+  const agents = count === undefined ? "ad-hoc agents" : `${count} ${plural(count, "ad-hoc agent", "ad-hoc agents")}`;
+  return `${agents} (${waitFor})`;
+}
+
+function taskBatchSummary(output: string | undefined): string | undefined {
+  const record = parseJsonObject(output);
+  if (!record) return undefined;
+  const tasks = arrayField(record, ["tasks"]);
+  const parts: string[] = [];
+  const spawn = taskBatchSpawnState(record);
+  const count = spawn.spawnedCount ?? spawn.expected;
+  if (count > 0 || spawn.spawnFailureCount > 0) parts.push(`agents=${count}`);
+  if (spawn.spawnFailureCount > 0 || count !== spawn.expected) parts.push(`planned=${spawn.expected}`);
+  if (spawn.spawnFailureCount > 0) parts.push(`spawn_failed=${spawn.spawnFailureCount}`);
+  const policy = firstString(record, ["completionPolicy", "completion_policy"]);
+  if (policy) parts.push(`policy=${policy}`);
+  const fanout = firstNumber(record, ["maxConcurrency", "max_concurrency"]);
+  if (fanout !== undefined) parts.push(`fanout=${fanout}`);
+  if (record.joined === true) parts.push("joined=true");
+  appendBooleanPart(parts, "timed_out", firstBoolean(record, ["timedOut", "timed_out"]));
+  appendTaskStatusCounts(parts, tasks);
+  return parts.length > 0 ? parts.join(", ") : undefined;
+}
+
+function taskBatchSpawnState(record: Record<string, unknown>): {
+  expected: number;
+  spawnedCount?: number;
+  spawnFailureCount: number;
+} {
+  const tasks = arrayField(record, ["tasks"]);
+  const failures = arrayField(record, ["spawnFailures", "spawn_failures"]);
+  const spawnFailureCount = firstNumber(record, ["spawnFailureCount", "spawn_failure_count"])
+    ?? failures.length;
+  const declaredExpected = firstNumber(record, ["expectedBatchSize", "expected_batch_size", "count"]);
+  const declaredSpawned = firstNumber(record, ["spawnedCount", "spawned_count"]);
+  const expected = Math.max(declaredExpected ?? 0, declaredSpawned ?? 0, tasks.length + spawnFailureCount);
+  const spawnedCount = declaredSpawned ?? (spawnFailureCount > 0 ? tasks.length : undefined);
+  return {
+    expected,
+    ...(spawnedCount === undefined ? {} : { spawnedCount }),
+    spawnFailureCount,
+  };
+}
+
+function taskWaitBatchSummary(output: string | undefined): string | undefined {
+  const record = parseJsonObject(output);
+  if (!record) return undefined;
+  const tasks = arrayField(record, ["tasks"]);
+  const parts: string[] = [];
+  const waitFor = firstString(record, ["waitFor", "wait_for"]);
+  if (waitFor) parts.push(`wait=${waitFor}`);
+  const count = firstNumber(record, ["count"]) ?? tasks.length;
+  if (count > 0) parts.push(`agents=${count}`);
+  appendBooleanPart(parts, "timed_out", firstBoolean(record, ["timedOut", "timed_out"]));
+  appendTaskStatusCounts(parts, tasks);
+  return parts.length > 0 ? parts.join(", ") : undefined;
+}
+
+function appendTaskStatusCounts(parts: string[], tasks: readonly Record<string, unknown>[]): void {
+  const statusCounts = new Map<string, number>();
+  for (const task of tasks) {
+    const status = recordString(task, "status");
+    if (status) statusCounts.set(status, (statusCounts.get(status) ?? 0) + 1);
+  }
+  for (const status of ["pending", "running", "completed", "incomplete", "failed", "cancelled"] as const) {
+    appendCountPart(parts, status, statusCounts.get(status));
+  }
+}
+
 function teamTarget(input: ToolRenderInput): string | undefined {
   return stringFromInput(input.input, "taskId", "task_id", "teamId", "team_id", "messageId", "message_id")
     ?? input.inputSummary.detail
@@ -514,22 +751,22 @@ function teamTarget(input: ToolRenderInput): string | undefined {
 }
 
 function teamTaskPastVerb(toolName: string): string {
-  if (toolName.endsWith("_create_batch")) return "Created team tasks";
-  if (toolName.endsWith("_dispatch_batch")) return "Dispatched team tasks";
-  if (toolName.endsWith("_create")) return "Created team task";
-  if (toolName.endsWith("_list")) return "Listed team tasks";
-  if (toolName.endsWith("_assign")) return "Assigned team task";
-  if (toolName.endsWith("_claim")) return "Claimed team task";
-  if (toolName.endsWith("_update")) return "Updated team task";
-  if (toolName.endsWith("_dispatch")) return "Dispatched team task";
-  if (toolName.endsWith("_sync")) return "Synced team task";
-  if (toolName.endsWith("_reconcile")) return "Reconciled team tasks";
-  return "Updated team task";
+  if (toolName.endsWith("_create_batch")) return "Created persistent team tasks";
+  if (toolName.endsWith("_dispatch_batch")) return "Dispatched persistent team tasks";
+  if (toolName.endsWith("_create")) return "Created persistent team task";
+  if (toolName.endsWith("_list")) return "Listed persistent team tasks";
+  if (toolName.endsWith("_assign")) return "Assigned persistent team task";
+  if (toolName.endsWith("_claim")) return "Claimed persistent team task";
+  if (toolName.endsWith("_update")) return "Updated persistent team task";
+  if (toolName.endsWith("_dispatch")) return "Dispatched persistent team task";
+  if (toolName.endsWith("_sync")) return "Synced persistent team task";
+  if (toolName.endsWith("_reconcile")) return "Reconciled persistent team tasks";
+  return "Updated persistent team task";
 }
 
 function teamTaskActiveVerb(toolName: string): string {
-  if (toolName.endsWith("_create_batch")) return "Creating team tasks";
-  if (toolName.endsWith("_dispatch_batch")) return "Dispatching team tasks";
+  if (toolName.endsWith("_create_batch")) return "Creating persistent team tasks";
+  if (toolName.endsWith("_dispatch_batch")) return "Dispatching persistent team tasks";
   return teamTaskPastVerb(toolName).replace(/ed\b/, "ing");
 }
 
@@ -585,6 +822,10 @@ function appendCountPart(parts: string[], label: string, count: number | undefin
   parts.push(`${label}=${count}`);
 }
 
+function appendBooleanPart(parts: string[], label: string, value: boolean | undefined): void {
+  if (value !== undefined) parts.push(`${label}=${String(value)}`);
+}
+
 function arrayField(record: Record<string, unknown>, keys: readonly string[]): Record<string, unknown>[] {
   for (const key of keys) {
     const value = record[key];
@@ -619,16 +860,24 @@ function firstNumber(record: Record<string, unknown>, keys: readonly string[]): 
   return undefined;
 }
 
+function firstBoolean(record: Record<string, unknown>, keys: readonly string[]): boolean | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "boolean") return value;
+  }
+  return undefined;
+}
+
 function teamMessagePastVerb(toolName: string): string {
-  if (toolName.endsWith("_send")) return "Sent team message";
-  if (toolName.endsWith("_list")) return "Listed team messages";
-  return "Handled team message";
+  if (toolName.endsWith("_send")) return "Sent persistent team message";
+  if (toolName.endsWith("_list")) return "Listed persistent team messages";
+  return "Handled persistent team message";
 }
 
 function teamMessageActiveVerb(toolName: string): string {
-  if (toolName.endsWith("_send")) return "Sending team message";
-  if (toolName.endsWith("_list")) return "Listing team messages";
-  return "Handling team message";
+  if (toolName.endsWith("_send")) return "Sending persistent team message";
+  if (toolName.endsWith("_list")) return "Listing persistent team messages";
+  return "Handling persistent team message";
 }
 
 function matchesTool(toolName: string, names: readonly string[]): boolean {
@@ -640,6 +889,50 @@ function displayPath(path: string): string {
   const normalized = path.replace(/\\/g, "/");
   const parts = normalized.split("/").filter(Boolean);
   return parts.at(-1) ?? path;
+}
+
+function displayToolPath(value: string, cwd: string | undefined, maxLength = 96): string {
+  const normalized = value.replace(/\\/g, "/");
+  let display = normalized;
+  if (isAbsolute(value)) {
+    const absolute = resolve(value);
+    const workspaceRelative = relative(resolve(cwd ?? process.cwd()), absolute);
+    if (workspaceRelative === "") {
+      display = ".";
+    } else if (isContainedRelativePath(workspaceRelative)) {
+      display = workspaceRelative.replace(/\\/g, "/");
+    } else {
+      const homeRelative = relative(resolve(homedir()), absolute);
+      display = isContainedRelativePath(homeRelative)
+        ? `~/${homeRelative.replace(/\\/g, "/")}`
+        : normalized;
+    }
+  }
+  return middleElidePath(display, maxLength);
+}
+
+function isContainedRelativePath(value: string): boolean {
+  return value !== ".." && !value.startsWith("../") && !value.startsWith("..\\") && !isAbsolute(value);
+}
+
+function middleElidePath(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  const slash = value.lastIndexOf("/");
+  if (slash > 0) {
+    const suffix = value.slice(slash);
+    const headLength = maxLength - suffix.length - 1;
+    if (headLength >= 8) return `${value.slice(0, headLength).replace(/\/+$/, "")}…${suffix}`;
+  }
+  const headLength = Math.max(1, Math.floor((maxLength - 1) / 2));
+  const tailLength = Math.max(1, maxLength - headLength - 1);
+  return `${value.slice(0, headLength)}…${value.slice(-tailLength)}`;
+}
+
+function middleElideText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  const headLength = Math.max(1, Math.ceil((maxLength - 1) / 2));
+  const tailLength = Math.max(1, maxLength - headLength - 1);
+  return `${value.slice(0, headLength)}…${value.slice(-tailLength)}`;
 }
 
 function formatInput(input: unknown): string {

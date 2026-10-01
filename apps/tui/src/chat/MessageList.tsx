@@ -6,9 +6,11 @@ import type { TuiTheme } from "../theme/index.js";
 import { AssistantMarkdownCell, assistantTextCellLines } from "./AssistantCells.js";
 import { componentBackedCell, lineBackedCell, TranscriptCellView, type TranscriptCellModel } from "./cells.js";
 import { type OpenFileLinkHandler, type TranscriptLineModel, wrapLine } from "./lines.js";
+import { charDisplayWidth, markdownToTerminalLines } from "./markdown.js";
 import { localTranscriptItemTime } from "./local-transcript.js";
 import { buildChatDisplayItems, groupExplorationTools, type ChatDisplayItem } from "./presentation.js";
 import { ToolCell, ToolGroupCell, toolCellLines, toolGroupCellLines } from "./ToolCells.js";
+import { AgentBatchCell, agentBatchCellLines, type InlineAgentBatchDisplay } from "./AgentBatchCells.js";
 import type { LocalTranscriptItem } from "./types.js";
 
 export function MessageList(props: {
@@ -21,6 +23,7 @@ export function MessageList(props: {
   cwd?: string | undefined;
   onOpenFile?: OpenFileLinkHandler | undefined;
   theme: TuiTheme;
+  agentBatches?: readonly InlineAgentBatchDisplay[];
 }) {
   const allCells = transcriptCells(props.chatView.items, props.localItems, {
     width: Math.max(24, props.width ?? 80),
@@ -30,6 +33,7 @@ export function MessageList(props: {
     activeToolCount: props.chatView.activeTools.length,
     theme: props.theme,
     cwd: props.cwd ?? process.cwd(),
+    ...(props.agentBatches === undefined ? {} : { agentBatches: props.agentBatches }),
   });
   const selectionColors = {
     selectionBg: props.theme.colors.menu.selectedBackground,
@@ -65,10 +69,33 @@ export function MessageList(props: {
   );
 }
 
+export function messageListLineCount(input: {
+  chatView: ChatSessionView;
+  localItems: readonly LocalTranscriptItem[];
+  width?: number;
+  showToolDetails?: boolean;
+  hideThinking?: boolean;
+  cwd?: string;
+  theme: TuiTheme;
+  agentBatches?: readonly InlineAgentBatchDisplay[];
+}): number {
+  const count = transcriptCells(input.chatView.items, input.localItems, {
+    width: Math.max(24, input.width ?? 80),
+    showToolDetails: input.showToolDetails === true,
+    hideThinking: input.hideThinking === true,
+    sessionStatus: input.chatView.status,
+    activeToolCount: input.chatView.activeTools.length,
+    theme: input.theme,
+    cwd: input.cwd ?? process.cwd(),
+    ...(input.agentBatches === undefined ? {} : { agentBatches: input.agentBatches }),
+  }).reduce((lineCount, cell) => lineCount + cell.lineCount, 0);
+  return Math.max(1, count);
+}
+
 function transcriptCells(
   items: readonly ChatTranscriptItem[],
   localItems: readonly LocalTranscriptItem[],
-  options: { width: number; showToolDetails: boolean; hideThinking: boolean; sessionStatus: ChatSessionView["status"]; activeToolCount: number; theme: TuiTheme; cwd: string },
+  options: { width: number; showToolDetails: boolean; hideThinking: boolean; sessionStatus: ChatSessionView["status"]; activeToolCount: number; theme: TuiTheme; cwd: string; agentBatches?: readonly InlineAgentBatchDisplay[] },
 ): TranscriptCellModel[] {
   const displayItems = buildChatDisplayItems(items, {
     showToolDetails: options.showToolDetails,
@@ -76,16 +103,18 @@ function transcriptCells(
     sessionStatus: options.sessionStatus,
     activeToolCount: options.activeToolCount,
     groupExplorationTools: localItems.length === 0,
+    cwd: options.cwd,
+    ...(options.agentBatches === undefined ? {} : { agentBatches: options.agentBatches }),
   });
   if (localItems.length === 0) {
-    return displayItems.map((item) => displayItemCell(item, options.width, options.theme, options.hideThinking, options.cwd));
+    return displayItems.map((item) => displayItemCell(item, options.width, options.theme, options.showToolDetails, options.hideThinking, options.cwd));
   }
 
   const output: TranscriptCellModel[] = [];
   let pendingDisplayItems: ChatDisplayItem[] = [];
   const flushDisplayItems = () => {
     if (pendingDisplayItems.length === 0) return;
-    output.push(...groupExplorationTools(pendingDisplayItems).map((item) => displayItemCell(item, options.width, options.theme, options.hideThinking, options.cwd)));
+    output.push(...groupExplorationTools(pendingDisplayItems).map((item) => displayItemCell(item, options.width, options.theme, options.showToolDetails, options.hideThinking, options.cwd)));
     pendingDisplayItems = [];
   };
 
@@ -138,20 +167,16 @@ function chatDisplayItemTime(item: ChatDisplayItem): number {
   return typeof item.time === "number" && Number.isFinite(item.time) ? item.time : Number.MAX_SAFE_INTEGER;
 }
 
-function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, hideThinking: boolean, cwd: string): TranscriptCellModel {
-  if (item.kind === "user_text") {
-    return lineBackedCell(`display:${item.kind}:${item.id}`, wrapLine(`🥔: ${item.text || "..."}`, {
-      key: `display:${item.kind}:${item.id}`,
-      fg: theme.colors.text.primary,
-      width,
-      hangingIndent: "    ",
-    }));
+function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, showToolDetails: boolean, hideThinking: boolean, cwd: string): TranscriptCellModel {
+  if (item.kind === "user_message") {
+    return lineBackedCell(`display:${item.kind}:${item.id}`, userMessageLines(item, width, theme));
   }
   if (item.kind === "assistant_text") {
     const key = `display:${item.kind}:${item.id}`;
     const lines = assistantTextCellLines({
       key,
       text: item.text,
+      phase: item.phase,
       streaming: item.streaming === true,
       width,
       theme,
@@ -163,6 +188,7 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
         <AssistantMarkdownCell
           cellKey={key}
           text={item.text}
+          phase={item.phase}
           streaming={item.streaming === true}
           width={width}
           theme={theme}
@@ -172,15 +198,7 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
       fallbackLines: lines,
     });
   }
-  if (item.kind === "user_image") {
-    return lineBackedCell(`display:${item.kind}:${item.id}`, wrapLine(`image: ${item.label || "[image]"}`, {
-      key: `display:${item.kind}:${item.id}`,
-      fg: theme.colors.text.secondary,
-      width,
-      hangingIndent: "    ",
-    }));
-  }
-  if (item.kind === "reasoning") return lineBackedCell(`display:${item.kind}:${item.id}`, reasoningLines(item, width, theme, hideThinking));
+  if (item.kind === "reasoning") return lineBackedCell(`display:${item.kind}:${item.id}`, reasoningLines(item, width, theme, showToolDetails, hideThinking));
   if (item.kind === "tool_activity") {
     return componentBackedCell({
       key: `display:tool:${item.activity.id}`,
@@ -195,6 +213,14 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
       fallbackLines: toolGroupCellLines(item, width, theme),
     });
   }
+  if (item.kind === "agent_batch") {
+    const lines = agentBatchCellLines(item.batch, width, showToolDetails, theme);
+    return componentBackedCell({
+      key: `display:${item.kind}:${item.id}`,
+      render: () => <AgentBatchCell batch={item.batch} width={width} expanded={showToolDetails} theme={theme} />,
+      fallbackLines: lines,
+    });
+  }
   if (item.kind === "summary") {
     return lineBackedCell(`display:${item.kind}:${item.id}`, wrapLine(`summary: ${item.text || "..."}`, {
       key: `display:${item.kind}:${item.id}`,
@@ -206,9 +232,69 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
   return lineBackedCell(`${item.approval.kind}:${item.approval.id}`, approvalLines(item.approval, width, theme));
 }
 
+function userMessageLines(
+  item: Extract<ChatDisplayItem, { kind: "user_message" }>,
+  width: number,
+  theme: TuiTheme,
+): TranscriptLineModel[] {
+  const key = `display:${item.kind}:${item.id}`;
+  const background = theme.colors.message.userBackground;
+  const contentWidth = Math.max(1, width - 1);
+  const lines: TranscriptLineModel[] = [
+    {
+      key: `${key}:before`,
+      text: " ",
+      fg: theme.colors.text.primary,
+    },
+  ];
+
+  item.imageLabels.forEach((label, index) => {
+    lines.push(...wrapLine(`    image: ${label || "[image]"}`, {
+      key: `${key}:image:${index}`,
+      fg: theme.colors.accent.secondary,
+      bg: background,
+      width: contentWidth,
+      hangingIndent: "    ",
+    }));
+  });
+  if (item.imageLabels.length > 0 && item.text) {
+    lines.push({
+      key: `${key}:image-text-spacer`,
+      text: " ",
+      fg: theme.colors.text.primary,
+      bg: background,
+    });
+  }
+  if (item.text) {
+    item.text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").forEach((text, index) => {
+      lines.push(...wrapLine(`${index === 0 ? "🥔: " : "    "}${text || " "}`, {
+        key: `${key}:text:${index}`,
+        fg: theme.colors.text.primary,
+        bg: background,
+        width: contentWidth,
+        hangingIndent: "    ",
+      }));
+    });
+  }
+
+  lines.push({
+    key: `${key}:after`,
+    text: " ",
+    fg: theme.colors.text.primary,
+  });
+  return lines.map((line) => line.bg
+    ? { ...line, text: padLineToWidth(line.text, contentWidth) }
+    : line);
+}
+
+function padLineToWidth(text: string, width: number): string {
+  const currentWidth = [...text].reduce((total, char) => total + charDisplayWidth(char), 0);
+  return `${text}${" ".repeat(Math.max(0, width - currentWidth))}`;
+}
+
 function localItemCell(item: LocalTranscriptItem, width: number, theme: TuiTheme): TranscriptCellModel {
   if (item.kind === "shell") return lineBackedCell(item.id, shellItemLines(item, width, theme));
-  return lineBackedCell(item.id, wrapLine(`${item.level}: ${item.text}`, {
+  return lineBackedCell(item.id, wrapLine(item.bare ? item.text : `${item.level}: ${item.text}`, {
     key: item.id,
     fg: item.level === "error" ? theme.colors.status.error : theme.colors.text.muted,
     width,
@@ -297,16 +383,54 @@ function shellStatusText(item: Extract<LocalTranscriptItem, { kind: "shell" }>):
   return item.status;
 }
 
-function reasoningLines(item: Extract<ChatDisplayItem, { kind: "reasoning" }>, width: number, theme: TuiTheme, hideThinking: boolean): TranscriptLineModel[] {
+function reasoningLines(
+  item: Extract<ChatDisplayItem, { kind: "reasoning" }>,
+  width: number,
+  theme: TuiTheme,
+  showToolDetails: boolean,
+  hideThinking: boolean,
+): TranscriptLineModel[] {
   const hiddenText = item.active === true ? "🫧 thinking..." : "🫧";
   const visibleThinking = item.active === true ? (item.text || "thinking...") : item.text;
-  const text = hideThinking ? hiddenText : `Thinking: ${shorten((visibleThinking || "...").replace(/\s+/g, " ").trim(), 180)}`;
-  return wrapLine(text, {
-    key: `display:${item.kind}:${item.id}`,
+  const key = `display:${item.kind}:${item.id}`;
+  if (hideThinking) {
+    return wrapLine(hiddenText, {
+      key,
+      fg: theme.colors.text.muted,
+      width,
+      hangingIndent: "  ",
+    });
+  }
+
+  const source = visibleThinking || "...";
+  if (showToolDetails) {
+    return markdownToTerminalLines(source, {
+      key,
+      width,
+      prefix: "Thinking: ",
+      hangingIndent: "  ",
+    }).map((line) => ({
+      key: line.key,
+      text: line.text,
+      fg: theme.colors.text.muted,
+    }));
+  }
+
+  const subject = reasoningSubject(source);
+  return wrapLine(`Thinking: ${shorten(subject, 180)}`, {
+    key,
     fg: theme.colors.text.muted,
     width,
     hangingIndent: "  ",
   });
+}
+
+function reasoningSubject(source: string): string {
+  const first = markdownToTerminalLines(source, {
+    key: "reasoning-subject",
+    width: 180,
+  }).map((line) => line.text.trim()).find(Boolean);
+  return (first || "...").replace(/^#{1,3}\s+/, "").replace(/\*{2,}/g, "").trim() || "...";
 }
 
 function approvalLines(item: Extract<ChatTranscriptItem, { kind: "approval" }>, width: number, theme: TuiTheme): TranscriptLineModel[] {

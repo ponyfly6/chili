@@ -2,7 +2,46 @@ import { expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runProcess } from "./process.js";
+import { observeRunProcessLifecycle, runProcess, type RunProcessLifecycleEvent } from "./process.js";
+
+test("runProcess reports its detached process group lifecycle", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-process-lifecycle-"));
+  const events: RunProcessLifecycleEvent[] = [];
+  const unsubscribe = observeRunProcessLifecycle((event) => events.push(event));
+  try {
+    expect((await runProcess("bash", ["-lc", "exit 0"], { cwd: workspace })).exitCode).toBe(0);
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({ type: "started", pid: expect.any(Number) });
+    const startedPid = events[0]?.pid;
+    if (!startedPid) throw new Error("runProcess did not report its started PID");
+    expect(events[1]).toEqual({ type: "finished", pid: startedPid });
+  } finally {
+    unsubscribe();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runProcess does not allow a background process to escape its detached group", async () => {
+  if (process.platform === "win32") return;
+  const workspace = await mkdtemp(join(tmpdir(), "chili-process-background-"));
+  const marker = join(workspace, "escaped.txt");
+  const events: RunProcessLifecycleEvent[] = [];
+  const unsubscribe = observeRunProcessLifecycle((event) => events.push(event));
+  try {
+    const result = await runProcess(
+      "bash",
+      ["-lc", `(sleep 0.4; printf escaped > ${shellQuote(marker)}) >/dev/null 2>&1 &`],
+      { cwd: workspace, killGraceMs: 80 },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(events.map((event) => event.type)).toEqual(["started", "finished"]);
+    await sleep(600);
+    await expect(readFile(marker, "utf8")).rejects.toThrow();
+  } finally {
+    unsubscribe();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
 
 test("runProcess reports output truncation with byte metadata", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-process-output-"));
@@ -21,6 +60,49 @@ test("runProcess reports output truncation with byte metadata", async () => {
     expect(result.stderrBytes).toBe(6);
     expect(result.outputLimitBytes).toBe(3);
     expect(result.timedOut).toBe(false);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runProcess exposes raw output after final capture is truncated", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-process-raw-output-"));
+  const raw: Buffer[] = [];
+  try {
+    const marker = "FINAL_CAPTURE_MARKER";
+    const script = `process.stdout.write("x".repeat(300000)); process.stdout.write("${marker}");`;
+    const result = await runProcess("node", ["-e", script], {
+      cwd: workspace,
+      maxOutputBytes: 16,
+      onRawOutput: ({ stream, chunk }) => {
+        if (stream === "stdout") raw.push(Buffer.from(chunk));
+      },
+    });
+
+    expect(result.stdout).toBe("x".repeat(16));
+    expect(result.stdoutTruncated).toBe(true);
+    expect(Buffer.concat(raw).toString("utf8")).toEndWith(marker);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runProcess awaits async raw output backpressure", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-process-raw-backpressure-"));
+  const raw: Buffer[] = [];
+  try {
+    const result = await runProcess("node", ["-e", `process.stdout.write("a".repeat(100000));`], {
+      cwd: workspace,
+      maxOutputBytes: 8,
+      onRawOutput: async ({ stream, chunk }) => {
+        if (stream !== "stdout") return;
+        await sleep(1);
+        raw.push(Buffer.from(chunk));
+      },
+    });
+
+    expect(result.stdoutBytes).toBe(100000);
+    expect(Buffer.concat(raw).byteLength).toBe(100000);
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -165,6 +247,48 @@ test("runProcess bounds verbose live output while keeping a fresh tail", async (
     expect(deltas.some((delta) => delta.truncated === true)).toBe(true);
     expect(deltas.at(-1)?.delta).toContain(marker);
     expect(deltas.map((delta) => delta.delta).join("")).not.toContain("�");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runProcess caps cumulative live output across repeated flushes", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-process-live-total-budget-"));
+  const deltas: { delta: string; truncated?: boolean }[] = [];
+  try {
+    const script = `
+      let writes = 0;
+      const chunk = "x".repeat(4096);
+      const timer = setInterval(() => {
+        process.stdout.write(chunk);
+        writes += 1;
+        if (writes >= 20) clearInterval(timer);
+      }, 10);
+    `;
+    const result = await runProcess("node", ["-e", script], {
+      cwd: workspace,
+      maxOutputBytes: 16,
+      maxLiveOutputBytes: 10 * 1024,
+      outputFlushIntervalMs: 1,
+      outputFlushBytes: 4096,
+      onOutput: (chunk) => {
+        if (chunk.stream === "stdout") {
+          deltas.push({
+            delta: chunk.delta,
+            ...(chunk.truncated !== undefined ? { truncated: chunk.truncated } : {}),
+          });
+        }
+      },
+    });
+
+    const liveBytes = deltas.reduce((total, delta) => total + Buffer.byteLength(delta.delta, "utf8"), 0);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("x".repeat(16));
+    expect(result.stdoutTruncated).toBe(true);
+    expect(result.stdoutBytes).toBe(20 * 4096);
+    expect(liveBytes).toBeLessThanOrEqual(10 * 1024);
+    expect(deltas.some((delta) => delta.truncated === true)).toBe(true);
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }

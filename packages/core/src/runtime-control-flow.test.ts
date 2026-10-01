@@ -5,7 +5,6 @@ import type {
   Message,
   MessagePart,
   SessionId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
 } from "@chili/protocol";
@@ -44,7 +43,6 @@ test("does not retry aborted model requests", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_abort" as SessionId,
-    threadId: "thread_abort" as ThreadId,
     cwd: "/repo",
     signal: controller.signal,
   });
@@ -61,12 +59,15 @@ test("retries transient socket failures before assistant output", async () => {
   const model: ModelRouter = {
     async *stream(): AsyncIterable<ModelStreamEvent> {
       modelCalls++;
-      yield { type: "metadata", provider: "openai-codex", model: "gpt-5.5" };
+      const usage = modelCalls === 1
+        ? { inputTokens: 4, outputTokens: 1, totalTokens: 5 }
+        : { inputTokens: 6, outputTokens: 2, totalTokens: 8 };
+      yield { type: "metadata", provider: "openai-codex", model: "gpt-5.5", usage };
       if (modelCalls === 1) {
         throw new Error("The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()");
       }
       yield { type: "text_delta", text: "ok" };
-      yield { type: "finish", reason: "stop" };
+      yield { type: "finish", reason: "stop", usage };
     },
   };
   const runtime = new SingleAgentRuntime({
@@ -85,14 +86,98 @@ test("retries transient socket failures before assistant output", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_socket_retry" as SessionId,
-    threadId: "thread_socket_retry" as ThreadId,
     cwd: "/repo",
   });
 
   expect(result.status).toBe("completed");
+  expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 3, totalTokens: 13 });
   expect(modelCalls).toBe(2);
   expect(textParts(store).map((part) => part.text).join("")).toBe("ok");
   expect(store.items.some((event) => event.type === "turn.retry_scheduled" && event.payload.reason.includes("socket connection"))).toBe(true);
+});
+
+test("does not retry provider errors explicitly marked non-retryable", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let modelCalls = 0;
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      modelCalls++;
+      throw Object.assign(new Error("Traffic is currently high (2062)"), {
+        status: 429,
+        retryable: false,
+        category: "plan_capacity",
+      });
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    retryPolicy: { maxAttempts: 3, initialDelayMs: 0 },
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await runtime.runTurn({
+    sessionId: "session_plan_capacity" as SessionId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("failed");
+  expect(modelCalls).toBe(1);
+  expect(store.items.some((event) => event.type === "turn.retry_scheduled")).toBe(false);
+});
+
+test("preserves bounded nested retry classification and Retry-After after discarding cause", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let modelCalls = 0;
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      modelCalls += 1;
+      if (modelCalls === 1) {
+        const cause = Object.assign(new Error("socket reset"), { code: "ECONNRESET", retryAfterMs: 1 });
+        throw Object.assign(new Error("wrapped provider failure"), { cause });
+      }
+      yield { type: "text_delta", text: "recovered" };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model, { maxAttempts: 2, initialDelayMs: 0 });
+
+  const result = await runtime.runTurn({ sessionId: "session_nested_retry" as SessionId, cwd: "/repo" });
+  expect(result.status).toBe("completed");
+  expect(modelCalls).toBe(2);
+  expect(store.items).toContainEqual(expect.objectContaining({
+    type: "turn.retry_scheduled",
+    payload: expect.objectContaining({ delayMs: 1 }),
+  }));
+});
+
+test("preserves a nested explicit non-retryable veto after discarding cause", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let modelCalls = 0;
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      modelCalls += 1;
+      throw Object.assign(new Error("socket connection was closed unexpectedly"), {
+        cause: Object.assign(new Error("quota exhausted"), { retryable: false }),
+      });
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({ sessionId: "session_nested_retry_veto" as SessionId, cwd: "/repo" });
+  expect(result.status).toBe("failed");
+  expect(modelCalls).toBe(1);
+  expect(store.items.some((event) => event.type === "turn.retry_scheduled")).toBe(false);
 });
 
 test("consumes rich model streams and executes tool calls after the stream finishes", async () => {
@@ -153,7 +238,6 @@ test("consumes rich model streams and executes tool calls after the stream finis
 
   const result = await runtime.runTurn({
     sessionId: "session_rich_stream" as SessionId,
-    threadId: "thread_rich_stream" as ThreadId,
     cwd: "/repo",
   });
 
@@ -212,6 +296,434 @@ test("consumes rich model streams and executes tool calls after the stream finis
   expect(toolStartedIndex).toBeGreaterThan(toolCallPartIndex);
 });
 
+test("bounds partial and final tool inputs only at persistence and desktop boundaries", async () => {
+  const hugeInput = "\u0000".repeat(4 * 1024 * 1024);
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let executedInputBytes = 0;
+  registry.register({
+    name: "large_input",
+    description: "Receives a large provider input.",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async (input: { payload?: string }) => {
+      executedInputBytes = Buffer.byteLength(input.payload ?? "", "utf8");
+      return { title: "large input", output: "ok" };
+    },
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call_start", toolCallId: "tool_large_input", name: "large_input" };
+      yield {
+        type: "tool_call_delta",
+        toolCallId: "tool_large_input",
+        name: "large_input",
+        delta: "partial",
+        partialInput: { payload: hugeInput },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCallId: "tool_large_input",
+        name: "large_input",
+        input: { payload: hugeInput },
+      };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+
+  const result = await testRuntime(store, registry, model).runTurn({
+    sessionId: "session_large_tool_input" as SessionId,
+    cwd: "/repo",
+  });
+  expect(result.status).toBe("completed");
+  expect(executedInputBytes).toBe(4 * 1024 * 1024);
+  const inputEvents = store.items.filter((event) =>
+    (event.type === "tool.call_updated" || event.type === "tool.call_started")
+      && event.payload.callId === "tool_large_input"
+  );
+  const toolCallPartEvents = store.items.filter((event) =>
+    event.type === "message.part_added" && event.payload.part.type === "tool_call"
+  );
+  expect(inputEvents.length).toBeGreaterThanOrEqual(3);
+  expect(toolCallPartEvents).toHaveLength(1);
+  const contractsModulePath = "../../../apps/desktop/src/shared/contracts.ts";
+  const { parseDesktopEvent } = await import(contractsModulePath) as {
+    parseDesktopEvent(value: unknown): unknown;
+  };
+  for (const event of [...inputEvents, ...toolCallPartEvents]) {
+    expect(Buffer.byteLength(JSON.stringify(event), "utf8")).toBeLessThan(520_000);
+    expect(() => parseDesktopEvent({ type: "runtime.event", event })).not.toThrow();
+  }
+});
+
+test("keeps one desktop-safe call id across provider stream, message parts, and executor events", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  registry.register({
+    name: "stable_call_id",
+    description: "Return a small result.",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => ({ title: "stable", output: "ok" }),
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call_start", toolCallId: "__proto__", name: "stable_call_id", index: 7 };
+      yield {
+        type: "tool_call_delta",
+        toolCallId: "__proto__",
+        name: "stable_call_id",
+        delta: "{}",
+        partialInput: {},
+        index: 7,
+      };
+      yield { type: "tool_call_end", toolCallId: "__proto__", name: "stable_call_id", input: {}, index: 7 };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+
+  const result = await testRuntime(store, registry, model).runTurn({
+    sessionId: "session_hostile_provider_call_id" as SessionId,
+    cwd: "/repo",
+  });
+  expect(result.status).toBe("completed");
+
+  const callEvents = store.items.filter((event): event is Extract<ChiliEvent, {
+    type: "tool.call_started" | "tool.call_updated" | "tool.call_finished" | "message.part_added";
+  }> =>
+    event.type === "tool.call_started"
+      || event.type === "tool.call_updated"
+      || event.type === "tool.call_finished"
+      || (event.type === "message.part_added"
+        && (event.payload.part.type === "tool_call" || event.payload.part.type === "tool_result"))
+  );
+  const ids = callEvents.map((event) => event.type === "message.part_added"
+    ? (event.payload.part as Extract<MessagePart, { type: "tool_call" | "tool_result" }>).callId
+    : event.payload.callId);
+  expect(ids.length).toBeGreaterThanOrEqual(6);
+  expect(new Set(ids).size).toBe(1);
+  expect(ids[0]).toMatch(/^toolcall_invalid_[a-f0-9]{16}$/u);
+
+  const contractsModulePath = "../../../apps/desktop/src/shared/contracts.ts";
+  const { parseDesktopEvent } = await import(contractsModulePath) as {
+    parseDesktopEvent(value: unknown): unknown;
+  };
+  for (const event of callEvents) {
+    expect(() => parseDesktopEvent({ type: "runtime.event", event })).not.toThrow();
+  }
+});
+
+test("RuntimeService shutdown fences a signal-ignoring model EOF before tool execution and completion", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const sessionId = "session_shutdown_model_eof" as SessionId;
+  store.addSession(sessionId);
+  let executions = 0;
+  registry.register({
+    name: "must_not_run_after_shutdown",
+    description: "Must remain fenced after shutdown.",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => {
+      executions += 1;
+      return { title: "unexpected", output: "unexpected" };
+    },
+  });
+  let reachedEofGateResolve: (() => void) | undefined;
+  const reachedEofGate = new Promise<void>((resolve) => { reachedEofGateResolve = resolve; });
+  let releaseEofResolve: (() => void) | undefined;
+  const releaseEof = new Promise<void>((resolve) => { releaseEofResolve = resolve; });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "text_delta", text: "queued" };
+      yield { type: "tool_call", name: "must_not_run_after_shutdown", input: {} };
+      reachedEofGateResolve?.();
+      await releaseEof;
+      return;
+    },
+  };
+  const createId = createSequentialId();
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+      createId,
+      now: () => 1 as TimestampMs,
+    }),
+    createId,
+    now: () => 1 as TimestampMs,
+  });
+  const service = new RuntimeService({
+    runtime,
+    store,
+    cwd: "/repo",
+    maxTurns: 1,
+    createId,
+    now: () => 1 as TimestampMs,
+  });
+
+  const prompt = service.submitPrompt({ sessionId, text: "start" });
+  await reachedEofGate;
+  const shutdown = service.shutdown("test_shutdown_model_eof");
+  releaseEofResolve?.();
+  const result = await prompt;
+  await shutdown;
+
+  expect(result.status).toBe("cancelled");
+  expect(executions).toBe(0);
+  expect(store.items.some(
+    (event) => event.type === "turn.completed" && event.payload.status === "completed",
+  )).toBe(false);
+  expect(store.items.some(
+    (event) => event.type === "turn.completed" && event.payload.status === "cancelled",
+  )).toBe(true);
+});
+
+test("copies only allowlisted tool metadata into model-visible execution context", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  registry.register({
+    name: "sandboxed_command",
+    description: "Run a sandboxed command.",
+    risk: "execute",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => ({
+      title: "exit 1",
+      output: "command failed",
+      metadata: {
+        sandbox: "macos-seatbelt",
+        executionMode: "sandboxed",
+        exitCode: 1,
+        timedOut: false,
+        aborted: false,
+        signal: null,
+        command: "secret command that must not enter model context",
+        cwd: "/private/workspace",
+        durationMs: 42,
+        arbitrary: { nested: "untrusted metadata" },
+      },
+    }),
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield {
+        type: "tool_call_end",
+        toolCallId: "tool_sandboxed",
+        name: "sandboxed_command",
+        input: {},
+      };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+
+  const result = await testRuntime(store, registry, model).runTurn({
+    sessionId: "session_tool_context" as SessionId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  const [part] = toolResultParts(store);
+  expect(part?.executionContext).toEqual({
+    sandbox: "macos-seatbelt",
+    executionMode: "sandboxed",
+    exitCode: 1,
+    timedOut: false,
+    aborted: false,
+    signal: null,
+  });
+  expect(part).not.toHaveProperty("metadata");
+  expect(JSON.stringify(part)).not.toContain("secret command");
+  expect(JSON.stringify(part)).not.toContain("untrusted metadata");
+});
+
+test("keeps indexed reasoning sections in separate message parts", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "reasoning_delta", index: 0, text: "**Inspecting " };
+      yield { type: "reasoning_delta", index: 0, text: "core**" };
+      yield { type: "reasoning_delta", index: 1, text: "**Checking " };
+      yield { type: "reasoning_delta", index: 1, text: "schema**" };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await runtime.runTurn({
+    sessionId: "session_reasoning_sections" as SessionId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(reasoningParts(store).map((part) => part.text)).toEqual([
+    "**Inspecting core**",
+    "**Checking schema**",
+  ]);
+});
+
+test("keeps indexed assistant phases in separate text parts", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "text_delta", index: 0, phase: "commentary", text: "Checking " };
+      yield { type: "text_delta", index: 2, phase: "final_answer", text: "Done." };
+      yield { type: "text_delta", index: 0, phase: "commentary", text: "files." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_text_phases" as SessionId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(textParts(store).map((part) => ({ text: part.text, phase: part.phase }))).toEqual([
+    { text: "Checking files.", phase: "commentary" },
+    { text: "Done.", phase: "final_answer" },
+  ]);
+});
+
+test("fails when one assistant text index changes phase", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "text_delta", index: 0, phase: "commentary", text: "Working" };
+      yield { type: "text_delta", index: 0, phase: "final_answer", text: "Done" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_phase_conflict" as SessionId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("failed");
+  if (result.status === "failed") {
+    expect(result.error.message).toContain("assistant text index 0 changed phase from commentary to final_answer");
+  }
+  expect(textParts(store).map((part) => ({ text: part.text, phase: part.phase }))).toEqual([
+    { text: "Working", phase: "commentary" },
+  ]);
+});
+
+test("does not execute tool calls from output-limited model responses", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let executed = false;
+  registry.register({
+    name: "write_file",
+    description: "Write a file.",
+    risk: "write",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => {
+      executed = true;
+      return { title: "write_file", output: "should not run" };
+    },
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call", name: "write_file", input: { filePath: "danger.txt", content: "partial" } };
+      yield { type: "finish", reason: "length" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_output_limited" as SessionId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("failed");
+  if (result.status === "failed") expect(result.error.message).toContain("output token limit");
+  expect(executed).toBe(false);
+  expect(toolFinishedPayloads(store)).toContainEqual(expect.objectContaining({
+    status: "failed",
+    synthetic: true,
+    error: expect.stringContaining("output token limit"),
+  }));
+  expect(toolResultParts(store)[0]).toMatchObject({
+    type: "tool_result",
+    output: "",
+    synthetic: true,
+    error: expect.stringContaining("finish reason: length"),
+  });
+});
+
+test("does not execute tool calls when the provider reports invalid JSON arguments", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let executed = false;
+  registry.register({
+    name: "write_file",
+    description: "Write a file.",
+    risk: "write",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => {
+      executed = true;
+      return { title: "write_file", output: "should not run" };
+    },
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call_start", toolCallId: "tool_invalid", name: "write_file" };
+      yield {
+        type: "tool_call_end",
+        toolCallId: "tool_invalid",
+        name: "write_file",
+        input: {},
+        inputParseError: "Tool call arguments were not valid JSON: Unexpected end of JSON input",
+      };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_invalid_tool_args" as SessionId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(executed).toBe(false);
+  expect(toolFinishedPayloads(store)).toContainEqual(expect.objectContaining({
+    status: "failed",
+    synthetic: true,
+    error: expect.stringContaining("not valid JSON"),
+  }));
+  expect(toolResultParts(store)[0]).toMatchObject({
+    output: "",
+    synthetic: true,
+    error: expect.stringContaining("not valid JSON"),
+  });
+});
+
 test("keeps live tool output deltas out of model-facing tool result parts", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();
@@ -237,7 +749,6 @@ test("keeps live tool output deltas out of model-facing tool result parts", asyn
 
   const result = await runtime.runTurn({
     sessionId: "session_tool_output_delta" as SessionId,
-    threadId: "thread_tool_output_delta" as ThreadId,
     cwd: "/repo",
   });
 
@@ -265,7 +776,6 @@ test("finishes live streaming tool rows as failed when the model errors before t
 
   const result = await runtime.runTurn({
     sessionId: "session_stream_error" as SessionId,
-    threadId: "thread_stream_error" as ThreadId,
     cwd: "/repo",
   });
 
@@ -288,7 +798,6 @@ test("surfaces model startup failures in the assistant message", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_model_startup_error" as SessionId,
-    threadId: "thread_model_startup_error" as ThreadId,
     cwd: "/repo",
   });
 
@@ -296,6 +805,7 @@ test("surfaces model startup failures in the assistant message", async () => {
   expect(textParts(store).map((part) => part.text)).toContain(
     "Model request failed: Kimi provider requires MOONSHOT_API_KEY or KIMI_API_KEY",
   );
+  expect(textParts(store).find((part) => part.text.startsWith("Model request failed:"))?.synthetic).toBe(true);
 });
 
 test("suppresses MCP image understanding tools when direct image input is available", async () => {
@@ -335,7 +845,6 @@ test("suppresses MCP image understanding tools when direct image input is availa
 
   const result = await runtime.runTurn({
     sessionId: "session_suppress_image_tools" as SessionId,
-    threadId: "thread_suppress_image_tools" as ThreadId,
     cwd: "/repo",
     suppressExternalImageTools: true,
   });
@@ -382,7 +891,6 @@ test("prefers MCP image understanding tools over read_image for path-only image 
 
   const result = await runtime.runTurn({
     sessionId: "session_prefer_external_image_tools" as SessionId,
-    threadId: "thread_prefer_external_image_tools" as ThreadId,
     cwd: "/repo",
     preferExternalImageTools: true,
   });
@@ -406,7 +914,6 @@ test("finishes live streaming tool rows as cancelled when aborted before tool_ca
 
   const result = await runtime.runTurn({
     sessionId: "session_stream_abort" as SessionId,
-    threadId: "thread_stream_abort" as ThreadId,
     cwd: "/repo",
     signal: controller.signal,
   });
@@ -432,11 +939,10 @@ test("finishes live streaming tool rows as failed when finish arrives before too
 
   const result = await runtime.runTurn({
     sessionId: "session_stream_finish" as SessionId,
-    threadId: "thread_stream_finish" as ThreadId,
     cwd: "/repo",
   });
 
-  expect(result.status).toBe("completed");
+  expect(result.status).toBe("failed");
   expect(toolCallParts(store)).toEqual([]);
   expect(toolResultParts(store)).toEqual([]);
   expect(toolFinishedPayloads(store)).toEqual([
@@ -444,6 +950,7 @@ test("finishes live streaming tool rows as failed when finish arrives before too
       callId: "tool_unfinished" as ToolCallId,
       status: "failed",
       error: "Tool call stream ended before tool_call_end",
+      errorDetails: expect.objectContaining({ name: "ModelStreamIncompleteError" }),
       synthetic: true,
     },
   ]);
@@ -462,17 +969,17 @@ test("finishes live streaming tool rows as failed when the stream ends before to
 
   const result = await runtime.runTurn({
     sessionId: "session_stream_eof" as SessionId,
-    threadId: "thread_stream_eof" as ThreadId,
     cwd: "/repo",
   });
 
-  expect(result.status).toBe("completed");
+  expect(result.status).toBe("failed");
   expect(toolCallParts(store)).toEqual([]);
   expect(toolFinishedPayloads(store)).toEqual([
     {
       callId: "tool_eof" as ToolCallId,
       status: "failed",
-      error: "Tool call stream ended before tool_call_end",
+      error: "Model stream ended before an explicit finish event",
+      errorDetails: expect.objectContaining({ name: "ModelStreamIncompleteError" }),
       synthetic: true,
     },
   ]);
@@ -527,7 +1034,6 @@ test("runtime hides unauthorized tools from model input", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_scoped_tools" as SessionId,
-    threadId: "thread_scoped_tools" as ThreadId,
     cwd: "/repo",
   });
 
@@ -557,13 +1063,55 @@ test("runtime hides all tools when tool mode is disabled", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_no_tools" as SessionId,
-    threadId: "thread_no_tools" as ThreadId,
     cwd: "/repo",
     toolMode: "disabled",
   });
 
   expect(result.status).toBe("completed");
   expect(seenTools).toEqual([[]]);
+});
+
+test("runtime refuses model-emitted tool calls when tool mode is disabled", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let executed = false;
+  registry.register({
+    name: "read",
+    description: "Read",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => {
+      executed = true;
+      return { title: "read", output: "should not run" };
+    },
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call", name: "read", input: { filePath: "secret.txt" } };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_no_tool_execution" as SessionId,
+    cwd: "/repo",
+    toolMode: "disabled",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(executed).toBe(false);
+  expect(toolFinishedPayloads(store)).toContainEqual(expect.objectContaining({
+    status: "failed",
+    synthetic: true,
+    error: expect.stringContaining("Tool use is disabled"),
+  }));
+  expect(toolResultParts(store)[0]).toMatchObject({
+    output: "",
+    synthetic: true,
+    error: expect.stringContaining("Tool use is disabled"),
+  });
 });
 
 test("runtime applies per-turn tool policy to visible and executed tools", async () => {
@@ -608,7 +1156,6 @@ test("runtime applies per-turn tool policy to visible and executed tools", async
 
   const result = await runtime.runTurn({
     sessionId: "session_turn_policy" as SessionId,
-    threadId: "thread_turn_policy" as ThreadId,
     cwd: "/repo",
     toolPolicy: { allowedTools: ["read"] },
   });
@@ -668,7 +1215,6 @@ test("runs concurrency-safe tool calls in parallel and preserves result order", 
 
   const result = await runtime.runTurn({
     sessionId: "session_parallel_tools" as SessionId,
-    threadId: "thread_parallel_tools" as ThreadId,
     cwd: "/repo",
   });
 
@@ -687,15 +1233,93 @@ test("clears the reserved runtime when the initial running status write fails", 
     now: () => 1 as TimestampMs,
   });
   const sessionId = "session_status_failure" as SessionId;
+  store.addSession(sessionId);
 
   await expect(
     service.submitPrompt({
       sessionId,
-      threadId: "thread_status_failure" as ThreadId,
       text: "hello",
     }),
   ).rejects.toThrow("status write failed");
   expect(service.isRunning(sessionId)).toBe(false);
+});
+
+test("accounts failed model event usage against an active goal", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const createId = createSequentialId();
+  const sessionId = "session_goal_model_error" as SessionId;
+  store.addSession(sessionId);
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield {
+        type: "error",
+        error: new Error("provider charged then failed"),
+        responseId: "response_charged_failure",
+        usage: {
+          inputTokens: 20,
+          outputTokens: 2,
+          cacheReadInputTokens: 3,
+          totalTokens: 25,
+        },
+      };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    createId,
+    now: () => 1 as TimestampMs,
+  });
+  const service = new RuntimeService({
+    runtime,
+    store,
+    cwd: "/repo",
+    createId,
+    now: () => 1 as TimestampMs,
+  });
+  await store.append({
+    id: "event_goal_model_error_seed",
+    type: "goal.updated",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: {
+      reason: "set",
+      goal: {
+        sessionId,
+        objective: "account all provider usage",
+        status: "active",
+        tokenBudget: 1_000,
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        createdAt: 1 as TimestampMs,
+        updatedAt: 1 as TimestampMs,
+      },
+    },
+  });
+
+  const result = await service.submitPrompt({ sessionId, text: "run once" });
+
+  expect(result.status).toBe("failed");
+  expect(result.turns[0]?.usage).toEqual({
+    inputTokens: 20,
+    outputTokens: 2,
+    cacheReadInputTokens: 3,
+    totalTokens: 25,
+  });
+  const goalEvents = store.items.filter(
+    (event): event is Extract<ChiliEvent, { type: "goal.updated" }> => event.type === "goal.updated",
+  );
+  expect(goalEvents.at(-1)?.payload.goal.tokensUsed).toBe(25);
+  expect(store.items.some(
+    (event) => event.type === "turn.model_metadata" && event.payload.responseId === "response_charged_failure",
+  )).toBe(true);
 });
 
 test("continues an active persistent goal and lets update_goal complete it", async () => {
@@ -703,22 +1327,20 @@ test("continues an active persistent goal and lets update_goal complete it", asy
   const registry = new InMemoryToolRegistry();
   const createId = createSequentialId();
   const sessionId = "session_goal" as SessionId;
-  const threadId = "thread_goal" as ThreadId;
+  store.addSession(sessionId);
   let service!: RuntimeService;
   let modelCalls = 0;
 
   for (const tool of createGoalTools({
-    getGoal: (context) => service.getGoal({ sessionId: context.sessionId, threadId: context.threadId ?? threadId }),
+    getGoal: (context) => service.getGoal({ sessionId: context.sessionId }),
     createGoal: (input, context) => service.setGoal({
       sessionId: context.sessionId,
-      threadId: context.threadId ?? threadId,
       objective: input.objective,
       ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
       replace: false,
     }),
     updateGoal: (input, context) => service.updateGoal({
       sessionId: context.sessionId,
-      threadId: context.threadId ?? threadId,
       status: input.status,
     }),
   })) {
@@ -766,12 +1388,10 @@ test("continues an active persistent goal and lets update_goal complete it", asy
     type: "goal.updated",
     time: 1 as TimestampMs,
     sessionId,
-    threadId,
     payload: {
       reason: "set",
       goal: {
         sessionId,
-        threadId,
         objective: "finish the goal",
         status: "active",
         tokenBudget: 1_000,
@@ -783,7 +1403,7 @@ test("continues an active persistent goal and lets update_goal complete it", asy
     },
   });
 
-  const result = await service.submitPrompt({ sessionId, threadId, text: "start" });
+  const result = await service.submitPrompt({ sessionId, text: "start" });
 
   expect(result.status).toBe("completed");
   expect(modelCalls).toBe(3);
@@ -795,6 +1415,7 @@ test("continues an active persistent goal and lets update_goal complete it", asy
 
 class MemoryEventStore implements EventStore {
   readonly items: ChiliEvent[] = [];
+  readonly sessionRows: SessionRow[] = [];
 
   async append(event: ChiliEvent): Promise<void> {
     this.items.push(event);
@@ -813,7 +1434,6 @@ class MemoryEventStore implements EventStore {
       .slice(afterIndex + 1)
       .filter((event) => {
         if (query.sessionId && event.sessionId !== query.sessionId) return false;
-        if (query.threadId && event.threadId !== query.threadId) return false;
         if (query.type && event.type !== query.type) return false;
         return true;
       })
@@ -821,7 +1441,18 @@ class MemoryEventStore implements EventStore {
   }
 
   async sessions(): Promise<SessionRow[]> {
-    return [];
+    return this.sessionRows.map((row) => ({ ...row }));
+  }
+
+  addSession(sessionId: SessionId, source: SessionRow["source"] = "interactive"): void {
+    this.sessionRows.push({
+      id: sessionId,
+      cwd: "/repo",
+      source,
+      status: "active",
+      createdAt: 1,
+      updatedAt: 1,
+    });
   }
 
   async messages(): Promise<Message[]> {
@@ -842,7 +1473,12 @@ class ThrowingStatusStore extends MemoryEventStore {
   }
 }
 
-function testRuntime(store: MemoryEventStore, registry: InMemoryToolRegistry, model: ModelRouter): SingleAgentRuntime {
+function testRuntime(
+  store: MemoryEventStore,
+  registry: InMemoryToolRegistry,
+  model: ModelRouter,
+  retryPolicy?: ConstructorParameters<typeof SingleAgentRuntime>[0]["retryPolicy"],
+): SingleAgentRuntime {
   return new SingleAgentRuntime({
     store,
     model,
@@ -852,6 +1488,7 @@ function testRuntime(store: MemoryEventStore, registry: InMemoryToolRegistry, mo
       events: { publish: (event) => store.append(event) },
       approvals: { decide: async () => ({ action: "allow_once" }) },
     }),
+    ...(retryPolicy ? { retryPolicy } : {}),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
   });

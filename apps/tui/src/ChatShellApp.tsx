@@ -1,10 +1,14 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useReducer, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from "react";
 import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent, ScrollBoxRenderable, Selection } from "@opentui/core";
-import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
+import { collectCommandNodes, completeCommandsSync, resolveCommand, type ResolveCommandResult } from "@chili/commands";
+import { runtimeDelegationStatus, type ChatSessionView, type ChatTranscriptItem, type HttpRuntimeClient, type RuntimeSessionSummary, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
+import { normalizeSessionTitle, SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import type {
   ApprovalId,
+  DelegationPolicy,
   MessageImageContent,
+  RuntimeCommandNode,
   RuntimeMcpAuthResponse,
   RuntimeMcpLogoutResponse,
   RuntimeMcpReloadResponse,
@@ -19,7 +23,6 @@ import type {
   ServiceTier,
   SessionId,
   TeamId,
-  ThreadId,
 } from "@chili/protocol";
 import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@chili/providers";
 import { discoverSkills, updateSkillDisabledSetting, type SkillSettingsScope, type SkillSummary } from "@chili/skills";
@@ -31,7 +34,7 @@ import { promisify } from "node:util";
 import { cleanClipboardText, systemClipboard, type ClipboardAccess, type ClipboardImage } from "./clipboard.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
-import { useChatRuntime, type ChatApprovalGrantScope, type ChatRuntimeState } from "./useChatRuntime.js";
+import { acceptedFeedbackMatchesStatus, useChatRuntime, type ChatApprovalGrantScope, type ChatRuntimeState } from "./useChatRuntime.js";
 import { findAction, shorten } from "./components/helpers.js";
 import {
   DEFAULT_REASONING_LEVEL,
@@ -40,19 +43,27 @@ import {
   filterModelCandidates,
   isValidModelSelection,
   type ModelCandidate,
+  modelAuthLabel,
   modelDescriptorSelection,
   modelSelectionLabel,
   modelSupportsImages,
   modelSupportsReasoning,
+  modelSupportsServiceTier,
+  safeEndpointHost,
   sameModelSelection,
   type ModelSelection,
   type ReasoningLevel,
 } from "./model-state.js";
 import { ApprovalDock, approvalDockHeight } from "./chat/ApprovalDock.js";
+import { AgentsView, agentsViewModel, type AgentsViewModel } from "./chat/AgentsView.js";
 import { BrandMark } from "./chat/BrandMark.js";
 import { charDisplayWidth } from "./chat/markdown.js";
 import { zedPathWithPosition, type FileLinkTarget } from "./chat/file-links.js";
 import { MessageList } from "./chat/MessageList.js";
+import { commandListHeight } from "./chat/CommandList.js";
+import { inlineAgentBatchesForSession } from "./chat/inline-agent-batches.js";
+import type { InlineAgentBatchDisplay } from "./chat/AgentBatchCells.js";
+import { TranscriptLine } from "./chat/lines.js";
 import {
   McpManager,
   initialMcpManagerState,
@@ -64,14 +75,15 @@ import {
   type McpServerMenuAction,
 } from "./chat/McpManager.js";
 import { PROMPT_INPUT_HEIGHT, PROMPT_PLACEHOLDER, PromptComposer, promptComposerHeight } from "./chat/PromptComposer.js";
+import { publicStatusReason, publicSyntheticAssistantText } from "./chat/public-error.js";
 import { StatusFooter, statusFooterHeight, type StatusFooterOptions } from "./chat/StatusFooter.js";
 import { buildTranscriptLines, buildTranscriptText } from "./chat/transcript.js";
 import { TranscriptView } from "./chat/TranscriptView.js";
 import type { LocalTranscriptItem, PromptPart } from "./chat/types.js";
 import { usePromptHistory } from "./chat/usePromptHistory.js";
-import { customSlashCommandsFromRuntime } from "./slash/custom.js";
-import { createDefaultSlashCommands, resolveSlashCommand, slashCompletions } from "./slash/registry.js";
-import type { SlashCommand, SlashCommandContext, SlashCommandResult, SlashCompletion } from "./slash/types.js";
+import { tuiCommands } from "./commands/catalog.js";
+import { initialCommandMenuState, reduceCommandMenu } from "./commands/menu-state.js";
+import type { TuiCommand, TuiCommandContext, TuiCommandResult, TuiCommandSuggestion } from "./commands/types.js";
 import {
   DEFAULT_TUI_THEME_ID,
   initialTuiThemeId,
@@ -85,7 +97,7 @@ import {
 } from "./theme/index.js";
 
 type ShellView = "chat" | "team" | "help" | "agents" | "status" | "mcp" | "transcript";
-type AppendLocalItem = (level: "info" | "error", text: string, options?: { persistent?: boolean | undefined }) => void;
+type AppendLocalItem = (level: "info" | "error", text: string, options?: { persistent?: boolean | undefined; bare?: boolean | undefined }) => void;
 type LocalShellItem = Extract<LocalTranscriptItem, { kind: "shell" }>;
 type AppendShellItem = (item: Omit<LocalShellItem, "id" | "kind" | "createdAt">) => string;
 type UpdateShellItem = (id: string, update: Partial<Omit<LocalShellItem, "id" | "kind" | "createdAt">>) => void;
@@ -95,13 +107,40 @@ interface PastedPromptImage extends MessageImageContent {
   absolutePath?: string | undefined;
 }
 
-interface SlashActions {
+interface InterruptedPromptCandidate {
+  promptParts: PromptPart[];
+  pastedTextByMarker: Array<[string, string]>;
+  pastedImages: Record<number, PastedPromptImage>;
+  skillMentionBindings: RuntimeSkillMention[];
+  baselineOutput: Map<string, string>;
+  sawActiveStatus: boolean;
+  interruptOutcome?: "restored" | "discarded" | undefined;
+}
+
+interface PendingInterruptRequest {
+  candidate?: InterruptedPromptCandidate | undefined;
+}
+
+interface CommandConfirmation {
+  title: string;
+  result: TuiCommandResult;
+  selectedIndex: number;
+}
+
+interface CommandActions {
   cwd: string;
+  enterSessionLayout: () => void;
+  currentSessionUiEpoch: () => number;
+  isSessionUiEpochCurrent: (epoch: number) => boolean;
   setView: (view: ShellView) => void;
   appendLocalItem: AppendLocalItem;
   appendShellItem: AppendShellItem;
   updateShellItem: UpdateShellItem;
   startNewChatSession: () => Promise<void>;
+  openResumePicker: () => void;
+  resumeSessionByTarget: (target: string) => Promise<void>;
+  openRenamePrompt: () => void;
+  renameChatSession: (title: string) => Promise<void>;
   setPrompt: (value: string | ((current: string) => string)) => void;
   openThemePicker: () => void;
   openMcpManager: () => void;
@@ -117,6 +156,9 @@ interface SlashActions {
   ensureOpenAICodexDefaultModel: () => Promise<void>;
   reloadSkills: () => Promise<void>;
   reloadCommands: () => Promise<void>;
+  requestConfirmation: (title: string, result: TuiCommandResult) => void;
+  openCommandPalette: () => void;
+  exitApp: () => void;
 }
 
 interface SkillSummariesState {
@@ -138,7 +180,6 @@ export interface ChatShellOptions extends TeamLiveTuiOptions {
 
 export interface ChatShellExitInfo {
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd?: string;
 }
 
@@ -149,6 +190,8 @@ interface AuthManualPrompt {
 
 const execFileAsync = promisify(execFile);
 const PROMPT_MENU_MAX_ITEMS = 8;
+const MODEL_PICKER_MAX_VISIBLE_ITEMS = 8;
+const MODEL_PICKER_CHROME_HEIGHT = 9;
 const LOCAL_ITEM_TTL_MS = 4_000;
 const USER_SHELL_TIMEOUT_MS = 60 * 60 * 1_000;
 const USER_SHELL_OUTPUT_LIMIT_BYTES = 256_000;
@@ -157,6 +200,7 @@ const PROMPT_TEXT_PASTE_LINE_THRESHOLD = 8;
 const PROMPT_TEXT_PASTE_CHAR_THRESHOLD = 1_000;
 const SLASH_COMPLETION_LIMIT = 64;
 export const CTRL_C_EXIT_CONFIRM_MS = 2_000;
+export const CONVERSATION_INTERRUPTED_NOTICE = "■ Conversation interrupted - tell the model what to do differently.";
 
 export function ChatShellApp(props: {
   client: HttpRuntimeClient;
@@ -173,25 +217,28 @@ export function ChatShellApp(props: {
   const chatOptions = useMemo(
     () => ({
       ...shellOptions,
-      streamScope: shellOptions.sessionId ? "session" as const : "all" as const,
+      // /resume can switch sessions in-process, so keep the live stream global.
+      // Older transcript history is hydrated on demand when a session is selected.
+      streamScope: "all" as const,
     }),
     [shellOptions],
   );
   const runtime = useChatRuntime({ client: props.client, options: chatOptions });
+  const currentSessionId = runtime.activeSessionId ?? runtime.chatView.sessionId;
   const allTeams = teamLiveModel(runtime.runtimeView, {
     connection: runtime.connection,
-    sessionId: shellOptions.sessionId,
+    sessionId: currentSessionId,
     limit: 48,
   });
   const [selectedTeamId, setSelectedTeamId] = useState<TeamId | undefined>(shellOptions.teamId ?? allTeams.selectedTeamId);
-  const resolvedSelectedTeamId = shellOptions.teamId ?? validSelectedTeamId(allTeams, selectedTeamId);
+  const resolvedSelectedTeamId = validSelectedTeamId(allTeams, shellOptions.teamId ?? selectedTeamId);
   const model = teamLiveModel(runtime.runtimeView, {
     connection: runtime.connection,
     selectedTeamId: resolvedSelectedTeamId,
-    sessionId: shellOptions.sessionId,
+    sessionId: currentSessionId,
     limit: 64,
   });
-  const skillSummaries = useSkillSummaries(shellOptions.cwd ?? process.cwd());
+  const skillSummaries = useSkillSummaries(runtime.chatView.cwd ?? shellOptions.cwd ?? process.cwd());
 
   useEffect(() => {
     if (shellOptions.teamId) {
@@ -227,7 +274,7 @@ export function ChatShellSurface(props: {
   selectedTeamLocked?: boolean;
   onSelectTeam?: (teamId: TeamId) => void;
   onExit?: (info?: ChatShellExitInfo) => void;
-  commands?: readonly SlashCommand[];
+  commands?: readonly TuiCommand[];
   clipboard?: ClipboardAccess | undefined;
   localMessageTtlMs?: number | undefined;
   skills?: readonly SkillSummary[] | undefined;
@@ -246,12 +293,27 @@ export function ChatShellSurface(props: {
   const nextPastedImageIdRef = useRef(1);
   const [skillMentionBindings, setSkillMentionBindings] = useState<RuntimeSkillMention[]>([]);
   const [localItems, setLocalItems] = useState<LocalTranscriptItem[]>([]);
+  // A session reset invalidates notices and other UI work started by the old session.
+  const sessionUiEpochRef = useRef(0);
+  // The welcome screen is an entry state. Once work reaches the session layout,
+  // expiring transient notices must not remount the composer back on welcome.
+  const [sessionLayoutEntered, setSessionLayoutEntered] = useState(() => (
+    props.runtime.chatView.items.length > 0
+    || props.runtime.chatView.pendingApprovals.length > 0
+    || Boolean(
+      props.options?.sessionId
+      || props.runtime.activeSessionId
+      || props.runtime.chatView.sessionId,
+    )
+  ));
+  const [statusClipboardFeedback, setStatusClipboardFeedback] = useState<StatusPageFeedback | undefined>(undefined);
   const deferredLocalItems = useDeferredValue(localItems);
-  const [paletteOpen, setPaletteOpen] = useState(false);
-  const [paletteIndex, setPaletteIndex] = useState(0);
+  const [commandMenu, dispatchCommandMenu] = useReducer(reduceCommandMenu, initialCommandMenuState);
+  const paletteOpen = commandMenu.mode === "palette";
+  const paletteIndex = commandMenu.selectedIndex;
+  const paletteQuery = commandMenu.query;
   const [completionIndex, setCompletionIndex] = useState(0);
-  const [acceptedCompletionPrompt, setAcceptedCompletionPrompt] = useState<string | undefined>(undefined);
-  const acceptedCompletionPromptRef = useRef<string | undefined>(undefined);
+  const [commandConfirmation, setCommandConfirmation] = useState<CommandConfirmation | undefined>(undefined);
   const [themeId, setThemeId] = useState(() => initialTuiThemeId(props.options?.themeId));
   const [themePicker, setThemePicker] = useState<ThemePickerNavigation | undefined>(undefined);
   const modelCandidates = useMemo(
@@ -261,38 +323,83 @@ export function ChatShellSurface(props: {
   const [modelSelection, setModelSelectionState] = useState<ModelSelection | undefined>(undefined);
   const [reasoningLevel, setReasoningLevelState] = useState<ReasoningLevel | undefined>(undefined);
   const [serviceTier, setServiceTierState] = useState<ServiceTier | undefined>(undefined);
+  const capabilitySelection = modelSelection ?? modelSelectionFromOptions(props.options);
+  const reasoningConfigurable = modelSupportsReasoning(capabilitySelection, modelCandidates);
+  const serviceTierConfigurable = modelSupportsServiceTier(capabilitySelection, modelCandidates);
+  const availableReasoningLevels = reasoningConfigurable
+    ? props.runtime.modelConfig?.availableReasoningLevels ?? REASONING_LEVELS
+    : [];
   const [modelPicker, setModelPicker] = useState<ModelPickerNavigation | undefined>(undefined);
   const [reasoningPicker, setReasoningPicker] = useState<ReasoningPickerNavigation | undefined>(undefined);
   const [permissionsPicker, setPermissionsPicker] = useState<PermissionsPickerNavigation | undefined>(undefined);
+  const [resumePicker, setResumePicker] = useState<ResumePickerNavigation | undefined>(undefined);
+  const [renamePrompt, setRenamePrompt] = useState<RenamePromptNavigation | undefined>(undefined);
   const [mcpManager, setMcpManager] = useState<McpManagerState>(() => initialMcpManagerState());
   const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
   const messageScrollBoxRef = useRef<ScrollBoxRenderable | null>(null);
   const [authManualPrompt, setAuthManualPromptState] = useState<AuthManualPrompt | undefined>(undefined);
   const [showToolDetails, setShowToolDetails] = useState(false);
   const [hideThinking, setHideThinkingState] = useState(false);
+  const interruptedPromptCandidateRef = useRef<InterruptedPromptCandidate | undefined>(undefined);
+  const [pendingInterrupt, setPendingInterrupt] = useState<PendingInterruptRequest | undefined>(undefined);
   const lastCtrlCPressMsRef = useRef<number | undefined>(undefined);
   const clearedPromptTextRef = useRef<string | undefined>(undefined);
   const localMessageTtlMs = props.localMessageTtlMs ?? LOCAL_ITEM_TTL_MS;
   const localItemTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const statusClipboardFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const statusClipboardFeedbackEpochRef = useRef(0);
+  const clearStatusClipboardFeedback = useCallback(() => {
+    statusClipboardFeedbackEpochRef.current += 1;
+    if (statusClipboardFeedbackTimerRef.current) clearTimeout(statusClipboardFeedbackTimerRef.current);
+    statusClipboardFeedbackTimerRef.current = undefined;
+    setStatusClipboardFeedback(undefined);
+  }, []);
+  const beginStatusClipboardFeedback = useCallback(() => {
+    statusClipboardFeedbackEpochRef.current += 1;
+    if (statusClipboardFeedbackTimerRef.current) clearTimeout(statusClipboardFeedbackTimerRef.current);
+    statusClipboardFeedbackTimerRef.current = undefined;
+    setStatusClipboardFeedback(undefined);
+    return statusClipboardFeedbackEpochRef.current;
+  }, []);
+  const showStatusClipboardFeedback = useCallback((feedback: StatusPageFeedback, epoch: number) => {
+    if (statusClipboardFeedbackEpochRef.current !== epoch) return;
+    setStatusClipboardFeedback(feedback);
+    if (localMessageTtlMs <= 0) return;
+    statusClipboardFeedbackTimerRef.current = setTimeout(() => {
+      if (statusClipboardFeedbackEpochRef.current !== epoch) return;
+      statusClipboardFeedbackTimerRef.current = undefined;
+      setStatusClipboardFeedback(undefined);
+    }, localMessageTtlMs);
+  }, [localMessageTtlMs]);
   const dismissLocalItem = useCallback((id: string) => {
     const timer = localItemTimersRef.current.get(id);
     if (timer) clearTimeout(timer);
     localItemTimersRef.current.delete(id);
     setLocalItems((current) => current.filter((item) => item.id !== id));
   }, []);
+  const enterSessionLayout = useCallback(() => {
+    setSessionLayoutEntered(true);
+  }, []);
+  const currentSessionUiEpoch = useCallback(() => sessionUiEpochRef.current, []);
+  const isSessionUiEpochCurrent = useCallback((epoch: number) => sessionUiEpochRef.current === epoch, []);
+  const invalidateSessionUiOperations = useCallback(() => {
+    sessionUiEpochRef.current += 1;
+  }, []);
   const appendLocalItem = useCallback<AppendLocalItem>((level, text, itemOptions) => {
-    const item = localItem(level, text, itemOptions?.persistent);
+    const item = localItem(level, text, itemOptions?.persistent, itemOptions?.bare);
+    enterSessionLayout();
     setLocalItems((current) => [...current, item]);
     if (itemOptions?.persistent || localMessageTtlMs <= 0) return;
     const timer = setTimeout(() => dismissLocalItem(item.id), localMessageTtlMs);
     localItemTimersRef.current.set(item.id, timer);
-  }, [dismissLocalItem, localMessageTtlMs]);
+  }, [dismissLocalItem, enterSessionLayout, localMessageTtlMs]);
   const appendShellItem = useCallback<AppendShellItem>((item) => {
     const createdAt = Date.now();
     const id = `${createdAt}:shell:${item.command}`;
+    enterSessionLayout();
     setLocalItems((current) => [...current, { id, kind: "shell", createdAt, ...item }]);
     return id;
-  }, []);
+  }, [enterSessionLayout]);
   const updateShellItem = useCallback<UpdateShellItem>((id, update) => {
     setLocalItems((current) => current.map((item) => item.kind === "shell" && item.id === id ? { ...item, ...update } : item));
   }, []);
@@ -301,15 +408,31 @@ export function ChatShellSurface(props: {
     setLocalItems([]);
   }, []);
   useEffect(() => {
-    return () => clearLocalItemTimers(localItemTimersRef.current);
+    if (view !== "status") clearStatusClipboardFeedback();
+  }, [clearStatusClipboardFeedback, view]);
+  const runtimeSessionActivity = props.runtime.chatView.items.length > 0
+    || props.runtime.chatView.pendingApprovals.length > 0;
+  useEffect(() => {
+    if (runtimeSessionActivity) setSessionLayoutEntered(true);
+  }, [runtimeSessionActivity]);
+  useEffect(() => {
+    return () => {
+      clearLocalItemTimers(localItemTimersRef.current);
+      statusClipboardFeedbackEpochRef.current += 1;
+      if (statusClipboardFeedbackTimerRef.current) clearTimeout(statusClipboardFeedbackTimerRef.current);
+      statusClipboardFeedbackTimerRef.current = undefined;
+    };
   }, []);
-  const sessionKey = `${props.runtime.activeSessionId ?? ""}\0${props.runtime.activeThreadId ?? ""}`;
+  const sessionKey = props.runtime.activeSessionId ?? "";
   const previousSessionKey = useRef(sessionKey);
   useEffect(() => {
     if (previousSessionKey.current === sessionKey) return;
     previousSessionKey.current = sessionKey;
+    interruptedPromptCandidateRef.current = undefined;
+    setPendingInterrupt(undefined);
     clearLocalItems();
-  }, [clearLocalItems, sessionKey]);
+    clearStatusClipboardFeedback();
+  }, [clearLocalItems, clearStatusClipboardFeedback, sessionKey]);
   useEffect(() => {
     const config = props.runtime.modelConfig;
     if (!config) return;
@@ -339,56 +462,118 @@ export function ChatShellSurface(props: {
   const theme = resolveTuiTheme(themeId, undefined, { systemTheme });
   const themeOptions = selectableTuiThemeOptions;
   const systemThemeAvailable = Boolean(systemTheme);
-  const cwd = props.options?.cwd ?? process.cwd();
-  const defaultSlashCommands = useMemo(() => createDefaultSlashCommands(), []);
-  const customSlashCommands = useMemo(
-    () => customSlashCommandsFromRuntime(props.runtime.commandList),
-    [props.runtime.commandList],
-  );
-  const commands = useMemo(
-    () => props.commands ?? [...defaultSlashCommands, ...customSlashCommands.commands],
-    [customSlashCommands.commands, defaultSlashCommands, props.commands],
-  );
-  const slashContext = useMemo<SlashCommandContext>(() => ({
+  const cwd = props.runtime.chatView.cwd ?? props.options?.cwd ?? process.cwd();
+  const closeCommandMenu = useCallback(() => {
+    dispatchCommandMenu({ type: "close" });
+  }, []);
+  const openCommandPalette = useCallback(() => {
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
+    setModelPicker(undefined);
+    setReasoningPicker(undefined);
+    setPermissionsPicker(undefined);
+    setThemePicker(undefined);
+    dispatchCommandMenu({ type: "open_palette", draft: prompt });
+  }, [prompt]);
+  const statusOptions: StatusFooterOptions = {
+    modeName: props.options?.modeName ?? "Build",
+    modelName: props.options?.modelName ?? "auto",
+    providerName: props.options?.providerName ?? "runtime",
+    ...(modelSelection ? { modelSelection } : {}),
+    reasoningConfigurable,
+    serviceTierConfigurable,
+    ...(reasoningConfigurable && reasoningLevel ? { reasoningLevel } : {}),
+    ...(serviceTierConfigurable && serviceTier ? { serviceTier } : {}),
+    cwd,
+  };
+  const delegationStatus = runtimeDelegationStatus(props.runtime.runtimeView, {
+    ...(props.runtime.activeSessionId ? { sessionId: props.runtime.activeSessionId } : {}),
+    ...(props.selectedTeamId ? { teamId: props.selectedTeamId } : {}),
+    ...(props.runtime.delegationConfig ? { delegationConfig: props.runtime.delegationConfig } : {}),
+  });
+  const capabilityCandidate = capabilitySelection
+    ? modelCandidates.find((item) => sameModelSelection(capabilitySelection, modelDescriptorSelection(item)))
+    : undefined;
+  const capabilitySupported = modelToolCallSupport(capabilityCandidate);
+  const agentExperience = agentsViewModel({
+    runtimeView: props.runtime.runtimeView,
+    status: delegationStatus,
+    parentExecution: props.runtime.chatView.status,
+    ...(props.runtime.activeSessionId ? { sessionId: props.runtime.activeSessionId } : {}),
+    ...(capabilitySupported === undefined ? {} : { capabilitySupported }),
+  });
+  const currentSessionId = props.runtime.activeSessionId ?? props.runtime.chatView.sessionId;
+  const inlineAgentBatches = useMemo(() => inlineAgentBatchesForSession({
+    runtimeView: props.runtime.runtimeView,
+    teamView: props.model,
+    ...(currentSessionId ? { sessionId: currentSessionId } : {}),
+    limit: 20,
+  }), [
+    currentSessionId,
+    props.model,
+    props.runtime.revision,
+    props.runtime.runtimeView,
+  ]);
+  useEffect(() => {
+    if (inlineAgentBatches.length > 0) setSessionLayoutEntered(true);
+  }, [inlineAgentBatches.length]);
+  const statusPage = statusPageModel({
     model: props.model,
+    runtime: props.runtime,
+    options: statusOptions,
+    agentExperience,
+    showToolDetails,
+    hideThinking,
+    transcriptActive: view === "transcript",
+  });
+  const commands = useMemo(
+    () => props.commands ?? tuiCommands(props.runtime.commandList),
+    [props.commands, props.runtime.commandList],
+  );
+  const commandContext = useMemo<TuiCommandContext>(() => ({
+    model: props.model,
+    busy: isInterruptInFlight(props.runtime.chatView.status),
     cwd,
     ...(modelSelection ? { modelSelection } : {}),
-    ...(reasoningLevel ? { reasoningLevel } : {}),
-    ...(serviceTier ? { serviceTier } : {}),
+    ...(reasoningConfigurable && reasoningLevel ? { reasoningLevel } : {}),
+    availableReasoningLevels,
+    serviceTierConfigurable,
+    ...(serviceTierConfigurable && serviceTier ? { serviceTier } : {}),
     modelCandidates,
     skills: props.skills ?? [],
     allSkills: props.allSkills ?? props.skills ?? [],
     mcpServers: props.runtime.mcpStatus?.servers ?? [],
-  }), [cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.runtime.mcpStatus?.servers, props.skills, reasoningLevel, serviceTier]);
-  const completionSuppressed = acceptedCompletionPrompt !== undefined && prompt === acceptedCompletionPrompt;
+    commandDiagnostics: props.runtime.commandList?.diagnostics ?? [],
+  }), [availableReasoningLevels, cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.runtime.chatView.status, props.runtime.commandList?.diagnostics, props.runtime.mcpStatus?.servers, props.skills, reasoningConfigurable, reasoningLevel, serviceTier, serviceTierConfigurable]);
   const skillTrigger = activeSkillMentionTrigger(prompt);
   const skillCompletionItems = skillTrigger && !prompt.startsWith("/") && !shellInputActive
     ? skillCompletions(props.skills ?? [], skillTrigger.query)
     : [];
   const skillCompletionOpen = Boolean(skillTrigger && !prompt.startsWith("/") && !shellInputActive);
-  const slashCompletionItems = prompt.startsWith("/") && !completionSuppressed
-    ? slashCompletions(commands, slashContext, prompt, SLASH_COMPLETION_LIMIT)
+  const commandCompletionItems = prompt.startsWith("/")
+    ? completeCommandsSync(commands, commandContext, prompt, { scope: "contextual", limit: SLASH_COMPLETION_LIMIT })
     : [];
-  const completions = skillCompletionOpen ? skillCompletionItems : slashCompletionItems;
-  const resolvedSlashPrompt = prompt.startsWith("/") ? resolveSlashCommand(commands, prompt) : undefined;
-  const slashInputActive = prompt.startsWith("/") && (prompt.trim() === "/" || completions.length > 0 || resolvedSlashPrompt !== undefined);
-  const slashCompletionOpen = prompt.startsWith("/") && slashCompletionItems.length > 0;
+  const completions = skillCompletionOpen ? skillCompletionItems : commandCompletionItems;
+  const resolvedCommandPrompt = prompt.startsWith("/") ? resolveCommand(commands, commandContext, prompt) : undefined;
+  const commandInputActive = prompt.startsWith("/")
+    && resolvedCommandPrompt?.status !== "not_command"
+    && (prompt.trim() === "/" || completions.length > 0 || resolvedCommandPrompt !== undefined);
+  const commandCompletionOpen = prompt.startsWith("/") && commandCompletionItems.length > 0;
   const selectedCompletionIndex = clampIndex(completionIndex, completions.length);
-  const paletteItems = slashCompletions(commands, slashContext, "/", SLASH_COMPLETION_LIMIT);
+  const paletteDrilldown = paletteQuery.endsWith(" ");
+  const paletteItems = completeCommandsSync(commands, commandContext, paletteDrilldown ? `/${paletteQuery}` : paletteQuery, {
+    scope: paletteDrilldown ? "contextual" : "global",
+    limit: SLASH_COMPLETION_LIMIT,
+  });
   const firstApproval = props.runtime.chatView.pendingApprovals[0];
   const setPrompt = useMemo(() => setPromptText(setPromptParts, pastedTextByMarkerRef), []);
   const historyPromptValueRef = useRef<string | undefined>(undefined);
-  const updateAcceptedCompletionPrompt = useCallback((value: string | undefined) => {
-    acceptedCompletionPromptRef.current = value;
-    setAcceptedCompletionPrompt(value);
-  }, []);
   const clearPromptAttachments = useCallback(() => {
     pastedTextByMarkerRef.current.clear();
     setPastedImages({});
   }, []);
   const clearPromptInput = useCallback((clearedText: string) => {
     clearedPromptTextRef.current = clearedText;
-    updateAcceptedCompletionPrompt(undefined);
     historyPromptValueRef.current = undefined;
     history.resetNavigation();
     setCompletionIndex(0);
@@ -396,7 +581,7 @@ export function ChatShellSurface(props: {
     clearPromptAttachments();
     setPrompt("");
     setPromptInputResetKey((current) => current + 1);
-  }, [clearPromptAttachments, history, setPrompt, updateAcceptedCompletionPrompt]);
+  }, [clearPromptAttachments, history, setPrompt]);
   const handlePromptChange = useCallback((value: string) => {
     const clearedText = clearedPromptTextRef.current;
     if (clearedText !== undefined) {
@@ -407,7 +592,6 @@ export function ChatShellSurface(props: {
       clearedPromptTextRef.current = undefined;
     }
     if (value.length > 0) lastCtrlCPressMsRef.current = undefined;
-    if (value !== acceptedCompletionPromptRef.current) updateAcceptedCompletionPrompt(undefined);
     if (historyPromptValueRef.current === value) {
       setPrompt(value);
       return;
@@ -415,7 +599,7 @@ export function ChatShellSurface(props: {
     historyPromptValueRef.current = undefined;
     history.resetNavigation();
     setPrompt(value);
-  }, [history, setPrompt, updateAcceptedCompletionPrompt]);
+  }, [history, setPrompt]);
   useEffect(() => {
     setSkillMentionBindings((current) => filterSkillMentionBindings(current, prompt));
   }, [prompt]);
@@ -423,10 +607,9 @@ export function ChatShellSurface(props: {
     setPastedImages((current) => filterPastedImagesByPrompt(current, prompt));
   }, [prompt]);
   const setPromptFromHistory = useCallback((value: string) => {
-    updateAcceptedCompletionPrompt(undefined);
     historyPromptValueRef.current = value;
     setPrompt(value);
-  }, [setPrompt, updateAcceptedCompletionPrompt]);
+  }, [setPrompt]);
   const setAuthManualPrompt = useCallback((value: AuthManualPrompt | undefined) => {
     authManualPromptRef.current = value;
     setAuthManualPromptState(value);
@@ -444,15 +627,108 @@ export function ChatShellSurface(props: {
     });
   }, [appendLocalItem]);
   const startNewChatSession = useCallback(async () => {
+    invalidateSessionUiOperations();
     setView("chat");
     setAuthManualPrompt(undefined);
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
+    interruptedPromptCandidateRef.current = undefined;
+    setPendingInterrupt(undefined);
     setPrompt("");
     history.clear();
     clearLocalItems();
     scrollMessageToBottom();
     setTranscriptScrollOffset(0);
+    setSessionLayoutEntered(false);
     await props.runtime.startNewSession();
-  }, [clearLocalItems, history, props.runtime, scrollMessageToBottom, setAuthManualPrompt, setPrompt]);
+  }, [clearLocalItems, history, invalidateSessionUiOperations, props.runtime, scrollMessageToBottom, setAuthManualPrompt, setPrompt]);
+  const prepareForSessionSwitch = useCallback(() => {
+    setView("chat");
+    setAuthManualPrompt(undefined);
+    interruptedPromptCandidateRef.current = undefined;
+    setPendingInterrupt(undefined);
+    setPrompt("");
+    history.clear();
+    clearLocalItems();
+    scrollMessageToBottom();
+    setTranscriptScrollOffset(0);
+    setSessionLayoutEntered(true);
+  }, [clearLocalItems, history, scrollMessageToBottom, setAuthManualPrompt, setPrompt]);
+  const resumeChatSession = useCallback(async (session: RuntimeSessionSummary) => {
+    if (session.status === "archived") {
+      appendLocalItem("error", "Archived sessions cannot be resumed yet.");
+      return;
+    }
+    invalidateSessionUiOperations();
+    const uiEpoch = currentSessionUiEpoch();
+    enterSessionLayout();
+    setResumePicker(undefined);
+    const resumed = await props.runtime.resumeSession(session);
+    if (resumed && isSessionUiEpochCurrent(uiEpoch)) prepareForSessionSwitch();
+  }, [appendLocalItem, currentSessionUiEpoch, enterSessionLayout, invalidateSessionUiOperations, isSessionUiEpochCurrent, prepareForSessionSwitch, props.runtime]);
+  const openResumePicker = useCallback(() => {
+    if (props.runtime.chatView.status === "running" || props.runtime.chatView.status === "waiting_for_approval") {
+      appendLocalItem("error", "Finish or interrupt the current session before resuming another chat.");
+      return;
+    }
+    closeCommandMenu();
+    setModelPicker(undefined);
+    setReasoningPicker(undefined);
+    setPermissionsPicker(undefined);
+    setThemePicker(undefined);
+    setRenamePrompt(undefined);
+    setResumePicker({ query: "", selectedIndex: 0, sessions: [], loading: true, showAll: false });
+    void props.runtime.listSessions()
+      .then((sessions) => {
+        setResumePicker((current) => current ? { ...current, sessions, loading: false, selectedIndex: 0 } : current);
+      })
+      .catch((error) => {
+        setResumePicker((current) => current ? { ...current, loading: false, error: errorMessage(error) } : current);
+      });
+  }, [appendLocalItem, closeCommandMenu, props.runtime]);
+  const resumeSessionByTarget = useCallback(async (target: string) => {
+    if (props.runtime.chatView.status === "running" || props.runtime.chatView.status === "waiting_for_approval") {
+      appendLocalItem("error", "Finish or interrupt the current session before resuming another chat.");
+      return;
+    }
+    const uiEpoch = currentSessionUiEpoch();
+    enterSessionLayout();
+    let sessions: RuntimeSessionSummary[];
+    try {
+      sessions = await props.runtime.listSessions();
+    } catch {
+      return;
+    }
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
+    const match = resolveResumeTarget(sessions, target);
+    if (typeof match === "string") {
+      appendLocalItem("error", match);
+      return;
+    }
+    await resumeChatSession(match);
+  }, [appendLocalItem, currentSessionUiEpoch, enterSessionLayout, isSessionUiEpochCurrent, props.runtime, resumeChatSession]);
+  const openRenamePrompt = useCallback(() => {
+    closeCommandMenu();
+    setModelPicker(undefined);
+    setReasoningPicker(undefined);
+    setPermissionsPicker(undefined);
+    setThemePicker(undefined);
+    setResumePicker(undefined);
+    setRenamePrompt({ value: "", submitting: false });
+  }, [closeCommandMenu]);
+  const renameChatSession = useCallback(async (title: string) => {
+    let normalized: string;
+    try {
+      normalized = normalizeSessionTitle(title);
+    } catch (error) {
+      appendLocalItem("error", error instanceof Error ? error.message : "Invalid session title.");
+      return;
+    }
+    setRenamePrompt((current) => current ? { ...current, submitting: true } : current);
+    const renamed = await props.runtime.renameSession(normalized);
+    if (renamed) setRenamePrompt(undefined);
+    else setRenamePrompt((current) => current ? { ...current, submitting: false } : current);
+  }, [appendLocalItem, props.runtime]);
   const submitAuthManualInput = useCallback(() => {
     const manual = authManualPromptRef.current;
     if (!manual) return false;
@@ -467,6 +743,8 @@ export function ChatShellSurface(props: {
   }, [appendLocalItem, clearPromptAttachments, expandedPrompt, setAuthManualPrompt, setPrompt]);
   const openThemePicker = useCallback(() => {
     const index = themeOptionIndex(themeOptions, themeId);
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
     setModelPicker(undefined);
     setReasoningPicker(undefined);
     setPermissionsPicker(undefined);
@@ -492,22 +770,33 @@ export function ChatShellSurface(props: {
   }, []);
   const openModelPicker = useCallback((query = "") => {
     void props.runtime.refreshModelConfig?.();
-    const index = modelPickerIndex(modelCandidates, query, modelSelection);
+    const items = modelPickerCandidates(modelCandidates, query, modelSelection, undefined);
+    const index = modelPickerIndex(modelCandidates, query, modelSelection, undefined);
+    const selectedCandidate = items[index];
+    const selected = selectedCandidate ? modelDescriptorSelection(selectedCandidate) : undefined;
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
     setReasoningPicker(undefined);
     setPermissionsPicker(undefined);
     setThemePicker(undefined);
-    setModelPicker({ query, selectedIndex: index });
+    setModelPicker({ query, cursor: query.length, selectedIndex: index, selected, provider: undefined });
   }, [modelCandidates, modelSelection, props.runtime]);
   const closeModelPicker = useCallback(() => {
     setModelPicker(undefined);
   }, []);
   const openReasoningPicker = useCallback(() => {
-    const selectedIndex = Math.max(0, REASONING_LEVELS.indexOf(reasoningLevel ?? DEFAULT_REASONING_LEVEL));
+    if (!reasoningConfigurable) {
+      appendLocalItem("error", `${capabilityModelLabel(capabilitySelection)} does not support configurable thinking`);
+      return;
+    }
+    const selectedIndex = Math.max(0, availableReasoningLevels.indexOf(reasoningLevel ?? DEFAULT_REASONING_LEVEL));
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
     setModelPicker(undefined);
     setPermissionsPicker(undefined);
     setThemePicker(undefined);
     setReasoningPicker({ selectedIndex });
-  }, [reasoningLevel]);
+  }, [appendLocalItem, availableReasoningLevels, capabilitySelection, reasoningConfigurable, reasoningLevel]);
   const closeReasoningPicker = useCallback(() => {
     setReasoningPicker(undefined);
   }, []);
@@ -515,6 +804,8 @@ export function ChatShellSurface(props: {
     void props.runtime.refreshPermissionConfig?.();
     const profiles = props.runtime.permissionConfig?.profiles ?? [];
     const selectedIndex = Math.max(0, profiles.findIndex((profile) => profile.current));
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
     setModelPicker(undefined);
     setReasoningPicker(undefined);
     setThemePicker(undefined);
@@ -543,21 +834,26 @@ export function ChatShellSurface(props: {
   }, [props.runtime]);
   const openMcpManager = useCallback(() => {
     setView("mcp");
-    setPaletteOpen(false);
+    closeCommandMenu();
     setModelPicker(undefined);
     setReasoningPicker(undefined);
     setPermissionsPicker(undefined);
     setThemePicker(undefined);
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
     setPrompt("");
     setMcpManager(initialMcpManagerState());
     void refreshMcpManager();
-  }, [refreshMcpManager, setPrompt]);
+  }, [closeCommandMenu, refreshMcpManager, setPrompt]);
   const closeMcpManager = useCallback(() => {
     setView("chat");
     setMcpManager(initialMcpManagerState());
   }, []);
   const setModelSelection = useCallback(async (selection: ModelSelection, nextReasoningLevel?: ReasoningLevel) => {
+    const uiEpoch = currentSessionUiEpoch();
+    enterSessionLayout();
     const persisted = props.runtime.setRuntimeModel ? await props.runtime.setRuntimeModel(selection) : true;
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     if (!persisted) {
       setModelPicker(undefined);
       appendLocalItem("error", `Model unchanged: failed to persist ${modelSelectionLabel(selection)}`);
@@ -569,29 +865,38 @@ export function ChatShellSurface(props: {
     if (modelSupportsReasoning(selection, modelCandidates)) {
       resolvedReasoning = nextReasoningLevel;
     } else {
-      resolvedReasoning = "off";
+      setReasoningLevelState(undefined);
     }
 
     if (resolvedReasoning !== undefined) {
       reasoningPersisted = props.runtime.setRuntimeReasoning
         ? await props.runtime.setRuntimeReasoning(resolvedReasoning)
         : true;
+      if (!isSessionUiEpochCurrent(uiEpoch)) return;
       if (!reasoningPersisted) {
         appendLocalItem("error", `Thinking unchanged: failed to persist ${resolvedReasoning}`);
       }
     }
 
     setModelSelectionState(selection);
+    if (!modelSupportsServiceTier(selection, modelCandidates)) setServiceTierState(undefined);
     if (resolvedReasoning && reasoningPersisted) setReasoningLevelState(resolvedReasoning);
     setModelPicker(undefined);
     const reasoningText = resolvedReasoning && reasoningPersisted ? ` (thinking ${resolvedReasoning})` : "";
     const selectedModel = modelCandidates.find((candidate) => sameModelSelection(selection, modelDescriptorSelection(candidate)));
     const availabilityText = selectedModel?.available === false ? " (not configured)" : "";
     appendLocalItem("info", `Model: ${modelSelectionLabel(selection)}${reasoningText}${availabilityText}`);
-  }, [appendLocalItem, modelCandidates, props.runtime]);
+  }, [appendLocalItem, currentSessionUiEpoch, enterSessionLayout, isSessionUiEpochCurrent, modelCandidates, props.runtime]);
 
   const setReasoningLevel = useCallback(async (level: ReasoningLevel) => {
+    if (!reasoningConfigurable) {
+      appendLocalItem("error", `${capabilityModelLabel(capabilitySelection)} does not support configurable thinking`);
+      return;
+    }
+    const uiEpoch = currentSessionUiEpoch();
+    enterSessionLayout();
     const persisted = props.runtime.setRuntimeReasoning ? await props.runtime.setRuntimeReasoning(level) : true;
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     if (!persisted) {
       setReasoningPicker(undefined);
       appendLocalItem("error", `Thinking unchanged: failed to persist ${level}`);
@@ -600,17 +905,24 @@ export function ChatShellSurface(props: {
     setReasoningLevelState(level);
     setReasoningPicker(undefined);
     appendLocalItem("info", `Thinking: ${level}`);
-  }, [appendLocalItem, props.runtime]);
+  }, [appendLocalItem, capabilitySelection, currentSessionUiEpoch, enterSessionLayout, isSessionUiEpochCurrent, props.runtime, reasoningConfigurable]);
 
   const setServiceTier = useCallback(async (nextServiceTier: ServiceTier) => {
+    if (!serviceTierConfigurable) {
+      appendLocalItem("error", `${capabilityModelLabel(capabilitySelection)} does not support selectable service tiers`);
+      return;
+    }
+    const uiEpoch = currentSessionUiEpoch();
+    enterSessionLayout();
     const persisted = props.runtime.setRuntimeServiceTier ? await props.runtime.setRuntimeServiceTier(nextServiceTier) : true;
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     if (!persisted) {
       appendLocalItem("error", `Fast mode unchanged: failed to persist ${nextServiceTier}`);
       return;
     }
     setServiceTierState(nextServiceTier);
     appendLocalItem("info", nextServiceTier === "fast" ? "Fast mode: on" : "Fast mode: off (standard)");
-  }, [appendLocalItem, props.runtime]);
+  }, [appendLocalItem, capabilitySelection, currentSessionUiEpoch, enterSessionLayout, isSessionUiEpochCurrent, props.runtime, serviceTierConfigurable]);
 
   const setPermissionProfile = useCallback(async (profile: RuntimePermissionProfileId) => {
     const item = props.runtime.permissionConfig?.profiles.find((candidate) => candidate.id === profile);
@@ -618,50 +930,62 @@ export function ChatShellSurface(props: {
       appendLocalItem("error", `${item.label}: ${item.disabledReason}`);
       return;
     }
+    const uiEpoch = currentSessionUiEpoch();
+    enterSessionLayout();
     const persisted = props.runtime.setRuntimePermissionProfile
       ? await props.runtime.setRuntimePermissionProfile(profile)
       : false;
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     setPermissionsPicker(undefined);
     if (!persisted) {
       appendLocalItem("error", `Permissions unchanged: failed to select ${item?.label ?? profile}`);
       return;
     }
     appendLocalItem("info", `Permissions updated to ${item?.label ?? profile}`);
-  }, [appendLocalItem, props.runtime]);
+  }, [appendLocalItem, currentSessionUiEpoch, enterSessionLayout, isSessionUiEpochCurrent, props.runtime]);
   const setHideThinking = useCallback((hidden: boolean) => {
     setHideThinkingState(hidden);
     appendLocalItem("info", hidden ? "Thinking traces hidden." : "Thinking traces shown.");
   }, [appendLocalItem]);
 
   const ensureOpenAICodexDefaultModel = useCallback(async () => {
+    const uiEpoch = currentSessionUiEpoch();
     await props.runtime.refreshModelConfig?.();
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     if (isValidModelSelection(modelSelection, modelCandidates)) return;
     const selection = defaultOpenAICodexSelection();
     await setModelSelection(selection);
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     await props.runtime.refreshModelConfig?.();
-  }, [modelCandidates, modelSelection, props.runtime, setModelSelection]);
+  }, [currentSessionUiEpoch, isSessionUiEpochCurrent, modelCandidates, modelSelection, props.runtime, setModelSelection]);
   const reloadCommands = useCallback(async () => {
+    const uiEpoch = currentSessionUiEpoch();
     const commandList = await props.runtime.reloadCommands?.();
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     if (!commandList) {
       appendLocalItem("error", "Could not reload commands.");
       return;
     }
-    const state = customSlashCommandsFromRuntime(commandList);
-    appendLocalItem("info", `Commands reloaded: ${state.commands.length} custom command${state.commands.length === 1 ? "" : "s"}.`);
-    for (const diagnostic of state.diagnostics) {
-      appendLocalItem(diagnostic.level === "error" ? "error" : "info", `/${diagnostic.code}: ${diagnostic.message}`);
+    const count = countRuntimeCommandNodes(commandList.roots);
+    appendLocalItem("info", `Command catalog reloaded: ${count} node${count === 1 ? "" : "s"}.`);
+    for (const diagnostic of commandList.diagnostics) {
+      appendLocalItem(diagnostic.level === "error" ? "error" : "info", `[${diagnostic.code}] ${diagnostic.message}`);
     }
-    for (const name of state.skippedConflicts) {
-      appendLocalItem("info", `Skipped user command /${name}; project command wins.`);
-    }
-  }, [appendLocalItem, props.runtime]);
-  const slashActions = useMemo<SlashActions>(() => ({
+  }, [appendLocalItem, currentSessionUiEpoch, isSessionUiEpochCurrent, props.runtime]);
+  const commandActions = useMemo<CommandActions>(() => ({
     cwd,
+    enterSessionLayout,
+    currentSessionUiEpoch,
+    isSessionUiEpochCurrent,
     setView,
     appendLocalItem,
     appendShellItem,
     updateShellItem,
     startNewChatSession,
+    openResumePicker,
+    resumeSessionByTarget,
+    openRenamePrompt,
+    renameChatSession,
     setPrompt,
     openThemePicker,
     openMcpManager,
@@ -679,28 +1003,38 @@ export function ChatShellSurface(props: {
       await props.onSkillsChanged?.();
     },
     reloadCommands,
-  }), [appendLocalItem, appendShellItem, cwd, ensureOpenAICodexDefaultModel, openMcpManager, openModelPicker, openPermissionsPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, reloadCommands, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, setServiceTier, startNewChatSession, updateShellItem]);
-  const runSelectedSlashCompletion = useCallback(() => {
-    if (!slashCompletionOpen) return false;
-    const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
+    requestConfirmation: (title, result) => setCommandConfirmation({ title, result, selectedIndex: 0 }),
+    openCommandPalette,
+    exitApp: () => props.onExit?.(chatShellExitInfo(props.runtime, cwd)),
+  }), [appendLocalItem, appendShellItem, currentSessionUiEpoch, cwd, ensureOpenAICodexDefaultModel, enterSessionLayout, isSessionUiEpochCurrent, openCommandPalette, openMcpManager, openModelPicker, openPermissionsPicker, openReasoningPicker, openRenamePrompt, openResumePicker, openThemePicker, props.onExit, props.onSkillsChanged, props.runtime, reloadCommands, renameChatSession, resumeSessionByTarget, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, setServiceTier, startNewChatSession, updateShellItem]);
+  const runSelectedCommandCompletion = useCallback(() => {
+    if (!commandCompletionOpen) return false;
+    const completion = commandCompletionItems[selectedCompletionIndex] ?? commandCompletionItems[0];
     if (!completion) return false;
+    if (!completion.value.toLowerCase().startsWith(prompt.trim().toLowerCase())) return false;
+    const requiresArgument = completion.intent === "complete"
+      && collectCommandNodes(commands).some((command) => command.id === completion.id && command.argumentMode === "required");
+    if (requiresArgument) {
+      history.resetNavigation();
+      setPrompt(`${completion.value} `);
+      return true;
+    }
     const promptAtSelection = prompt;
     let promptUpdated = false;
-    const trackedSlashActions: SlashActions = {
-      ...slashActions,
+    const trackedCommandActions: CommandActions = {
+      ...commandActions,
       setPrompt: (value) => {
         promptUpdated = true;
-        slashActions.setPrompt(value);
+        commandActions.setPrompt(value);
       },
     };
-    updateAcceptedCompletionPrompt(undefined);
     history.resetNavigation();
-    void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, trackedSlashActions)
+    void runCommandInput(completion.value, commands, commandContext, props.model, props.runtime, trackedCommandActions)
       .then(() => {
         if (!promptUpdated) setPrompt((current) => current === promptAtSelection ? "" : current);
       });
     return true;
-  }, [commands, history, prompt, props.model, props.runtime, selectedCompletionIndex, setPrompt, slashActions, slashCompletionItems, slashCompletionOpen, slashContext, updateAcceptedCompletionPrompt]);
+  }, [commandActions, commandCompletionItems, commandCompletionOpen, commandContext, commands, history, prompt, props.model, props.runtime, selectedCompletionIndex, setPrompt]);
   const runSelectedSkillCompletion = useCallback(() => {
     if (!skillCompletionOpen || !skillTrigger) return false;
     const completion = skillCompletionItems[selectedCompletionIndex] ?? skillCompletionItems[0];
@@ -712,19 +1046,36 @@ export function ChatShellSurface(props: {
       setPrompt,
       setSkillMentionBindings,
       history,
-      updateAcceptedCompletionPrompt,
     });
     return true;
-  }, [history, prompt, selectedCompletionIndex, setPrompt, skillCompletionItems, skillCompletionOpen, skillTrigger, updateAcceptedCompletionPrompt]);
+  }, [history, prompt, selectedCompletionIndex, setPrompt, skillCompletionItems, skillCompletionOpen, skillTrigger]);
+  const submitCurrentChatPrompt = useCallback(() => {
+    const candidate = interruptedPromptCandidate(
+      promptParts,
+      pastedTextByMarkerRef.current,
+      pastedImages,
+      skillMentionBindings,
+      props.runtime.chatView.items,
+    );
+    void submitPrompt(
+      prompt,
+      expandedPrompt,
+      commands,
+      commandContext,
+      props.model,
+      props.runtime,
+      commandActions,
+      history.record,
+      skillMentionBindings,
+      props.skills ?? [],
+      pastedImages,
+      clearPromptAttachments,
+      (state) => trackInterruptedPromptCandidate(interruptedPromptCandidateRef, candidate, state),
+    );
+  }, [clearPromptAttachments, commandActions, commandContext, commands, expandedPrompt, history.record, pastedImages, prompt, promptParts, props.model, props.runtime, props.skills, skillMentionBindings]);
   useEffect(() => {
     setCompletionIndex(0);
   }, [prompt]);
-
-  useEffect(() => {
-    if (acceptedCompletionPrompt !== undefined && prompt !== acceptedCompletionPrompt) {
-      updateAcceptedCompletionPrompt(undefined);
-    }
-  }, [acceptedCompletionPrompt, prompt, updateAcceptedCompletionPrompt]);
 
   useEffect(() => {
     setCompletionIndex((current) => clampIndex(current, completions.length));
@@ -867,8 +1218,18 @@ export function ChatShellSurface(props: {
     setMcpManager((current) => ({ screen: "list", selectedIndex: serverIndexByName(mcpServers, server.name), status: current.status }));
   }, [authenticateMcpFromManager, loadMcpTools, logoutMcpFromManager, mcpServers, reloadMcpFromManager]);
 
-  const selectorOpen = Boolean(modelPicker || reasoningPicker || permissionsPicker);
-  const approvalShortcutsEnabled = view === "chat" && Boolean(firstApproval) && props.runtime.chatView.pendingApprovals.length > 0 && !authManualPrompt && !selectorOpen && !themePicker && !paletteOpen && !slashCompletionOpen && !skillCompletionOpen;
+  const resumePickerItems = resumePicker
+    ? filteredResumeSessions(resumePicker.sessions, resumePicker.query, cwd, resumePicker.showAll)
+    : [];
+  const selectorOpen = Boolean(modelPicker || reasoningPicker || permissionsPicker || resumePicker || renamePrompt);
+  const approvalReviewHeight = approvalDockHeight(
+    props.runtime.chatView.pendingApprovals,
+    Math.max(24, dimensions.width - 8),
+    theme,
+  );
+  const approvalReviewBlocked = firstApproval?.permission === "bash.unsandboxed"
+    && approvalReviewHeight > Math.max(6, dimensions.height - 8);
+  const approvalShortcutsEnabled = view === "chat" && Boolean(firstApproval) && props.runtime.chatView.pendingApprovals.length > 0 && !authManualPrompt && !selectorOpen && !themePicker && !paletteOpen && !commandCompletionOpen && !skillCompletionOpen;
   const disabledReason = authManualPrompt
     ? undefined
     : modelPicker
@@ -877,21 +1238,27 @@ export function ChatShellSurface(props: {
     ? "Choose thinking level"
     : permissionsPicker
     ? "Choose permissions"
+    : resumePicker
+    ? "Choose a saved chat"
+    : renamePrompt
+    ? "Rename the current chat"
     : view === "mcp"
     ? "MCP manager open"
     : shellInputActive
     ? undefined
-    : slashInputActive
+    : commandInputActive
     ? undefined
     : props.runtime.chatView.pendingApprovals.length > 0
       ? "Resolve approval to continue"
-      : props.runtime.chatView.status === "running"
-        ? "Session running - ctrl+x interrupt"
-        : props.runtime.submitBlockedReason
-          ? props.runtime.submitBlockedReason
-        : !props.runtime.canSubmit
-          ? "Waiting for runtime"
-          : undefined;
+      : props.runtime.chatView.status === "cancelling"
+        ? "Cancelling session..."
+        : props.runtime.chatView.status === "running"
+          ? "Session running - Esc or Ctrl+X to interrupt"
+          : props.runtime.submitBlockedReason
+            ? props.runtime.submitBlockedReason
+            : !props.runtime.canSubmit
+              ? "Waiting for runtime"
+              : undefined;
   const promptDisabled = Boolean(disabledReason);
   const clipboard = props.clipboard ?? systemClipboard;
   const registerPromptTextPaste = useCallback((value: string) => {
@@ -955,6 +1322,61 @@ export function ChatShellSurface(props: {
     appendLocalItem("info", hadPrompt ? "Input cleared. Press Ctrl+C again to exit." : "Press Ctrl+C again to exit.");
   }, [appendLocalItem, clearPromptInput, cwd, prompt, props.onExit, props.runtime]);
 
+  const restoreInterruptedPrompt = useCallback((candidate: InterruptedPromptCandidate) => {
+    clearedPromptTextRef.current = undefined;
+    historyPromptValueRef.current = undefined;
+    history.resetNavigation();
+    pastedTextByMarkerRef.current.clear();
+    for (const [marker, text] of candidate.pastedTextByMarker) {
+      pastedTextByMarkerRef.current.set(marker, text);
+    }
+    setPromptParts(candidate.promptParts.map((part) => ({ ...part })));
+    setPastedImages({ ...candidate.pastedImages });
+    setSkillMentionBindings(candidate.skillMentionBindings.map((binding) => ({ ...binding })));
+    setPromptInputResetKey((current) => current + 1);
+  }, [history]);
+
+  const requestActiveSessionInterrupt = useCallback(() => {
+    if (!isInterruptInFlight(props.runtime.chatView.status) || pendingInterrupt) return;
+    setPendingInterrupt({ candidate: interruptedPromptCandidateRef.current });
+    void props.runtime.interruptActiveSession();
+  }, [pendingInterrupt, props.runtime]);
+
+  useEffect(() => {
+    const status = props.runtime.chatView.status;
+    const active = isInterruptInFlight(status);
+    const candidate = interruptedPromptCandidateRef.current;
+    if (active && candidate) candidate.sawActiveStatus = true;
+
+    if (pendingInterrupt) {
+      if (active) return;
+      const interruptedCandidate = pendingInterrupt.candidate;
+      if (interruptedCandidate && !hasVisibleOutputSince(interruptedCandidate, props.runtime.chatView.items)) {
+        interruptedCandidate.interruptOutcome = "restored";
+        restoreInterruptedPrompt(interruptedCandidate);
+      } else {
+        if (interruptedCandidate) interruptedCandidate.interruptOutcome = "discarded";
+        appendLocalItem("error", CONVERSATION_INTERRUPTED_NOTICE, { persistent: true, bare: true });
+      }
+      interruptedPromptCandidateRef.current = undefined;
+      setPendingInterrupt(undefined);
+      return;
+    }
+
+    if (
+      candidate
+      && !active
+      && (
+        candidate.sawActiveStatus
+        || status === "cancelled"
+        || status === "failed"
+        || hasVisibleOutputSince(candidate, props.runtime.chatView.items)
+      )
+    ) {
+      interruptedPromptCandidateRef.current = undefined;
+    }
+  }, [appendLocalItem, pendingInterrupt, props.runtime.chatView.items, props.runtime.chatView.status, restoreInterruptedPrompt]);
+
   useEffect(() => {
     const previous = previousTranscriptLineCount.current;
     previousTranscriptLineCount.current = transcriptLineCount;
@@ -982,13 +1404,22 @@ export function ChatShellSurface(props: {
     if (isCopyShortcut(key)) {
       key.preventDefault();
       key.stopPropagation();
-      const source = clipboardCopySource(renderer, props.runtime.chatView.items, view);
+      const copyView = view;
+      const statusFeedbackEpoch = copyView === "status" ? beginStatusClipboardFeedback() : undefined;
+      const reportCopyResult = (level: "info" | "error", text: string) => {
+        if (statusFeedbackEpoch !== undefined) {
+          showStatusClipboardFeedback({ level, text }, statusFeedbackEpoch);
+          return;
+        }
+        appendLocalItem(level, text);
+      };
+      const source = clipboardCopySource(renderer, props.runtime.chatView.items, copyView, statusPage.text);
       if (!source) {
-        appendLocalItem("error", "Nothing to copy yet.");
+        reportCopyResult("error", "Nothing to copy yet.");
         return;
       }
       void copyClipboardText(source.text, clipboard, renderer).then((copied) => {
-        appendLocalItem(copied ? "info" : "error", copied ? `Copied ${source.label}.` : "Clipboard copy is unavailable.");
+        reportCopyResult(copied ? "info" : "error", copied ? `Copied ${source.label}.` : "Clipboard copy is unavailable.");
       });
       return;
     }
@@ -999,12 +1430,100 @@ export function ChatShellSurface(props: {
       return;
     }
     if (key.ctrl && key.name === "x") {
-      void props.runtime.interruptActiveSession();
+      key.preventDefault();
+      key.stopPropagation();
+      requestActiveSessionInterrupt();
+      return;
+    }
+    if (commandConfirmation) {
+      if (isEscape(key) || (!key.ctrl && key.name === "n")) {
+        setCommandConfirmation(undefined);
+        return;
+      }
+      if (isArrowLeft(key) || isArrowRight(key) || isArrowUp(key) || isArrowDown(key)) {
+        setCommandConfirmation((current) => current ? { ...current, selectedIndex: current.selectedIndex === 0 ? 1 : 0 } : current);
+        return;
+      }
+      if (isEnter(key) || (!key.ctrl && key.name === "y")) {
+        if (commandConfirmation.selectedIndex === 1 || key.name === "y") {
+          const result = commandConfirmation.result;
+          setCommandConfirmation(undefined);
+          void applyCommandResult(result, commandContext, props.model, props.runtime, commandActions);
+        } else {
+          setCommandConfirmation(undefined);
+        }
+        return;
+      }
+      return;
+    }
+    if (resumePicker) {
+      if (isEscape(key)) {
+        setResumePicker(undefined);
+        return;
+      }
+      if (key.ctrl && key.name === "a") {
+        setResumePicker((current) => current ? { ...current, showAll: !current.showAll, selectedIndex: 0 } : current);
+        return;
+      }
+      if (isArrowUp(key) || isArrowDown(key)) {
+        const delta = isArrowUp(key) ? -1 : 1;
+        setResumePicker((current) => current ? {
+          ...current,
+          selectedIndex: clampIndex(current.selectedIndex + delta, resumePickerItems.length),
+        } : current);
+        return;
+      }
+      if (isEnter(key)) {
+        const selected = resumePickerItems[clampIndex(resumePicker.selectedIndex, resumePickerItems.length)];
+        if (selected) void resumeChatSession(selected);
+        return;
+      }
+      if (isBackspace(key)) {
+        setResumePicker((current) => current ? { ...current, query: current.query.slice(0, -1), selectedIndex: 0 } : current);
+        return;
+      }
+      if (isPasteShortcut(key)) {
+        void clipboard.readText().then((value) => {
+          const pasted = cleanClipboardText(value ?? "")?.replace(/\s+/g, " ") ?? "";
+          if (pasted) setResumePicker((current) => current ? { ...current, query: `${current.query}${pasted}`, selectedIndex: 0 } : current);
+        });
+        return;
+      }
+      const printable = printableKey(key);
+      if (printable) {
+        setResumePicker((current) => current ? { ...current, query: `${current.query}${printable}`, selectedIndex: 0 } : current);
+      }
+      return;
+    }
+    if (renamePrompt) {
+      if (isEscape(key)) {
+        setRenamePrompt(undefined);
+        return;
+      }
+      if (renamePrompt.submitting) return;
+      if (isEnter(key)) {
+        void renameChatSession(renamePrompt.value);
+        return;
+      }
+      if (isBackspace(key)) {
+        setRenamePrompt((current) => current ? { ...current, value: current.value.slice(0, -1) } : current);
+        return;
+      }
+      if (isPasteShortcut(key)) {
+        void clipboard.readText().then((value) => {
+          const pasted = cleanClipboardText(value ?? "")?.replace(/\s+/g, " ") ?? "";
+          if (pasted) setRenamePrompt((current) => current ? { ...current, value: `${current.value}${pasted}`.slice(0, SESSION_TITLE_MAX_CHARS) } : current);
+        });
+        return;
+      }
+      const printable = printableKey(key);
+      if (printable) {
+        setRenamePrompt((current) => current ? { ...current, value: `${current.value}${printable}`.slice(0, SESSION_TITLE_MAX_CHARS) } : current);
+      }
       return;
     }
     if (key.ctrl && key.name === "p") {
-      setPaletteOpen(true);
-      setPaletteIndex(0);
+      openCommandPalette();
       return;
     }
     if (key.ctrl && key.name === "o" && !key.shift) {
@@ -1103,10 +1622,49 @@ export function ChatShellSurface(props: {
       return;
     }
     if (paletteOpen) {
-      handlePaletteKey(key, paletteItems, paletteIndex, setPaletteIndex, (completion) => {
-        setPaletteOpen(false);
-        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, slashActions);
-      }, () => setPaletteOpen(false));
+      const selected = paletteItems[clampIndex(paletteIndex, paletteItems.length)];
+      if (isEscape(key)) {
+        closeCommandMenu();
+        return;
+      }
+      if (isArrowUp(key) || isArrowDown(key)) {
+        dispatchCommandMenu({ type: "move", delta: isArrowUp(key) ? -1 : 1, itemCount: paletteItems.length });
+        return;
+      }
+      if (isTab(key) || isArrowRight(key)) {
+        if (!selected) return;
+        if (selected.intent === "drilldown") {
+          dispatchCommandMenu({ type: "complete", value: `${selected.value} ` });
+          return;
+        }
+        closeCommandMenu();
+        history.resetNavigation();
+        setPrompt(`${selected.value}${selected.intent === "complete" ? " " : ""}`);
+        return;
+      }
+      if (isEnter(key)) {
+        if (!selected) return;
+        closeCommandMenu();
+        const requiresArgument = selected.intent === "complete"
+          && collectCommandNodes(commands).some((command) => command.id === selected.id && command.argumentMode === "required");
+        if (requiresArgument) {
+          history.resetNavigation();
+          setPrompt(`${selected.value} `);
+          return;
+        }
+        void runCommandInput(selected.value, commands, commandContext, props.model, props.runtime, commandActions);
+        return;
+      }
+      if (isBackspace(key)) {
+        dispatchCommandMenu({ type: "backspace" });
+        return;
+      }
+      if (key.ctrl && key.name === "u") {
+        dispatchCommandMenu({ type: "delete" });
+        return;
+      }
+      const printable = printableKey(key);
+      if (printable) dispatchCommandMenu({ type: "insert", text: printable });
       return;
     }
     if (modelPicker) {
@@ -1118,7 +1676,7 @@ export function ChatShellSurface(props: {
       return;
     }
     if (reasoningPicker) {
-      handleReasoningPickerKey(key, reasoningPicker, {
+      handleReasoningPickerKey(key, reasoningPicker, availableReasoningLevels, {
         setReasoningPicker,
         selectLevel: setReasoningLevel,
         cancel: closeReasoningPicker,
@@ -1149,7 +1707,7 @@ export function ChatShellSurface(props: {
       }
       return;
     }
-    if ((slashCompletionOpen || skillCompletionOpen) && !key.shift && (isArrowUp(key) || isArrowDown(key))) {
+    if ((commandCompletionOpen || skillCompletionOpen) && !key.shift && (isArrowUp(key) || isArrowDown(key))) {
       const delta = isArrowUp(key) ? -1 : 1;
       setCompletionIndex((current) => wrapIndex(current + delta, completions.length));
       return;
@@ -1157,20 +1715,18 @@ export function ChatShellSurface(props: {
     if (skillCompletionOpen && isTab(key)) {
       if (runSelectedSkillCompletion()) return;
     }
-    if (slashCompletionOpen && isTab(key)) {
-      const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
+    if (commandCompletionOpen && (isTab(key) || isArrowRight(key))) {
+      const completion = commandCompletionItems[selectedCompletionIndex] ?? commandCompletionItems[0];
       if (completion) {
-        const accepted = `${completion.value} `;
         history.resetNavigation();
-        updateAcceptedCompletionPrompt(accepted);
-        setPrompt(accepted);
+        setPrompt(`${completion.value}${completion.intent === "execute" ? "" : " "}`);
       }
       return;
     }
     if (isEscape(key)) {
       // Interrupt the active session if running
-      if (props.runtime.chatView.status === "running") {
-        void props.runtime.interruptActiveSession();
+      if (isInterruptInFlight(props.runtime.chatView.status)) {
+        requestActiveSessionInterrupt();
         return;
       }
       // Close theme picker if open
@@ -1195,7 +1751,7 @@ export function ChatShellSurface(props: {
       }
       // Close palette if open
       if (paletteOpen) {
-        setPaletteOpen(false);
+        closeCommandMenu();
         return;
       }
       // Return to chat view if in another view
@@ -1229,26 +1785,34 @@ export function ChatShellSurface(props: {
       setTranscriptScrollOffset((current) => Math.max(0, current - scrollStep(dimensions.height)));
       return;
     }
-    if (view === "chat" && !promptDisabled && isPlainArrowUp(key) && !slashCompletionOpen && !skillCompletionOpen) {
+    if (view === "chat" && !promptDisabled && isPlainArrowUp(key) && !commandCompletionOpen && !skillCompletionOpen) {
       const previous = history.previous(prompt);
       if (previous !== undefined) setPromptFromHistory(previous);
       return;
     }
-    if (view === "chat" && !promptDisabled && isPlainArrowDown(key) && !slashCompletionOpen && !skillCompletionOpen) {
+    if (view === "chat" && !promptDisabled && isPlainArrowDown(key) && !commandCompletionOpen && !skillCompletionOpen) {
       const next = history.next(prompt);
       if (next !== undefined) setPromptFromHistory(next);
       return;
     }
     if (approvalShortcutsEnabled && firstApproval && isApproveAlwaysKey(key)) {
-      void props.runtime.approveApproval(firstApproval.id, { scope: "persistent" });
+      if (firstApproval.maxApprovalScope === undefined || firstApproval.maxApprovalScope === "persistent") {
+        void props.runtime.approveApproval(firstApproval.id, { scope: "persistent" });
+      }
       return;
     }
     if (approvalShortcutsEnabled && firstApproval && isApproveSessionKey(key)) {
-      void props.runtime.approveApproval(firstApproval.id, { scope: "session" });
+      if (firstApproval.maxApprovalScope !== "once") {
+        void props.runtime.approveApproval(firstApproval.id, { scope: "session" });
+      }
       return;
     }
     if (approvalShortcutsEnabled && firstApproval && isApproveOnceKey(key)) {
-      void props.runtime.approveApproval(firstApproval.id, { scope: "once" });
+      if (approvalReviewBlocked) {
+        appendLocalItem("error", "Resize the terminal to review the full command before approval.");
+      } else {
+        void props.runtime.approveApproval(firstApproval.id, { scope: "once" });
+      }
       return;
     }
     if (approvalShortcutsEnabled && firstApproval && isRejectApprovalKey(key)) {
@@ -1259,24 +1823,39 @@ export function ChatShellSurface(props: {
 
   const gitBranch = useGitBranch(cwd, props.options?.gitBranch);
   const shellOptions: StatusFooterOptions = {
-    modeName: props.options?.modeName ?? "Build",
-    modelName: props.options?.modelName ?? "auto",
-    providerName: props.options?.providerName ?? "runtime",
-    ...(modelSelection ? { modelSelection } : {}),
-    ...(reasoningLevel ? { reasoningLevel } : {}),
-    ...(serviceTier ? { serviceTier } : {}),
-    cwd,
+    ...statusOptions,
     ...(gitBranch ? { gitBranch } : {}),
   };
   const modelPickerModel = modelPicker
     ? modelPickerView(modelPicker, modelCandidates, modelSelection)
     : undefined;
   const reasoningPickerModel = reasoningPicker
-    ? reasoningPickerView(reasoningPicker, reasoningLevel ?? DEFAULT_REASONING_LEVEL)
+    ? reasoningPickerView(reasoningPicker, reasoningLevel ?? DEFAULT_REASONING_LEVEL, availableReasoningLevels)
     : undefined;
   const permissionsPickerModel = permissionsPicker
     ? permissionsPickerView(permissionsPicker, props.runtime.permissionConfig?.profiles ?? [])
     : undefined;
+  const resumePickerModel = resumePicker
+    ? resumePickerView(resumePicker, resumePickerItems, props.runtime.activeSessionId)
+    : undefined;
+  const renamePromptModel = renamePrompt;
+
+  if (commandConfirmation) {
+    return (
+      <box width="100%" height="100%" flexDirection="column" alignItems="center" justifyContent="center" backgroundColor={theme.colors.background}>
+        <box width={Math.min(72, Math.max(36, dimensions.width - 8))} flexDirection="column" border borderStyle="single" borderColor={theme.colors.status.warning} paddingX={2} paddingY={1}>
+          <text fg={theme.colors.status.warning} wrapMode="none" truncate>{"Confirm command"}</text>
+          <box height={1} />
+          <text fg={theme.colors.text.primary} wrapMode="word">{commandConfirmation.title}</text>
+          <box height={1} />
+          <text fg={commandConfirmation.selectedIndex === 0 ? theme.colors.menu.selectedText : theme.colors.menu.text} bg={commandConfirmation.selectedIndex === 0 ? theme.colors.menu.selectedBackground : theme.colors.menu.background} wrapMode="none">{"  Cancel"}</text>
+          <text fg={commandConfirmation.selectedIndex === 1 ? theme.colors.menu.selectedText : theme.colors.menu.text} bg={commandConfirmation.selectedIndex === 1 ? theme.colors.menu.selectedBackground : theme.colors.menu.background} wrapMode="none">{"  Confirm"}</text>
+          <box height={1} />
+          <text fg={theme.colors.text.muted} wrapMode="none" truncate>{"←/→ choose · Enter confirm · Esc cancel"}</text>
+        </box>
+      </box>
+    );
+  }
 
   if (view === "team") {
     return (
@@ -1293,7 +1872,9 @@ export function ChatShellSurface(props: {
     );
   }
 
-  const home = props.runtime.chatView.items.length === 0
+  const home = !sessionLayoutEntered
+    && props.runtime.chatView.items.length === 0
+    && inlineAgentBatches.length === 0
     && localItems.length === 0
     && props.runtime.chatView.pendingApprovals.length === 0
     && view === "chat";
@@ -1305,7 +1886,7 @@ export function ChatShellSurface(props: {
           height={dimensions.height}
           prompt={prompt}
           promptInputResetKey={promptInputResetKey}
-          focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !disabledReason}
+          focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !resumePicker && !renamePrompt && !disabledReason}
           onPromptChange={handlePromptChange}
           onExitShortcut={handleCtrlCExitShortcut}
           onPasteShortcut={readPromptClipboard}
@@ -1313,18 +1894,20 @@ export function ChatShellSurface(props: {
           onSubmit={() => {
             if (submitAuthManualInput()) return;
             if (runSelectedSkillCompletion()) return;
-            if (runSelectedSlashCompletion()) return;
-            void submitPrompt(prompt, expandedPrompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? [], pastedImages, clearPromptAttachments);
+            if (runSelectedCommandCompletion()) return;
+            submitCurrentChatPrompt();
           }}
           completions={completions}
-          completionOpen={skillCompletionOpen || slashCompletionOpen}
+          completionOpen={skillCompletionOpen || commandCompletionOpen}
           completionTitle={skillCompletionOpen ? "Skills" : "Commands"}
           emptyCompletionText={skillCompletionOpen ? "no skills" : "no commands"}
           completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
+          paletteTitle={`Command Palette · ${paletteQuery || "type to search"}`}
           paletteItems={paletteItems}
           paletteIndex={paletteIndex}
           model={props.model}
+          agentExperience={agentExperience}
           options={shellOptions}
           runtime={props.runtime}
           showToolDetails={showToolDetails}
@@ -1339,6 +1922,8 @@ export function ChatShellSurface(props: {
           modelPicker={modelPickerModel}
           reasoningPicker={reasoningPickerModel}
           permissionsPicker={permissionsPickerModel}
+          resumePicker={resumePickerModel}
+          renamePrompt={renamePromptModel}
         />
       ) : (
         <SessionScreen
@@ -1347,7 +1932,7 @@ export function ChatShellSurface(props: {
           view={view}
           prompt={prompt}
           promptInputResetKey={promptInputResetKey}
-          focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !disabledReason}
+          focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !resumePicker && !renamePrompt && !disabledReason}
           onPromptChange={handlePromptChange}
           onExitShortcut={handleCtrlCExitShortcut}
           onPasteShortcut={readPromptClipboard}
@@ -1355,9 +1940,9 @@ export function ChatShellSurface(props: {
           onSubmit={() => {
             if (submitAuthManualInput()) return;
             if (runSelectedSkillCompletion()) return;
-            if (runSelectedSlashCompletion()) return;
+            if (runSelectedCommandCompletion()) return;
             scrollMessageToBottom();
-            void submitPrompt(prompt, expandedPrompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? [], pastedImages, clearPromptAttachments);
+            submitCurrentChatPrompt();
           }}
           onTranscriptScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -1377,21 +1962,27 @@ export function ChatShellSurface(props: {
           onOpenFile={openFileLink}
           transcriptScrollOffset={transcriptScrollOffset}
           completions={completions}
-          completionOpen={skillCompletionOpen || slashCompletionOpen}
+          completionOpen={skillCompletionOpen || commandCompletionOpen}
           completionTitle={skillCompletionOpen ? "Skills" : "Commands"}
           emptyCompletionText={skillCompletionOpen ? "no skills" : "no commands"}
           completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
+          paletteTitle={`Command Palette · ${paletteQuery || "type to search"}`}
           paletteItems={paletteItems}
           paletteIndex={paletteIndex}
           model={props.model}
+          agentExperience={agentExperience}
+          agentBatches={inlineAgentBatches}
           options={shellOptions}
           runtime={props.runtime}
           mcpManager={mcpManager}
+          statusPage={statusPage}
+          statusClipboardFeedback={statusClipboardFeedback}
           showToolDetails={showToolDetails}
           hideThinking={hideThinking}
           transcriptActive={view === "transcript"}
           commands={commands}
+          approvalReviewBlocked={approvalReviewBlocked}
           disabledReason={disabledReason}
           theme={theme}
           themePicker={themePicker ? {
@@ -1402,6 +1993,8 @@ export function ChatShellSurface(props: {
           modelPicker={modelPickerModel}
           reasoningPicker={reasoningPickerModel}
           permissionsPicker={permissionsPickerModel}
+          resumePicker={resumePickerModel}
+          renamePrompt={renamePromptModel}
         />
       )}
     </box>
@@ -1419,15 +2012,17 @@ function HomeScreen(props: {
   onPasteShortcut: () => Promise<string | undefined>;
   onTextPaste: (value: string) => string;
   onSubmit: () => void;
-  completions: readonly SlashCompletion[];
+  completions: readonly TuiCommandSuggestion[];
   completionOpen: boolean;
   completionTitle: string;
   emptyCompletionText: string;
   completionIndex: number;
   paletteOpen: boolean;
-  paletteItems: readonly SlashCompletion[];
+  paletteTitle: string;
+  paletteItems: readonly TuiCommandSuggestion[];
   paletteIndex: number;
   model: TeamLiveView;
+  agentExperience: AgentsViewModel;
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
   showToolDetails: boolean;
@@ -1438,13 +2033,24 @@ function HomeScreen(props: {
   modelPicker?: ModelPickerModel | undefined;
   reasoningPicker?: ReasoningPickerModel | undefined;
   permissionsPicker?: PermissionsPickerModel | undefined;
+  resumePicker?: ResumePickerModel | undefined;
+  renamePrompt?: RenamePromptNavigation | undefined;
 }) {
   const promptWidth = Math.min(76, Math.max(42, props.width - 12));
   const compactBrand = props.width < 92 || props.height < 32;
   const feedback = currentFeedback(props.runtime);
   const footerHeight = statusFooterHeight(props.width);
   const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
-  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker, props.permissionsPicker);
+  const modelPicker = fitModelPickerRows(
+    props.modelPicker,
+    props.height
+      - footerHeight
+      - PROMPT_INPUT_HEIGHT
+      - (feedback ? 1 : 0)
+      - MODEL_PICKER_CHROME_HEIGHT,
+  );
+  const showBrand = !modelPicker;
+  const selectorHeight = selectorPickerHeight(modelPicker, props.reasoningPicker, props.permissionsPicker, props.resumePicker, props.renamePrompt);
   const maxCommandItems = promptMenuItemLimit({
     height: props.height,
     footerHeight,
@@ -1453,19 +2059,26 @@ function HomeScreen(props: {
     selectorHeight,
     feedback: Boolean(feedback),
     menuOpen: props.paletteOpen || props.completionOpen || props.completions.length > 0,
+    menuItems: props.paletteOpen ? props.paletteItems : props.completions,
   });
   return (
     <box width="100%" height="100%" flexDirection="column">
       <box flexGrow={2} />
       <box width="100%" flexDirection="column" alignItems="center">
-        <BrandMark compact={compactBrand} />
-        <box height={1} />
-        <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Chili"}</text>
-        <box height={1} />
+        {showBrand ? (
+          <>
+            <BrandMark compact={compactBrand} />
+            <box height={1} />
+            <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Chili"}</text>
+            <box height={1} />
+          </>
+        ) : null}
         {props.themePicker ? <ThemePicker model={props.themePicker} theme={props.theme} /> : null}
-        {props.modelPicker ? <ModelPicker model={props.modelPicker} theme={props.theme} /> : null}
+        {modelPicker ? <ModelPicker model={modelPicker} theme={props.theme} /> : null}
         {props.reasoningPicker ? <ReasoningPicker model={props.reasoningPicker} theme={props.theme} /> : null}
         {props.permissionsPicker ? <PermissionsPicker model={props.permissionsPicker} theme={props.theme} /> : null}
+        {props.resumePicker ? <ResumePicker model={props.resumePicker} theme={props.theme} /> : null}
+        {props.renamePrompt ? <RenamePrompt model={props.renamePrompt} theme={props.theme} /> : null}
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
@@ -1484,6 +2097,7 @@ function HomeScreen(props: {
           emptyCompletionText={props.emptyCompletionText}
           completionIndex={props.completionIndex}
           paletteOpen={props.paletteOpen}
+          paletteTitle={props.paletteTitle}
           paletteItems={props.paletteItems}
           paletteIndex={props.paletteIndex}
           feedback={feedback}
@@ -1492,7 +2106,7 @@ function HomeScreen(props: {
         />
       </box>
       <box flexGrow={3} />
-      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
+      <StatusFooter options={props.options} model={props.model} agentExperience={props.agentExperience} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
     </box>
   );
 }
@@ -1514,36 +2128,60 @@ function SessionScreen(props: {
   messageScrollRef: RefObject<ScrollBoxRenderable | null>;
   onOpenFile: (target: FileLinkTarget) => void;
   transcriptScrollOffset: number;
-  completions: readonly SlashCompletion[];
+  completions: readonly TuiCommandSuggestion[];
   completionOpen: boolean;
   completionTitle: string;
   emptyCompletionText: string;
   completionIndex: number;
   paletteOpen: boolean;
-  paletteItems: readonly SlashCompletion[];
+  paletteTitle: string;
+  paletteItems: readonly TuiCommandSuggestion[];
   paletteIndex: number;
   model: TeamLiveView;
+  agentExperience: AgentsViewModel;
+  agentBatches: readonly InlineAgentBatchDisplay[];
   runtime: ChatRuntimeState;
   mcpManager: McpManagerState;
+  statusPage: StatusPageModel;
+  statusClipboardFeedback?: StatusPageFeedback | undefined;
   options: StatusFooterOptions;
   showToolDetails: boolean;
   hideThinking: boolean;
   transcriptActive: boolean;
-  commands: readonly SlashCommand[];
+  commands: readonly TuiCommand[];
+  approvalReviewBlocked: boolean;
   disabledReason?: string | undefined;
   theme: TuiTheme;
   themePicker?: ThemePickerModel | undefined;
   modelPicker?: ModelPickerModel | undefined;
   reasoningPicker?: ReasoningPickerModel | undefined;
   permissionsPicker?: PermissionsPickerModel | undefined;
+  resumePicker?: ResumePickerModel | undefined;
+  renamePrompt?: RenamePromptNavigation | undefined;
 }) {
   const promptWidth = Math.min(96, Math.max(42, props.width - 8));
   const messageWidth = Math.max(24, props.width - 8);
-  const approvalHeight = approvalDockHeight(props.runtime.chatView.pendingApprovals, messageWidth, props.theme);
+  const approvalHeight = approvalDockHeight(
+    props.runtime.chatView.pendingApprovals,
+    messageWidth,
+    props.theme,
+    props.approvalReviewBlocked,
+  );
   const feedback = currentFeedback(props.runtime);
   const footerHeight = statusFooterHeight(props.width);
   const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
-  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker, props.permissionsPicker);
+  const modelPicker = fitModelPickerRows(
+    props.modelPicker,
+    props.height
+      - approvalHeight
+      - themePickerHeight
+      - footerHeight
+      - PROMPT_INPUT_HEIGHT
+      - (feedback ? 1 : 0)
+      - 2
+      - MODEL_PICKER_CHROME_HEIGHT,
+  );
+  const selectorHeight = selectorPickerHeight(modelPicker, props.reasoningPicker, props.permissionsPicker, props.resumePicker, props.renamePrompt);
   const maxCommandItems = promptMenuItemLimit({
     height: props.height,
     footerHeight,
@@ -1552,6 +2190,7 @@ function SessionScreen(props: {
     selectorHeight,
     feedback: Boolean(feedback),
     menuOpen: props.paletteOpen || props.completionOpen || props.completions.length > 0,
+    menuItems: props.paletteOpen ? props.paletteItems : props.completions,
   });
   const promptHeight = promptComposerHeight({
     completions: props.completions,
@@ -1580,11 +2219,11 @@ function SessionScreen(props: {
         {props.view === "help" ? (
           <HelpView commands={props.commands} theme={props.theme} showToolDetails={props.showToolDetails} />
         ) : props.view === "status" ? (
-          <StatusView model={props.model} runtime={props.runtime} options={props.options} theme={props.theme} showToolDetails={props.showToolDetails} hideThinking={props.hideThinking} transcriptActive={props.transcriptActive} />
+          <StatusView page={props.statusPage} feedback={props.statusClipboardFeedback} theme={props.theme} />
         ) : props.view === "mcp" ? (
           <McpManager state={props.mcpManager} runtime={props.runtime} theme={props.theme} />
         ) : props.view === "agents" ? (
-          <AgentsView model={props.model} theme={props.theme} />
+          <AgentsView model={props.agentExperience} theme={props.theme} />
         ) : props.view === "transcript" ? (
           <TranscriptView
             chatView={props.runtime.chatView}
@@ -1600,26 +2239,30 @@ function SessionScreen(props: {
             localItems={props.localItems}
             width={messageWidth}
             scrollRef={props.messageScrollRef}
-            cwd={props.options.cwd}
+            cwd={props.runtime.chatView.cwd ?? props.options.cwd}
             onOpenFile={props.onOpenFile}
             theme={props.theme}
             showToolDetails={props.showToolDetails}
             hideThinking={props.hideThinking}
+            agentBatches={props.agentBatches}
           />
         )}
       </box>
       <ApprovalDock
         approvals={props.runtime.chatView.pendingApprovals}
         width={messageWidth}
+        reviewBlocked={props.approvalReviewBlocked}
         onApprove={(approvalId: ApprovalId, scope: ChatApprovalGrantScope) => void props.runtime.approveApproval(approvalId, { scope })}
         onReject={(approvalId: ApprovalId) => void props.runtime.rejectApproval(approvalId)}
         theme={props.theme}
       />
       <box width="100%" alignItems="center" flexDirection="column">
         {props.themePicker ? <ThemePicker model={props.themePicker} theme={props.theme} /> : null}
-        {props.modelPicker ? <ModelPicker model={props.modelPicker} theme={props.theme} /> : null}
+        {modelPicker ? <ModelPicker model={modelPicker} theme={props.theme} /> : null}
         {props.reasoningPicker ? <ReasoningPicker model={props.reasoningPicker} theme={props.theme} /> : null}
         {props.permissionsPicker ? <PermissionsPicker model={props.permissionsPicker} theme={props.theme} /> : null}
+        {props.resumePicker ? <ResumePicker model={props.resumePicker} theme={props.theme} /> : null}
+        {props.renamePrompt ? <RenamePrompt model={props.renamePrompt} theme={props.theme} /> : null}
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
@@ -1638,6 +2281,7 @@ function SessionScreen(props: {
           emptyCompletionText={props.emptyCompletionText}
           completionIndex={props.completionIndex}
           paletteOpen={props.paletteOpen}
+          paletteTitle={props.paletteTitle}
           paletteItems={props.paletteItems}
           paletteIndex={props.paletteIndex}
           feedback={feedback}
@@ -1645,7 +2289,7 @@ function SessionScreen(props: {
           maxCommandItems={maxCommandItems}
         />
       </box>
-      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
+      <StatusFooter options={props.options} model={props.model} agentExperience={props.agentExperience} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
     </box>
   );
 }
@@ -1657,7 +2301,7 @@ function estimatedTranscriptLineCount(items: readonly ChatTranscriptItem[], loca
 }
 
 function localTranscriptEstimateText(item: LocalTranscriptItem): string {
-  if (item.kind === "local") return `${item.level}: ${item.text}`;
+  if (item.kind === "local") return item.bare ? item.text : `${item.level}: ${item.text}`;
   const status = item.status === "running"
     ? `running in ${item.cwd}`
     : item.exitCode !== undefined
@@ -1687,23 +2331,38 @@ interface ThemePickerModel {
 
 interface ModelPickerNavigation {
   query: string;
+  cursor: number;
   selectedIndex: number;
+  selected: ModelSelection | undefined;
+  provider: string | undefined;
 }
 
 interface ModelPickerModel {
   query: string;
+  cursor: number;
   items: readonly ModelPickerItem[];
   selectedIndex: number;
   total: number;
+  provider: ModelPickerProvider;
+  visibleLimit: number;
 }
 
 interface ModelPickerItem {
   selection: ModelSelection;
   label: string;
   provider: string;
+  providerLabel: string;
   displayName?: string | undefined;
+  connectionLabel?: string | undefined;
+  authSource?: ModelCandidate["authSource"];
+  endpoint?: string | undefined;
   available?: boolean | undefined;
   current: boolean;
+}
+
+interface ModelPickerProvider {
+  id: string | undefined;
+  label: string;
 }
 
 interface ReasoningPickerNavigation {
@@ -1730,12 +2389,36 @@ interface PermissionsPickerModel {
   selectedIndex: number;
 }
 
+interface ResumePickerNavigation {
+  query: string;
+  selectedIndex: number;
+  sessions: readonly RuntimeSessionSummary[];
+  loading: boolean;
+  showAll: boolean;
+  error?: string;
+}
+
+interface ResumePickerModel {
+  query: string;
+  items: readonly RuntimeSessionSummary[];
+  selectedIndex: number;
+  loading: boolean;
+  showAll: boolean;
+  currentSessionId?: SessionId;
+  error?: string;
+}
+
+interface RenamePromptNavigation {
+  value: string;
+  submitting: boolean;
+}
+
 interface SkillMentionTrigger {
   start: number;
   query: string;
 }
 
-type SkillCompletion = SlashCompletion & { skill: SkillSummary };
+type SkillCompletion = TuiCommandSuggestion & { skill: SkillSummary };
 
 function pickerHeight(itemCount: number): number {
   return itemCount + 3;
@@ -1745,10 +2428,16 @@ function selectorPickerHeight(
   modelPicker: ModelPickerModel | undefined,
   reasoningPicker: ReasoningPickerModel | undefined,
   permissionsPicker: PermissionsPickerModel | undefined,
+  resumePicker: ResumePickerModel | undefined,
+  renamePrompt: RenamePromptNavigation | undefined,
 ): number {
-  if (modelPicker) return Math.min(modelPicker.items.length, 8) + 4;
+  if (modelPicker) {
+    return Math.min(modelPicker.items.length, modelPicker.visibleLimit) + MODEL_PICKER_CHROME_HEIGHT;
+  }
   if (reasoningPicker) return reasoningPicker.items.length + 3;
   if (permissionsPicker) return permissionsPicker.items.length + 3;
+  if (resumePicker) return Math.min(resumePicker.items.length, 8) + 6;
+  if (renamePrompt) return 5;
   return 0;
 }
 
@@ -1760,6 +2449,7 @@ function promptMenuItemLimit(input: {
   selectorHeight: number;
   feedback: boolean;
   menuOpen: boolean;
+  menuItems: readonly TuiCommandSuggestion[];
 }): number {
   if (!input.menuOpen) return PROMPT_MENU_MAX_ITEMS;
   const reserved = input.footerHeight
@@ -1769,7 +2459,11 @@ function promptMenuItemLimit(input: {
     + PROMPT_INPUT_HEIGHT
     + (input.feedback ? 1 : 0)
     + 1;
-  return Math.max(1, Math.min(PROMPT_MENU_MAX_ITEMS, input.height - reserved - 3));
+  const availableHeight = input.height - reserved;
+  for (let maxItems = PROMPT_MENU_MAX_ITEMS; maxItems >= 1; maxItems -= 1) {
+    if (commandListHeight(input.menuItems, maxItems) <= availableHeight) return maxItems;
+  }
+  return 1;
 }
 
 function ThemePicker(props: { model: ThemePickerModel; theme: TuiTheme }) {
@@ -1796,14 +2490,43 @@ function ThemePicker(props: { model: ThemePickerModel; theme: TuiTheme }) {
 }
 
 function ModelPicker(props: { model: ModelPickerModel; theme: TuiTheme }) {
-  const visibleItems = visiblePickerItems(props.model.items, props.model.selectedIndex, 8);
+  const visibleItems = visiblePickerItems(props.model.items, props.model.selectedIndex, props.model.visibleLimit);
+  const cursor = Math.min(Math.max(0, props.model.cursor), props.model.query.length);
+  const searchValue = `${props.model.query.slice(0, cursor)}▏${props.model.query.slice(cursor)}`;
+  const hasQuery = props.model.query.trim().length > 0;
+  const resultNoun = hasQuery
+    ? props.model.total === 1 ? "match" : "matches"
+    : props.model.total === 1 ? "model" : "models";
+  const resultLabel = `${props.model.total} ${resultNoun}`;
   return (
     <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
-      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Model"}</text>
-      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Filter: ${props.model.query || "all"}`}</text>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Select model"}</text>
+      <box
+        width="100%"
+        height={3}
+        border
+        borderStyle="single"
+        borderColor={props.theme.colors.border.default}
+        backgroundColor={props.theme.colors.input.background}
+        paddingX={1}
+        flexDirection="row"
+        alignItems="center"
+      >
+        <text
+          fg={hasQuery ? props.theme.colors.input.text : props.theme.colors.input.placeholder}
+          wrapMode="none"
+          truncate
+        >
+          {`Search  > ${searchValue}${hasQuery ? "" : "  type a model or source"}`}
+        </text>
+      </box>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>
+        {`Source  ${props.model.provider.label} · ${resultLabel}  tab switch`}
+      </text>
       {visibleItems.map(({ item, index }) => {
         const selected = index === props.model.selectedIndex;
         const suffix = [item.available === false ? " not configured" : "", item.current ? " *" : ""].join("");
+        const provider = ` [${item.providerLabel}]`;
         return (
           <text
             key={modelSelectionLabel(item.selection)}
@@ -1812,7 +2535,7 @@ function ModelPicker(props: { model: ModelPickerModel; theme: TuiTheme }) {
             wrapMode="none"
             truncate
           >
-            {`${selected ? ">" : " "} ${item.label} [${item.provider}]${suffix}`}
+            {`${selected ? ">" : " "} ${item.label}${provider}${suffix}`}
           </text>
         );
       })}
@@ -1821,6 +2544,7 @@ function ModelPicker(props: { model: ModelPickerModel; theme: TuiTheme }) {
       ) : (
         <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{modelPickerDetail(props.model)}</text>
       )}
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"  ↑/↓ navigate  type to search  tab source  enter select  esc close"}</text>
     </box>
   );
 }
@@ -1871,29 +2595,141 @@ function PermissionsPicker(props: { model: PermissionsPickerModel; theme: TuiThe
   );
 }
 
+function ResumePicker(props: { model: ResumePickerModel; theme: TuiTheme }) {
+  const visibleItems = visiblePickerItems(props.model.items, props.model.selectedIndex, 8);
+  const scope = props.model.showAll ? "all projects" : "current project";
+  return (
+    <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Resume saved chat"}</text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Search: ${props.model.query || "type to filter"}  Scope: ${scope}`}</text>
+      {props.model.loading ? (
+        <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"  Loading sessions..."}</text>
+      ) : props.model.error ? (
+        <text fg={props.theme.colors.status.error} wrapMode="none" truncate>{`  ${props.model.error}`}</text>
+      ) : visibleItems.length === 0 ? (
+        <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{props.model.showAll ? "  No matching saved chats" : "  No matching chats in this project"}</text>
+      ) : visibleItems.map(({ item, index }) => {
+        const selected = index === props.model.selectedIndex;
+        const current = item.id === props.model.currentSessionId ? " (current)" : "";
+        const preview = sessionDisplayPreview(item);
+        return (
+          <text
+            key={item.id}
+            fg={selected ? props.theme.colors.menu.selectedText : props.theme.colors.menu.text}
+            bg={selected ? props.theme.colors.menu.selectedBackground : props.theme.colors.menu.background}
+            wrapMode="none"
+            truncate
+          >
+            {`${selected ? ">" : " "} ${sessionDisplayTitle(item)}${current}  ${relativeSessionTime(item.updatedAt)}${preview ? `  ${preview}` : ""}`}
+          </text>
+        );
+      })}
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"  ↑/↓ navigate  enter resume  ctrl+a all projects  esc close"}</text>
+    </box>
+  );
+}
+
+function RenamePrompt(props: { model: RenamePromptNavigation; theme: TuiTheme }) {
+  const status = props.model.submitting
+    ? "Saving..."
+    : props.model.value || "Type a name";
+  return (
+    <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Rename chat"}</text>
+      <text fg={props.model.value ? props.theme.colors.input.text : props.theme.colors.input.placeholder} wrapMode="none" truncate>{`> ${status}`}</text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"  enter save  esc cancel"}</text>
+    </box>
+  );
+}
+
 function modelPickerView(
   picker: ModelPickerNavigation,
   candidates: readonly ModelCandidate[],
   current: ModelSelection | undefined,
 ): ModelPickerModel {
-  const items = filterModelCandidates(candidates, picker.query, current).map((candidate) => ({
+  const providers = modelPickerProviders(candidates, current, picker.query, picker.provider);
+  const providerIndex = Math.max(0, providers.findIndex((provider) => provider.id === picker.provider));
+  const provider = providers[providerIndex] ?? providers[0]!;
+  const items = modelPickerCandidates(candidates, picker.query, current, provider.id).map((candidate) => ({
     selection: modelDescriptorSelection(candidate),
     label: candidate.model,
     provider: candidate.provider,
+    providerLabel: candidate.providerDisplayName ?? candidate.provider,
     ...(candidate.displayName ? { displayName: candidate.displayName } : {}),
+    ...(candidate.connectionLabel ? { connectionLabel: candidate.connectionLabel } : {}),
+    ...(candidate.authSource ? { authSource: candidate.authSource } : {}),
+    ...(candidate.endpoint ? { endpoint: candidate.endpoint } : {}),
     ...(candidate.available !== undefined ? { available: candidate.available } : {}),
     current: sameModelSelection(current, modelDescriptorSelection(candidate)),
   }));
   return {
     query: picker.query,
+    cursor: picker.cursor,
     items,
-    selectedIndex: clampIndex(picker.selectedIndex, items.length),
+    selectedIndex: resolvedModelPickerIndex(picker, items, (item) => item.selection),
     total: items.length,
+    provider,
+    visibleLimit: MODEL_PICKER_MAX_VISIBLE_ITEMS,
   };
 }
 
-function reasoningPickerView(picker: ReasoningPickerNavigation, current: ReasoningLevel): ReasoningPickerModel {
-  const items = REASONING_LEVELS.map((level) => ({
+function fitModelPickerRows(
+  model: ModelPickerModel | undefined,
+  availableRows: number,
+): ModelPickerModel | undefined {
+  if (!model) return undefined;
+  return {
+    ...model,
+    visibleLimit: Math.max(0, Math.min(model.visibleLimit, availableRows)),
+  };
+}
+
+function modelPickerProviders(
+  candidates: readonly ModelCandidate[],
+  current: ModelSelection | undefined,
+  query: string,
+  activeProvider: string | undefined,
+): ModelPickerProvider[] {
+  const matchingCandidates = filterModelCandidates(candidates, query, current);
+  const matchingCounts = new Map<string, number>();
+  for (const candidate of matchingCandidates) {
+    matchingCounts.set(candidate.provider, (matchingCounts.get(candidate.provider) ?? 0) + 1);
+  }
+  const hasQuery = query.trim().length > 0;
+  const providers = new Map<string, ModelPickerProvider>();
+  for (const candidate of candidates) {
+    const matchCount = matchingCounts.get(candidate.provider) ?? 0;
+    if (hasQuery && matchCount === 0 && candidate.provider !== activeProvider) continue;
+    const existing = providers.get(candidate.provider);
+    providers.set(candidate.provider, {
+      id: candidate.provider,
+      label: candidate.providerDisplayName ?? existing?.label ?? candidate.provider,
+    });
+  }
+  const sorted = [...providers.values()].sort((left, right) => {
+    if (left.id === current?.provider && right.id !== current?.provider) return -1;
+    if (right.id === current?.provider && left.id !== current?.provider) return 1;
+    return left.label.localeCompare(right.label);
+  });
+  return [{ id: undefined, label: "All" }, ...sorted];
+}
+
+function modelPickerCandidates(
+  candidates: readonly ModelCandidate[],
+  query: string,
+  current: ModelSelection | undefined,
+  provider: string | undefined,
+): ModelCandidate[] {
+  const scoped = provider ? candidates.filter((candidate) => candidate.provider === provider) : candidates;
+  return filterModelCandidates(scoped, query, current);
+}
+
+function reasoningPickerView(
+  picker: ReasoningPickerNavigation,
+  current: ReasoningLevel,
+  availableLevels: readonly ReasoningLevel[],
+): ReasoningPickerModel {
+  const items = availableLevels.map((level) => ({
     level,
     description: reasoningDescription(level),
     current: level === current,
@@ -1914,6 +2750,102 @@ function permissionsPickerView(
   };
 }
 
+function resumePickerView(
+  picker: ResumePickerNavigation,
+  items: readonly RuntimeSessionSummary[],
+  currentSessionId: SessionId | undefined,
+): ResumePickerModel {
+  return {
+    query: picker.query,
+    items,
+    selectedIndex: clampIndex(picker.selectedIndex, items.length),
+    loading: picker.loading,
+    showAll: picker.showAll,
+    ...(currentSessionId ? { currentSessionId } : {}),
+    ...(picker.error ? { error: picker.error } : {}),
+  };
+}
+
+function filteredResumeSessions(
+  sessions: readonly RuntimeSessionSummary[],
+  query: string,
+  cwd: string,
+  showAll: boolean,
+): RuntimeSessionSummary[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  return sessions
+    .filter(isInteractiveSession)
+    .filter((session) => session.status === "active")
+    .filter((session) => showAll || samePath(session.cwd, cwd))
+    .filter((session) => {
+      if (!normalizedQuery) return true;
+      const text = [session.id, session.title, session.preview, session.cwd].filter(Boolean).join(" ").toLowerCase();
+      return text.includes(normalizedQuery) || fuzzyMatchText(text, normalizedQuery);
+    })
+    .sort((left, right) => right.updatedAt - left.updatedAt || String(right.id).localeCompare(String(left.id)));
+}
+
+function resolveResumeTarget(
+  sessions: readonly RuntimeSessionSummary[],
+  target: string,
+): RuntimeSessionSummary | string {
+  const normalized = target.trim().toLowerCase();
+  const active = sessions.filter((session) => session.status === "active" && isInteractiveSession(session));
+  const exactId = active.find((session) => String(session.id).toLowerCase() === normalized);
+  if (exactId) return exactId;
+  const exactTitles = active.filter((session) => session.title?.toLowerCase() === normalized);
+  if (exactTitles.length === 1) return exactTitles[0]!;
+  if (exactTitles.length > 1) return `More than one saved chat is named "${target}". Use /session resume and select one, or pass its session ID.`;
+  const idPrefixes = active.filter((session) => String(session.id).toLowerCase().startsWith(normalized));
+  if (idPrefixes.length === 1) return idPrefixes[0]!;
+  if (idPrefixes.length > 1) return `Session ID prefix "${target}" is ambiguous.`;
+  return `Saved chat not found: ${target}`;
+}
+
+function isInteractiveSession(session: RuntimeSessionSummary): boolean {
+  // Older runtimes do not expose source; preserve their previous interactive behavior.
+  return session.source !== "subagent";
+}
+
+function sessionDisplayTitle(session: RuntimeSessionSummary): string {
+  const automaticTitle = session.cwd.split("/").filter(Boolean).at(-1) ?? "Untitled";
+  const title = session.title?.trim();
+  if (title && title !== automaticTitle) return shorten(title, 44);
+  const preview = firstDisplayLine(session.preview);
+  if (preview) return shorten(preview, 44);
+  return shorten(title || String(session.id), 44);
+}
+
+function sessionDisplayPreview(session: RuntimeSessionSummary): string {
+  const title = sessionDisplayTitle(session);
+  const preview = firstDisplayLine(session.preview);
+  if (!preview || title === shorten(preview, 44)) {
+    return session.cwd.split("/").filter(Boolean).at(-1) ?? session.cwd;
+  }
+  return shorten(preview, 54);
+}
+
+function firstDisplayLine(value: string | undefined): string {
+  return value?.replace(/\s+/g, " ").trim() ?? "";
+}
+
+function relativeSessionTime(time: number, now = Date.now()): string {
+  const seconds = Math.max(0, Math.floor((now - time) / 1_000));
+  if (seconds < 60) return "now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d`;
+  return new Date(time).toISOString().slice(0, 10);
+}
+
+function samePath(left: string, right: string): boolean {
+  const normalize = (value: string) => value.replace(/\/+$/, "") || "/";
+  return normalize(left) === normalize(right);
+}
+
 function visiblePickerItems<T>(items: readonly T[], selectedIndex: number, maxVisible: number): Array<{ item: T; index: number }> {
   const start = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), Math.max(0, items.length - maxVisible)));
   return items.slice(start, start + maxVisible).map((item, offset) => ({ item, index: start + offset }));
@@ -1925,16 +2857,46 @@ function modelPickerDetail(model: ModelPickerModel): string {
   const count = model.total > 1 ? ` (${model.selectedIndex + 1}/${model.total})` : "";
   const displayName = selected.displayName && selected.displayName !== selected.label ? ` ${selected.displayName}` : "";
   const availability = selected.available === false ? " not configured" : "";
-  return `  ${modelSelectionLabel(selected.selection)}${displayName}${availability}${count}`;
+  const connection = safeConnectionLabel(selected.connectionLabel);
+  const endpoint = safeEndpointHost(selected.endpoint);
+  const details = [
+    connection ? `connection ${connection}` : undefined,
+    selected.authSource ? `auth ${modelAuthLabel(selected.authSource)}` : undefined,
+    endpoint ? `endpoint ${endpoint}` : undefined,
+  ].filter(Boolean).join(" · ");
+  const suffix = details ? ` · ${details}` : "";
+  return `  ${modelSelectionLabel(selected.selection)}${displayName}${availability}${count}${suffix}`;
+}
+
+function resolvedModelPickerIndex<T>(
+  picker: ModelPickerNavigation,
+  items: readonly T[],
+  selectionForItem: (item: T) => ModelSelection,
+): number {
+  if (picker.selected) {
+    const selectedIndex = items.findIndex((item) => sameModelSelection(picker.selected, selectionForItem(item)));
+    if (selectedIndex >= 0) return selectedIndex;
+  }
+  return clampIndex(picker.selectedIndex, items.length);
+}
+
+function modelPickerSelectedCandidate(
+  items: readonly ModelCandidate[],
+  index: number,
+): ModelSelection | undefined {
+  const candidate = items[index];
+  return candidate ? modelDescriptorSelection(candidate) : undefined;
 }
 
 function modelPickerIndex(
   candidates: readonly ModelCandidate[],
   query: string,
   current: ModelSelection | undefined,
+  provider: string | undefined,
 ): number {
-  const items = filterModelCandidates(candidates, query, current);
+  const items = modelPickerCandidates(candidates, query, current, provider);
   if (items.length === 0) return 0;
+  if (query.trim()) return 0;
   const currentIndex = current
     ? items.findIndex((item) => sameModelSelection(current, modelDescriptorSelection(item)))
     : -1;
@@ -1954,7 +2916,11 @@ function reasoningDescription(level: ReasoningLevel): string {
     case "high":
       return "Deep reasoning (~16k tokens)";
     case "xhigh":
-      return "Maximum reasoning (~32k tokens)";
+      return "Extra-high reasoning (~32k tokens)";
+    case "max":
+      return "Maximum reasoning for the hardest problems";
+    case "ultra":
+      return "Maximum reasoning with proactive agents";
   }
 }
 
@@ -1985,10 +2951,16 @@ function skillCompletions(skills: readonly SkillSummary[], query: string): Skill
     })
     .slice(0, 8)
     .map((skill) => ({
+      id: `skill:${skill.filePath}`,
       value: `${skill.name}`,
       label: `$${skill.name}`,
       description: skillDescription(skill),
-      category: "skills",
+      group: "skills",
+      source: "builtin" as const,
+      argumentHint: "",
+      hidden: false,
+      enabled: true,
+      intent: "execute" as const,
       skill,
     }));
 }
@@ -2016,11 +2988,9 @@ function insertSkillMention(input: {
   setPrompt: (value: string | ((current: string) => string)) => void;
   setSkillMentionBindings: Dispatch<SetStateAction<RuntimeSkillMention[]>>;
   history: ReturnType<typeof usePromptHistory>;
-  updateAcceptedCompletionPrompt: (value: string | undefined) => void;
 }): void {
   const next = `${input.prompt.slice(0, input.trigger.start)}$${input.skill.name} ${input.prompt.slice(input.trigger.start + input.trigger.query.length + 1)}`;
   input.history.resetNavigation();
-  input.updateAcceptedCompletionPrompt(undefined);
   input.setSkillMentionBindings((current) => upsertSkillMentionBinding(current, {
     name: input.skill.name,
     path: input.skill.filePath,
@@ -2072,7 +3042,7 @@ function localSkillMentionWarnings(
     if (matches.length === 0) {
       warnings.push(`Skill $${name} was not found; it will not be injected.`);
     } else if (matches.length > 1) {
-      warnings.push(`Skill $${name} is ambiguous; select it from /skills so Chili can bind the exact SKILL.md.`);
+      warnings.push(`Skill $${name} is ambiguous; select it from /skills browse so Chili can bind the exact SKILL.md.`);
     }
   }
   return warnings;
@@ -2097,15 +3067,16 @@ function fuzzyMatchText(value: string, query: string): boolean {
   return true;
 }
 
-function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme; showToolDetails: boolean }) {
+function HelpView(props: { commands: readonly TuiCommand[]; theme: TuiTheme; showToolDetails: boolean }) {
   const detailsText = props.showToolDetails ? "on" : "off";
+  const commandNodes = collectCommandNodes(props.commands).filter((command) => !command.hidden);
   return (
     <box width="100%" height="100%" flexDirection="column">
       <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Commands"}</text>
       <box height={1} />
-      {props.commands.filter((command) => !command.hidden).map((command) => (
-        <text key={command.name} fg={props.theme.colors.text.secondary} wrapMode="none" truncate>
-          {`/${command.name.padEnd(12)} ${command.description}`}
+      {commandNodes.map((command) => (
+        <text key={command.id} fg={props.theme.colors.text.secondary} wrapMode="none" truncate>
+          {`${command.path.padEnd(24)} ${command.description}`}
         </text>
       ))}
       <box height={1} />
@@ -2115,71 +3086,188 @@ function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme; s
   );
 }
 
-function StatusView(props: {
+function countRuntimeCommandNodes(nodes: readonly RuntimeCommandNode[]): number {
+  return nodes.reduce((count, node) => count + 1 + countRuntimeCommandNodes(node.children), 0);
+}
+
+type StatusPageRowTone = "heading" | "text" | "error" | "spacer";
+
+interface StatusPageRow {
+  key: string;
+  text: string;
+  tone: StatusPageRowTone;
+}
+
+interface StatusPageModel {
+  rows: readonly StatusPageRow[];
+  text: string;
+}
+
+interface StatusPageInput {
   model: TeamLiveView;
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
-  theme: TuiTheme;
+  agentExperience: AgentsViewModel;
   showToolDetails: boolean;
   hideThinking: boolean;
   transcriptActive: boolean;
-}) {
-  const selected = props.model.selected;
-  const modelLabel = props.options.modelSelection
-    ? modelSelectionLabel(props.options.modelSelection)
-    : `${props.options.providerName}/${props.options.modelName}`;
+}
+
+interface StatusPageFeedback {
+  level: "info" | "error";
+  text: string;
+}
+
+function StatusView(props: { page: StatusPageModel; feedback?: StatusPageFeedback | undefined; theme: TuiTheme }) {
+  const selectionColors = {
+    selectionBg: props.theme.colors.menu.selectedBackground,
+    selectionFg: props.theme.colors.menu.selectedText,
+  };
+  const [heading, ...bodyRows] = props.page.rows;
   return (
     <box width="100%" height="100%" flexDirection="column">
-      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Status"}</text>
-      <box height={1} />
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`connection: ${props.model.connection.status}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`session: ${props.runtime.activeSessionId ?? "none"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thread: ${props.runtime.activeThreadId ?? "none"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`mode: ${props.options.modeName}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`model: ${modelLabel}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking: ${props.options.reasoningLevel ?? "default"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`service tier: ${props.options.serviceTier ?? "standard"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking traces: ${props.hideThinking ? "hidden" : "shown"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`details: ${props.showToolDetails ? "on" : "off"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`transcript: ${props.transcriptActive ? "on" : "off"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`cwd: ${props.options.cwd}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`team: ${selected?.team.name ?? selected?.team.id ?? "none"}`}</text>
+      {heading ? <StatusPageRowView row={heading} theme={props.theme} selectionColors={selectionColors} /> : null}
+      {props.feedback ? (
+        <TranscriptLine
+          line={{
+            key: `status:feedback:${props.feedback.level}:${props.feedback.text}`,
+            text: props.feedback.text,
+            fg: props.feedback.level === "error" ? props.theme.colors.status.error : props.theme.colors.status.info,
+          }}
+          selectionColors={selectionColors}
+        />
+      ) : null}
+      {bodyRows.map((row) => <StatusPageRowView key={row.key} row={row} theme={props.theme} selectionColors={selectionColors} />)}
     </box>
   );
 }
 
-function AgentsView(props: { model: TeamLiveView; theme: TuiTheme }) {
-  const members = props.model.selected?.members ?? [];
+function StatusPageRowView(props: {
+  row: StatusPageRow;
+  theme: TuiTheme;
+  selectionColors: { selectionBg: string; selectionFg: string };
+}) {
+  if (props.row.tone === "spacer") return <box height={1} />;
   return (
-    <box width="100%" height="100%" flexDirection="column">
-      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Agents"}</text>
-      <box height={1} />
-      {members.length === 0 ? (
-        <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"No active agents yet."}</text>
-      ) : (
-        members.slice(0, 10).map((member) => (
-          <text key={member.id} fg={props.theme.colors.text.secondary} wrapMode="none" truncate>
-            {`${member.isLead ? "lead" : "agent"} ${member.name ?? member.path} ${member.status}`}
-          </text>
-        ))
-      )}
-    </box>
+    <TranscriptLine
+      line={{ key: props.row.key, text: props.row.text, fg: statusPageRowFg(props.row.tone, props.theme) }}
+      selectionColors={props.selectionColors}
+    />
   );
+}
+
+function statusPageModel(input: StatusPageInput): StatusPageModel {
+  const modelSelection = statusModelSelection(input.runtime, input.options);
+  const candidate = modelSelection
+    ? input.runtime.modelCandidates?.find((item) => sameModelSelection(modelSelection, modelDescriptorSelection(item)))
+    : undefined;
+  const modelLabel = modelSelection
+    ? modelSelectionLabel(modelSelection)
+    : `${input.options.providerName}/${input.options.modelName}`;
+  const connection = safeConnectionLabel(candidate?.connectionLabel)
+    ?? safeConnectionLabel(candidate?.providerDisplayName)
+    ?? safeConnectionLabel(modelSelection?.provider)
+    ?? "unknown";
+  const auth = modelAuthLabel(candidate?.authSource);
+  const endpoint = safeEndpointHost(candidate?.endpoint) ?? "unknown";
+  const executionStatus = input.runtime.chatView.status;
+  const rows: StatusPageRow[] = [
+    { key: "status:title", text: "Status", tone: "heading" },
+    { key: "status:spacer", text: "", tone: "spacer" },
+    { key: "status:event-stream", text: `event stream: ${eventStreamStatus(input.model.connection.status)}`, tone: "text" },
+    { key: "status:execution", text: `parent execution: ${input.agentExperience.parentExecution}`, tone: executionStatus === "failed" || executionStatus === "cancelled" ? "error" : "text" },
+  ];
+  const reason = singleLineStatusValue(input.runtime.chatView.statusReason);
+  if ((executionStatus === "failed" || executionStatus === "cancelled") && reason) {
+    rows.push({ key: "status:reason", text: `reason: ${reason}`, tone: "error" });
+  }
+  rows.push(
+    { key: "status:agent-capability", text: `agent capability: ${input.agentExperience.capability}`, tone: input.agentExperience.capability.startsWith("unavailable") ? "error" : "text" },
+    { key: "status:delegation", text: `delegation: ${input.agentExperience.delegation}`, tone: "text" },
+    { key: "status:ad-hoc-agents", text: `ad-hoc agents: ${input.agentExperience.adHocSummary}`, tone: "text" },
+    { key: "status:persistent-team", text: `persistent teams: ${input.agentExperience.persistentTeamSummary}`, tone: "text" },
+    { key: "status:session", text: `session: ${input.runtime.activeSessionId ?? "none"}`, tone: "text" },
+    { key: "status:mode", text: `mode: ${input.options.modeName}`, tone: "text" },
+    { key: "status:model", text: `model: ${modelLabel}`, tone: "text" },
+    { key: "status:connection", text: `connection: ${connection}`, tone: "text" },
+    { key: "status:auth", text: `auth: ${auth}`, tone: "text" },
+    { key: "status:endpoint", text: `endpoint: ${endpoint}`, tone: "text" },
+    { key: "status:thinking", text: `thinking: ${input.options.reasoningConfigurable === false ? "unsupported" : input.options.reasoningLevel ?? "default"}`, tone: "text" },
+    { key: "status:service-tier", text: `service tier: ${input.options.serviceTierConfigurable === false ? "unsupported" : input.options.serviceTier ?? "standard"}`, tone: "text" },
+    { key: "status:thinking-traces", text: `thinking traces: ${input.hideThinking ? "hidden" : "shown"}`, tone: "text" },
+    { key: "status:details", text: `details: ${input.showToolDetails ? "on" : "off"}`, tone: "text" },
+    { key: "status:transcript", text: `transcript: ${input.transcriptActive ? "on" : "off"}`, tone: "text" },
+    { key: "status:workspace", text: `workspace: ${input.runtime.chatView.cwd ?? input.options.cwd}`, tone: "text" },
+    ...(input.runtime.chatView.cwd && input.runtime.chatView.cwd !== input.options.cwd
+      ? [{ key: "status:local-cwd", text: `local cwd: ${input.options.cwd}`, tone: "text" as const }]
+      : []),
+  );
+  return { rows, text: rows.map((row) => row.text).join("\n") };
+}
+
+function statusPageRowFg(tone: Exclude<StatusPageRowTone, "spacer">, theme: TuiTheme): string {
+  if (tone === "heading") return theme.colors.text.primary;
+  if (tone === "error") return theme.colors.status.error;
+  return theme.colors.text.secondary;
+}
+
+function singleLineStatusValue(value: string | undefined): string | undefined {
+  return publicStatusReason(value);
+}
+
+function statusModelSelection(runtime: ChatRuntimeState, options: StatusFooterOptions): ModelSelection | undefined {
+  if (options.modelSelection) return options.modelSelection;
+  const metadata = runtime.chatView.latestModelMetadata;
+  if (metadata?.provider && metadata.model) {
+    return { provider: metadata.provider, model: metadata.model };
+  }
+  return modelSelectionFromOptions(options);
+}
+
+function safeConnectionLabel(value: string | undefined): string | undefined {
+  const sanitized = value
+    ?.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!sanitized) return undefined;
+  if (/^[a-z][a-z\d+.-]*:\/\//i.test(sanitized)) return safeEndpointHost(sanitized);
+  return sanitized.slice(0, 80);
+}
+
+function eventStreamStatus(status: TeamLiveView["connection"]["status"]): string {
+  return status === "streaming" ? "connected" : status;
+}
+
+function modelSelectionFromOptions(
+  options: { providerName?: string | undefined; modelName?: string | undefined } | undefined,
+): ModelSelection | undefined {
+  const provider = options?.providerName?.trim();
+  const model = options?.modelName?.trim();
+  return provider && model ? { provider, model } : undefined;
+}
+
+function capabilityModelLabel(selection: ModelSelection | undefined): string {
+  return selection ? modelSelectionLabel(selection) : "Selected model";
+}
+
+function modelToolCallSupport(candidate: ModelCandidate | undefined): boolean | undefined {
+  return candidate?.capabilities?.toolCalls;
 }
 
 async function submitPrompt(
   prompt: string,
   expandedPrompt: string,
-  commands: readonly SlashCommand[],
-  ctx: SlashCommandContext,
+  commands: readonly TuiCommand[],
+  ctx: TuiCommandContext,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
-  actions: SlashActions,
+  actions: CommandActions,
   onAccepted?: (text: string) => void,
   skillMentionBindings: readonly RuntimeSkillMention[] = [],
   skills: readonly SkillSummary[] = [],
   pastedImages: Readonly<Record<number, PastedPromptImage>> = {},
   clearPromptAttachments?: () => void,
+  onPromptSubmissionState?: (state: "pending" | "accepted" | "rejected") => boolean | void,
 ): Promise<void> {
   const visibleTrimmed = prompt.trim();
   const trimmed = expandedPrompt.trim();
@@ -2198,15 +3286,15 @@ async function submitPrompt(
     return;
   }
   if (commandPrompt.startsWith("/")) {
-    const slashMatch = resolveSlashCommand(commands, commandPrompt);
-    if (slashMatch) {
+    const commandMatch = resolveCommand(commands, ctx, commandPrompt);
+    if (commandMatch.status === "matched") {
       actions.setPrompt("");
       clearPromptAttachments?.();
-      await runResolvedSlashCommand(slashMatch, ctx, model, runtime, actions);
+      await runResolvedCommand(commandMatch, ctx, model, runtime, actions);
       return;
     }
-    if (isSlashCommandCandidate(commands, ctx, commandPrompt)) {
-      actions.appendLocalItem("error", `Unknown command: ${commandPrompt}`);
+    if (commandMatch.status !== "not_command") {
+      actions.appendLocalItem("error", commandResolutionMessage(commandMatch));
       return;
     }
   }
@@ -2223,6 +3311,7 @@ async function submitPrompt(
   const text = images.length > 0 && !supportsImages
     ? textWithImagePathContext(trimmed, promptReferencedImages(visibleTrimmed, pastedImages))
     : trimmed;
+  onPromptSubmissionState?.("pending");
   const accepted = await runtime.submitPrompt(text, {
     ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),
     ...(ctx.reasoningLevel ? { reasoningLevel: ctx.reasoningLevel } : {}),
@@ -2232,13 +3321,18 @@ async function submitPrompt(
     ...activeSkillMentionsOption(visibleTrimmed, skillMentionBindings),
   });
   if (accepted) {
+    const applyAcceptedState = onPromptSubmissionState?.("accepted") !== false;
     onAccepted?.(trimmed);
-    actions.setPrompt("");
-    clearPromptAttachments?.();
+    if (applyAcceptedState) {
+      actions.setPrompt("");
+      clearPromptAttachments?.();
+    }
+  } else {
+    onPromptSubmissionState?.("rejected");
   }
 }
 
-async function runUserShellCommand(command: string, cwd: string, actions: SlashActions): Promise<void> {
+async function runUserShellCommand(command: string, cwd: string, actions: CommandActions): Promise<void> {
   const id = actions.appendShellItem({
     command,
     cwd,
@@ -2277,41 +3371,73 @@ function formatUserShellOutput(result: RunProcessResult): string {
   return sections.filter((section) => section.length > 0).join("\n\n");
 }
 
-async function runSlashInput(
+async function runCommandInput(
   input: string,
-  commands: readonly SlashCommand[],
-  ctx: SlashCommandContext,
+  commands: readonly TuiCommand[],
+  ctx: TuiCommandContext,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
-  actions: SlashActions,
+  actions: CommandActions,
 ): Promise<void> {
-  const match = resolveSlashCommand(commands, input);
-  if (!match) {
-    actions.appendLocalItem("error", `Unknown command: ${input}`);
+  const match = resolveCommand(commands, ctx, input);
+  if (match.status !== "matched") {
+    actions.appendLocalItem("error", commandResolutionMessage(match));
     return;
   }
-  await runResolvedSlashCommand(match, ctx, model, runtime, actions);
+  await runResolvedCommand(match, ctx, model, runtime, actions);
 }
 
-async function runResolvedSlashCommand(
-  match: { command: SlashCommand; args: string },
-  ctx: SlashCommandContext,
+async function runResolvedCommand(
+  match: Extract<ResolveCommandResult<TuiCommandContext, TuiCommandResult>, { status: "matched" }>,
+  ctx: TuiCommandContext,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
-  actions: SlashActions,
+  actions: CommandActions,
 ): Promise<void> {
+  if (!match.command.run) {
+    actions.appendLocalItem("error", `${match.path} cannot be executed.`);
+    return;
+  }
+  const uiEpoch = actions.currentSessionUiEpoch();
   const result = await match.command.run(ctx, match.args);
-  await applySlashResult(result, ctx, model, runtime, actions);
+  if (!actions.isSessionUiEpochCurrent(uiEpoch)) return;
+  const scopedActions: CommandActions = {
+    ...actions,
+    enterSessionLayout: () => {
+      if (actions.isSessionUiEpochCurrent(uiEpoch)) actions.enterSessionLayout();
+    },
+    appendLocalItem: (level, text, options) => {
+      if (actions.isSessionUiEpochCurrent(uiEpoch)) actions.appendLocalItem(level, text, options);
+    },
+    setAuthManualPrompt: (value) => {
+      if (actions.isSessionUiEpochCurrent(uiEpoch)) actions.setAuthManualPrompt(value);
+    },
+    ensureOpenAICodexDefaultModel: async () => {
+      if (actions.isSessionUiEpochCurrent(uiEpoch)) await actions.ensureOpenAICodexDefaultModel();
+    },
+    requestConfirmation: (title, result) => {
+      if (actions.isSessionUiEpochCurrent(uiEpoch)) actions.requestConfirmation(title, result);
+    },
+  };
+  await applyCommandResult(result, ctx, model, runtime, scopedActions);
 }
 
-async function applySlashResult(
-  result: SlashCommandResult,
-  ctx: SlashCommandContext,
+async function applyCommandResult(
+  result: TuiCommandResult,
+  ctx: TuiCommandContext,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
-  actions: SlashActions,
+  actions: CommandActions,
 ): Promise<void> {
+  if (result.type === "confirm") {
+    actions.requestConfirmation(result.title, result.result);
+    return;
+  }
   if (result.type === "open_view") {
+    if (result.view === "help") {
+      actions.openCommandPalette();
+      return;
+    }
     if (result.view === "mcp") {
       actions.openMcpManager();
       return;
@@ -2328,7 +3454,18 @@ async function applySlashResult(
     return;
   }
   if (result.type === "reload_commands") {
+    actions.enterSessionLayout();
     await actions.reloadCommands();
+    return;
+  }
+  if (result.type === "reload_skills") {
+    actions.enterSessionLayout();
+    await actions.reloadSkills();
+    actions.appendLocalItem("info", "Skills reloaded.");
+    return;
+  }
+  if (result.type === "exit_app") {
+    actions.exitApp();
     return;
   }
   if (result.type === "submit_command") {
@@ -2336,12 +3473,13 @@ async function applySlashResult(
       actions.appendLocalItem("error", runtime.submitBlockedReason ?? "Session is not ready for another prompt.");
       return;
     }
-    const accepted = await runtime.submitCommand(result.commandName, result.args, {
+    actions.enterSessionLayout();
+    const accepted = await runtime.submitCommand(result.commandId, result.args, {
       ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),
       ...(ctx.reasoningLevel ? { reasoningLevel: ctx.reasoningLevel } : {}),
       ...(ctx.serviceTier ? { serviceTier: ctx.serviceTier } : {}),
     });
-    if (!accepted) actions.appendLocalItem("error", `/${result.commandName} did not submit.`);
+    if (!accepted) actions.appendLocalItem("error", `Command ${result.commandId} did not submit.`);
     return;
   }
   if (result.type === "open_permissions_picker") {
@@ -2352,7 +3490,24 @@ async function applySlashResult(
     await actions.startNewChatSession();
     return;
   }
+  if (result.type === "open_resume_picker") {
+    actions.openResumePicker();
+    return;
+  }
+  if (result.type === "resume_session") {
+    await actions.resumeSessionByTarget(result.target);
+    return;
+  }
+  if (result.type === "open_rename_prompt") {
+    actions.openRenamePrompt();
+    return;
+  }
+  if (result.type === "rename_session") {
+    await actions.renameChatSession(result.title);
+    return;
+  }
   if (result.type === "goal_action") {
+    actions.enterSessionLayout();
     await performGoalAction(result, runtime, actions.appendLocalItem);
     return;
   }
@@ -2388,32 +3543,94 @@ async function applySlashResult(
     actions.setHideThinking(result.hidden);
     return;
   }
+  if (result.type === "delegation_action") {
+    actions.enterSessionLayout();
+    await performDelegationAction(result, runtime, actions.appendLocalItem);
+    return;
+  }
   if (result.type === "auth_action") {
+    actions.enterSessionLayout();
     await performAuthAction(result, actions.appendLocalItem, actions.setAuthManualPrompt, actions.ensureOpenAICodexDefaultModel);
     return;
   }
   if (result.type === "skills_action") {
+    actions.enterSessionLayout();
     await performSkillsAction(result, actions);
     return;
   }
   if (result.type === "mcp_action") {
+    actions.enterSessionLayout();
     await performMcpAction(result, runtime, actions.appendLocalItem);
     return;
   }
   if (result.type === "sdk_action") {
-    const action = actionForSlashResult(result, model);
+    const action = actionForCommandResult(result, model);
     if (action) runtime.executeAction(action);
   }
 }
 
+function commandResolutionMessage(
+  result: Exclude<ResolveCommandResult<TuiCommandContext, TuiCommandResult>, { status: "matched" }>,
+): string {
+  if (result.status === "disabled") return `${result.path} is unavailable: ${result.reason}`;
+  if (result.status === "incomplete") {
+    const available = result.children.length > 0 ? `\nAvailable: ${result.children.join(", ")}` : "";
+    return `Incomplete command. Usage: ${result.usage}${available}`;
+  }
+  if (result.status === "unknown") {
+    const suggestions = result.suggestions.length > 0 ? ` Did you mean ${result.suggestions.join(" or ")}?` : "";
+    return `Unknown command token: ${result.token || result.input}.${suggestions}`;
+  }
+  return `Not a command: ${result.input}`;
+}
+
+async function performDelegationAction(
+  result: Extract<TuiCommandResult, { type: "delegation_action" }>,
+  runtime: ChatRuntimeState,
+  appendLocalItem: AppendLocalItem,
+): Promise<void> {
+  if (result.action === "status") {
+    if (!runtime.activeSessionId && !runtime.chatView.sessionId) {
+      appendLocalItem("error", "Start a session before checking its agent delegation policy.");
+      return;
+    }
+    const config = await runtime.refreshDelegationConfig?.() ?? runtime.delegationConfig;
+    if (!config) {
+      appendLocalItem("error", "Could not read the session agent delegation policy.");
+      return;
+    }
+    appendLocalItem("info", delegationConfigMessage(config.policy, config.source));
+    return;
+  }
+  if (!result.policy || !runtime.setRuntimeDelegationPolicy) {
+    appendLocalItem("error", "This runtime cannot update agent delegation policy.");
+    return;
+  }
+  const config = await runtime.setRuntimeDelegationPolicy(result.policy);
+  if (!config) {
+    appendLocalItem("error", `Could not set agent delegation to ${result.policy}.`);
+    return;
+  }
+  appendLocalItem("info", delegationConfigMessage(config.policy, config.source));
+}
+
+function delegationConfigMessage(policy: DelegationPolicy, source: string): string {
+  const detail = policy === "off"
+    ? "Chili will not delegate work in this session."
+    : policy === "explicit"
+      ? "Chili delegates only when the user explicitly requests it."
+      : "Chili may delegate useful independent work proactively.";
+  return `Agent delegation: ${policy} (source: ${source}). ${detail}`;
+}
+
 async function performGoalAction(
-  result: Extract<SlashCommandResult, { type: "goal_action" }>,
+  result: Extract<TuiCommandResult, { type: "goal_action" }>,
   runtime: ChatRuntimeState,
   appendLocalItem: AppendLocalItem,
 ): Promise<void> {
   if (result.action === "show") {
     const goal = runtime.chatView.goal;
-    appendLocalItem("info", goal ? goalSummary(goal) : "No goal set for this thread.");
+    appendLocalItem("info", goal ? goalSummary(goal) : "No goal set for this session.");
     return;
   }
   if (result.action === "set") {
@@ -2457,8 +3674,8 @@ function formatTokenCount(value: number): string {
 }
 
 async function performSkillsAction(
-  result: Extract<SlashCommandResult, { type: "skills_action" }>,
-  actions: SlashActions,
+  result: Extract<TuiCommandResult, { type: "skills_action" }>,
+  actions: CommandActions,
 ): Promise<void> {
   const scope: SkillSettingsScope = result.scope ?? "project";
   try {
@@ -2478,7 +3695,7 @@ async function performSkillsAction(
 }
 
 async function performMcpAction(
-  result: Extract<SlashCommandResult, { type: "mcp_action" }>,
+  result: Extract<TuiCommandResult, { type: "mcp_action" }>,
   runtime: ChatRuntimeState,
   appendLocalItem: AppendLocalItem,
 ): Promise<void> {
@@ -2674,7 +3891,7 @@ function mcpEndpoint(server: RuntimeMcpServerDescriptor): string {
 }
 
 async function performAuthAction(
-  result: Extract<SlashCommandResult, { type: "auth_action" }>,
+  result: Extract<TuiCommandResult, { type: "auth_action" }>,
   appendLocalItem: AppendLocalItem,
   setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void,
   onLoginComplete?: () => Promise<void>,
@@ -2689,7 +3906,7 @@ async function performAuthAction(
     const status = await storage.status(OPENAI_CODEX_PROVIDER_ID);
     const text = status.configured
       ? `ChatGPT Codex auth: ${status.type}${status.accountId ? ` account ${status.accountId}` : ""}${status.expires ? `, expires ${formatAuthTime(status.expires)}` : ""}. Stored at ${status.authPath}.`
-      : `ChatGPT Codex auth: not configured. Run /login to connect a ChatGPT Plus/Pro account. Auth file: ${status.authPath}.`;
+      : `ChatGPT Codex auth: not configured. Run /auth login to connect a ChatGPT Plus/Pro account. Auth file: ${status.authPath}.`;
     appendLocalItem("info", text);
     return;
   }
@@ -2719,7 +3936,7 @@ async function performAuthAction(
         appendLocalItem("info", "If browser login stalls, paste the full redirect URL or authorization code here and press Enter.");
       }),
       onPrompt: async () => {
-        throw new Error("Local callback did not complete. Run /login again and keep the browser redirect window open.");
+        throw new Error("Local callback did not complete. Run /auth login again and keep the browser redirect window open.");
       },
     });
     await storage.setOAuthCredentials(OPENAI_CODEX_PROVIDER_ID, credentials);
@@ -2760,7 +3977,7 @@ function formatAuthTime(value: number): string {
   return new Date(value).toLocaleString();
 }
 
-function actionForSlashResult(result: Extract<SlashCommandResult, { type: "sdk_action" }>, model: TeamLiveView): TeamLiveAction | undefined {
+function actionForCommandResult(result: Extract<TuiCommandResult, { type: "sdk_action" }>, model: TeamLiveView): TeamLiveAction | undefined {
   const actions = model.selected?.availableActions ?? model.availableActions;
   if (result.action === "team_run") {
     return findAction(actions, "run_loop") ?? { type: "run_loop", ...(model.selectedTeamId ? { teamId: model.selectedTeamId } : {}), enabled: false, reason: "no_team" };
@@ -2771,35 +3988,6 @@ function actionForSlashResult(result: Extract<SlashCommandResult, { type: "sdk_a
   if (result.action === "approve") return findAction(actions, "approve");
   if (result.action === "reject") return findAction(actions, "reject");
   return undefined;
-}
-
-function isSlashCommandCandidate(commands: readonly SlashCommand[], ctx: SlashCommandContext, input: string): boolean {
-  if (input.trim() === "/") return true;
-  return slashCompletions(commands, ctx, input, 1).length > 0;
-}
-
-function handlePaletteKey(
-  key: KeyEvent,
-  items: readonly SlashCompletion[],
-  selectedIndex: number,
-  setSelectedIndex: (value: number) => void,
-  onSelect: (completion: SlashCompletion) => void,
-  onCancel: () => void,
-): void {
-  if (isEscape(key)) {
-    onCancel();
-    return;
-  }
-  if (isArrowUp(key) || isArrowDown(key)) {
-    const delta = isArrowUp(key) ? -1 : 1;
-    const next = Math.min(Math.max(0, selectedIndex + delta), Math.max(0, items.length - 1));
-    setSelectedIndex(next);
-    return;
-  }
-  if (isEnter(key)) {
-    const item = items[selectedIndex] ?? items[0];
-    if (item) onSelect(item);
-  }
 }
 
 function handleModelPickerKey(
@@ -2817,22 +4005,96 @@ function handleModelPickerKey(
     actions.cancel();
     return;
   }
-  const items = filterModelCandidates(candidates, picker.query, current);
+  const providers = modelPickerProviders(candidates, current, picker.query, picker.provider);
+  const effectiveProvider = picker.provider !== undefined
+    && providers.some((provider) => provider.id === picker.provider)
+    ? picker.provider
+    : undefined;
+  if (isTab(key)) {
+    const currentProviderIndex = Math.max(0, providers.findIndex((provider) => provider.id === effectiveProvider));
+    const delta = key.shift ? -1 : 1;
+    const provider = providers[wrapIndex(currentProviderIndex + delta, providers.length)]?.id;
+    actions.setModelPicker((state) => {
+      if (!state) return state;
+      const items = modelPickerCandidates(candidates, state.query, current, provider);
+      const selectedIndex = modelPickerIndex(candidates, state.query, current, provider);
+      return {
+        ...state,
+        provider,
+        selectedIndex,
+        selected: modelPickerSelectedCandidate(items, selectedIndex),
+      };
+    });
+    return;
+  }
+  if (isArrowLeft(key) || isArrowRight(key)) {
+    actions.setModelPicker((state) => {
+      if (!state) return state;
+      const delta = isArrowLeft(key) ? -1 : 1;
+      return {
+        ...state,
+        provider: effectiveProvider,
+        cursor: Math.min(Math.max(0, state.cursor + delta), state.query.length),
+      };
+    });
+    return;
+  }
+  const items = modelPickerCandidates(candidates, picker.query, current, effectiveProvider);
   if (isArrowUp(key) || isArrowDown(key)) {
     const delta = isArrowUp(key) ? -1 : 1;
-    actions.setModelPicker((state) => state ? { ...state, selectedIndex: clampIndex(state.selectedIndex + delta, items.length) } : state);
+    actions.setModelPicker((state) => {
+      if (!state) return state;
+      const currentIndex = resolvedModelPickerIndex(state, items, modelDescriptorSelection);
+      const selectedIndex = clampIndex(currentIndex + delta, items.length);
+      return {
+        ...state,
+        provider: effectiveProvider,
+        selectedIndex,
+        selected: modelPickerSelectedCandidate(items, selectedIndex),
+      };
+    });
     return;
   }
   if (isEnter(key)) {
-    const selected = items[clampIndex(picker.selectedIndex, items.length)];
+    const selected = items[resolvedModelPickerIndex(picker, items, modelDescriptorSelection)];
     if (selected) void actions.selectModel(modelDescriptorSelection(selected));
     return;
   }
   if (isBackspace(key)) {
     actions.setModelPicker((state) => {
       if (!state) return state;
-      const query = state.query.slice(0, -1);
-      return { query, selectedIndex: modelPickerIndex(candidates, query, current) };
+      const cursor = Math.min(Math.max(0, state.cursor), state.query.length);
+      if (cursor === 0) return state;
+      const query = `${state.query.slice(0, cursor - 1)}${state.query.slice(cursor)}`;
+      const nextItems = modelPickerCandidates(candidates, query, current, effectiveProvider);
+      const selectedIndex = modelPickerIndex(candidates, query, current, effectiveProvider);
+      return {
+        ...state,
+        provider: effectiveProvider,
+        query,
+        cursor: cursor - 1,
+        selectedIndex,
+        selected: modelPickerSelectedCandidate(nextItems, selectedIndex),
+      };
+    });
+    return;
+  }
+  if (isDelete(key)) {
+    actions.setModelPicker((state) => {
+      if (!state) return state;
+      const cursor = Math.min(Math.max(0, state.cursor), state.query.length);
+      if (cursor >= state.query.length) return state;
+      const query = `${state.query.slice(0, cursor)}${state.query.slice(cursor + 1)}`;
+      const nextItems = modelPickerCandidates(candidates, query, current, effectiveProvider);
+      const selectedIndex = modelPickerIndex(candidates, query, current, effectiveProvider);
+      return {
+        ...state,
+        provider: effectiveProvider,
+        query,
+        cursor,
+        selectedIndex,
+        selected: modelPickerSelectedCandidate(nextItems, selectedIndex),
+      };
     });
     return;
   }
@@ -2840,8 +4102,18 @@ function handleModelPickerKey(
   if (printable) {
     actions.setModelPicker((state) => {
       if (!state) return state;
-      const query = `${state.query}${printable}`;
-      return { query, selectedIndex: modelPickerIndex(candidates, query, current) };
+      const cursor = Math.min(Math.max(0, state.cursor), state.query.length);
+      const query = `${state.query.slice(0, cursor)}${printable}${state.query.slice(cursor)}`;
+      const nextItems = modelPickerCandidates(candidates, query, current, effectiveProvider);
+      const selectedIndex = modelPickerIndex(candidates, query, current, effectiveProvider);
+      return {
+        ...state,
+        provider: effectiveProvider,
+        query,
+        cursor: cursor + printable.length,
+        selectedIndex,
+        selected: modelPickerSelectedCandidate(nextItems, selectedIndex),
+      };
     });
   }
 }
@@ -2849,6 +4121,7 @@ function handleModelPickerKey(
 function handleReasoningPickerKey(
   key: KeyEvent,
   picker: ReasoningPickerNavigation,
+  availableLevels: readonly ReasoningLevel[],
   actions: {
     setReasoningPicker: Dispatch<SetStateAction<ReasoningPickerNavigation | undefined>>;
     selectLevel: (level: ReasoningLevel) => Promise<void>;
@@ -2861,11 +4134,11 @@ function handleReasoningPickerKey(
   }
   if (isArrowUp(key) || isArrowDown(key)) {
     const delta = isArrowUp(key) ? -1 : 1;
-    actions.setReasoningPicker((state) => state ? { selectedIndex: clampIndex(state.selectedIndex + delta, REASONING_LEVELS.length) } : state);
+    actions.setReasoningPicker((state) => state ? { selectedIndex: clampIndex(state.selectedIndex + delta, availableLevels.length) } : state);
     return;
   }
   if (isEnter(key)) {
-    const level = REASONING_LEVELS[clampIndex(picker.selectedIndex, REASONING_LEVELS.length)];
+    const level = availableLevels[clampIndex(picker.selectedIndex, availableLevels.length)];
     if (level) void actions.selectLevel(level);
   }
 }
@@ -2902,7 +4175,38 @@ function handlePermissionsPickerKey(
 }
 
 function currentFeedback(runtime: ChatRuntimeState): { status: string; message: string } | undefined {
-  if (runtime.chatFeedback) return runtime.chatFeedback;
+  if (runtime.chatFeedback?.status === "pending") return runtime.chatFeedback;
+  if (runtime.chatFeedback?.status === "accepted") {
+    if (acceptedFeedbackMatchesStatus(runtime.chatFeedback, runtime.chatView)) return runtime.chatFeedback;
+    if (runtime.chatFeedback.acceptedAgainstStatusEventId === undefined
+      && (runtime.chatView.status === "idle" || runtime.chatView.status === "unknown")) {
+      return runtime.chatFeedback;
+    }
+  }
+  const reason = publicStatusReason(runtime.chatView.statusReason);
+  if (runtime.chatView.status === "failed") return { status: "error", message: reason ?? "Session failed" };
+  if (runtime.chatView.status === "cancelled") return { status: "error", message: reason ?? "Session cancelled" };
+  if (runtime.chatFeedback && runtime.chatFeedback.status !== "accepted") {
+    if (runtime.chatFeedback.status === "error") {
+      return {
+        status: "error",
+        message: publicStatusReason(runtime.chatFeedback.message) ?? "Runtime request failed",
+      };
+    }
+    return runtime.chatFeedback;
+  }
+  if (runtime.chatView.status === "cancelling") return { status: "pending", message: "cancelling session" };
+  // The approval dock and footer already own this state. Avoid consuming an
+  // extra row (and never let a stale neutral acknowledgement replace the dock).
+  if (runtime.chatView.status === "waiting_for_approval") return undefined;
+  if (runtime.chatView.status === "running") {
+    const retry = runtime.chatView.retry;
+    if (retry) {
+      const delaySeconds = Math.max(1, Math.ceil(retry.delayMs / 1_000));
+      return { status: "pending", message: `retrying request · attempt ${retry.attempt} · ${delaySeconds}s` };
+    }
+    return { status: "pending", message: "session running" };
+  }
   if (runtime.actionFeedback) return runtime.actionFeedback;
   return undefined;
 }
@@ -2914,9 +4218,18 @@ interface ClipboardRenderer {
   off?: (event: "selection", handler: (selection: Selection) => void) => void;
 }
 
-function clipboardCopySource(renderer: ClipboardRenderer, items: readonly ChatTranscriptItem[], view: ShellView): { text: string; label: string } | undefined {
+function clipboardCopySource(
+  renderer: ClipboardRenderer,
+  items: readonly ChatTranscriptItem[],
+  view: ShellView,
+  statusText: string,
+): { text: string; label: string } | undefined {
   const selected = cleanClipboardText(renderer.getSelection?.()?.getSelectedText() ?? "");
   if (selected) return { text: selected, label: "selection" };
+
+  if (view === "status" && statusText.trim()) {
+    return { text: statusText.trimEnd(), label: "status" };
+  }
 
   if (view === "transcript") {
     const transcript = buildTranscriptText(items).trimEnd();
@@ -2940,7 +4253,7 @@ function latestAssistantText(items: readonly ChatTranscriptItem[]): string | und
     if (item?.kind !== "message" || item.role !== "assistant") continue;
     const text = item.parts
       .filter((part) => part.type === "text")
-      .map((part) => part.text)
+      .map((part) => publicSyntheticAssistantText(part.text, part.synthetic))
       .filter(Boolean)
       .join("\n\n");
     if (text.trim()) return text;
@@ -2950,11 +4263,9 @@ function latestAssistantText(items: readonly ChatTranscriptItem[]): string | und
 
 function chatShellExitInfo(runtime: ChatRuntimeState, cwd: string | undefined): ChatShellExitInfo | undefined {
   const sessionId = runtime.activeSessionId ?? runtime.chatView.sessionId;
-  const threadId = runtime.activeThreadId ?? runtime.chatView.threadId;
-  if (!sessionId && !threadId && !cwd) return undefined;
+  if (!sessionId && !cwd) return undefined;
   const info: ChatShellExitInfo = {};
   if (sessionId) info.sessionId = sessionId;
-  if (threadId) info.threadId = threadId;
   if (cwd) info.cwd = cwd;
   return info;
 }
@@ -2964,11 +4275,14 @@ function useSkillSummaries(cwd: string): SkillSummariesState {
     skills: [],
     allSkills: [],
   });
+  const loadEpochRef = useRef(0);
   const load = useCallback(async () => {
+    const epoch = ++loadEpochRef.current;
     const [activeRegistry, allRegistry] = await Promise.all([
       discoverSkills({ cwd }),
       discoverSkills({ cwd, includeDisabled: true }),
     ]);
+    if (loadEpochRef.current !== epoch) return;
     setState({
       skills: activeRegistry.listAll(),
       allSkills: allRegistry.listAll(),
@@ -2976,23 +4290,25 @@ function useSkillSummaries(cwd: string): SkillSummariesState {
   }, [cwd]);
 
   useEffect(() => {
+    const epoch = ++loadEpochRef.current;
     let cancelled = false;
     void Promise.all([
       discoverSkills({ cwd }),
       discoverSkills({ cwd, includeDisabled: true }),
     ])
       .then(([activeRegistry, allRegistry]) => {
-        if (cancelled) return;
+        if (cancelled || loadEpochRef.current !== epoch) return;
         setState({
           skills: activeRegistry.listAll(),
           allSkills: allRegistry.listAll(),
         });
       })
       .catch(() => {
-        if (!cancelled) setState({ skills: [], allSkills: [] });
+        if (!cancelled && loadEpochRef.current === epoch) setState({ skills: [], allSkills: [] });
       });
     return () => {
       cancelled = true;
+      if (loadEpochRef.current === epoch) loadEpochRef.current += 1;
     };
   }, [cwd]);
   return {
@@ -3216,9 +4532,87 @@ function timestampForFilename(date: Date): string {
   ].join("");
 }
 
-function localItem(level: "info" | "error", text: string, persistent?: boolean | undefined): LocalTranscriptItem {
+function interruptedPromptCandidate(
+  promptParts: readonly PromptPart[],
+  pastedTextByMarker: ReadonlyMap<string, string>,
+  pastedImages: Readonly<Record<number, PastedPromptImage>>,
+  skillMentionBindings: readonly RuntimeSkillMention[],
+  items: readonly ChatTranscriptItem[],
+): InterruptedPromptCandidate {
+  return {
+    promptParts: promptParts.map((part) => ({ ...part })),
+    pastedTextByMarker: [...pastedTextByMarker.entries()],
+    pastedImages: Object.fromEntries(
+      Object.entries(pastedImages).map(([id, image]) => [id, { ...image }]),
+    ),
+    skillMentionBindings: skillMentionBindings.map((binding) => ({ ...binding })),
+    baselineOutput: visibleOutputFingerprints(items),
+    sawActiveStatus: false,
+  };
+}
+
+function trackInterruptedPromptCandidate(
+  candidateRef: { current: InterruptedPromptCandidate | undefined },
+  candidate: InterruptedPromptCandidate,
+  state: "pending" | "accepted" | "rejected",
+): boolean {
+  if (state === "rejected") {
+    if (candidateRef.current === candidate) candidateRef.current = undefined;
+  } else if (!candidate.interruptOutcome) {
+    candidateRef.current = candidate;
+  }
+  return state !== "accepted" || candidate.interruptOutcome !== "restored";
+}
+
+function hasVisibleOutputSince(
+  candidate: InterruptedPromptCandidate,
+  items: readonly ChatTranscriptItem[],
+): boolean {
+  for (const [key, fingerprint] of visibleOutputFingerprints(items)) {
+    if (candidate.baselineOutput.get(key) !== fingerprint) return true;
+  }
+  return false;
+}
+
+function visibleOutputFingerprints(items: readonly ChatTranscriptItem[]): Map<string, string> {
+  const output = new Map<string, string>();
+  for (const item of items) {
+    const fingerprint = visibleOutputFingerprint(item);
+    if (fingerprint) output.set(`${item.kind}:${item.id}`, fingerprint);
+  }
+  return output;
+}
+
+function visibleOutputFingerprint(item: ChatTranscriptItem): string | undefined {
+  if (item.kind === "tool" || item.kind === "approval") return item.id;
+  if (item.role === "user") return undefined;
+  const visibleParts = item.parts.flatMap((part) => {
+    if (part.type === "reasoning") return [];
+    if (part.type === "text") return part.text.trim() ? [`text:${part.id}:${part.text}`] : [];
+    if (part.type === "tool_result") {
+      const visible = part.output.trim() || part.error?.trim() || (part.content?.length ?? 0) > 0;
+      return visible ? [`tool_result:${part.id}:${part.output}:${part.error ?? ""}:${part.content?.length ?? 0}`] : [];
+    }
+    return [`${part.type}:${part.id}`];
+  });
+  return visibleParts.length > 0 ? visibleParts.join("\0") : undefined;
+}
+
+function isInterruptInFlight(status: ChatSessionView["status"]): boolean {
+  return status === "running" || status === "waiting_for_approval" || status === "cancelling";
+}
+
+function localItem(level: "info" | "error", text: string, persistent?: boolean | undefined, bare?: boolean | undefined): LocalTranscriptItem {
   const createdAt = Date.now();
-  return { id: `${createdAt}:${level}:${text}`, kind: "local", level, text, createdAt, ...(persistent ? { persistent } : {}) };
+  return {
+    id: `${createdAt}:${level}:${text}`,
+    kind: "local",
+    level,
+    text,
+    createdAt,
+    ...(persistent ? { persistent } : {}),
+    ...(bare ? { bare } : {}),
+  };
 }
 
 function clearLocalItemTimers(timers: Map<string, ReturnType<typeof setTimeout>>): void {
@@ -3270,6 +4664,10 @@ function isBackspace(key: KeyEvent): boolean {
   return key.name === "backspace" || key.sequence === "\b" || key.sequence === "\x7f";
 }
 
+function isDelete(key: KeyEvent): boolean {
+  return key.name === "delete" || key.name === "del" || key.sequence === "\x1b[3~";
+}
+
 function isTab(key: KeyEvent): boolean {
   return key.name === "tab";
 }
@@ -3305,6 +4703,14 @@ function isArrowUp(key: KeyEvent): boolean {
 
 function isArrowDown(key: KeyEvent): boolean {
   return key.name === "down" || key.name === "arrow_down";
+}
+
+function isArrowLeft(key: KeyEvent): boolean {
+  return key.name === "left" || key.name === "arrow_left";
+}
+
+function isArrowRight(key: KeyEvent): boolean {
+  return key.name === "right" || key.name === "arrow_right";
 }
 
 function isPlainArrowUp(key: KeyEvent): boolean {

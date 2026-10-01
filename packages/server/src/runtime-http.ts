@@ -1,11 +1,38 @@
-import { RUNTIME_PERMISSION_PROFILE_IDS } from "@chili/protocol";
+import {
+  DELEGATION_POLICIES,
+  isTransientEvent,
+  normalizePersistedError,
+  normalizeSessionTitle,
+  parseRuntimeArray,
+  parseRuntimeBoolean,
+  parseRuntimeModelSelection,
+  parseRuntimeRecord,
+  parseRuntimeString,
+  parseRuntimeStringArray,
+  parseRuntimeStringRecord,
+  parseUserInputAnswers,
+  rejectRuntimeUnknownFields,
+  RUNTIME_PERMISSION_PROFILE_IDS,
+  RuntimeValidationError,
+} from "@chili/protocol";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { realpath } from "node:fs/promises";
+import { basename, dirname, resolve } from "node:path";
+import {
+  resolveTeamSessionAuthority,
+  RuntimeSessionNotFoundError,
+  TeamSessionAuthorityError,
+} from "@chili/core";
 import type {
   ChiliEvent,
+  EventEnvelope,
   AgentPath,
   AgentTaskMode,
   AgentTaskStatus,
   ApprovalDecisionAction,
+  DelegationPolicy,
   RuntimeInterruptResult,
+  RuntimeDelegationConfig,
   RuntimeModelConfig,
   RuntimeModelDescriptor,
   RuntimeMcpAddServerRequest,
@@ -32,12 +59,14 @@ import type {
   ReasoningLevel,
   ServiceTier,
   SessionId,
-  ThreadId,
   TaskId,
   TeamId,
   TeamMessageDelivery,
-  ThreadGoal,
-  ThreadGoalStatus,
+  SessionGoal,
+  SessionGoalStatus,
+  PendingUserInputRequest,
+  UserInputAnswers,
+  UserInputId,
 } from "@chili/protocol";
 import type {
   AgentTreeSnapshot,
@@ -72,9 +101,21 @@ import type {
   TeamSnapshot,
   UpdateTeamTaskInput,
 } from "@chili/core";
+import { UnknownEventCursorError } from "@chili/store";
 import type { EventPublisher, EventStore } from "@chili/store";
+import {
+  jsonEventArrayUtf8Bytes,
+  ReplayableRuntimeEventWindowAccumulator,
+  runtimeEventDependencyKey,
+  runtimeEventJsonUtf8Bytes,
+  runtimeEventProvides,
+  runtimeEventRequires,
+  type RuntimePendingApprovalRequest,
+  type RuntimePendingApprovalWindow,
+  type RuntimeSessionEventWindow,
+} from "@chili/sdk";
 import type { PromptCommandControl, PromptCommandRunResult } from "./commands.js";
-import { PromptCommandAmbiguousError, PromptCommandNotFoundError } from "./commands.js";
+import { PromptCommandNotFoundError, PromptCommandUsageError } from "./commands.js";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
@@ -90,21 +131,35 @@ import type {
 } from "@chili/store";
 import { projectRuntimeAgents } from "./agent-projection.js";
 
+export interface RuntimeHttpSessionOperation {
+  readonly signal: AbortSignal;
+  assertCurrent(): void;
+}
+
 export interface RuntimeHttpService {
-  createSession(input?: { sessionId?: SessionId; threadId?: ThreadId; cwd?: string }): Promise<RuntimeSessionRef>;
+  withSessionOperation<T>(
+    sessionId: SessionId,
+    fn: (operation: RuntimeHttpSessionOperation) => Promise<T> | T,
+  ): Promise<T>;
+  createSession(input?: { sessionId?: SessionId; cwd?: string }): Promise<RuntimeSessionRef>;
   listModels?(input?: { provider?: string }): Promise<RuntimeModelDescriptor[]>;
   getModelConfig?(sessionId: SessionId): Promise<RuntimeModelConfig>;
-  setModel?(input: { sessionId: SessionId; threadId?: ThreadId; modelSelection: ModelSelection }): Promise<RuntimeModelConfig>;
-  setReasoning?(input: { sessionId: SessionId; threadId?: ThreadId; reasoningLevel: ReasoningLevel }): Promise<RuntimeModelConfig>;
-  setServiceTier?(input: { sessionId: SessionId; threadId?: ThreadId; serviceTier: ServiceTier }): Promise<RuntimeModelConfig>;
-  getGoal?(input: { sessionId: SessionId; threadId: ThreadId }): Promise<ThreadGoal | undefined>;
-  setGoal?(input: { sessionId: SessionId; threadId: ThreadId; objective: string; tokenBudget?: number; replace?: boolean }): Promise<ThreadGoal>;
-  updateGoal?(input: { sessionId: SessionId; threadId: ThreadId; status?: ThreadGoalStatus; objective?: string; tokenBudget?: number }): Promise<ThreadGoal>;
-  clearGoal?(input: { sessionId: SessionId; threadId: ThreadId }): Promise<{ cleared: boolean; previousGoal?: ThreadGoal }>;
+  setModel?(input: { sessionId: SessionId; modelSelection: ModelSelection }): Promise<RuntimeModelConfig>;
+  setReasoning?(input: { sessionId: SessionId; reasoningLevel: ReasoningLevel }): Promise<RuntimeModelConfig>;
+  setServiceTier?(input: { sessionId: SessionId; serviceTier: ServiceTier }): Promise<RuntimeModelConfig>;
+  getDelegationConfig?(sessionId: SessionId): Promise<RuntimeDelegationConfig>;
+  setDelegationPolicy?(input: { sessionId: SessionId; policy: DelegationPolicy }): Promise<RuntimeDelegationConfig>;
+  getGoal?(input: { sessionId: SessionId }): Promise<SessionGoal | undefined>;
+  setGoal?(input: { sessionId: SessionId; objective: string; tokenBudget?: number; replace?: boolean }): Promise<SessionGoal>;
+  updateGoal?(input: { sessionId: SessionId; status?: SessionGoalStatus; objective?: string; tokenBudget?: number }): Promise<SessionGoal>;
+  clearGoal?(input: { sessionId: SessionId }): Promise<{ cleared: boolean; previousGoal?: SessionGoal }>;
+  assertSessionReadAllowed(sessionId: SessionId): Promise<void>;
+  assertSessionTurnAllowed(sessionId: SessionId): Promise<void>;
   submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult>;
   submitPromptAsync(input: SubmitPromptInput, onError?: RuntimeBackgroundErrorHandler): void;
   interrupt(sessionId: SessionId, reason?: string): Promise<boolean>;
   archiveSession(sessionId: SessionId): Promise<void>;
+  renameSession?(sessionId: SessionId, title: string): Promise<void>;
 }
 
 export interface RuntimeTaskControlService {
@@ -152,14 +207,18 @@ export interface RuntimeTeamMergeService {
   mergeTeamTasks(input: TeamMergeInput): Promise<TeamMergeSweepResult>;
 }
 
+export interface RuntimeMcpScopeInput {
+  cwd?: string;
+}
+
 export interface RuntimeMcpControlService {
-  list(): Promise<RuntimeMcpListResponse>;
-  status?(): Promise<RuntimeMcpStatusResponse>;
-  get?(server: string): Promise<RuntimeMcpServerDescriptor | undefined>;
-  reload?(): Promise<RuntimeMcpReloadResponse>;
+  list(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpListResponse>;
+  status?(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpStatusResponse>;
+  get?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpServerDescriptor | undefined>;
+  reload?(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpReloadResponse>;
   add?(input: RuntimeMcpAddServerRequest): Promise<RuntimeMcpServerDescriptor>;
   remove?(server: string): Promise<RuntimeMcpRemoveServerResponse>;
-  tools?(server: string): Promise<RuntimeMcpToolsResponse>;
+  tools?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpToolsResponse>;
   auth?(server: string, input?: RuntimeMcpAuthRequest): Promise<RuntimeMcpAuthResponse>;
   logout?(server: string): Promise<RuntimeMcpLogoutResponse>;
 }
@@ -167,6 +226,7 @@ export interface RuntimeMcpControlService {
 export interface RuntimeHttpHandlerOptions {
   service: RuntimeHttpService;
   store: EventStore & EventPublisher;
+  authToken?: string;
   tasks?: RuntimeTaskControlService;
   agents?: RuntimeAgentTreeService;
   teams?: RuntimeTeamService;
@@ -174,10 +234,19 @@ export interface RuntimeHttpHandlerOptions {
   teamMerger?: RuntimeTeamMergeService;
   teamRunner?: RuntimeTeamExecutionRunnerService;
   approvals?: ApprovalResolver;
+  userInputs?: UserInputController;
   permissions?: PermissionProfileControl;
   commands?: PromptCommandControl;
   mcp?: RuntimeMcpControlService;
   maxBacklogEvents?: number;
+  maxEventStreamDurableEvents?: number;
+  maxEventStreamAgeMs?: number;
+  maxSessionEventWindowBytes?: number;
+  maxSessionEventScanPages?: number;
+  maxSessionEventScanEvents?: number;
+  maxSessionEventScanBytes?: number;
+  maxSessionEventScanMs?: number;
+  maxSessionEventWindowConcurrency?: number;
   onBackgroundError?: (error: unknown) => void;
 }
 
@@ -186,6 +255,15 @@ export interface ApprovalResolver {
     approvalId: import("@chili/protocol").ApprovalId;
     decision: ApprovalDecisionAction;
     feedback?: string;
+  }): boolean | Promise<boolean>;
+  maxApprovalScope?(approvalId: import("@chili/protocol").ApprovalId): import("@chili/protocol").ApprovalScope | undefined | Promise<import("@chili/protocol").ApprovalScope | undefined>;
+}
+
+export interface UserInputController {
+  list(input?: { sessionId?: SessionId }): readonly PendingUserInputRequest[] | Promise<readonly PendingUserInputRequest[]>;
+  resolve(input: {
+    inputId: UserInputId;
+    answers: UserInputAnswers;
   }): boolean | Promise<boolean>;
 }
 
@@ -198,17 +276,44 @@ export interface StartRuntimeHttpServerOptions extends RuntimeHttpHandlerOptions
   hostname?: string;
   port?: number;
   idleTimeout?: number;
+  tls?: Bun.TLSOptions | Bun.TLSOptions[];
 }
 
 export interface RuntimeHttpServer {
   url: string;
-  close(): void;
+  close(): Promise<void>;
 }
+
+export const RUNTIME_HTTP_MINIMUM_REMOTE_AUTH_TOKEN_BYTES = 32;
 
 export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (request: Request) => Promise<Response> {
   const maxBacklogEvents = options.maxBacklogEvents ?? 5000;
+  const maxEventStreamDurableEvents = positiveIntegerOrDefault(
+    options.maxEventStreamDurableEvents,
+    4096,
+  );
+  const maxEventStreamAgeMs = positiveIntegerOrDefault(options.maxEventStreamAgeMs, 5 * 60_000);
+  const sessionEventWindowLimits: SessionEventWindowLimits = {
+    maxBytes: positiveIntegerOrDefault(options.maxSessionEventWindowBytes, 4_000_000),
+    maxScanPages: positiveIntegerOrDefault(options.maxSessionEventScanPages, 512),
+    maxScanEvents: positiveIntegerOrDefault(options.maxSessionEventScanEvents, 4_096),
+    maxScanBytes: positiveIntegerOrDefault(options.maxSessionEventScanBytes, 4_000_000),
+    maxScanMs: positiveIntegerOrDefault(options.maxSessionEventScanMs, 250),
+  };
+  const sessionEventWindowAdmission = new AsyncAdmissionGate(
+    positiveIntegerOrDefault(options.maxSessionEventWindowConcurrency, 4),
+  );
+  const inFlightSessionEventWindows = new Map<string, Promise<RuntimeSessionEventWindow>>();
+  const authTokenDigest = configuredAuthTokenDigest(options.authToken);
 
   return async function runtimeHttpHandler(request: Request): Promise<Response> {
+    if (authTokenDigest && !hasValidBearerToken(request, authTokenDigest)) {
+      return unauthorized();
+    }
+    if (isUnsafeHttpMethod(request.method) && request.headers.has("origin")) {
+      return jsonError(403, "Browser-originated runtime mutations are disabled");
+    }
+
     const url = new URL(request.url);
     const route = routeRequest(request.method, url.pathname);
 
@@ -233,38 +338,49 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "setPermissions") {
         if (!options.permissions) return jsonError(501, "No permission profile controller is configured");
-        const body = await readJson<PermissionsBody>(request);
+        const body = await readJson<PermissionsBody>(request, ["profile"]);
         if (!isRuntimePermissionProfileId(body.profile)) throw badRequest("profile must be default, auto-review, or full-access");
         return json(await options.permissions.set(body.profile));
       }
 
       if (route.name === "commands") {
-        return json(await requireCommandControl(options).list());
+        if (!route.sessionId) return json(await requireCommandControl(options).list());
+        await options.service.assertSessionTurnAllowed(route.sessionId);
+        const session = await requireSession(options.store, route.sessionId);
+        const cwd = await authoritativeRequestCwd(session.cwd, undefined);
+        return json(await requireCommandControl(options).list({ cwd }));
       }
 
       if (route.name === "commandsReload") {
-        return json(await requireCommandControl(options).reload());
+        if (!route.sessionId) return json(await requireCommandControl(options).reload());
+        await options.service.assertSessionTurnAllowed(route.sessionId);
+        const session = await requireSession(options.store, route.sessionId);
+        const cwd = await authoritativeRequestCwd(session.cwd, undefined);
+        return json(await requireCommandControl(options).reload({ cwd }));
       }
 
       if (route.name === "mcpList") {
-        return json(await requireMcpControl(options).list());
+        return json(await requireMcpControl(options).list(await mcpScopeFromRequest(options, url)));
       }
 
       if (route.name === "mcpStatus") {
         const mcp = requireMcpControl(options);
-        return json(mcp.status ? await mcp.status() : statusFromMcpList(await mcp.list()));
+        const scope = await mcpScopeFromRequest(options, url);
+        return json(mcp.status ? await mcp.status(scope) : statusFromMcpList(await mcp.list(scope)));
       }
 
       if (route.name === "mcpReload") {
         const mcp = requireMcpControl(options);
         if (!mcp.reload) return jsonError(501, "No MCP reload controller is configured");
-        return json(await mcp.reload());
+        return json(await withMcpMutationScope(options, url, (scope) => mcp.reload!(scope)));
       }
 
       if (route.name === "mcpAdd") {
         const mcp = requireMcpControl(options);
         if (!mcp.add) return jsonError(501, "No MCP add controller is configured");
-        const body = await readJson<McpAddBody>(request);
+        const body = await readJson<McpAddBody>(request, [
+          "name", "transport", "command", "args", "env", "cwd", "url", "headers", "description", "enabled",
+        ]);
         const input = mcpAddInput(body);
         if (mcpAddCreatesStdioServer(input)) {
           return jsonError(403, "Adding stdio MCP servers over HTTP is disabled because it can execute local commands.");
@@ -273,7 +389,11 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "mcpServer") {
-        return json(await mcpServerDescriptor(requireMcpControl(options), route.server));
+        return json(await mcpServerDescriptor(
+          requireMcpControl(options),
+          route.server,
+          await mcpScopeFromRequest(options, url),
+        ));
       }
 
       if (route.name === "mcpRemove") {
@@ -285,13 +405,13 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "mcpTools") {
         const mcp = requireMcpControl(options);
         if (!mcp.tools) return jsonError(501, "No MCP tools controller is configured");
-        return json(await mcp.tools(route.server));
+        return json(await mcp.tools(route.server, await mcpScopeFromRequest(options, url)));
       }
 
       if (route.name === "mcpAuth") {
         const mcp = requireMcpControl(options);
         if (!mcp.auth) return jsonError(501, "No MCP auth controller is configured");
-        return json(await mcp.auth(route.server, mcpAuthInput(await readJson<McpAuthBody>(request))));
+        return json(await mcp.auth(route.server, mcpAuthInput(await readJson<McpAuthBody>(request, ["callbackUrl", "scopes"]))));
       }
 
       if (route.name === "mcpLogout") {
@@ -307,7 +427,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "tasksReconcileStale") {
         const tasks = requireTaskControl(options);
-        const body = await readJson<TaskReconcileStaleBody>(request);
+        const body = await readJson<TaskReconcileStaleBody>(request, [
+          "parentSessionId", "staleAfterMs", "modes", "limit", "summary", "error",
+        ]);
         return json(await tasks.reconcileStaleTasks(reconcileStaleInput(body)));
       }
 
@@ -318,35 +440,35 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "taskFollowup") {
         const tasks = requireTaskControl(options);
-        const body = await readJson<TaskFollowupBody>(request);
+        const body = await readJson<TaskFollowupBody>(request, ["text", "maxTurns", "system"]);
         rejectLegacySystemField(body);
-        if (!body.text) throw badRequest("text is required");
         const input: AgentTaskFollowupInput = {
           taskId: route.taskId,
-          text: body.text,
+          text: stringField(body.text, "text"),
+          signal: request.signal,
         };
-        if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
+        if (body.maxTurns !== undefined) input.maxTurns = positiveInteger(body.maxTurns, "maxTurns");
         return json(serializeTaskFollowupResult(await tasks.followupTask(input)));
       }
 
       if (route.name === "taskWait") {
         const tasks = requireTaskControl(options);
-        const body = await readJson<TaskWaitBody>(request);
-        const input: AgentTaskWaitInput = { taskId: route.taskId };
-        if (body.timeoutMs !== undefined) input.timeoutMs = body.timeoutMs;
+        const body = await readJson<TaskWaitBody>(request, ["timeoutMs"]);
+        const input: AgentTaskWaitInput = { taskId: route.taskId, signal: request.signal };
+        if (body.timeoutMs !== undefined) input.timeoutMs = nonNegativeInteger(body.timeoutMs, "timeoutMs");
         return json(await tasks.waitForTask(input));
       }
 
       if (route.name === "taskClose") {
         const tasks = requireTaskControl(options);
-        const body = await readJson<TaskCloseBody>(request);
+        const body = await readJson<TaskCloseBody>(request, ["status", "summary", "error", "interrupt"]);
         const input: AgentTaskCloseInput = {
           taskId: route.taskId,
           status: closeStatus(body.status),
         };
-        if (body.summary) input.summary = body.summary;
-        if (body.error) input.error = body.error;
-        if (body.interrupt !== undefined) input.interrupt = body.interrupt;
+        if (body.summary !== undefined) input.summary = stringField(body.summary, "summary");
+        if (body.error !== undefined) input.error = stringField(body.error, "error");
+        if (body.interrupt !== undefined) input.interrupt = parseRuntimeBoolean(body.interrupt, "body.interrupt");
         return json(await tasks.closeTask(input));
       }
 
@@ -371,14 +493,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "agents") {
-        const query = {
-          limit: maxBacklogEvents,
-        } as {
-          sessionId?: SessionId;
-          limit: number;
-        };
-        if (route.sessionId) query.sessionId = route.sessionId;
-        const events = await options.store.events(query);
+        const events = await readAllProjectionEvents(options.store, route.sessionId, maxBacklogEvents);
         return json(projectRuntimeAgents(events, route.sessionId));
       }
 
@@ -389,30 +504,60 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "createTeam") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamCreateBody>(request);
+        const body = await readJson<TeamCreateBody>(request, [
+          "teamId", "sessionId", "name", "leadPath", "description", "leadName", "leadRole", "leadStatus", "leadWriteScope",
+        ]);
         if (!body.name) throw badRequest("name is required");
         if (!body.leadPath) throw badRequest("leadPath is required");
-        return json(await teams.createTeam(teamCreateInput(body)), 201);
+        const input = teamCreateInput(body);
+        if (!input.sessionId) return json(await teams.createTeam(input), 201);
+        const sessionId = input.sessionId;
+        await resolveHttpInteractiveSession(options, sessionId);
+        return json(await options.service.withSessionOperation(sessionId, async (operation) => {
+          await resolveHttpInteractiveSession(options, sessionId);
+          operation.assertCurrent();
+          return teams.createTeam(input);
+        }), 201);
       }
 
       if (route.name === "teamReconcileDispatches") {
         const dispatcher = requireTeamDispatcher(options);
-        const body = await readJson<TeamTaskReconcileBody>(request);
-        return json(await dispatcher.reconcileTasks(teamTaskReconcileInput(route.teamId, body)));
+        const body = await readJson<TeamTaskReconcileBody>(request, ["teamId", "sessionId", "limit"]);
+        const input = teamTaskReconcileInput(route.teamId, body);
+        await assertHttpTeamReconcileAuthority(options, input);
+        return json(await dispatcher.reconcileTasks(input));
       }
 
       if (route.name === "teamRunLoop") {
         const runner = requireTeamRunner(options);
-        const body = await readJson<TeamRunLoopBody>(request);
+        const body = await readJson<TeamRunLoopBody>(request, [
+          "teamId", "sessionId", "cwd", "mode", "once", "maxCycles", "timeoutMs", "pollIntervalMs",
+        ]);
         const input = teamRunLoopInput(route.teamId, body);
+        const team = await requireHttpTeam(options, route.teamId);
+        if (team.status !== "active") {
+          throw new TeamSessionAuthorityError(`Cannot operate on archived team ${team.id}`);
+        }
+        if (team.sessionId) {
+          const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, input.cwd);
+          input.sessionId = authority.sessionId;
+          input.cwd = authority.cwd;
+        } else {
+          // An unbound team must let the runner create and atomically persist a
+          // fresh owner session. Never promote a caller-provided id to owner.
+          delete input.sessionId;
+        }
         input.signal = request.signal;
         return json(await runner.run(input));
       }
 
       if (route.name === "teamMerge") {
         const merger = requireTeamMerger(options);
-        const body = await readJson<TeamMergeBody>(request);
+        const body = await readJson<TeamMergeBody>(request, ["teamId", "sessionId", "taskId", "cwd"]);
         const input = teamMergeInput(route.teamId, body);
+        const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, input.cwd);
+        input.sessionId = authority.sessionId;
+        input.cwd = authority.cwd;
         input.signal = request.signal;
         return json(await merger.mergeTeamTasks(input));
       }
@@ -429,11 +574,17 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamAddMember") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamMemberBody>(request);
+        const body = await readJson<TeamMemberBody>(request, [
+          "teamId", "sessionId", "path", "name", "role", "status", "childSessionId", "model", "toolScope", "writeScope",
+        ]);
         if (!body.path) throw badRequest("path is required");
         if (!body.name) throw badRequest("name is required");
         if (!body.role) throw badRequest("role is required");
-        return json(await teams.addMember(teamMemberInput(route.teamId, body)), 201);
+        const input = teamMemberInput(route.teamId, body);
+        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
+          input.sessionId = authority.sessionId;
+          return teams.addMember(input);
+        }), 201);
       }
 
       if (route.name === "teamTasks") {
@@ -443,43 +594,73 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamCreateTask") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamTaskCreateBody>(request);
+        const body = await readJson<TeamTaskCreateBody>(request, [
+          "teamId", "sessionId", "taskId", "title", "description", "createdBy", "ownerPath", "dependsOn", "status", "metadata",
+        ]);
         if (!body.title) throw badRequest("title is required");
-        return json(await teams.createTask(teamTaskCreateInput(route.teamId, body)), 201);
+        const input = teamTaskCreateInput(route.teamId, body);
+        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
+          input.sessionId = authority.sessionId;
+          return teams.createTask(input);
+        }), 201);
       }
 
       if (route.name === "teamAssignTask") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamTaskAssignBody>(request);
+        const body = await readJson<TeamTaskAssignBody>(request, [
+          "teamId", "taskId", "sessionId", "ownerPath", "assignedBy", "message", "messageDelivery", "messageSummary",
+        ]);
         if (!body.ownerPath) throw badRequest("ownerPath is required");
-        return json(await teams.assignTask(teamTaskAssignInput(route.teamId, route.taskId, body)));
+        const input = teamTaskAssignInput(route.teamId, route.taskId, body);
+        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
+          input.sessionId = authority.sessionId;
+          return teams.assignTask(input);
+        }));
       }
 
       if (route.name === "teamClaimTask") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamTaskClaimBody>(request);
+        const body = await readJson<TeamTaskClaimBody>(request, ["teamId", "taskId", "sessionId", "ownerPath", "claimedBy"]);
         if (!body.ownerPath) throw badRequest("ownerPath is required");
-        return json(await teams.claimTask(teamTaskClaimInput(route.teamId, route.taskId, body)));
+        const input = teamTaskClaimInput(route.teamId, route.taskId, body);
+        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
+          input.sessionId = authority.sessionId;
+          return teams.claimTask(input);
+        }));
       }
 
       if (route.name === "teamDispatchTask") {
         const dispatcher = requireTeamDispatcher(options);
-        const body = await readJson<TeamTaskDispatchBody>(request);
+        const body = await readJson<TeamTaskDispatchBody>(request, ["teamId", "taskId", "sessionId", "ownerPath", "cwd", "mode", "prompt"]);
+        const input = teamTaskDispatchInput(route.teamId, route.taskId, body);
+        const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, input.cwd);
+        input.sessionId = authority.sessionId;
+        input.cwd = authority.cwd;
+        input.signal = request.signal;
         return json(
-          serializeTeamTaskDispatchResult(await dispatcher.dispatchTask(teamTaskDispatchInput(route.teamId, route.taskId, body))),
+          serializeTeamTaskDispatchResult(await dispatcher.dispatchTask(input)),
         );
       }
 
       if (route.name === "teamSyncTask") {
         const dispatcher = requireTeamDispatcher(options);
-        const body = await readJson<TeamContextBody>(request);
-        return json(await dispatcher.syncTask(teamTaskSyncInput(route.teamId, route.taskId, body)));
+        const body = await readJson<TeamContextBody>(request, ["teamId", "taskId", "sessionId"]);
+        const input = teamTaskSyncInput(route.teamId, route.taskId, body);
+        const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, undefined);
+        input.sessionId = authority.sessionId;
+        return json(await dispatcher.syncTask(input));
       }
 
       if (route.name === "teamUpdateTask") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamTaskUpdateBody>(request);
-        return json(await teams.updateTask(teamTaskUpdateInput(route.teamId, route.taskId, body)));
+        const body = await readJson<TeamTaskUpdateBody>(request, [
+          "teamId", "taskId", "sessionId", "status", "ownerPath", "title", "description", "dependsOn", "summary", "error", "metadata",
+        ]);
+        const input = teamTaskUpdateInput(route.teamId, route.taskId, body);
+        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
+          input.sessionId = authority.sessionId;
+          return teams.updateTask(input);
+        }));
       }
 
       if (route.name === "teamMessages") {
@@ -489,24 +670,98 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamSendMessage") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamMessageBody>(request);
+        const body = await readJson<TeamMessageBody>(request, [
+          "teamId", "sessionId", "messageId", "from", "to", "content", "kind", "delivery", "taskId", "summary", "metadata",
+        ]);
         if (!body.from) throw badRequest("from is required");
         if (!body.to) throw badRequest("to is required");
         if (!body.content) throw badRequest("content is required");
-        return json(await teams.sendMessage(teamMessageInput(route.teamId, body)), 201);
+        const input = teamMessageInput(route.teamId, body);
+        const authority = await resolveHttpTeamAuthority(options, route.teamId, undefined, undefined);
+        const actorSessionId = input.sessionId;
+        if (actorSessionId && actorSessionId !== authority.sessionId) {
+          await resolveHttpActiveActorSession(options, actorSessionId);
+        }
+        return json(await options.service.withSessionOperation(authority.sessionId, async (operation) => {
+          const current = await resolveHttpTeamAuthority(
+            options,
+            route.teamId,
+            authority.sessionId,
+            undefined,
+          );
+          if (actorSessionId && actorSessionId !== current.sessionId) {
+            await resolveHttpActiveActorSession(options, actorSessionId);
+            input.sessionId = actorSessionId;
+          } else {
+            input.sessionId = current.sessionId;
+          }
+          operation.assertCurrent();
+          return teams.sendMessage(input);
+        }), 201);
       }
 
       if (route.name === "createSession") {
-        const body = await readJson<CreateSessionBody>(request);
-        const input: { sessionId?: SessionId; threadId?: ThreadId; cwd?: string } = {};
-        if (body.sessionId) input.sessionId = body.sessionId;
-        if (body.threadId) input.threadId = body.threadId;
-        if (body.cwd) input.cwd = body.cwd;
+        const body = await readJson<CreateSessionBody>(request, ["sessionId", "cwd"]);
+        const input: { sessionId?: SessionId; cwd?: string } = {};
+        if (body.sessionId !== undefined) input.sessionId = requestSessionId(body.sessionId);
+        if (body.cwd !== undefined) input.cwd = await requestWorkspaceCwd(body.cwd);
         return json(await options.service.createSession(input), 201);
       }
 
       if (route.name === "messages") {
         return json(await options.store.messages(route.sessionId));
+      }
+
+      if (route.name === "sessionEvents") {
+        await requireSession(options.store, route.sessionId);
+        rejectUnknownQueryParameters(url, ["limit", "window"]);
+        const requestedLimit = Number(url.searchParams.get("limit") ?? "5000");
+        const limit = Number.isFinite(requestedLimit)
+          ? Math.max(1, Math.min(5_000, Math.trunc(requestedLimit)))
+          : 5_000;
+        const windowKey = `${route.sessionId}\u0000${limit}`;
+        let windowPromise = inFlightSessionEventWindows.get(windowKey);
+        if (!windowPromise) {
+          windowPromise = sessionEventWindowAdmission.run(async () => replayableSessionEventWindow({
+            store: options.store,
+            sessionId: route.sessionId,
+            limit,
+            limits: sessionEventWindowLimits,
+            pendingInputs: options.userInputs
+              ? await options.userInputs.list({ sessionId: route.sessionId })
+              : [],
+          }));
+          inFlightSessionEventWindows.set(windowKey, windowPromise);
+          void windowPromise.finally(() => {
+            if (inFlightSessionEventWindows.get(windowKey) === windowPromise) {
+              inFlightSessionEventWindows.delete(windowKey);
+            }
+          }).catch(() => undefined);
+        }
+        const window = await windowPromise;
+        if (url.searchParams.get("window") === "replayable") return json(window);
+        return json(window.events, 200, {
+          "x-chili-event-window-truncated": String(window.truncated),
+          "x-chili-event-window-bytes": String(window.bytes),
+        });
+      }
+
+      if (route.name === "renameSession") {
+        await requireSession(options.store, route.sessionId);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
+        if (!options.service.renameSession) return jsonError(501, "Session rename is not available from this runtime");
+        const body = await readJson<RenameSessionBody>(request, ["title"]);
+        let title: string;
+        try {
+          title = normalizeSessionTitle(parseRuntimeString(body.title, "body.title", { allowEmpty: true }));
+        } catch (error) {
+          if (error instanceof TypeError) throw badRequest(error.message);
+          throw error;
+        }
+        await options.service.renameSession(route.sessionId, title);
+        const renamed = (await options.store.sessions()).find((session) => session.id === route.sessionId);
+        if (!renamed) throw notFound(`Session not found: ${route.sessionId}`);
+        return json(renamed);
       }
 
       if (route.name === "modelConfig") {
@@ -516,74 +771,102 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "setModel") {
         await requireSession(options.store, route.sessionId);
-        const body = await readJson<ModelBody>(request);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
+        const body = await readJson<ModelBody>(request, ["modelSelection"]);
         if (!isModelSelection(body.modelSelection)) throw badRequest("modelSelection with provider and model is required");
         return json(await requireModelControl(options).setModel({
           sessionId: route.sessionId,
-          ...(body.threadId ? { threadId: body.threadId } : {}),
           modelSelection: body.modelSelection,
         }));
       }
 
       if (route.name === "setReasoning") {
         await requireSession(options.store, route.sessionId);
-        const body = await readJson<ReasoningBody>(request);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
+        const body = await readJson<ReasoningBody>(request, ["reasoningLevel"]);
         if (!isReasoningLevel(body.reasoningLevel)) {
-          throw badRequest("reasoningLevel must be off, minimal, low, medium, high, or xhigh");
+          throw badRequest("reasoningLevel must be off, minimal, low, medium, high, xhigh, max, or ultra");
         }
         return json(await requireModelControl(options).setReasoning({
           sessionId: route.sessionId,
-          ...(body.threadId ? { threadId: body.threadId } : {}),
           reasoningLevel: body.reasoningLevel,
         }));
       }
 
       if (route.name === "setServiceTier") {
         await requireSession(options.store, route.sessionId);
-        const body = await readJson<ServiceTierBody>(request);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
+        const body = await readJson<ServiceTierBody>(request, ["serviceTier"]);
         if (!isServiceTier(body.serviceTier)) {
           throw badRequest("serviceTier must be standard or fast");
         }
         return json(await requireServiceTierControl(options).setServiceTier({
           sessionId: route.sessionId,
-          ...(body.threadId ? { threadId: body.threadId } : {}),
           serviceTier: body.serviceTier,
         }));
       }
 
-      if (route.name === "goal") {
+      if (route.name === "delegationConfig") {
         await requireSession(options.store, route.sessionId);
+        return json(await requireDelegationControl(options).getDelegationConfig(route.sessionId));
+      }
+
+      if (route.name === "setDelegationPolicy") {
+        await requireSession(options.store, route.sessionId);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
+        const body = await readJson<DelegationBody>(request, ["policy"]);
+        if (!isDelegationPolicy(body.policy)) {
+          throw badRequest("policy must be off, explicit, or proactive");
+        }
+        return json(await requireDelegationControl(options).setDelegationPolicy({
+          sessionId: route.sessionId,
+          policy: body.policy,
+        }));
+      }
+
+      if (route.name === "goal") {
         const goals = requireGoalControl(options);
         if (request.method === "GET") {
-          const threadId = requiredThreadId(url.searchParams.get("threadId"));
-          const goal = await goals.getGoal({ sessionId: route.sessionId, threadId });
+          rejectUnknownQueryParameters(url, []);
+          await requireSession(options.store, route.sessionId);
+          const goal = await goals.getGoal({ sessionId: route.sessionId });
           return goal ? json(goal) : new Response(null, { status: 204 });
         }
         if (request.method === "POST") {
-          const body = await readJson<GoalBody>(request);
+          const body = await readJson<GoalBody>(request, ["objective", "tokenBudget", "replace"]);
           const input = goalSetInput(route.sessionId, body);
+          await options.service.assertSessionTurnAllowed(route.sessionId);
+          await requireSession(options.store, route.sessionId);
           return json(await goals.setGoal(input), 201);
         }
         if (request.method === "PATCH") {
-          const body = await readJson<GoalBody>(request);
+          const body = await readJson<GoalBody>(request, ["status", "objective", "tokenBudget"]);
           const input = goalUpdateInput(route.sessionId, body);
+          await options.service.assertSessionTurnAllowed(route.sessionId);
+          await requireSession(options.store, route.sessionId);
           return json(await goals.updateGoal(input));
         }
         if (request.method === "DELETE") {
-          const threadId = requiredThreadId(url.searchParams.get("threadId"));
-          return json(await goals.clearGoal({ sessionId: route.sessionId, threadId }));
+          rejectUnknownQueryParameters(url, []);
+          await options.service.assertSessionTurnAllowed(route.sessionId);
+          await requireSession(options.store, route.sessionId);
+          return json(await goals.clearGoal({ sessionId: route.sessionId }));
         }
       }
 
       if (route.name === "prompt" || route.name === "promptAsync") {
-        const body = await readJson<PromptBody>(request);
+        const body = await readJson<PromptBody>(request, [
+          "text", "displayText", "images", "skillMentions", "cwd", "maxTurns", "modelSelection", "reasoningLevel", "serviceTier", "system",
+        ]);
         rejectLegacySystemField(body);
-        if (!body.threadId) throw badRequest("threadId is required");
         const promptImages = parsePromptImages(body.images);
         if (!body.text && promptImages.length === 0) throw badRequest("text is required");
-        await requireSession(options.store, route.sessionId);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
+        const session = await requireSession(options.store, route.sessionId);
+        const cwd = await authoritativeRequestCwd(session.cwd, body.cwd);
 
         const input = buildSubmitPromptInput(route.sessionId, body, promptImages);
+        input.cwd = cwd;
 
         if (route.name === "prompt") {
           return json(serializeSubmitPromptResult(await options.service.submitPrompt(input)));
@@ -593,63 +876,118 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const accepted: RuntimePromptAccepted = {
           status: "accepted",
           sessionId: route.sessionId,
-          threadId: body.threadId,
         };
         return json(accepted, 202);
       }
 
-      if (route.name === "commandAsync") {
-        const body = await readJson<CommandPromptBody>(request);
-        if (!body.threadId) throw badRequest("threadId is required");
-        if (typeof body.name !== "string" || body.name.trim().length === 0) throw badRequest("name is required");
+      if (route.name === "command" || route.name === "commandAsync") {
+        const body = await readJson<CommandPromptBody>(request, [
+          "commandId", "name", "args", "cwd", "modelSelection", "reasoningLevel", "serviceTier",
+        ]);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
+        const session = await requireSession(options.store, route.sessionId);
+        if (typeof body.commandId !== "string" || body.commandId.trim().length === 0) {
+          throw badRequest("commandId is required");
+        }
         if (body.args !== undefined && typeof body.args !== "string") throw badRequest("args must be a string when provided");
-        if (body.cwd !== undefined && typeof body.cwd !== "string") throw badRequest("cwd must be a string when provided");
-        await requireSession(options.store, route.sessionId);
+        const cwd = await authoritativeRequestCwd(session.cwd, body.cwd);
 
         const command = await requireCommandControl(options).run({
-          name: body.name.trim(),
+          commandId: body.commandId.trim(),
           ...(body.args ? { args: body.args } : {}),
-          ...(body.cwd ? { cwd: body.cwd } : {}),
+          cwd,
         });
         const displayText = body.args?.trim()
-          ? `/${command.command.name} ${body.args.trim()}`
-          : `/${command.command.name}`;
+          ? `${command.command.path} ${body.args.trim()}`
+          : command.command.path;
         const input = buildSubmitPromptInput(route.sessionId, {
-          threadId: body.threadId,
           text: command.prompt,
           displayText,
-          ...(body.cwd ? { cwd: body.cwd } : {}),
+          cwd,
           ...(body.modelSelection ? { modelSelection: body.modelSelection } : {}),
           ...(body.reasoningLevel ? { reasoningLevel: body.reasoningLevel } : {}),
           ...(body.serviceTier ? { serviceTier: body.serviceTier } : {}),
         });
         const toolPolicy = commandToolPolicy(command.metadata);
         if (toolPolicy) input.toolPolicy = toolPolicy;
+
+        if (route.name === "command") {
+          return json(serializeSubmitPromptResult(await options.service.submitPrompt(input)));
+        }
+
         options.service.submitPromptAsync(input, options.onBackgroundError);
         const accepted: RuntimePromptAccepted = {
           status: "accepted",
           sessionId: route.sessionId,
-          threadId: body.threadId,
         };
         return json(accepted, 202);
       }
 
       if (route.name === "interrupt") {
-        const body = await readJson<InterruptBody>(request);
+        const body = await readJson<InterruptBody>(request, ["reason"]);
+        const reason = body.reason === undefined ? undefined : stringField(body.reason, "reason");
         const result: RuntimeInterruptResult = {
-          interrupted: await options.service.interrupt(route.sessionId, body.reason),
+          interrupted: await options.service.interrupt(route.sessionId, reason),
         };
         return json(result);
       }
 
       if (route.name === "archive") {
+        await requireSession(options.store, route.sessionId);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
         await options.service.archiveSession(route.sessionId);
         return new Response(null, { status: 204 });
+      }
+
+      if (route.name === "listUserInputs") {
+        if (!options.userInputs) return jsonError(501, "No user input controller is configured");
+        rejectUnknownQueryParameters(url, ["sessionId"]);
+        const sessionId = asSessionId(url.searchParams.get("sessionId"));
+        return json(await options.userInputs.list(sessionId ? { sessionId } : {}));
+      }
+
+      if (route.name === "listPendingApprovals") {
+        rejectUnknownQueryParameters(url, ["sessionId", "window"]);
+        const sessionId = asSessionId(url.searchParams.get("sessionId"));
+        const window = await boundedPendingApprovalWindow(options.store, sessionId);
+        if (url.searchParams.get("window") === "bounded") return json(window);
+        return json(window.approvals, 200, {
+          "x-chili-approval-window-truncated": String(window.truncated),
+          "x-chili-approval-window-bytes": String(window.bytes),
+        });
+      }
+
+      if (route.name === "resolveUserInput") {
+        if (!options.userInputs) return jsonError(501, "No user input controller is configured");
+        const inputId = requestUserInputId(route.inputId);
+        const answers = parseResolveUserInputBody(await readJson<unknown>(request));
+        const pending = (await options.userInputs.list()).find((candidate) => candidate.id === inputId);
+        if (!pending) return jsonError(404, `User input request not found: ${inputId}`);
+        let validatedAnswers: UserInputAnswers;
+        try {
+          validatedAnswers = parseUserInputAnswers(answers, pending.questions);
+        } catch (error) {
+          throw badRequest(error instanceof Error ? error.message : String(error));
+        }
+        const resolved = await options.userInputs.resolve({ inputId, answers: validatedAnswers });
+        if (!resolved) {
+          return jsonError(409, "User input request is no longer pending. It may have been handled already or orphaned by a server restart.");
+        }
+        return json({ resolved: true });
       }
 
       if (route.name === "resolveApproval") {
         if (!options.approvals) return jsonError(501, "No approval resolver is configured");
         const resolveInput = parseResolveApprovalBody(route.approvalId, await readJson<unknown>(request));
+        // A resolver that cannot report the pending request's scope must not be
+        // allowed to create reusable grants. Treat the extension boundary as
+        // one-shot by default and fail closed before resolve() can persist state.
+        const maxApprovalScope = options.approvals.maxApprovalScope
+          ? await options.approvals.maxApprovalScope(route.approvalId)
+          : "once";
+        if (!approvalDecisionWithinScope(resolveInput.decision, maxApprovalScope)) {
+          return jsonError(400, `Approval decision ${resolveInput.decision} exceeds the maximum approval scope ${maxApprovalScope}.`);
+        }
         const resolved = await options.approvals.resolve(resolveInput);
         if (!resolved) {
           return jsonError(409, "Approval is not pending in this runtime. It may have been handled already or orphaned by a server restart.");
@@ -659,18 +997,19 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "events") {
+        rejectUnknownQueryParameters(url, ["sessionId", "afterEventId"]);
         const streamOptions: EventStreamOptions = {
           store: options.store,
           request,
           maxBacklogEvents,
+          maxDurableEvents: maxEventStreamDurableEvents,
+          maxAgeMs: maxEventStreamAgeMs,
         };
         const sessionId = asSessionId(url.searchParams.get("sessionId"));
-        const threadId = asThreadId(url.searchParams.get("threadId"));
         const afterEventId = url.searchParams.get("afterEventId");
         if (sessionId) streamOptions.sessionId = sessionId;
-        if (threadId) streamOptions.threadId = threadId;
         if (afterEventId) streamOptions.afterEventId = afterEventId;
-        return eventStream(streamOptions);
+        return await eventStream(streamOptions);
       }
 
       return jsonError(404, "Not found");
@@ -681,18 +1020,155 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
   };
 }
 
+function isUnsafeHttpMethod(method: string): boolean {
+  return method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+}
+
 export function startRuntimeHttpServer(options: StartRuntimeHttpServerOptions): RuntimeHttpServer {
+  assertRuntimeHttpServerAuthentication(options.hostname, options.authToken, options.tls);
+  const handler = createRuntimeHttpHandler(options);
+  const protectLoopbackHost = isLoopbackBindHostname(options.hostname ?? "127.0.0.1");
   const server = Bun.serve({
     hostname: options.hostname ?? "127.0.0.1",
     port: options.port ?? 0,
     idleTimeout: options.idleTimeout ?? 255,
-    fetch: createRuntimeHttpHandler(options),
+    ...(options.tls !== undefined ? { tls: options.tls } : {}),
+    fetch(request, listener) {
+      if (protectLoopbackHost && (listener.port === undefined || !isTrustedLoopbackHostAuthority(
+        request.headers.get("host"),
+        listener.port,
+        options.tls !== undefined,
+      ))) {
+        return jsonError(421, "Misdirected request");
+      }
+      return handler(request);
+    },
   });
 
   return {
     url: server.url.href,
-    close: () => server.stop(true),
+    close: async () => {
+      await server.stop(true);
+    },
   };
+}
+
+/**
+ * Remote binds expose task execution and filesystem-affecting controls. Keep
+ * loopback development compatible, but require a high-entropy bearer secret
+ * and an explicit certificate/private-key pair before Bun opens any other
+ * interface.
+ */
+export function assertRuntimeHttpServerAuthentication(
+  hostname: string | undefined,
+  authToken: string | undefined,
+  tls?: Bun.TLSOptions | Bun.TLSOptions[],
+): void {
+  const effectiveHostname = hostname === undefined ? "127.0.0.1" : hostname;
+  if (isLoopbackBindHostname(effectiveHostname)) return;
+  const tokenBytes = typeof authToken === "string"
+    ? new TextEncoder().encode(authToken).byteLength
+    : 0;
+  if (tokenBytes < RUNTIME_HTTP_MINIMUM_REMOTE_AUTH_TOKEN_BYTES) {
+    throw new Error(
+      `Refusing to bind runtime HTTP server to non-loopback host ${JSON.stringify(diagnosticHostname(effectiveHostname))} without an authToken of at least ${RUNTIME_HTTP_MINIMUM_REMOTE_AUTH_TOKEN_BYTES} UTF-8 bytes`,
+    );
+  }
+  if (!hasExplicitTlsCredentials(tls)) {
+    throw new Error(
+      `Refusing to bind runtime HTTP server to non-loopback host ${JSON.stringify(diagnosticHostname(effectiveHostname))} without explicit TLS cert and key`,
+    );
+  }
+}
+
+export function isLoopbackBindHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase();
+  if (!normalized) return false;
+  const unbracketed = normalized.startsWith("[") && normalized.endsWith("]")
+    ? normalized.slice(1, -1)
+    : normalized;
+  if (unbracketed === "localhost" || unbracketed.endsWith(".localhost")) return true;
+  if (unbracketed === "::1") return true;
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(unbracketed);
+  if (!ipv4) return false;
+  const octets = ipv4.slice(1).map(Number);
+  return octets.every((octet) => octet >= 0 && octet <= 255) && octets[0] === 127;
+}
+
+function isTrustedLoopbackHostAuthority(
+  authority: string | null,
+  listenerPort: number,
+  tls: boolean,
+): boolean {
+  if (!authority || authority.length > 512 || /[\u0000-\u0020\u007f]/u.test(authority)) return false;
+
+  let hostname: string;
+  let port: string | undefined;
+  if (authority.startsWith("[")) {
+    const match = /^\[([0-9A-Fa-f:]+)\](?::([0-9]+))?$/u.exec(authority);
+    if (!match || !isIpv6LoopbackLiteral(match[1] ?? "")) return false;
+    hostname = match[1] ?? "";
+    port = match[2];
+  } else {
+    const match = /^([^:]+)(?::([0-9]+))?$/u.exec(authority);
+    if (!match) return false;
+    hostname = match[1] ?? "";
+    port = match[2];
+    if (!isCanonicalIpv4Loopback(hostname) && !isLocalhostDnsName(hostname)) return false;
+  }
+
+  if (!hostname) return false;
+  if (port === undefined) return listenerPort === (tls ? 443 : 80);
+  if (!/^[1-9][0-9]{0,4}$/u.test(port)) return false;
+  const numericPort = Number(port);
+  return numericPort <= 65_535 && numericPort === listenerPort;
+}
+
+function isCanonicalIpv4Loopback(hostname: string): boolean {
+  const octets = hostname.split(".");
+  if (octets.length !== 4) return false;
+  const values: number[] = [];
+  for (const octet of octets) {
+    if (!/^(?:0|[1-9][0-9]{0,2})$/u.test(octet)) return false;
+    const value = Number(octet);
+    if (value > 255) return false;
+    values.push(value);
+  }
+  return values[0] === 127;
+}
+
+function isLocalhostDnsName(hostname: string): boolean {
+  const normalized = hostname.toLowerCase();
+  if (normalized.length > 253 || (normalized !== "localhost" && !normalized.endsWith(".localhost"))) return false;
+  return normalized.split(".").every((label) => (
+    label.length > 0 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u.test(label)
+  ));
+}
+
+function isIpv6LoopbackLiteral(hostname: string): boolean {
+  const halves = hostname.split("::");
+  if (halves.length > 2) return false;
+  const left = ipv6Hextets(halves[0] ?? "");
+  const right = halves.length === 2 ? ipv6Hextets(halves[1] ?? "") : [];
+  if (!left || !right) return false;
+
+  let hextets: number[];
+  if (halves.length === 1) {
+    if (left.length !== 8) return false;
+    hextets = left;
+  } else {
+    const omitted = 8 - left.length - right.length;
+    if (omitted < 1) return false;
+    hextets = [...left, ...Array.from({ length: omitted }, () => 0), ...right];
+  }
+  return hextets.length === 8 && hextets.slice(0, 7).every((value) => value === 0) && hextets[7] === 1;
+}
+
+function ipv6Hextets(value: string): number[] | undefined {
+  if (!value) return [];
+  const parts = value.split(":");
+  if (parts.some((part) => !/^[0-9A-Fa-f]{1,4}$/u.test(part))) return undefined;
+  return parts.map((part) => Number.parseInt(part, 16));
 }
 
 type Route =
@@ -705,8 +1181,8 @@ type Route =
   | { name: "models" }
   | { name: "permissionsConfig" }
   | { name: "setPermissions" }
-  | { name: "commands" }
-  | { name: "commandsReload" }
+  | { name: "commands"; sessionId?: SessionId }
+  | { name: "commandsReload"; sessionId?: SessionId }
   | { name: "mcpList" }
   | { name: "mcpStatus" }
   | { name: "mcpReload" }
@@ -743,65 +1219,74 @@ type Route =
   | { name: "taskClose"; taskId: TaskId }
   | { name: "createSession" }
   | { name: "messages"; sessionId: SessionId }
+  | { name: "sessionEvents"; sessionId: SessionId }
+  | { name: "renameSession"; sessionId: SessionId }
   | { name: "modelConfig"; sessionId: SessionId }
   | { name: "setModel"; sessionId: SessionId }
   | { name: "setReasoning"; sessionId: SessionId }
   | { name: "setServiceTier"; sessionId: SessionId }
+  | { name: "delegationConfig"; sessionId: SessionId }
+  | { name: "setDelegationPolicy"; sessionId: SessionId }
   | { name: "goal"; sessionId: SessionId }
   | { name: "prompt"; sessionId: SessionId }
   | { name: "promptAsync"; sessionId: SessionId }
+  | { name: "command"; sessionId: SessionId }
   | { name: "commandAsync"; sessionId: SessionId }
   | { name: "interrupt"; sessionId: SessionId }
   | { name: "archive"; sessionId: SessionId }
+  | { name: "listUserInputs" }
+  | { name: "listPendingApprovals" }
+  | { name: "resolveUserInput"; inputId: string }
   | { name: "resolveApproval"; approvalId: import("@chili/protocol").ApprovalId }
   | { name: "notFound" };
 
 interface CreateSessionBody {
-  sessionId?: SessionId;
-  threadId?: ThreadId;
-  cwd?: string;
+  sessionId?: unknown;
+  cwd?: unknown;
+}
+
+interface RenameSessionBody {
+  title?: unknown;
 }
 
 interface PromptBody {
-  threadId?: ThreadId;
-  text?: string;
-  displayText?: string;
+  text?: unknown;
+  displayText?: unknown;
   images?: unknown;
   skillMentions?: unknown;
-  cwd?: string;
-  maxTurns?: number;
-  modelSelection?: ModelSelection;
-  reasoningLevel?: ReasoningLevel;
-  serviceTier?: ServiceTier;
+  cwd?: unknown;
+  maxTurns?: unknown;
+  modelSelection?: unknown;
+  reasoningLevel?: unknown;
+  serviceTier?: unknown;
 }
 
 interface CommandPromptBody {
-  threadId?: ThreadId;
-  name?: string;
-  args?: string;
-  cwd?: string;
-  modelSelection?: ModelSelection;
-  reasoningLevel?: ReasoningLevel;
-  serviceTier?: ServiceTier;
+  commandId?: unknown;
+  args?: unknown;
+  cwd?: unknown;
+  modelSelection?: unknown;
+  reasoningLevel?: unknown;
+  serviceTier?: unknown;
 }
 
 interface ModelBody {
-  threadId?: ThreadId;
   modelSelection?: unknown;
 }
 
 interface ReasoningBody {
-  threadId?: ThreadId;
   reasoningLevel?: unknown;
 }
 
 interface ServiceTierBody {
-  threadId?: ThreadId;
   serviceTier?: unknown;
 }
 
+interface DelegationBody {
+  policy?: unknown;
+}
+
 interface GoalBody {
-  threadId?: ThreadId;
   objective?: unknown;
   status?: unknown;
   tokenBudget?: unknown;
@@ -810,6 +1295,10 @@ interface GoalBody {
 
 interface PermissionsBody {
   profile?: unknown;
+}
+
+interface ResolveUserInputBody {
+  answers?: unknown;
 }
 
 interface McpAddBody {
@@ -831,140 +1320,170 @@ interface McpAuthBody {
 }
 
 interface TaskFollowupBody {
-  text?: string;
-  maxTurns?: number;
+  text?: unknown;
+  maxTurns?: unknown;
 }
 
 interface TaskWaitBody {
-  timeoutMs?: number;
+  timeoutMs?: unknown;
 }
 
 interface TaskCloseBody {
   status?: unknown;
-  summary?: string;
-  error?: string;
-  interrupt?: boolean;
+  summary?: unknown;
+  error?: unknown;
+  interrupt?: unknown;
 }
 
 interface TaskReconcileStaleBody {
-  staleAfterMs?: number;
+  parentSessionId?: unknown;
+  staleAfterMs?: unknown;
   modes?: unknown;
-  limit?: number;
-  summary?: string;
-  error?: string;
+  limit?: unknown;
+  summary?: unknown;
+  error?: unknown;
 }
 
 interface TeamContextBody {
-  sessionId?: SessionId;
-  threadId?: ThreadId;
+  sessionId?: unknown;
+  teamId?: unknown;
+  taskId?: unknown;
 }
 
 interface TeamCreateBody extends TeamContextBody {
-  teamId?: TeamId;
-  name?: string;
-  leadPath?: AgentPath;
-  description?: string;
-  leadName?: string;
-  leadRole?: string;
+  name?: unknown;
+  leadPath?: unknown;
+  description?: unknown;
+  leadName?: unknown;
+  leadRole?: unknown;
   leadStatus?: unknown;
-  leadWriteScope?: string[];
+  leadWriteScope?: unknown;
 }
 
 interface TeamMemberBody extends TeamContextBody {
-  path?: AgentPath;
-  name?: string;
-  role?: string;
+  path?: unknown;
+  name?: unknown;
+  role?: unknown;
   status?: unknown;
-  childSessionId?: SessionId;
-  childThreadId?: ThreadId;
-  model?: string;
-  toolScope?: string[];
-  writeScope?: string[];
+  childSessionId?: unknown;
+  model?: unknown;
+  toolScope?: unknown;
+  writeScope?: unknown;
 }
 
 interface TeamTaskCreateBody extends TeamContextBody {
-  taskId?: TaskId;
-  title?: string;
-  description?: string;
-  createdBy?: AgentPath;
-  ownerPath?: AgentPath;
-  dependsOn?: TaskId[];
+  taskId?: unknown;
+  title?: unknown;
+  description?: unknown;
+  createdBy?: unknown;
+  ownerPath?: unknown;
+  dependsOn?: unknown;
   status?: unknown;
-  metadata?: Record<string, unknown>;
+  metadata?: unknown;
 }
 
 interface TeamTaskAssignBody extends TeamContextBody {
-  ownerPath?: AgentPath;
-  assignedBy?: AgentPath;
-  message?: string;
+  ownerPath?: unknown;
+  assignedBy?: unknown;
+  message?: unknown;
   messageDelivery?: unknown;
-  messageSummary?: string;
+  messageSummary?: unknown;
 }
 
 interface TeamTaskClaimBody extends TeamContextBody {
-  ownerPath?: AgentPath;
-  claimedBy?: AgentPath;
+  ownerPath?: unknown;
+  claimedBy?: unknown;
 }
 
 interface TeamTaskDispatchBody extends TeamContextBody {
-  ownerPath?: AgentPath;
-  cwd?: string;
-  mode?: string;
-  prompt?: string;
+  ownerPath?: unknown;
+  cwd?: unknown;
+  mode?: unknown;
+  prompt?: unknown;
 }
 
 interface TeamTaskReconcileBody extends TeamContextBody {
-  limit?: number;
+  limit?: unknown;
 }
 
 interface TeamRunLoopBody extends TeamContextBody {
-  cwd?: string;
-  mode?: string;
-  once?: boolean;
-  maxCycles?: number;
-  timeoutMs?: number;
-  pollIntervalMs?: number;
+  cwd?: unknown;
+  mode?: unknown;
+  once?: unknown;
+  maxCycles?: unknown;
+  timeoutMs?: unknown;
+  pollIntervalMs?: unknown;
 }
 
 interface TeamMergeBody extends TeamContextBody {
-  taskId?: TaskId;
-  cwd?: string;
+  taskId?: unknown;
+  cwd?: unknown;
 }
 
 interface TeamTaskUpdateBody extends TeamContextBody {
   status?: unknown;
-  ownerPath?: AgentPath;
-  title?: string;
-  description?: string;
-  dependsOn?: TaskId[];
-  summary?: string;
-  error?: string;
-  metadata?: Record<string, unknown>;
+  ownerPath?: unknown;
+  title?: unknown;
+  description?: unknown;
+  dependsOn?: unknown;
+  summary?: unknown;
+  error?: unknown;
+  metadata?: unknown;
 }
 
 interface TeamMessageBody extends TeamContextBody {
-  messageId?: string;
-  from?: AgentPath;
-  to?: AgentPath | "*";
-  content?: string;
+  messageId?: unknown;
+  from?: unknown;
+  to?: unknown;
+  content?: unknown;
   kind?: unknown;
   delivery?: unknown;
-  taskId?: TaskId;
-  summary?: string;
-  metadata?: Record<string, unknown>;
+  taskId?: unknown;
+  summary?: unknown;
+  metadata?: unknown;
 }
 
 interface InterruptBody {
-  reason?: string;
+  reason?: unknown;
+}
+
+interface SessionEventWindowLimits {
+  maxBytes: number;
+  maxScanPages: number;
+  maxScanEvents: number;
+  maxScanBytes: number;
+  maxScanMs: number;
+}
+
+interface SessionEventWindowBuildInput {
+  store: EventStore & EventPublisher;
+  sessionId: SessionId;
+  limit: number;
+  limits: SessionEventWindowLimits;
+  pendingInputs: readonly PendingUserInputRequest[];
+}
+
+interface SessionEventHistoryScanState {
+  pages: number;
+  events: number;
+  bytes: number;
+  startedAt: number;
+  boundary?: "pages" | "events" | "bytes" | "time" | "candidate_bytes";
+}
+
+interface ScannedDependencyEvent {
+  event: ChiliEvent;
+  discoveryOrder: number;
 }
 
 interface EventStreamOptions {
   store: EventStore & EventPublisher;
   request: Request;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   afterEventId?: string;
   maxBacklogEvents: number;
+  maxDurableEvents: number;
+  maxAgeMs: number;
 }
 
 interface HttpError {
@@ -984,6 +1503,8 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "POST" && path === "/teams") return { name: "createTeam" };
   if (method === "POST" && path === "/teams/reconcile_dispatches") return { name: "teamReconcileDispatches" };
   if (method === "GET" && path === "/sessions") return { name: "listSessions" };
+  if (method === "GET" && path === "/user-inputs") return { name: "listUserInputs" };
+  if (method === "GET" && path === "/approvals") return { name: "listPendingApprovals" };
   if (method === "GET" && path === "/models") return { name: "models" };
   if (method === "GET" && path === "/commands") return { name: "commands" };
   if (method === "POST" && path === "/commands/reload") return { name: "commandsReload" };
@@ -1018,6 +1539,11 @@ function routeRequest(method: string, pathname: string): Route {
       name: "resolveApproval",
       approvalId: decodeURIComponent(approvalRoute[1] ?? "") as import("@chili/protocol").ApprovalId,
     };
+  }
+
+  const userInputRoute = /^\/user-inputs\/([^/]+)\/resolve$/.exec(path);
+  if (method === "POST" && userInputRoute) {
+    return { name: "resolveUserInput", inputId: decodeURIComponent(userInputRoute[1] ?? "") };
   }
 
   const teamRoute = /^\/teams\/([^/]+)(?:\/([^/]+)(?:\/([^/]+)(?:\/([^/]+))?)?)?$/.exec(path);
@@ -1074,20 +1600,34 @@ function routeRequest(method: string, pathname: string): Route {
     return { name: "notFound" };
   }
 
+  const sessionCommandsRoute = /^\/sessions\/([^/]+)\/commands(?:\/(reload))?$/.exec(path);
+  if (sessionCommandsRoute) {
+    const sessionId = requestSessionId(decodeURIComponent(sessionCommandsRoute[1] ?? ""));
+    const action = sessionCommandsRoute[2];
+    if (method === "GET" && !action) return { name: "commands", sessionId };
+    if (method === "POST" && action === "reload") return { name: "commandsReload", sessionId };
+    return { name: "notFound" };
+  }
+
   const sessionRoute = /^\/sessions\/([^/]+)\/([^/]+)$/.exec(path);
   if (!sessionRoute) return { name: "notFound" };
 
-  const sessionId = decodeURIComponent(sessionRoute[1] ?? "") as SessionId;
+  const sessionId = requestSessionId(decodeURIComponent(sessionRoute[1] ?? ""));
   const action = sessionRoute[2];
   if (method === "GET" && action === "agents") return { name: "agents", sessionId };
   if (method === "GET" && action === "messages") return { name: "messages", sessionId };
+  if (method === "GET" && action === "events") return { name: "sessionEvents", sessionId };
+  if ((method === "POST" || method === "PATCH") && action === "rename") return { name: "renameSession", sessionId };
   if (method === "GET" && action === "model") return { name: "modelConfig", sessionId };
   if (method === "POST" && action === "model") return { name: "setModel", sessionId };
   if (method === "POST" && action === "reasoning") return { name: "setReasoning", sessionId };
   if (method === "POST" && (action === "service-tier" || action === "service_tier" || action === "fast")) return { name: "setServiceTier", sessionId };
+  if (method === "GET" && action === "delegation") return { name: "delegationConfig", sessionId };
+  if (method === "POST" && action === "delegation") return { name: "setDelegationPolicy", sessionId };
   if ((method === "GET" || method === "POST" || method === "PATCH" || method === "DELETE") && action === "goal") return { name: "goal", sessionId };
   if (method === "POST" && action === "prompt") return { name: "prompt", sessionId };
   if (method === "POST" && action === "prompt_async") return { name: "promptAsync", sessionId };
+  if (method === "POST" && action === "command") return { name: "command", sessionId };
   if (method === "POST" && action === "command_async") return { name: "commandAsync", sessionId };
   if (method === "POST" && action === "interrupt") return { name: "interrupt", sessionId };
   if (method === "POST" && action === "archive") return { name: "archive", sessionId };
@@ -1097,19 +1637,32 @@ function routeRequest(method: string, pathname: string): Route {
 function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody, parsedImages?: readonly MessageImageContent[]): SubmitPromptInput {
   const input: SubmitPromptInput = {
     sessionId,
-    threadId: body.threadId as ThreadId,
-    text: body.text ?? "",
+    text: body.text === undefined
+      ? ""
+      : parseRuntimeString(body.text, "body.text", { allowEmpty: true }),
   };
-  if (body.displayText) input.displayText = body.displayText;
+  if (body.displayText !== undefined) {
+    input.displayText = parseRuntimeString(body.displayText, "body.displayText", { allowEmpty: true });
+  }
   const images = parsedImages ?? parsePromptImages(body.images);
   if (images.length > 0) input.images = images;
-  if (body.cwd) input.cwd = body.cwd;
+  if (typeof body.cwd === "string" && body.cwd.trim().length > 0) input.cwd = body.cwd;
   const skillMentions = parseSkillMentions(body.skillMentions);
   if (skillMentions.length > 0) input.skillMentions = skillMentions;
-  if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
-  if (isModelSelection(body.modelSelection)) input.modelSelection = body.modelSelection;
-  if (isReasoningLevel(body.reasoningLevel)) input.reasoningLevel = body.reasoningLevel;
-  if (isServiceTier(body.serviceTier)) input.serviceTier = body.serviceTier;
+  if (body.maxTurns !== undefined) input.maxTurns = positiveInteger(body.maxTurns, "maxTurns");
+  if (body.modelSelection !== undefined) {
+    input.modelSelection = parseRuntimeModelSelection(body.modelSelection, "body.modelSelection");
+  }
+  if (body.reasoningLevel !== undefined) {
+    if (!isReasoningLevel(body.reasoningLevel)) {
+      throw badRequest("reasoningLevel must be off, minimal, low, medium, high, xhigh, max, or ultra");
+    }
+    input.reasoningLevel = body.reasoningLevel;
+  }
+  if (body.serviceTier !== undefined) {
+    if (!isServiceTier(body.serviceTier)) throw badRequest("serviceTier must be standard or fast");
+    input.serviceTier = body.serviceTier;
+  }
   return input;
 }
 
@@ -1133,48 +1686,41 @@ function metadataStringArray(value: unknown): string[] | undefined {
 
 function goalSetInput(sessionId: SessionId, body: GoalBody): {
   sessionId: SessionId;
-  threadId: ThreadId;
   objective: string;
   tokenBudget?: number;
   replace?: boolean;
 } {
-  const threadId = requiredThreadId(body.threadId);
   if (typeof body.objective !== "string" || body.objective.trim().length === 0) {
     throw badRequest("objective is required");
   }
   const input: {
     sessionId: SessionId;
-    threadId: ThreadId;
     objective: string;
     tokenBudget?: number;
     replace?: boolean;
   } = {
     sessionId,
-    threadId,
     objective: body.objective.trim(),
   };
   const tokenBudget = optionalPositiveInteger(body.tokenBudget, "tokenBudget");
   if (tokenBudget !== undefined) input.tokenBudget = tokenBudget;
-  if (body.replace !== undefined) input.replace = Boolean(body.replace);
+  if (body.replace !== undefined) input.replace = parseRuntimeBoolean(body.replace, "body.replace");
   return input;
 }
 
 function goalUpdateInput(sessionId: SessionId, body: GoalBody): {
   sessionId: SessionId;
-  threadId: ThreadId;
-  status?: ThreadGoalStatus;
+  status?: SessionGoalStatus;
   objective?: string;
   tokenBudget?: number;
 } {
   const input: {
     sessionId: SessionId;
-    threadId: ThreadId;
-    status?: ThreadGoalStatus;
+    status?: SessionGoalStatus;
     objective?: string;
     tokenBudget?: number;
   } = {
     sessionId,
-    threadId: requiredThreadId(body.threadId),
   };
   const status = optionalGoalStatus(body.status);
   if (status) input.status = status;
@@ -1192,12 +1738,7 @@ function goalUpdateInput(sessionId: SessionId, body: GoalBody): {
   return input;
 }
 
-function requiredThreadId(value: unknown): ThreadId {
-  if (typeof value !== "string" || value.trim().length === 0) throw badRequest("threadId is required");
-  return value.trim() as ThreadId;
-}
-
-function optionalGoalStatus(value: unknown): ThreadGoalStatus | undefined {
+function optionalGoalStatus(value: unknown): SessionGoalStatus | undefined {
   if (value === undefined) return undefined;
   if (value === "active" || value === "paused" || value === "budgetLimited" || value === "complete") return value;
   throw badRequest("status must be active, paused, budgetLimited, or complete");
@@ -1205,32 +1746,35 @@ function optionalGoalStatus(value: unknown): ThreadGoalStatus | undefined {
 
 function optionalPositiveInteger(value: unknown, field: string): number | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-    throw badRequest(`${field} must be a positive integer`);
+  return positiveInteger(value, field);
+}
+
+function positiveInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw badRequest(`${field} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw badRequest(`${field} must be a non-negative safe integer`);
   }
   return value;
 }
 
 function stringField(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) throw badRequest(`${field} must be a non-empty string`);
-  return value.trim();
+  const text = parseRuntimeString(value, `body.${field}`);
+  if (text.trim().length === 0) throw badRequest(`${field} must be a non-empty string`);
+  return text.trim();
 }
 
 function stringArrayField(value: unknown, field: string): string[] {
-  if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) {
-    throw badRequest(`${field} must be an array of strings`);
-  }
-  return value;
+  return parseRuntimeStringArray(value, `body.${field}`);
 }
 
 function stringRecordField(value: unknown, field: string): Record<string, string> {
-  if (!isRecord(value) || Array.isArray(value)) throw badRequest(`${field} must be an object of strings`);
-  const result: Record<string, string> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item !== "string") throw badRequest(`${field}.${key} must be a string`);
-    result[key] = item;
-  }
-  return result;
+  return parseRuntimeStringRecord(value, `body.${field}`);
 }
 
 function parseSkillMentions(value: unknown): RuntimeSkillMention[] {
@@ -1312,8 +1856,30 @@ function parseResolveApprovalBody(approvalId: import("@chili/protocol").Approval
   return input;
 }
 
+function parseResolveUserInputBody(body: unknown): UserInputAnswers {
+  if (!isRecord(body) || Array.isArray(body)) throw badRequest("JSON object body is required");
+  const typed = body as ResolveUserInputBody & Record<string, unknown>;
+  const unknownKeys = Object.keys(typed).filter((key) => key !== "answers");
+  if (unknownKeys.length > 0) throw badRequest(`Unexpected field: ${unknownKeys[0]}`);
+  if (typed.answers === undefined) throw badRequest("answers is required");
+  try {
+    return parseUserInputAnswers(typed.answers);
+  } catch (error) {
+    throw badRequest(error instanceof Error ? error.message : String(error));
+  }
+}
+
 function isApprovalDecisionAction(value: unknown): value is ApprovalDecisionAction {
   return value === "allow_once" || value === "allow_session" || value === "allow_always" || value === "deny";
+}
+
+function approvalDecisionWithinScope(
+  decision: ApprovalDecisionAction,
+  maxApprovalScope: import("@chili/protocol").ApprovalScope | undefined,
+): boolean {
+  if (decision === "deny" || decision === "allow_once") return true;
+  if (decision === "allow_session") return maxApprovalScope !== "once";
+  return maxApprovalScope === undefined || maxApprovalScope === "persistent";
 }
 
 function rejectLegacySystemField(body: unknown): void {
@@ -1322,15 +1888,512 @@ function rejectLegacySystemField(body: unknown): void {
   }
 }
 
+function rejectUnknownQueryParameters(url: URL, allowed: readonly string[]): void {
+  const supported = new Set(allowed);
+  for (const key of url.searchParams.keys()) {
+    if (!supported.has(key)) throw badRequest(`Query parameter ${JSON.stringify(key)} is not supported`);
+  }
+}
+
+async function readAllProjectionEvents(
+  store: EventStore,
+  sessionId: SessionId | undefined,
+  requestedPageSize: number,
+): Promise<EventEnvelope[]> {
+  const events: EventEnvelope[] = [];
+  const pageSize = Math.max(1, Math.trunc(requestedPageSize));
+  let afterEventId: string | undefined;
+
+  while (true) {
+    const batch = await store.events({
+      ...(sessionId ? { sessionId } : {}),
+      ...(afterEventId ? { afterEventId } : {}),
+      limit: pageSize,
+    });
+    events.push(...batch);
+    if (batch.length < pageSize) return events;
+    afterEventId = batch.at(-1)?.id;
+    if (!afterEventId) return events;
+  }
+}
+
+// Persisted events are capped at 512k; seven rows keep a scan page below the
+// default 4MB response window before any dependency candidates are retained.
+const SESSION_EVENT_WINDOW_PAGE_SIZE = 7;
+const SESSION_EVENT_WINDOW_METADATA_RESERVE = 16_384;
+const SESSION_EVENT_WINDOW_PIN_LIMIT = 256;
+const SESSION_EVENT_WINDOW_ROW_LIMIT = 2_000;
+const PENDING_APPROVAL_WINDOW_BYTES = 1_000_000;
+const PENDING_APPROVAL_ROW_BYTES = 64_000;
+
+class AsyncAdmissionGate {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly concurrency: number) {}
+
+  async run<T>(operation: () => Promise<T>): Promise<T> {
+    let inheritedSlot = false;
+    if (this.active >= this.concurrency) {
+      if (this.waiters.length >= this.concurrency * 8) {
+        const error = new Error("Session event window capacity is exhausted");
+        error.name = "RuntimeEventWindowCapacityError";
+        throw error;
+      }
+      await new Promise<void>((resolvePromise) => this.waiters.push(resolvePromise));
+      inheritedSlot = true;
+    }
+    if (!inheritedSlot) this.active += 1;
+    try {
+      return await operation();
+    } finally {
+      const next = this.waiters.shift();
+      if (next) next();
+      else this.active -= 1;
+    }
+  }
+}
+
+async function boundedPendingApprovalWindow(
+  store: EventStore,
+  sessionId?: SessionId,
+  maxBytes = PENDING_APPROVAL_WINDOW_BYTES,
+): Promise<RuntimePendingApprovalWindow> {
+  const rows = await store.pendingApprovals(sessionId, SESSION_EVENT_WINDOW_ROW_LIMIT + 1);
+  const approvals: RuntimePendingApprovalRequest[] = [];
+  let bytes = 2;
+  let truncated = rows.length > SESSION_EVENT_WINDOW_ROW_LIMIT;
+  for (const row of rows.slice(0, SESSION_EVENT_WINDOW_ROW_LIMIT)) {
+    const safe = safePendingApproval(row, sessionId);
+    if (!safe) {
+      truncated = true;
+      continue;
+    }
+    const approval = safe.approval;
+    truncated ||= safe.sanitized;
+    const rowBytes = utf8Bytes(JSON.stringify(approval));
+    const extra = rowBytes + (approvals.length > 0 ? 1 : 0);
+    if (rowBytes > PENDING_APPROVAL_ROW_BYTES || bytes + extra > maxBytes) {
+      truncated = true;
+      break;
+    }
+    approvals.push(approval);
+    bytes += extra;
+  }
+  return {
+    approvals,
+    truncated,
+    bytes,
+    ...(truncated ? { warning: "Pending approvals exceeded their validated count or UTF-8 byte budget." } : {}),
+  };
+}
+
+function safePendingApproval(
+  value: unknown,
+  requestedSessionId?: SessionId,
+): { approval: RuntimePendingApprovalRequest; sanitized: boolean } | undefined {
+  if (!isRecord(value)) return undefined;
+  const id = boundedIdentifierText(value.id, 256);
+  const permission = boundedPlainText(value.permission, 512);
+  const sessionId = value.sessionId === undefined ? undefined : boundedIdentifierText(value.sessionId, 256);
+  const callId = value.callId === undefined ? undefined : boundedIdentifierText(value.callId, 256);
+  if (!id || !permission || (requestedSessionId && sessionId !== requestedSessionId)) return undefined;
+  let sanitized = (value.sessionId !== undefined && !sessionId) || (value.callId !== undefined && !callId);
+  if (!Array.isArray(value.patterns) || value.patterns.length > 64) return undefined;
+  const patterns = value.patterns.map((pattern) => boundedPlainText(pattern, 2_000));
+  if (patterns.some((pattern) => pattern === undefined)) return undefined;
+  if (typeof value.createdAt !== "number" || !Number.isFinite(value.createdAt)) return undefined;
+  const approval: RuntimePendingApprovalRequest = {
+    id,
+    permission,
+    patterns: patterns as string[],
+    createdAt: value.createdAt,
+  };
+  if (sessionId) approval.sessionId = sessionId as SessionId;
+  if (callId) approval.callId = callId;
+  if (value.maxApprovalScope === "once" || value.maxApprovalScope === "session" || value.maxApprovalScope === "persistent") {
+    approval.maxApprovalScope = value.maxApprovalScope;
+  } else if (value.maxApprovalScope !== undefined) {
+    sanitized = true;
+  }
+  if (isRecord(value.metadata)) {
+    try {
+      if (utf8Bytes(JSON.stringify(value.metadata)) <= 16_000) approval.metadata = value.metadata;
+      else sanitized = true;
+    } catch {
+      sanitized = true;
+    }
+  } else if (value.metadata !== undefined) {
+    sanitized = true;
+  }
+  return { approval, sanitized };
+}
+
+function boundedPlainText(value: unknown, maxChars: number): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= maxChars ? value : undefined;
+}
+
+function boundedIdentifierText(value: unknown, maxChars: number): string | undefined {
+  const text = boundedPlainText(value, maxChars);
+  if (!text || /[\u0000-\u001f\u007f]/u.test(text)) return undefined;
+  if (text === "__proto__" || text === "prototype" || text === "constructor") return undefined;
+  return text;
+}
+
+async function replayableSessionEventWindow(
+  input: SessionEventWindowBuildInput,
+): Promise<RuntimeSessionEventWindow> {
+  const warnings = new Set<string>();
+  const tail = await boundedSessionEventTail(input);
+  if (tail.truncated) warnings.add("durable event tail exceeded its count or byte budget");
+
+  const pendingApprovalWindow = await boundedPendingApprovalWindow(
+    input.store,
+    input.sessionId,
+    Math.max(2, Math.min(PENDING_APPROVAL_WINDOW_BYTES, Math.floor(input.limits.maxBytes / 2))),
+  );
+  if (pendingApprovalWindow.truncated) warnings.add("pending approvals exceeded their validated snapshot budget");
+  if (input.pendingInputs.length > SESSION_EVENT_WINDOW_ROW_LIMIT) {
+    warnings.add(`pending inputs exceeded the ${SESSION_EVENT_WINDOW_ROW_LIMIT}-row event-window seed limit`);
+  }
+
+  const authoritativePins = new Set<string>();
+  const authoritativeDependencyKeys = new Set<string>();
+  for (const approval of pendingApprovalWindow.approvals) {
+    authoritativeDependencyKeys.add(runtimeEventDependencyKey({ kind: "approval", key: approval.id }));
+    if (approval.callId) {
+      authoritativeDependencyKeys.add(runtimeEventDependencyKey({ kind: "tool", key: approval.callId }));
+    }
+  }
+  for (const pending of input.pendingInputs.slice(0, SESSION_EVENT_WINDOW_ROW_LIMIT)) {
+    if (
+      pending.sessionId !== input.sessionId
+      || typeof pending.id !== "string"
+      || pending.id.length === 0
+      || typeof pending.callId !== "string"
+      || pending.callId.length === 0
+    ) {
+      warnings.add("invalid pending input rows were omitted from the event-window seed");
+      continue;
+    }
+    authoritativeDependencyKeys.add(runtimeEventDependencyKey({ kind: "user_input", key: pending.id }));
+    authoritativeDependencyKeys.add(runtimeEventDependencyKey({ kind: "tool", key: pending.callId }));
+  }
+
+  const candidates = new Map<string, ScannedDependencyEvent>();
+  let discoveryOrder = 0;
+  let recoveredOrder = -1_000_000_000;
+  let candidateBytes = 2;
+  const addCandidate = (event: ChiliEvent, explicitOrder?: number): boolean => {
+    if (candidates.has(event.id)) return true;
+    const bytes = runtimeEventJsonUtf8Bytes(event) + (candidates.size > 0 ? 1 : 0);
+    if (candidateBytes + bytes > input.limits.maxBytes * 2) return false;
+    candidates.set(event.id, { event, discoveryOrder: explicitOrder ?? discoveryOrder });
+    if (explicitOrder === undefined) discoveryOrder += 1;
+    candidateBytes += bytes;
+    return true;
+  };
+
+  const created = await input.store.events({
+    sessionId: input.sessionId,
+    type: "session.created",
+    limit: 1,
+  }) as ChiliEvent[];
+  for (const event of created) {
+    if (!addCandidate(event, -2_000_000_000)) warnings.add("session event dependency candidates exceeded their byte budget");
+  }
+  for (const event of tail.events) {
+    if (!addCandidate(event)) {
+      warnings.add("session event dependency candidates exceeded their byte budget");
+      break;
+    }
+  }
+
+  const scanState: SessionEventHistoryScanState = {
+    pages: 0,
+    events: 0,
+    bytes: 0,
+    startedAt: Date.now(),
+  };
+  while (true) {
+    const providers = providerKeys(candidates.values());
+    const unresolved = new Set(authoritativeDependencyKeys);
+    for (const candidate of candidates.values()) {
+      for (const required of runtimeEventRequires(candidate.event)) {
+        unresolved.add(runtimeEventDependencyKey(required));
+      }
+    }
+    for (const key of providers) unresolved.delete(key);
+    if (unresolved.size === 0) break;
+
+    const found = await scanSessionDependencyProviders(input, unresolved, scanState);
+    if (found.length === 0) break;
+    let added = false;
+    for (const row of found) {
+      if (!addCandidate(row.event, recoveredOrder)) {
+        scanState.boundary = "candidate_bytes";
+        break;
+      }
+      recoveredOrder += 1;
+      added = true;
+      for (const provided of runtimeEventProvides(row.event)) {
+        if (authoritativeDependencyKeys.has(runtimeEventDependencyKey(provided))) {
+          authoritativePins.add(row.event.id);
+        }
+      }
+    }
+    if (!added || scanState.boundary) break;
+  }
+
+  const providers = providerKeys(candidates.values());
+  const unresolved = new Set(authoritativeDependencyKeys);
+  for (const candidate of candidates.values()) {
+    for (const required of runtimeEventRequires(candidate.event)) {
+      unresolved.add(runtimeEventDependencyKey(required));
+    }
+  }
+  for (const key of providers) unresolved.delete(key);
+  if (unresolved.size > 0) warnings.add(`${unresolved.size} event dependency anchors could not be recovered`);
+  if (scanState.boundary) warnings.add(`event dependency scan reached its ${scanState.boundary.replace("_", " ")} limit`);
+
+  const ordered = dependencyOrderedCandidates(candidates);
+  const eventBudget = Math.max(
+    2,
+    input.limits.maxBytes - pendingApprovalWindow.bytes - SESSION_EVENT_WINDOW_METADATA_RESERVE,
+  );
+  const accumulator = new ReplayableRuntimeEventWindowAccumulator({
+    maxEvents: input.limit,
+    maxBytes: eventBudget,
+    maxSources: 1,
+  });
+  let retained = accumulator.addSource(ordered, {
+    sourceOrder: 0,
+    pinnedEventIds: authoritativePins,
+  });
+  if (retained.missingDependencies.length > 0) {
+    warnings.add(`${retained.missingDependencies.length} event groups were dropped without their anchors`);
+  }
+  if (retained.truncated) warnings.add("session event window exceeded its replay budget");
+
+  let pins = retained.pinnedEventIds.slice(0, SESSION_EVENT_WINDOW_PIN_LIMIT);
+  if (pins.length < retained.pinnedEventIds.length) warnings.add("active event pins exceeded their metadata limit");
+  let warning = boundedSessionWindowWarning(warnings);
+  let window: RuntimeSessionEventWindow = {
+    events: retained.events,
+    pendingApprovals: pendingApprovalWindow.approvals,
+    truncated: tail.truncated || retained.truncated || warnings.size > 0,
+    bytes: retained.bytes,
+    pinnedEventIds: pins,
+    ...(warning ? { warning } : {}),
+  };
+
+  for (let attempt = 0; attempt < 3 && utf8Bytes(JSON.stringify(window)) > input.limits.maxBytes; attempt += 1) {
+    const overflow = utf8Bytes(JSON.stringify(window)) - input.limits.maxBytes;
+    const nextBudget = Math.max(2, eventBudget - overflow - 256 * (attempt + 1));
+    retained = new ReplayableRuntimeEventWindowAccumulator({
+      maxEvents: input.limit,
+      maxBytes: nextBudget,
+      maxSources: 1,
+    }).addSource(ordered, { sourceOrder: 0, pinnedEventIds: authoritativePins });
+    warnings.add("session event response envelope exceeded its byte budget");
+    pins = retained.pinnedEventIds.slice(0, SESSION_EVENT_WINDOW_PIN_LIMIT);
+    warning = boundedSessionWindowWarning(warnings);
+    window = {
+      events: retained.events,
+      pendingApprovals: pendingApprovalWindow.approvals,
+      truncated: true,
+      bytes: retained.bytes,
+      pinnedEventIds: pins,
+      ...(warning ? { warning } : {}),
+    };
+  }
+  if (utf8Bytes(JSON.stringify(window)) > input.limits.maxBytes) {
+    return {
+      events: [],
+      pendingApprovals: pendingApprovalWindow.approvals,
+      truncated: true,
+      bytes: 2,
+      pinnedEventIds: [],
+      warning: "Session event response metadata exceeded its byte budget; reload after reducing active controls.",
+    };
+  }
+  return window;
+}
+
+async function boundedSessionEventTail(
+  input: SessionEventWindowBuildInput,
+): Promise<{ events: ChiliEvent[]; truncated: boolean }> {
+  const chunks: ChiliEvent[][] = [];
+  let count = 0;
+  let bytes = 2;
+  let beforeEventId: string | undefined;
+  let truncated = false;
+
+  while (count < input.limit + 1) {
+    const requested = Math.min(SESSION_EVENT_WINDOW_PAGE_SIZE, input.limit + 1 - count);
+    const batch = await input.store.events({
+      sessionId: input.sessionId,
+      limit: requested,
+      tail: true,
+      ...(beforeEventId ? { beforeEventId } : {}),
+    }) as ChiliEvent[];
+    if (batch.length === 0) break;
+    if (beforeEventId && batch.at(-1)?.id === beforeEventId) {
+      truncated = true;
+      break;
+    }
+    const accepted: ChiliEvent[] = [];
+    for (let index = batch.length - 1; index >= 0; index -= 1) {
+      const event = batch[index];
+      if (!event) continue;
+      const eventBytes = runtimeEventJsonUtf8Bytes(event) + (count > 0 ? 1 : 0);
+      if (bytes + eventBytes > input.limits.maxBytes || count >= input.limit + 1) {
+        truncated = true;
+        break;
+      }
+      accepted.unshift(event);
+      bytes += eventBytes;
+      count += 1;
+    }
+    if (accepted.length > 0) chunks.unshift(accepted);
+    if (accepted.length < batch.length || batch.length < requested) break;
+    const nextCursor = batch[0]?.id;
+    if (!nextCursor || nextCursor === beforeEventId) break;
+    beforeEventId = nextCursor;
+  }
+  const events = chunks.flat();
+  if (events.length > input.limit) {
+    events.splice(0, events.length - input.limit);
+    truncated = true;
+  }
+  return { events, truncated };
+}
+
+async function scanSessionDependencyProviders(
+  input: SessionEventWindowBuildInput,
+  targets: ReadonlySet<string>,
+  state: SessionEventHistoryScanState,
+): Promise<ScannedDependencyEvent[]> {
+  const found = new Map<string, ScannedDependencyEvent>();
+  let afterEventId: string | undefined;
+  let discoveryOrder = 0;
+
+  while (found.size < targets.size) {
+    if (state.pages >= input.limits.maxScanPages) {
+      state.boundary = "pages";
+      break;
+    }
+    if (state.events >= input.limits.maxScanEvents) {
+      state.boundary = "events";
+      break;
+    }
+    if (Date.now() - state.startedAt >= input.limits.maxScanMs) {
+      state.boundary = "time";
+      break;
+    }
+    const requested = Math.min(
+      SESSION_EVENT_WINDOW_PAGE_SIZE,
+      input.limits.maxScanEvents - state.events,
+    );
+    const batch = await input.store.events({
+      sessionId: input.sessionId,
+      ...(afterEventId ? { afterEventId } : {}),
+      limit: requested,
+    }) as ChiliEvent[];
+    state.pages += 1;
+    if (batch.length === 0) break;
+    for (const event of batch) {
+      const eventBytes = runtimeEventJsonUtf8Bytes(event);
+      if (state.bytes + eventBytes > input.limits.maxScanBytes) {
+        state.boundary = "bytes";
+        break;
+      }
+      state.events += 1;
+      state.bytes += eventBytes;
+      for (const provided of runtimeEventProvides(event)) {
+        const key = runtimeEventDependencyKey(provided);
+        if (targets.has(key) && !found.has(key)) {
+          found.set(key, { event, discoveryOrder });
+        }
+      }
+      discoveryOrder += 1;
+    }
+    if (state.boundary || batch.length < requested) break;
+    const nextCursor = batch.at(-1)?.id;
+    if (!nextCursor || nextCursor === afterEventId) break;
+    afterEventId = nextCursor;
+  }
+  return [...new Map([...found.values()].map((row) => [row.event.id, row])).values()];
+}
+
+function providerKeys(candidates: Iterable<ScannedDependencyEvent>): Set<string> {
+  const providers = new Set<string>();
+  for (const candidate of candidates) {
+    for (const provided of runtimeEventProvides(candidate.event)) {
+      providers.add(runtimeEventDependencyKey(provided));
+    }
+  }
+  return providers;
+}
+
+function dependencyOrderedCandidates(candidates: ReadonlyMap<string, ScannedDependencyEvent>): ChiliEvent[] {
+  const providerByKey = new Map<string, ChiliEvent>();
+  for (const candidate of candidates.values()) {
+    for (const provided of runtimeEventProvides(candidate.event)) {
+      if (!providerByKey.has(runtimeEventDependencyKey(provided))) {
+        providerByKey.set(runtimeEventDependencyKey(provided), candidate.event);
+      }
+    }
+  }
+  const base = [...candidates.values()].sort((left, right) => left.discoveryOrder - right.discoveryOrder);
+  const emitted = new Set<string>();
+  const visiting = new Set<string>();
+  const ordered: ChiliEvent[] = [];
+  const emit = (event: ChiliEvent): void => {
+    if (emitted.has(event.id) || visiting.has(event.id)) return;
+    visiting.add(event.id);
+    for (const required of runtimeEventRequires(event)) {
+      const provider = providerByKey.get(runtimeEventDependencyKey(required));
+      if (provider) emit(provider);
+    }
+    visiting.delete(event.id);
+    emitted.add(event.id);
+    ordered.push(event);
+  };
+  for (const candidate of base) emit(candidate.event);
+  return ordered;
+}
+
+function boundedSessionWindowWarning(warnings: ReadonlySet<string>): string | undefined {
+  if (warnings.size === 0) return undefined;
+  const text = `Session event window truncated: ${[...warnings].join("; ")}.`;
+  return text.length <= 2_000 ? text : `${text.slice(0, 1_997)}...`;
+}
+
 async function eventStream(options: EventStreamOptions): Promise<Response> {
   const encoder = new TextEncoder();
-  const sentIds = new Set<string>();
   const pending: ChiliEvent[] = [];
+  const maxBacklogEvents = Math.max(1, Math.trunc(options.maxBacklogEvents));
+  const maxDurableEvents = Math.max(1, Math.trunc(options.maxDurableEvents));
+  const maxAgeMs = Math.max(1, Math.trunc(options.maxAgeMs));
+  // This set is bounded by rotating the connection after maxDurableEvents. A
+  // resumed connection never trusts live durable notification order: it pumps
+  // committed events after its durable cursor, so an arbitrarily late emit from
+  // an older connection cannot move the stream backwards or duplicate an event.
+  const seenDurableEventIds = new Set<string>();
   let backlogDone = false;
   let closed = false;
+  let durableEventsSent = 0;
+  let durableCursor = options.afterEventId;
+  let durablePumpRunning = false;
+  let durablePumpRequested = false;
+  let rotationDue = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let rotationTimer: ReturnType<typeof setTimeout> | undefined;
   let unsubscribe: (() => void) | undefined;
   let closeController: (() => void) | undefined;
+  let sendEvent: ((event: ChiliEvent) => void) | undefined;
+  let requestDurablePump: (() => void) | undefined;
 
   const cleanup = (): void => {
     if (closed) return;
@@ -1339,24 +2402,144 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
     unsubscribe = undefined;
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = undefined;
+    if (rotationTimer) clearTimeout(rotationTimer);
+    rotationTimer = undefined;
     closeController?.();
   };
 
+  type BacklogQuery = {
+    sessionId?: SessionId;
+    afterEventId?: string;
+    limit: number;
+    tail: boolean;
+  };
+  const query = (input: { afterEventId?: string; limit: number; tail: boolean }): BacklogQuery => ({
+    ...input,
+    ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+  });
+
+  unsubscribe = options.store.subscribe((event) => {
+    if (!matchesEvent(event, options)) return;
+    if (backlogDone) {
+      if (isTransientEvent(event)) sendEvent?.(event);
+      else requestDurablePump?.();
+    } else {
+      pending.push(event);
+    }
+  });
+  options.request.signal.addEventListener("abort", cleanup, { once: true });
+
+  let backlog: ChiliEvent[];
+  try {
+    if (options.afterEventId) {
+      const resumed = await options.store.events(query({
+        afterEventId: options.afterEventId,
+        limit: maxBacklogEvents + 1,
+        tail: false,
+      }));
+      if (resumed.length > maxBacklogEvents) {
+        throw {
+          status: 409,
+          message: `Event backlog exceeds the ${maxBacklogEvents}-event replay limit. Reconnect without afterEventId to resync from the latest events.`,
+        } satisfies HttpError;
+      }
+      backlog = resumed as ChiliEvent[];
+    } else {
+      backlog = await options.store.events(query({
+        limit: maxBacklogEvents,
+        tail: true,
+      })) as ChiliEvent[];
+    }
+  } catch (error) {
+    cleanup();
+    if (error instanceof UnknownEventCursorError) {
+      throw {
+        status: 409,
+        message: `Unknown event cursor ${JSON.stringify(error.eventId)}. Reconnect without afterEventId to resync from the latest events.`,
+      } satisfies HttpError;
+    }
+    throw error;
+  }
+
   const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
+    start(controller) {
       const send = (event: ChiliEvent): void => {
-        if (closed || sentIds.has(event.id) || !matchesEvent(event, options)) return;
-        sentIds.add(event.id);
-        controller.enqueue(encoder.encode(formatSse(event)));
+        if (closed || !matchesEvent(event, options)) return;
+        const durable = !isTransientEvent(event);
+        if (durable && seenDurableEventIds.has(event.id)) return;
+        try {
+          controller.enqueue(formatSse(event));
+          if (durable) {
+            seenDurableEventIds.add(event.id);
+            durableCursor = event.id;
+            durableEventsSent += 1;
+            if (durableEventsSent >= maxDurableEvents || rotationDue) cleanup();
+          }
+        } catch (error) {
+          // Legacy/corrupt stores may predate today's producer limits. Advance
+          // only through the exact persisted poison row, tell the SDK to force
+          // an authoritative snapshot, then rotate. No synthetic ChiliEvent is
+          // allowed into the projection and reconnect cannot loop forever.
+          if (durable && isRuntimeEventTransportLimitError(error)) {
+            try {
+              controller.enqueue(formatSseResync(event));
+              seenDurableEventIds.add(event.id);
+              durableCursor = event.id;
+              durableEventsSent += 1;
+            } catch {
+              // An invalid legacy cursor that cannot fit the bounded control
+              // frame still closes safely without allocating another payload.
+            }
+          }
+          cleanup();
+        }
+      };
+      sendEvent = send;
+
+      const pumpDurableEvents = async (): Promise<void> => {
+        while (!closed) {
+          const remaining = maxDurableEvents - durableEventsSent;
+          if (remaining <= 0) return;
+          const limit = Math.min(maxBacklogEvents, remaining);
+          const cursorBeforeQuery = durableCursor;
+          const batch = await options.store.events(query({
+            ...(cursorBeforeQuery ? { afterEventId: cursorBeforeQuery } : {}),
+            limit,
+            tail: false,
+          })) as ChiliEvent[];
+          if (closed || batch.length === 0) return;
+
+          let advanced = false;
+          for (const event of batch) {
+            if (isTransientEvent(event)) continue;
+            send(event);
+            advanced = true;
+            if (closed) return;
+          }
+          if (!advanced || batch.length < limit) return;
+        }
       };
 
-      unsubscribe = options.store.subscribe((event) => {
-        if (backlogDone) {
-          send(event);
-        } else {
-          pending.push(event);
-        }
-      });
+      requestDurablePump = (): void => {
+        durablePumpRequested = true;
+        if (durablePumpRunning || closed) return;
+        durablePumpRunning = true;
+        void (async () => {
+          try {
+            while (durablePumpRequested && !closed) {
+              durablePumpRequested = false;
+              await pumpDurableEvents();
+            }
+          } catch {
+            // Closing normally lets the client reconnect with the last durable
+            // cursor. A rejected cursor then receives the regular 409 resync.
+            cleanup();
+          } finally {
+            durablePumpRunning = false;
+            if (durablePumpRequested && !closed) requestDurablePump?.();
+          }
+        })();
+      };
 
       closeController = (): void => {
         try {
@@ -1366,26 +2549,39 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
         }
       };
 
-      options.request.signal.addEventListener("abort", cleanup, { once: true });
+      if (closed) {
+        closeController();
+        return;
+      }
       heartbeat = setInterval(() => {
-        if (!closed) controller.enqueue(encoder.encode(": heartbeat\n\n"));
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(": heartbeat\n\n"));
+        } catch {
+          cleanup();
+        }
       }, 5_000);
+      rotationTimer = setTimeout(() => {
+        rotationDue = true;
+        // Once a durable cursor exists, closing is a safe replay boundary. If
+        // the stream has only transient data, wait for its next durable event.
+        if (durableCursor) cleanup();
+      }, maxAgeMs);
+      rotationTimer.unref?.();
 
-      const query = {
-        limit: options.maxBacklogEvents,
-      } as {
-        sessionId?: SessionId;
-        threadId?: ThreadId;
-        afterEventId?: string;
-        limit: number;
-      };
-      if (options.sessionId) query.sessionId = options.sessionId;
-      if (options.threadId) query.threadId = options.threadId;
-      if (options.afterEventId) query.afterEventId = options.afterEventId;
-      const backlog = await options.store.events(query);
-      for (const event of backlog) send(event as ChiliEvent);
+      for (const event of backlog) {
+        send(event);
+        if (closed) return;
+      }
+      let pendingDurable = false;
+      for (const event of pending) {
+        if (isTransientEvent(event)) send(event);
+        else pendingDurable = true;
+        if (closed) return;
+      }
+      pending.length = 0;
       backlogDone = true;
-      for (const event of pending.splice(0)) send(event);
+      if (pendingDurable) requestDurablePump();
     },
     cancel() {
       cleanup();
@@ -1404,19 +2600,56 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
 
 function matchesEvent(event: ChiliEvent, options: EventStreamOptions): boolean {
   if (options.sessionId && event.sessionId !== options.sessionId) return false;
-  if (options.threadId && event.threadId !== options.threadId) return false;
   return true;
 }
 
-function formatSse(event: ChiliEvent): string {
-  return [`id: ${event.id}`, "event: chili.event", `data: ${JSON.stringify(event)}`, "", ""].join("\n");
+const MAX_SSE_FRAME_BYTES = 4_000_000;
+const MAX_SSE_RESYNC_FRAME_BYTES = 4_096;
+
+function formatSse(event: ChiliEvent): Uint8Array {
+  const payload = JSON.stringify(event);
+  const payloadBytes = Buffer.byteLength(payload, "utf8");
+  const prefix = `${!isTransientEvent(event) ? `id: ${event.id}\n` : ""}event: chili.event\ndata: `;
+  const suffix = "\n\n";
+  const prefixBytes = Buffer.byteLength(prefix, "utf8");
+  const frameBytes = prefixBytes + payloadBytes + Buffer.byteLength(suffix, "utf8");
+  if (frameBytes > MAX_SSE_FRAME_BYTES) {
+    const error = new Error(`Runtime event ${event.id} exceeds the ${MAX_SSE_FRAME_BYTES}-byte SSE frame boundary`);
+    error.name = "RuntimeEventTransportLimitError";
+    throw error;
+  }
+  const frame = Buffer.allocUnsafe(frameBytes);
+  let offset = frame.write(prefix, 0, "utf8");
+  offset += frame.write(payload, offset, "utf8");
+  frame.write(suffix, offset, "utf8");
+  return frame;
+}
+
+function formatSseResync(event: ChiliEvent): Uint8Array {
+  const payload = JSON.stringify({
+    reason: "event_transport_limit",
+    afterEventId: event.id,
+    message: `Runtime event ${event.id} exceeded the ${MAX_SSE_FRAME_BYTES}-byte transport boundary. An authoritative resync is required.`,
+  });
+  const frame = `event: chili.resync\ndata: ${payload}\n\n`;
+  const bytes = Buffer.byteLength(frame, "utf8");
+  if (bytes > MAX_SSE_RESYNC_FRAME_BYTES) {
+    const error = new Error("Runtime event resync control frame exceeds its byte boundary");
+    error.name = "RuntimeEventTransportLimitError";
+    throw error;
+  }
+  return Buffer.from(frame, "utf8");
+}
+
+function isRuntimeEventTransportLimitError(error: unknown): boolean {
+  return error instanceof Error && error.name === "RuntimeEventTransportLimitError";
 }
 
 function serializeSubmitPromptResult(result: SubmitPromptResult): RuntimePromptResult {
   const turns = result.turns.map(serializeTurnResult);
   if (result.status === "completed") {
     const completed: Extract<RuntimePromptResult, { status: "completed" }> = { status: "completed", turns };
-    if (result.finishReason) completed.finishReason = result.finishReason;
+    if (result.finishReason) completed.finishReason = normalizeDiagnosticText(result.finishReason);
     return completed;
   }
 
@@ -1425,7 +2658,7 @@ function serializeSubmitPromptResult(result: SubmitPromptResult): RuntimePromptR
     turns,
   };
   if (result.error) failed.error = serializeError(result.error);
-  if (result.finishReason) failed.finishReason = result.finishReason;
+  if (result.finishReason) failed.finishReason = normalizeDiagnosticText(result.finishReason);
   return failed;
 }
 
@@ -1443,7 +2676,7 @@ function serializeTurnResult(result: SubmitPromptResult["turns"][number]): Runti
       turnId: result.turnId,
       assistantMessageId: result.assistantMessageId,
     };
-    if (result.finishReason) completed.finishReason = result.finishReason;
+    if (result.finishReason) completed.finishReason = normalizeDiagnosticText(result.finishReason);
     return completed;
   }
 
@@ -1457,37 +2690,230 @@ function serializeTurnResult(result: SubmitPromptResult["turns"][number]): Runti
 }
 
 function serializeError(error: Error): { name: string; message: string } {
+  const normalized = normalizePersistedError(error);
   return {
-    name: error.name || "Error",
-    message: error.message,
+    name: normalized.name,
+    message: normalized.message,
   };
 }
 
-async function requireSession(store: EventStore, sessionId: SessionId): Promise<void> {
+function normalizeDiagnosticText(value: string): string {
+  return normalizePersistedError(new Error(value)).message;
+}
+
+async function requireSession(store: EventStore, sessionId: SessionId): Promise<Awaited<ReturnType<EventStore["sessions"]>>[number]> {
   const sessions = await store.sessions();
-  if (!sessions.some((session) => session.id === sessionId)) {
+  const session = sessions.find((candidate) => candidate.id === sessionId);
+  if (!session) {
     throw notFound(`Session not found: ${sessionId}`);
   }
+  return session;
 }
 
-async function readJson<T>(request: Request): Promise<T> {
-  if (request.headers.get("content-length") === "0") return {} as T;
-  try {
-    return (await request.json()) as T;
-  } catch {
-    return {} as T;
-  }
+async function mcpScopeFromRequest(
+  options: RuntimeHttpHandlerOptions,
+  url: URL,
+): Promise<RuntimeMcpScopeInput> {
+  rejectUnknownQueryParameters(url, ["sessionId"]);
+  const sessionId = asSessionId(url.searchParams.get("sessionId"));
+  if (!sessionId) return {};
+
+  await options.service.assertSessionReadAllowed(sessionId);
+  const session = await requireSession(options.store, sessionId);
+  return { cwd: await authoritativeRequestCwd(session.cwd, undefined) };
 }
 
-function json(value: unknown, status = 200): Response {
-  return new Response(JSON.stringify(value), {
-    status,
-    headers: { "content-type": "application/json; charset=utf-8" },
+async function withMcpMutationScope<T>(
+  options: RuntimeHttpHandlerOptions,
+  url: URL,
+  mutate: (scope: RuntimeMcpScopeInput) => Promise<T>,
+): Promise<T> {
+  rejectUnknownQueryParameters(url, ["sessionId"]);
+  const sessionId = asSessionId(url.searchParams.get("sessionId"));
+  if (!sessionId) return mutate({});
+
+  return options.service.withSessionOperation(sessionId, async (operation) => {
+    await options.service.assertSessionTurnAllowed(sessionId);
+    const session = await requireSession(options.store, sessionId);
+    const scope = { cwd: await authoritativeRequestCwd(session.cwd, undefined) };
+    operation.assertCurrent();
+    return mutate(scope);
   });
 }
 
+async function authoritativeRequestCwd(sessionCwd: string, requestedCwd: unknown): Promise<string> {
+  const workspace = await canonicalWorkspacePath(sessionCwd);
+  if (requestedCwd === undefined) return workspace;
+
+  const requestedWorkspace = await requestWorkspaceCwd(requestedCwd);
+  if (requestedWorkspace !== workspace) {
+    throw {
+      status: 409,
+      message:
+        `Request workspace does not match the session workspace. Expected ${workspace}; received ${requestedWorkspace}. ` +
+        "Start a new session to use another workspace.",
+    } satisfies HttpError;
+  }
+  return workspace;
+}
+
+async function requestWorkspaceCwd(value: unknown): Promise<string> {
+  if (typeof value !== "string") throw badRequest("cwd must be a string when provided");
+  if (value.trim().length === 0) throw badRequest("cwd must not be empty");
+  if (value.includes("\0")) throw badRequest("cwd must be a valid filesystem path");
+  return canonicalWorkspacePath(value);
+}
+
+function requestSessionId(value: unknown, field = "sessionId"): SessionId {
+  return requestIdentifier<SessionId>(value, field);
+}
+
+function requestIdentifier<T extends string = string>(value: unknown, field = "id"): T {
+  if (typeof value !== "string") throw badRequest(`${field} must be a string when provided`);
+  const identifier = value.trim();
+  if (!identifier) throw badRequest(`${field} must not be empty`);
+  if (identifier.length > 512) throw badRequest(`${field} must not exceed 512 characters`);
+  if (/[\u0000-\u001f\u007f]/u.test(identifier)) throw badRequest(`${field} must be valid text`);
+  return identifier as T;
+}
+
+function requestAgentPath(value: unknown, field: string): AgentPath {
+  const path = requestIdentifier<string>(value, field);
+  if (!path.startsWith("/")) throw badRequest(`${field} must be an absolute agent path`);
+  return path as AgentPath;
+}
+
+function requestIdentifierArray<T extends string>(value: unknown, field: string): T[] {
+  return parseRuntimeArray(value, (item, itemPath) => requestIdentifier<T>(item, itemPath), `body.${field}`);
+}
+
+function requestUserInputId(value: unknown): UserInputId {
+  if (typeof value !== "string") throw badRequest("inputId must be a string");
+  const inputId = value.trim();
+  if (!inputId) throw badRequest("inputId must not be empty");
+  if (inputId.length > 512) throw badRequest("inputId must not exceed 512 characters");
+  if (/[\u0000-\u001f\u007f]/u.test(inputId)) throw badRequest("inputId must be valid text");
+  return inputId as UserInputId;
+}
+
+async function canonicalWorkspacePath(value: string): Promise<string> {
+  const absolute = resolve(value);
+  const missingSegments: string[] = [];
+  let candidate = absolute;
+
+  while (true) {
+    try {
+      const canonicalBase = await realpath(candidate);
+      return resolve(canonicalBase, ...missingSegments);
+    } catch (error) {
+      if (!isMissingPathError(error)) throw error;
+      const parent = dirname(candidate);
+      if (parent === candidate) return absolute;
+      missingSegments.unshift(basename(candidate));
+      candidate = parent;
+    }
+  }
+}
+
+function isMissingPathError(error: unknown): boolean {
+  if (!(error instanceof Error) || !("code" in error)) return false;
+  const code = (error as Error & { code?: unknown }).code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+const MAX_RUNTIME_HTTP_JSON_BODY_BYTES = 32_000_000;
+
+async function readJson<T>(request: Request, allowedFields?: readonly string[]): Promise<T> {
+  const contentType = request.headers.get("content-type");
+  if (contentType !== null && !isJsonMediaType(contentType)) {
+    throw { status: 415, message: "content-type must be application/json" } satisfies HttpError;
+  }
+  const declaredLength = request.headers.get("content-length");
+  if (declaredLength === "0") return {} as T;
+  if (declaredLength !== null) {
+    const bytes = Number(declaredLength);
+    if (!Number.isSafeInteger(bytes) || bytes < 0) throw badRequest("content-length must be a non-negative integer");
+    if (bytes > MAX_RUNTIME_HTTP_JSON_BODY_BYTES) {
+      throw { status: 413, message: `JSON body must not exceed ${MAX_RUNTIME_HTTP_JSON_BODY_BYTES} bytes` } satisfies HttpError;
+    }
+  }
+  let text: string;
+  try {
+    text = await request.text();
+  } catch {
+    throw badRequest("JSON body could not be read");
+  }
+  if (utf8Bytes(text) > MAX_RUNTIME_HTTP_JSON_BODY_BYTES) {
+    throw { status: 413, message: `JSON body must not exceed ${MAX_RUNTIME_HTTP_JSON_BODY_BYTES} bytes` } satisfies HttpError;
+  }
+  if (text.trim().length === 0) return {} as T;
+  let value: unknown;
+  try {
+    value = JSON.parse(text) as unknown;
+  } catch {
+    throw badRequest("JSON body must contain valid JSON");
+  }
+  const record = parseRuntimeRecord(value, "body");
+  if (allowedFields) rejectRuntimeUnknownFields(record, allowedFields, "body");
+  return record as T;
+}
+
+function isJsonMediaType(value: string): boolean {
+  const mediaType = value.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  return mediaType === "application/json" || mediaType.endsWith("+json");
+}
+
+function json(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8", ...headers },
+  });
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
 function jsonError(status: number, message: string): Response {
-  return json({ error: { message } }, status);
+  return json({ error: { message: normalizeDiagnosticText(message) } }, status);
+}
+
+function unauthorized(): Response {
+  return new Response(JSON.stringify({ error: { message: "Unauthorized" } }), {
+    status: 401,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "www-authenticate": "Bearer",
+    },
+  });
+}
+
+function positiveIntegerOrDefault(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value) || value < 1) {
+    throw new Error("Event stream limits must be positive finite numbers");
+  }
+  return Math.trunc(value);
+}
+
+function configuredAuthTokenDigest(authToken: unknown): Uint8Array | undefined {
+  if (authToken === undefined) return undefined;
+  if (typeof authToken !== "string" || authToken.length === 0 || /[\s\u0000-\u001f\u007f]/u.test(authToken)) {
+    throw new TypeError("authToken must be a non-empty string when provided");
+  }
+  return tokenDigest(authToken);
+}
+
+function hasValidBearerToken(request: Request, expectedDigest: Uint8Array): boolean {
+  const authorization = request.headers.get("authorization");
+  const match = authorization ? /^Bearer +(\S+)$/i.exec(authorization) : null;
+  const candidateDigest = tokenDigest(match?.[1] ?? "");
+  const tokensMatch = timingSafeEqual(expectedDigest, candidateDigest);
+  return match !== null && tokensMatch;
+}
+
+function tokenDigest(token: string): Uint8Array {
+  return createHash("sha256").update(token, "utf8").digest();
 }
 
 function badRequest(message: string): HttpError {
@@ -1499,8 +2925,26 @@ function notFound(message: string): HttpError {
 }
 
 function toHttpError(error: unknown): HttpError {
-  if (isHttpError(error)) return error;
-  const err = error instanceof Error ? error : new Error(String(error));
+  if (error instanceof RuntimeValidationError) {
+    return { status: 400, message: error.message };
+  }
+  if (isHttpError(error)) {
+    return { status: error.status, message: normalizeDiagnosticText(error.message) };
+  }
+  const rawError = error instanceof Error ? error : new Error(String(error));
+  const normalized = normalizePersistedError(rawError);
+  const err = {
+    name: normalized.name,
+    message: normalized.message,
+  };
+  if (
+    err.name === "RuntimeServiceClosedError"
+    || err.name === "AgentTaskControlServiceClosedError"
+    || err.name === "LocalSubagentManagerClosedError"
+    || err.name === "RuntimeEventWindowCapacityError"
+  ) {
+    return { status: 503, message: err.message };
+  }
   if (err.name === "AgentTaskNotFoundError") {
     return { status: 404, message: err.message };
   }
@@ -1510,23 +2954,69 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "AgentTaskWaitTimeoutError") {
     return { status: 408, message: err.message };
   }
+  if (err.name === "AbortError") {
+    return { status: 499, message: err.message };
+  }
   if (err.name === "AgentMailboxNotFoundError") {
     return { status: 404, message: err.message };
   }
   if (err.name === "AgentMailboxNotDeliverableError") {
     return { status: 409, message: err.message };
   }
+  if (err.name === "AgentMessageRecipientNotFoundError") {
+    return { status: 404, message: err.message };
+  }
+  if (err.name === "AgentMessageRecipientAmbiguousError" || err.name === "AgentMessageConflictError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "AgentMessageRecipientTerminalError" || err.name === "AgentMessageRecipientMetadataError") {
+    return { status: 422, message: err.message };
+  }
   if (err.name === "TeamNotFoundError" || err.name === "TeamMemberNotFoundError" || err.name === "TeamTaskNotFoundError") {
     return { status: 404, message: err.message };
+  }
+  if (err.name === "TeamAlreadyExistsError" || err.name === "TeamTaskAlreadyExistsError") {
+    return { status: 409, message: err.message };
   }
   if (err.name === "TeamTaskClaimError") {
     return { status: 409, message: err.message };
   }
+  if (err.name === "TeamTaskDispatchAuthorityError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "TeamSessionAuthorityError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "TeamMemberSessionOwnershipError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "TeamTaskWorkerMutationError") {
+    return { status: 403, message: err.message };
+  }
   if (err.name === "TeamMessageDeliveryError") {
     return { status: 409, message: err.message };
   }
+  if (err.name === "TeamMemberTargetAmbiguousError" || err.name === "TeamMessageConflictError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "TeamMessageSenderUnauthorizedError") {
+    return { status: 403, message: err.message };
+  }
   if (err.name === "RuntimeBusyError") {
     return { status: 409, message: err.message };
+  }
+  if (err.name === "RuntimeSubagentSessionAccessError") {
+    return { status: 409, message: err.message };
+  }
+  if (
+    err.name === "RuntimeSessionAlreadyExistsError" ||
+    err.name === "RuntimeSessionCreationConflictError" ||
+    err.name === "RuntimeSessionInactiveError"
+  ) {
+    return { status: 409, message: err.message };
+  }
+  if (rawError instanceof RuntimeSessionNotFoundError || err.name === "RuntimeSessionNotFoundError") {
+    return { status: 404, message: err.message };
   }
   if (err.name === "GoalAlreadyExistsError") {
     return { status: 409, message: err.message };
@@ -1534,13 +3024,48 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "GoalNotFoundError") {
     return { status: 404, message: err.message };
   }
-  if (err instanceof PromptCommandNotFoundError) {
+  if (rawError instanceof PromptCommandNotFoundError) {
     return { status: 404, message: err.message };
   }
-  if (err instanceof PromptCommandAmbiguousError) {
-    return { status: 409, message: err.message };
+  if (rawError instanceof PromptCommandUsageError) {
+    return { status: 400, message: err.message };
   }
   return { status: 500, message: err.message };
+}
+
+function diagnosticHostname(hostname: string): string {
+  if (hostname.length > 200) return "<unsafe-hostname>";
+  if (/^[A-Za-z0-9_*.-]+$/u.test(hostname)) return hostname;
+  if (/^\[[0-9A-Fa-f:.]+(?:%[A-Za-z0-9_.-]+)?\]$/u.test(hostname)) return hostname;
+  if (/^[0-9A-Fa-f:.]+(?:%[A-Za-z0-9_.-]+)?$/u.test(hostname) && hostname.includes(":")) {
+    return hostname;
+  }
+  return "<unsafe-hostname>";
+}
+
+function hasExplicitTlsCredentials(tls: Bun.TLSOptions | Bun.TLSOptions[] | undefined): boolean {
+  if (tls === undefined) return false;
+  const configurations = Array.isArray(tls) ? tls : [tls];
+  return configurations.length > 0 && configurations.every((configuration) => (
+    isRecord(configuration) &&
+    hasNonEmptyTlsMaterial(configuration.cert) &&
+    hasNonEmptyTlsMaterial(configuration.key)
+  ));
+}
+
+function hasNonEmptyTlsMaterial(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.length > 0 && value.every((entry) => !Array.isArray(entry) && hasNonEmptyTlsMaterialEntry(entry));
+  }
+  return hasNonEmptyTlsMaterialEntry(value);
+}
+
+function hasNonEmptyTlsMaterialEntry(value: unknown): boolean {
+  if (typeof value === "string") return value.trim().length > 0;
+  if (ArrayBuffer.isView(value)) return value.byteLength > 0;
+  if (value instanceof ArrayBuffer) return value.byteLength > 0;
+  if (value instanceof Blob) return value.size > 0;
+  return false;
 }
 
 function isHttpError(error: unknown): error is HttpError {
@@ -1554,12 +3079,9 @@ function isHttpError(error: unknown): error is HttpError {
   );
 }
 
-function asSessionId(value: string | null): SessionId | undefined {
-  return value ? (value as SessionId) : undefined;
-}
-
-function asThreadId(value: string | null): ThreadId | undefined {
-  return value ? (value as ThreadId) : undefined;
+function asSessionId(value: string | null, parameterName = "sessionId"): SessionId | undefined {
+  if (value === null) return undefined;
+  return requestSessionId(value, parameterName);
 }
 
 function requireModelControl(options: RuntimeHttpHandlerOptions): Required<Pick<RuntimeHttpService, "listModels" | "getModelConfig" | "setModel" | "setReasoning">> {
@@ -1582,6 +3104,17 @@ function requireServiceTierControl(options: RuntimeHttpHandlerOptions): Required
   }
   return {
     setServiceTier: service.setServiceTier.bind(service),
+  };
+}
+
+function requireDelegationControl(options: RuntimeHttpHandlerOptions): Required<Pick<RuntimeHttpService, "getDelegationConfig" | "setDelegationPolicy">> {
+  const service = options.service;
+  if (!service.getDelegationConfig || !service.setDelegationPolicy) {
+    throw { status: 501, message: "No delegation control service is configured" } satisfies HttpError;
+  }
+  return {
+    getDelegationConfig: service.getDelegationConfig.bind(service),
+    setDelegationPolicy: service.setDelegationPolicy.bind(service),
   };
 }
 
@@ -1612,7 +3145,13 @@ function isReasoningLevel(value: unknown): value is ReasoningLevel {
     || value === "low"
     || value === "medium"
     || value === "high"
-    || value === "xhigh";
+    || value === "xhigh"
+    || value === "max"
+    || value === "ultra";
+}
+
+function isDelegationPolicy(value: unknown): value is DelegationPolicy {
+  return typeof value === "string" && (DELEGATION_POLICIES as readonly string[]).includes(value);
 }
 
 function isServiceTier(value: unknown): value is ServiceTier {
@@ -1642,10 +3181,14 @@ function requireMcpControl(options: RuntimeHttpHandlerOptions): RuntimeMcpContro
   return options.mcp;
 }
 
-async function mcpServerDescriptor(control: RuntimeMcpControlService, server: string): Promise<RuntimeMcpServerDescriptor> {
+async function mcpServerDescriptor(
+  control: RuntimeMcpControlService,
+  server: string,
+  scope: RuntimeMcpScopeInput = {},
+): Promise<RuntimeMcpServerDescriptor> {
   const descriptor = control.get
-    ? await control.get(server)
-    : (await control.list()).servers.find((candidate) => candidate.name === server);
+    ? await control.get(server, scope)
+    : (await control.list(scope)).servers.find((candidate) => candidate.name === server);
   if (!descriptor) throw notFound(`MCP server not found: ${server}`);
   return descriptor;
 }
@@ -1688,14 +3231,87 @@ function requireTeamMerger(options: RuntimeHttpHandlerOptions): RuntimeTeamMerge
   return options.teamMerger;
 }
 
+async function resolveHttpTeamAuthority(
+  options: RuntimeHttpHandlerOptions,
+  teamId: TeamId,
+  requestedSessionId: SessionId | undefined,
+  requestedCwd: string | undefined,
+): Promise<{ sessionId: SessionId; cwd: string }> {
+  const team = await requireHttpTeam(options, teamId);
+  return resolveTeamSessionAuthority({
+    team,
+    tasks: [],
+    ...(requestedSessionId ? { requestedSessionId } : {}),
+    ...(requestedCwd !== undefined ? { requestedCwd } : {}),
+    resolveSession: (sessionId) => resolveHttpInteractiveSession(options, sessionId),
+  });
+}
+
+async function requireHttpTeam(options: RuntimeHttpHandlerOptions, teamId: TeamId) {
+  const team = (await requireTeams(options).listTeams()).find((candidate) => candidate.id === teamId);
+  if (!team) throw { status: 404, message: `Team not found: ${teamId}` } satisfies HttpError;
+  return team;
+}
+
+async function resolveHttpInteractiveSession(options: RuntimeHttpHandlerOptions, sessionId: SessionId) {
+  await options.service.assertSessionTurnAllowed(sessionId);
+  const session = await requireSession(options.store, sessionId);
+  if (session.status !== "active") throw new Error(`Session ${sessionId} is not active (${session.status})`);
+  if (session.source === "subagent") throw new Error(`Session ${sessionId} is reserved for a subagent`);
+  return session;
+}
+
+async function resolveHttpActiveActorSession(options: RuntimeHttpHandlerOptions, sessionId: SessionId) {
+  const session = await requireSession(options.store, sessionId);
+  if (session.status !== "active") {
+    throw { status: 409, message: `Session ${sessionId} is not active (${session.status})` } satisfies HttpError;
+  }
+  return session;
+}
+
+async function withHttpTeamOwnerMutation<T>(
+  options: RuntimeHttpHandlerOptions,
+  teamId: TeamId,
+  requestedSessionId: SessionId | undefined,
+  mutate: (authority: { sessionId: SessionId; cwd: string }) => Promise<T>,
+): Promise<T> {
+  const authority = await resolveHttpTeamAuthority(options, teamId, requestedSessionId, undefined);
+  return options.service.withSessionOperation(authority.sessionId, async (operation) => {
+    const current = await resolveHttpTeamAuthority(
+      options,
+      teamId,
+      authority.sessionId,
+      undefined,
+    );
+    operation.assertCurrent();
+    return mutate(current);
+  });
+}
+
+async function assertHttpTeamReconcileAuthority(
+  options: RuntimeHttpHandlerOptions,
+  input: TeamTaskReconcileInput,
+): Promise<void> {
+  const teams = input.teamId
+    ? [await requireHttpTeam(options, input.teamId)]
+    : (await requireTeams(options).listTeams()).filter((team) => team.status === "active");
+  for (const team of teams) {
+    const authority = await resolveHttpTeamAuthority(options, team.id, input.sessionId, undefined);
+    if (input.teamId) input.sessionId = authority.sessionId;
+  }
+}
+
 function teamContext(body: TeamContextBody): TeamEventContextInput {
   const input: TeamEventContextInput = {};
-  if (body.sessionId) input.sessionId = body.sessionId;
-  if (body.threadId) input.threadId = body.threadId;
+  if (body.sessionId !== undefined) input.sessionId = requestSessionId(body.sessionId);
+  if (body.teamId !== undefined) requestIdentifier<TeamId>(body.teamId, "teamId");
+  if (body.taskId !== undefined) requestIdentifier<TaskId>(body.taskId, "taskId");
   return input;
 }
 
-type TeamEventContextInput = Pick<CreateTeamInput, "sessionId" | "threadId">;
+interface TeamEventContextInput {
+  sessionId?: SessionId;
+}
 
 function mcpAddInput(body: McpAddBody): RuntimeMcpAddServerRequest {
   if (typeof body.name !== "string" || body.name.trim().length === 0) throw badRequest("name is required");
@@ -1736,16 +3352,16 @@ function mcpTransport(value: unknown): RuntimeMcpTransport | undefined {
 function teamCreateInput(body: TeamCreateBody): CreateTeamInput {
   const input: CreateTeamInput = {
     ...teamContext(body),
-    name: body.name ?? "",
-    leadPath: body.leadPath as AgentPath,
+    name: stringField(body.name, "name"),
+    leadPath: requestAgentPath(body.leadPath, "leadPath"),
   };
-  if (body.teamId) input.teamId = body.teamId;
-  if (body.description) input.description = body.description;
-  if (body.leadName) input.leadName = body.leadName;
-  if (body.leadRole) input.leadRole = body.leadRole;
+  if (body.teamId !== undefined) input.teamId = requestIdentifier<TeamId>(body.teamId, "teamId");
+  if (body.description !== undefined) input.description = stringField(body.description, "description");
+  if (body.leadName !== undefined) input.leadName = stringField(body.leadName, "leadName");
+  if (body.leadRole !== undefined) input.leadRole = stringField(body.leadRole, "leadRole");
   const leadStatus = teamMemberStatus(body.leadStatus);
   if (leadStatus) input.leadStatus = leadStatus;
-  if (body.leadWriteScope) input.leadWriteScope = body.leadWriteScope;
+  if (body.leadWriteScope !== undefined) input.leadWriteScope = stringArrayField(body.leadWriteScope, "leadWriteScope");
   return input;
 }
 
@@ -1753,17 +3369,16 @@ function teamMemberInput(teamId: TeamId, body: TeamMemberBody): AddTeamMemberInp
   const input: AddTeamMemberInput = {
     ...teamContext(body),
     teamId,
-    path: body.path as AgentPath,
-    name: body.name ?? "",
-    role: body.role ?? "",
+    path: requestAgentPath(body.path, "path"),
+    name: stringField(body.name, "name"),
+    role: stringField(body.role, "role"),
   };
   const status = teamMemberStatus(body.status);
   if (status) input.status = status;
-  if (body.childSessionId) input.childSessionId = body.childSessionId;
-  if (body.childThreadId) input.childThreadId = body.childThreadId;
-  if (body.model) input.model = body.model;
-  if (body.toolScope) input.toolScope = body.toolScope;
-  if (body.writeScope) input.writeScope = body.writeScope;
+  if (body.childSessionId !== undefined) input.childSessionId = requestSessionId(body.childSessionId, "childSessionId");
+  if (body.model !== undefined) input.model = stringField(body.model, "model");
+  if (body.toolScope !== undefined) input.toolScope = stringArrayField(body.toolScope, "toolScope");
+  if (body.writeScope !== undefined) input.writeScope = stringArrayField(body.writeScope, "writeScope");
   return input;
 }
 
@@ -1771,16 +3386,16 @@ function teamTaskCreateInput(teamId: TeamId, body: TeamTaskCreateBody): CreateTe
   const input: CreateTeamTaskInput = {
     ...teamContext(body),
     teamId,
-    title: body.title ?? "",
+    title: stringField(body.title, "title"),
   };
-  if (body.taskId) input.taskId = body.taskId;
-  if (body.description) input.description = body.description;
-  if (body.createdBy) input.createdBy = body.createdBy;
-  if (body.ownerPath) input.ownerPath = body.ownerPath;
-  if (body.dependsOn) input.dependsOn = body.dependsOn;
+  if (body.taskId !== undefined) input.taskId = requestIdentifier<TaskId>(body.taskId, "taskId");
+  if (body.description !== undefined) input.description = stringField(body.description, "description");
+  if (body.createdBy !== undefined) input.createdBy = requestAgentPath(body.createdBy, "createdBy");
+  if (body.ownerPath !== undefined) input.ownerPath = requestAgentPath(body.ownerPath, "ownerPath");
+  if (body.dependsOn !== undefined) input.dependsOn = requestIdentifierArray<TaskId>(body.dependsOn, "dependsOn");
   const status = teamTaskStatus(body.status);
   if (status) input.status = status;
-  if (body.metadata) input.metadata = body.metadata;
+  if (body.metadata !== undefined) input.metadata = parseRuntimeRecord(body.metadata, "body.metadata");
   return input;
 }
 
@@ -1789,13 +3404,13 @@ function teamTaskAssignInput(teamId: TeamId, taskId: TaskId, body: TeamTaskAssig
     ...teamContext(body),
     teamId,
     taskId,
-    ownerPath: body.ownerPath as AgentPath,
+    ownerPath: requestAgentPath(body.ownerPath, "ownerPath"),
   };
-  if (body.assignedBy) input.assignedBy = body.assignedBy;
-  if (body.message) input.message = body.message;
+  if (body.assignedBy !== undefined) input.assignedBy = requestAgentPath(body.assignedBy, "assignedBy");
+  if (body.message !== undefined) input.message = stringField(body.message, "message");
   const delivery = teamMessageDelivery(body.messageDelivery);
   if (delivery) input.messageDelivery = delivery;
-  if (body.messageSummary) input.messageSummary = body.messageSummary;
+  if (body.messageSummary !== undefined) input.messageSummary = stringField(body.messageSummary, "messageSummary");
   return input;
 }
 
@@ -1804,9 +3419,9 @@ function teamTaskClaimInput(teamId: TeamId, taskId: TaskId, body: TeamTaskClaimB
     ...teamContext(body),
     teamId,
     taskId,
-    ownerPath: body.ownerPath as AgentPath,
+    ownerPath: requestAgentPath(body.ownerPath, "ownerPath"),
   };
-  if (body.claimedBy) input.claimedBy = body.claimedBy;
+  if (body.claimedBy !== undefined) input.claimedBy = requestAgentPath(body.claimedBy, "claimedBy");
   return input;
 }
 
@@ -1816,9 +3431,13 @@ function teamTaskDispatchInput(teamId: TeamId, taskId: TaskId, body: TeamTaskDis
     teamId,
     taskId,
   };
-  if (body.ownerPath) input.ownerPath = body.ownerPath;
-  if (body.cwd) input.cwd = body.cwd;
-  if (body.prompt) input.prompt = body.prompt;
+  if (body.ownerPath !== undefined) input.ownerPath = requestAgentPath(body.ownerPath, "ownerPath");
+  if (body.cwd !== undefined) {
+    const cwd = stringField(body.cwd, "cwd");
+    if (cwd.includes("\0")) throw badRequest("cwd must be a valid filesystem path");
+    input.cwd = cwd;
+  }
+  if (body.prompt !== undefined) input.prompt = stringField(body.prompt, "prompt");
   const mode = localSubagentMode(body.mode);
   if (mode) input.mode = mode;
   return input;
@@ -1837,10 +3456,7 @@ function teamTaskReconcileInput(teamId: TeamId | undefined, body: TeamTaskReconc
     ...teamContext(body),
   };
   if (teamId) input.teamId = teamId;
-  if (body.limit !== undefined) {
-    if (!Number.isInteger(body.limit) || body.limit <= 0) throw badRequest("limit must be a positive integer");
-    input.limit = body.limit;
-  }
+  if (body.limit !== undefined) input.limit = positiveInteger(body.limit, "limit");
   return input;
 }
 
@@ -1849,22 +3465,13 @@ function teamRunLoopInput(teamId: TeamId, body: TeamRunLoopBody): TeamExecutionR
     ...teamContext(body),
     teamId,
   };
-  if (body.cwd) input.cwd = body.cwd;
+  if (body.cwd !== undefined) input.cwd = teamRequestCwd(body.cwd);
   const mode = localSubagentMode(body.mode);
   if (mode) input.mode = mode;
-  if (body.once !== undefined) input.once = body.once;
-  if (body.maxCycles !== undefined) {
-    if (!Number.isInteger(body.maxCycles) || body.maxCycles <= 0) throw badRequest("maxCycles must be a positive integer");
-    input.maxCycles = body.maxCycles;
-  }
-  if (body.timeoutMs !== undefined) {
-    if (!Number.isInteger(body.timeoutMs) || body.timeoutMs <= 0) throw badRequest("timeoutMs must be a positive integer");
-    input.timeoutMs = body.timeoutMs;
-  }
-  if (body.pollIntervalMs !== undefined) {
-    if (!Number.isInteger(body.pollIntervalMs) || body.pollIntervalMs < 0) throw badRequest("pollIntervalMs must be a non-negative integer");
-    input.pollIntervalMs = body.pollIntervalMs;
-  }
+  if (body.once !== undefined) input.once = parseRuntimeBoolean(body.once, "body.once");
+  if (body.maxCycles !== undefined) input.maxCycles = positiveInteger(body.maxCycles, "maxCycles");
+  if (body.timeoutMs !== undefined) input.timeoutMs = positiveInteger(body.timeoutMs, "timeoutMs");
+  if (body.pollIntervalMs !== undefined) input.pollIntervalMs = nonNegativeInteger(body.pollIntervalMs, "pollIntervalMs");
   return input;
 }
 
@@ -1873,9 +3480,15 @@ function teamMergeInput(teamId: TeamId, body: TeamMergeBody): TeamMergeInput {
     ...teamContext(body),
     teamId,
   };
-  if (body.taskId) input.taskId = body.taskId;
-  if (body.cwd) input.cwd = body.cwd;
+  if (body.taskId !== undefined) input.taskId = requestIdentifier<TaskId>(body.taskId, "taskId");
+  if (body.cwd !== undefined) input.cwd = teamRequestCwd(body.cwd);
   return input;
+}
+
+function teamRequestCwd(value: unknown): string {
+  const cwd = stringField(value, "cwd");
+  if (cwd.includes("\0")) throw badRequest("cwd must be a valid filesystem path");
+  return cwd;
 }
 
 function teamTaskUpdateInput(teamId: TeamId, taskId: TaskId, body: TeamTaskUpdateBody): UpdateTeamTaskInput {
@@ -1886,32 +3499,35 @@ function teamTaskUpdateInput(teamId: TeamId, taskId: TaskId, body: TeamTaskUpdat
   };
   const status = teamTaskStatus(body.status);
   if (status) input.status = status;
-  if (body.ownerPath) input.ownerPath = body.ownerPath;
-  if (body.title) input.title = body.title;
-  if (body.description) input.description = body.description;
-  if (body.dependsOn) input.dependsOn = body.dependsOn;
-  if (body.summary) input.summary = body.summary;
-  if (body.error) input.error = body.error;
-  if (body.metadata) input.metadata = body.metadata;
+  if (body.ownerPath !== undefined) input.ownerPath = requestAgentPath(body.ownerPath, "ownerPath");
+  if (body.title !== undefined) input.title = stringField(body.title, "title");
+  if (body.description !== undefined) input.description = stringField(body.description, "description");
+  if (body.dependsOn !== undefined) input.dependsOn = requestIdentifierArray<TaskId>(body.dependsOn, "dependsOn");
+  if (body.summary !== undefined) input.summary = stringField(body.summary, "summary");
+  if (body.error !== undefined) input.error = stringField(body.error, "error");
+  if (body.metadata !== undefined) input.metadata = parseRuntimeRecord(body.metadata, "body.metadata");
   return input;
 }
 
 function teamMessageInput(teamId: TeamId, body: TeamMessageBody): SendTeamMessageInput {
+  const from = stringField(body.from, "from");
+  const to = stringField(body.to, "to");
+  const content = stringField(body.content, "content");
   const input: SendTeamMessageInput = {
     ...teamContext(body),
     teamId,
-    from: body.from as AgentPath,
-    to: body.to as AgentPath | "*",
-    content: body.content ?? "",
+    from: from as SendTeamMessageInput["from"],
+    to: to as SendTeamMessageInput["to"],
+    content,
   };
-  if (body.messageId) input.messageId = body.messageId;
+  if (body.messageId !== undefined) input.messageId = requestIdentifier(body.messageId, "messageId");
   const kind = teamMessageKind(body.kind);
   if (kind) input.kind = kind;
   const delivery = teamMessageDelivery(body.delivery);
   if (delivery) input.delivery = delivery;
-  if (body.taskId) input.taskId = body.taskId;
-  if (body.summary) input.summary = body.summary;
-  if (body.metadata) input.metadata = body.metadata;
+  if (body.taskId !== undefined) input.taskId = requestIdentifier<TaskId>(body.taskId, "taskId");
+  if (body.summary !== undefined) input.summary = stringField(body.summary, "summary");
+  if (body.metadata !== undefined) input.metadata = parseRuntimeRecord(body.metadata, "body.metadata");
   return input;
 }
 
@@ -1931,14 +3547,14 @@ function agentTreeQueryFromUrl(url: URL): AgentTreeSnapshotQuery {
 function agentRunQueryFromUrl(url: URL): AgentRunQuery {
   const query: AgentRunQuery = {};
   const sessionId = asSessionId(url.searchParams.get("sessionId"));
-  const childSessionId = asSessionId(url.searchParams.get("childSessionId"));
+  const childSessionId = asSessionId(url.searchParams.get("childSessionId"), "childSessionId");
   const path = url.searchParams.get("path");
   const status = url.searchParams.get("status");
   const limit = numberParam(url.searchParams.get("limit"));
   if (sessionId) query.sessionId = sessionId;
   if (childSessionId) query.childSessionId = childSessionId;
   if (path) query.path = path as AgentPath;
-  if (status === "running" || status === "completed" || status === "failed" || status === "cancelled") {
+  if (status === "running" || status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled") {
     query.status = status;
   }
   if (limit !== undefined) query.limit = limit;
@@ -1946,18 +3562,21 @@ function agentRunQueryFromUrl(url: URL): AgentRunQuery {
 }
 
 function mailboxQueryFromUrl(url: URL): AgentMailboxQuery {
+  rejectUnknownQueryParameters(url, ["messageId", "taskId", "status", "path", "recipientSessionId", "limit"]);
   const query: AgentMailboxQuery = {};
   const messageId = url.searchParams.get("messageId");
   const taskId = url.searchParams.get("taskId");
   const status = url.searchParams.get("status");
   const path = url.searchParams.get("path");
-  const childSessionId = asSessionId(url.searchParams.get("childSessionId"));
+  const recipientSessionId = asSessionId(url.searchParams.get("recipientSessionId"), "recipientSessionId");
   const limit = numberParam(url.searchParams.get("limit"));
   if (messageId) query.messageId = messageId;
   if (taskId) query.taskId = taskId as TaskId;
-  if (status === "queued" || status === "delivering" || status === "consumed") query.status = status;
+  if (status === "queued" || status === "delivering" || status === "consumed" || status === "discarded") {
+    query.status = status;
+  }
   if (path) query.path = path as AgentPath;
-  if (childSessionId) query.childSessionId = childSessionId;
+  if (recipientSessionId) query.recipientSessionId = recipientSessionId;
   if (limit !== undefined) query.limit = limit;
   return query;
 }
@@ -1965,8 +3584,8 @@ function mailboxQueryFromUrl(url: URL): AgentMailboxQuery {
 function taskQueryFromUrl(url: URL): AgentTaskQuery {
   const query: AgentTaskQuery = {};
   const status = taskStatus(url.searchParams.get("status"));
-  const parentSessionId = asSessionId(url.searchParams.get("parentSessionId"));
-  const childSessionId = asSessionId(url.searchParams.get("childSessionId"));
+  const parentSessionId = asSessionId(url.searchParams.get("parentSessionId"), "parentSessionId");
+  const childSessionId = asSessionId(url.searchParams.get("childSessionId"), "childSessionId");
   const limit = numberParam(url.searchParams.get("limit"));
   if (status) query.status = status;
   if (parentSessionId) query.parentSessionId = parentSessionId;
@@ -1980,6 +3599,7 @@ function taskStatus(value: string | null): AgentTaskStatus | undefined {
     value === "pending" ||
     value === "running" ||
     value === "completed" ||
+    value === "incomplete" ||
     value === "failed" ||
     value === "cancelled"
   ) {
@@ -2044,32 +3664,29 @@ function serializeTeamTaskDispatchResult(result: TeamTaskDispatchResult): Record
 function serializeLocalSubagentTask(task: NonNullable<TeamTaskDispatchResult["agentTask"]>): Record<string, unknown> {
   return {
     ...task,
-    error: task.error ? task.error.message : undefined,
+    error: task.error ? normalizePersistedError(task.error).message : undefined,
   };
 }
 
 function closeStatus(value: unknown): AgentTaskFinalStatus {
   if (value === undefined) return "cancelled";
-  if (value === "completed" || value === "failed" || value === "cancelled") return value;
-  throw badRequest("status must be completed, failed, or cancelled");
+  if (value === "completed" || value === "incomplete" || value === "failed" || value === "cancelled") return value;
+  throw badRequest("status must be completed, incomplete, failed, or cancelled");
 }
 
 function reconcileStaleInput(body: TaskReconcileStaleBody): AgentTaskReconcileStaleInput {
-  const input: AgentTaskReconcileStaleInput = {};
+  // HTTP is a cross-process boundary. Never expose the single-process unsafe
+  // mode that can close a task before its durable worker lease is committed.
+  const input: AgentTaskReconcileStaleInput = { requireLeaseEvidence: true };
+  if (body.parentSessionId !== undefined) {
+    input.parentSessionId = requestSessionId(body.parentSessionId);
+  }
   if (body.staleAfterMs !== undefined) {
-    if (!Number.isInteger(body.staleAfterMs) || body.staleAfterMs < 0) {
-      throw badRequest("staleAfterMs must be a non-negative integer");
-    }
-    input.staleAfterMs = body.staleAfterMs;
+    input.staleAfterMs = nonNegativeInteger(body.staleAfterMs, "staleAfterMs");
   }
-  if (body.limit !== undefined) {
-    if (!Number.isInteger(body.limit) || body.limit <= 0) {
-      throw badRequest("limit must be a positive integer");
-    }
-    input.limit = body.limit;
-  }
-  if (body.summary) input.summary = body.summary;
-  if (body.error) input.error = body.error;
+  if (body.limit !== undefined) input.limit = positiveInteger(body.limit, "limit");
+  if (body.summary !== undefined) input.summary = stringField(body.summary, "summary");
+  if (body.error !== undefined) input.error = stringField(body.error, "error");
   if (body.modes !== undefined) {
     if (!Array.isArray(body.modes)) throw badRequest("modes must be an array");
     input.modes = body.modes.map((mode) => {

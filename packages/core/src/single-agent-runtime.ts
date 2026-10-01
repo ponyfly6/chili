@@ -1,36 +1,57 @@
 import type {
+  AssistantMessagePhase,
   ChiliEvent,
   EventEnvelope,
   Message,
   MessageId,
   MessagePart,
+  ModelSelection,
   ModelUsage,
   RuntimeModelDescriptor,
+  ReasoningLevel,
+  ServiceTier,
   PartId,
   SessionId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
+  ToolResultExecutionContext,
   TurnId,
 } from "@chili/protocol";
-import { timestampNow } from "@chili/protocol";
+import {
+  boundPersistedErrorMessage,
+  boundPersistedJsonValue,
+  normalizePersistedError,
+  normalizeToolCallId,
+  PERSISTED_JSON_LIMITS,
+  timestampNow,
+} from "@chili/protocol";
 import type { EventStore } from "@chili/store";
 import type { ChiliToolDefinition, ToolAccessPolicy, ToolAccessPolicyResolver, ToolRegistry } from "@chili/tools";
 import { ToolExecutor, filterToolsByPolicy } from "@chili/tools";
 import {
   ContextCompactionService,
+  ContextWindowExceededError,
   ContextWindowBuilder,
   type CompactionBoundary,
   type ContextBudgetOptions,
   type ContextCompactionOptions,
   type ContextCompactionResult,
+  type ContextRequestSurface,
   type ContextUsage,
 } from "./context/index.js";
 import { messagesForContext } from "./cancelled-turn-context.js";
 import { DoomLoopError, DoomLoopGuard, type DoomLoopGuardOptions } from "./doom-loop-guard.js";
-import { normalizeRetryPolicy, retryDelay, sleep, type RetryPolicy } from "./retry.js";
+import { addModelUsage, attachModelUsage, takeModelUsage } from "./model-usage.js";
+import {
+  isRetryableTransientError,
+  normalizeRetryPolicy,
+  retryAfterDelayHint,
+  retryDelay,
+  sleep,
+  type RetryPolicy,
+} from "./retry.js";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
-import type { AgentRunner, AppendUserMessageInput, CreateSessionInput, RunTurnInput, RunTurnResult } from "./runner.js";
+import type { AgentRunner, AppendUserMessageInput, CreateSessionInput, PromptExecutionScope, RunTurnInput, RunTurnResult } from "./runner.js";
 
 export type { AppendUserMessageInput, CreateSessionInput, RunTurnInput, RunTurnResult } from "./runner.js";
 
@@ -53,13 +74,13 @@ export interface SingleAgentRuntimeOptions {
 
 interface EventContext {
   sessionId: SessionId;
-  threadId?: ThreadId;
 }
 
 interface PendingToolCall {
   callId: ToolCallId;
   toolName: string;
   input: unknown;
+  inputParseError?: string;
 }
 
 interface StreamingToolCall {
@@ -69,24 +90,34 @@ interface StreamingToolCall {
 }
 
 interface AssistantStreamState {
-  textPartId?: PartId;
-  reasoningPartId?: PartId;
+  textParts: Map<number, { partId: PartId; phase?: AssistantMessagePhase }>;
+  reasoningPartIds: Map<number, PartId>;
   toolCalls: PendingToolCall[];
   streamingToolCalls: Map<string, StreamingToolCall>;
 }
 
 interface AssistantStreamResult {
-  finishReason?: string;
+  finishReason: string;
   toolCalls: PendingToolCall[];
   usage?: ModelUsage;
 }
 
+interface CompactionAttemptResult {
+  completed: boolean;
+  usage?: ModelUsage;
+}
+
+const MAX_MODEL_METADATA_TEXT_BYTES = 4_096;
+const MAX_MODEL_RESPONSE_ID_CHARS = 512;
+
 export interface CompactContextInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   turnId?: TurnId;
   reason?: "manual" | "token_budget" | "recovery";
   instructions?: string;
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
   signal?: AbortSignal;
 }
 
@@ -97,19 +128,24 @@ export type CompactContextResult =
       messageId: MessageId;
       boundaryMessageId: MessageId;
       summaryChars: number;
+      usage?: ModelUsage;
     }
   | {
       status: "skipped";
       turnId: TurnId;
       reason: string;
+      usage?: ModelUsage;
     }
   | {
       status: "failed" | "cancelled";
       turnId: TurnId;
       error: Error;
+      usage?: ModelUsage;
     };
 
 export class SingleAgentRuntime implements AgentRunner {
+  private readonly promptGuards = new WeakMap<PromptExecutionScope, DoomLoopGuard>();
+
   constructor(private readonly options: SingleAgentRuntimeOptions) {}
 
   listModels(): Promise<readonly RuntimeModelDescriptor[]> | readonly RuntimeModelDescriptor[] {
@@ -119,10 +155,7 @@ export class SingleAgentRuntime implements AgentRunner {
   async createSession(input: CreateSessionInput): Promise<SessionId> {
     const sessionId = input.sessionId ?? this.id<SessionId>("session");
     await this.append(
-      {
-        sessionId,
-        threadId: input.threadId,
-      },
+      { sessionId },
       "session.created",
       { sessionId, cwd: input.cwd },
     );
@@ -168,11 +201,13 @@ export class SingleAgentRuntime implements AgentRunner {
     const turnId = input.turnId ?? this.id<TurnId>("turn");
     const reason = input.reason ?? "manual";
     let boundary: CompactionBoundary | undefined;
+    let usage: ModelUsage | undefined;
     try {
       await this.append(input, "turn.started", { turnId });
       const rawMessages = await messagesForContext(this.options.store, input.sessionId);
       boundary = this.contextBuilder().compactionBoundary(rawMessages, reason);
       if (!boundary) {
+        throwIfTurnAborted(input.signal);
         await this.append(input, "turn.completed", { turnId, status: "completed" });
         return { status: "skipped", turnId, reason: "No messages available to compact" };
       }
@@ -185,25 +220,38 @@ export class SingleAgentRuntime implements AgentRunner {
         budgetChars: boundary.budgetChars,
       });
       const result = await this.compactMessages(input, turnId, rawMessages, boundary);
+      usage = addModelUsage(usage, result.usage);
+      throwIfTurnAborted(input.signal);
       await this.append(input, "turn.completed", { turnId, status: "completed" });
-      return {
+      const completed: Extract<CompactContextResult, { status: "completed" }> = {
         status: "completed",
         turnId,
         messageId: result.messageId,
         boundaryMessageId: result.boundaryMessageId,
         summaryChars: result.summaryChars,
       };
+      if (usage) completed.usage = usage;
+      return completed;
     } catch (error) {
       const err = toError(error);
-      const status = isAbortError(err) ? "cancelled" : "failed";
+      usage = addModelUsage(usage, takeModelUsage(err));
+      const aborted = input.signal?.aborted === true || isAbortError(err);
+      const persistedError = terminalPersistedError(err, aborted);
+      const status = aborted ? "cancelled" : "failed";
       await this.append(input, "turn.compaction_failed", {
         turnId,
         reason,
         ...(boundary ? { boundaryMessageId: boundary.boundaryMessageId } : {}),
-        error: err.message,
+        error: persistedError.message,
       });
       await this.append(input, "turn.completed", { turnId, status });
-      return { status, turnId, error: err };
+      const failed: Extract<CompactContextResult, { status: "failed" | "cancelled" }> = {
+        status,
+        turnId,
+        error: persistedError,
+      };
+      if (usage) failed.usage = usage;
+      return failed;
     }
   }
 
@@ -211,12 +259,33 @@ export class SingleAgentRuntime implements AgentRunner {
     const turnId = input.turnId ?? this.id<TurnId>("turn");
     let assistantMessageId: MessageId | undefined;
     let contextUsage: ContextUsage | undefined;
+    let turnUsage: ModelUsage | undefined;
+    const pendingToolCalls = new Set<PendingToolCall>();
 
     try {
       await this.append(input, "turn.started", { turnId });
+      const guard = this.guardForTurn(input);
 
+      const visibleTools = await this.visibleTools(input, turnId);
+      const requestLimits = await this.options.model.resolveRequestLimits?.({
+        ...(input.modelSelection ? { modelSelection: input.modelSelection } : {}),
+        ...(input.reasoningLevel !== undefined ? { reasoningLevel: input.reasoningLevel } : {}),
+        ...(input.serviceTier !== undefined ? { serviceTier: input.serviceTier } : {}),
+      });
+      const contextSurface: ContextRequestSurface = {
+        ...(requestLimits?.contextWindowTokens !== undefined
+          ? { contextWindowTokens: requestLimits.contextWindowTokens }
+          : {}),
+        ...(requestLimits?.requestMaxOutputTokens !== undefined
+          ? { requestMaxOutputTokens: requestLimits.requestMaxOutputTokens }
+          : {}),
+        system: input.system ?? [],
+        developer: input.developer ?? [],
+        contextualUser: input.contextualUser ?? [],
+        tools: visibleTools,
+      };
       const rawMessages = await messagesForContext(this.options.store, input.sessionId);
-      let context = this.contextBuilder().build(rawMessages);
+      let context = this.contextBuilder().build(rawMessages, contextSurface);
       contextUsage = context.usage;
       if (context.compactionBoundary) {
         await this.append(input, "turn.compaction_requested", {
@@ -227,11 +296,17 @@ export class SingleAgentRuntime implements AgentRunner {
           budgetChars: context.compactionBoundary.budgetChars,
         });
         const compacted = await this.tryCompactMessages(input, turnId, rawMessages, context.compactionBoundary);
-        if (compacted) {
-          context = this.contextBuilder().build(await messagesForContext(this.options.store, input.sessionId));
+        turnUsage = addModelUsage(turnUsage, compacted.usage);
+        if (compacted.completed) {
+          context = this.contextBuilder().build(
+            await messagesForContext(this.options.store, input.sessionId),
+            contextSurface,
+          );
+          if (context.overflow) throw new ContextWindowExceededError(context.overflow);
           contextUsage = context.usage;
         }
       }
+      if (context.overflow) throw new ContextWindowExceededError(context.overflow);
 
       assistantMessageId = this.id<MessageId>("msg");
       await this.append(input, "message.created", {
@@ -242,27 +317,26 @@ export class SingleAgentRuntime implements AgentRunner {
 
       let modelInput: ModelStreamInput = {
         sessionId: input.sessionId,
-        threadId: input.threadId,
         turnId,
         messages: context.messages,
-        tools: await this.visibleTools(input, turnId),
-        system: input.system ?? [],
+        tools: context.surface.tools,
+        system: context.surface.system,
       };
-      if (input.developer && input.developer.length > 0) modelInput.developer = input.developer;
-      if (input.contextualUser && input.contextualUser.length > 0) modelInput.contextualUser = input.contextualUser;
+      if (context.surface.developer.length > 0) modelInput.developer = context.surface.developer;
+      if (context.surface.contextualUser.length > 0) modelInput.contextualUser = context.surface.contextualUser;
       if (input.promptDebug) modelInput.promptDebug = input.promptDebug;
       if (input.modelSelection) modelInput.modelSelection = input.modelSelection;
       if (input.reasoningLevel !== undefined) modelInput.reasoningLevel = input.reasoningLevel;
       if (input.serviceTier !== undefined) modelInput.serviceTier = input.serviceTier;
       if (input.signal) modelInput.signal = input.signal;
 
-      const guard = new DoomLoopGuard(this.options.doomLoopGuard);
       let streamResult: AssistantStreamResult;
       try {
         streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
       } catch (error) {
         const err = toError(error);
         if (!this.canRecoverWithCompaction(err)) throw err;
+        turnUsage = addModelUsage(turnUsage, takeModelUsage(err));
         const recoveryMessages = await messagesForContext(this.options.store, input.sessionId);
         const recoveryBoundary = this.contextBuilder().compactionBoundary(recoveryMessages, "recovery");
         if (!recoveryBoundary) throw err;
@@ -274,17 +348,45 @@ export class SingleAgentRuntime implements AgentRunner {
           budgetChars: recoveryBoundary.budgetChars,
         });
         const recovered = await this.tryCompactMessages(input, turnId, recoveryMessages, recoveryBoundary);
-        if (!recovered) throw err;
-        const recoveredContext = this.contextBuilder().build(await messagesForContext(this.options.store, input.sessionId));
+        turnUsage = addModelUsage(turnUsage, recovered.usage);
+        if (!recovered.completed) throw err;
+        const recoveredContext = this.contextBuilder().build(
+          await messagesForContext(this.options.store, input.sessionId),
+          contextSurface,
+        );
+        if (recoveredContext.overflow) throw new ContextWindowExceededError(recoveredContext.overflow);
         contextUsage = recoveredContext.usage;
         modelInput = {
           ...modelInput,
           messages: recoveredContext.messages,
+          tools: recoveredContext.surface.tools,
+          system: recoveredContext.surface.system,
+          ...(recoveredContext.surface.developer.length > 0
+            ? { developer: recoveredContext.surface.developer }
+            : {}),
+          ...(recoveredContext.surface.contextualUser.length > 0
+            ? { contextualUser: recoveredContext.surface.contextualUser }
+            : {}),
         };
         streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
       }
-      await this.executeToolCalls(input, turnId, assistantMessageId, streamResult.toolCalls);
+      turnUsage = addModelUsage(turnUsage, streamResult.usage);
+      for (const toolCall of streamResult.toolCalls) pendingToolCalls.add(toolCall);
+      throwIfTurnAborted(input.signal);
+      await this.executeToolCalls(
+        input,
+        turnId,
+        assistantMessageId,
+        streamResult.toolCalls,
+        pendingToolCalls,
+        new Set(
+          visibleTools
+            .map((tool) => tool.name)
+            .filter((toolName) => !modelInput.tools.some((tool) => tool.name === toolName)),
+        ),
+      );
 
+      throwIfTurnAborted(input.signal);
       await this.append(input, "turn.completed", {
         turnId,
         status: "completed",
@@ -296,14 +398,23 @@ export class SingleAgentRuntime implements AgentRunner {
         assistantMessageId,
       };
       if (contextUsage) result.contextUsage = contextUsage;
-      if (streamResult.usage) result.usage = streamResult.usage;
-      if (streamResult.finishReason) result.finishReason = streamResult.finishReason;
+      if (turnUsage) result.usage = turnUsage;
+      result.finishReason = streamResult.finishReason;
       return result;
     } catch (error) {
       const err = toError(error);
-      const status = isAbortError(err) ? "cancelled" : "failed";
+      turnUsage = addModelUsage(turnUsage, takeModelUsage(err));
+      const aborted = input.signal?.aborted === true || isAbortError(err);
+      const persistedError = terminalPersistedError(err, aborted);
+      const status = aborted ? "cancelled" : "failed";
+      if (assistantMessageId && pendingToolCalls.size > 0) {
+        await this.finishPendingToolCalls(
+          input, turnId, assistantMessageId, [...pendingToolCalls], status, persistedError,
+        );
+        pendingToolCalls.clear();
+      }
       if (status === "failed" && assistantMessageId && !didAssistantMutate(err)) {
-        await this.appendModelFailureMessage(input, assistantMessageId, err);
+        await this.appendModelFailureMessage(input, assistantMessageId, persistedError);
       }
       await this.append(input, "turn.completed", {
         turnId,
@@ -312,12 +423,28 @@ export class SingleAgentRuntime implements AgentRunner {
       const result: Extract<RunTurnResult, { status: "failed" | "cancelled" }> = {
         status,
         turnId,
-        error: err,
+        error: persistedError,
       };
       if (assistantMessageId) result.assistantMessageId = assistantMessageId;
       if (contextUsage) result.contextUsage = contextUsage;
+      if (turnUsage) result.usage = turnUsage;
       return result;
     }
+  }
+
+  private guardForTurn(input: RunTurnInput): DoomLoopGuard {
+    const scope = input.promptExecution;
+    if (!scope) return new DoomLoopGuard(this.options.doomLoopGuard);
+    if (scope.sessionId !== input.sessionId) {
+      throw new Error("Prompt execution scope belongs to a different session");
+    }
+    let guard = this.promptGuards.get(scope);
+    if (!guard) {
+      guard = new DoomLoopGuard(this.options.doomLoopGuard);
+      this.promptGuards.set(scope, guard);
+    }
+    guard.beginTurn();
+    return guard;
   }
 
   private async appendModelFailureMessage(
@@ -325,12 +452,14 @@ export class SingleAgentRuntime implements AgentRunner {
     assistantMessageId: MessageId,
     error: Error,
   ): Promise<void> {
+    const message = normalizePersistedError(error).message;
     await this.appendPart(input, assistantMessageId, {
       id: this.id<PartId>("part"),
       messageId: assistantMessageId,
       sessionId: input.sessionId,
       type: "text",
-      text: `Model request failed: ${error.message}`,
+      text: boundPersistedErrorMessage(`Model request failed: ${message}`).text,
+      synthetic: true,
     });
   }
 
@@ -338,11 +467,17 @@ export class SingleAgentRuntime implements AgentRunner {
     if (input.toolMode === "disabled") return [];
     const resolvedPolicy = await this.options.toolPolicyResolver?.resolve({
       sessionId: input.sessionId,
-      threadId: input.threadId,
       turnId,
       cwd: input.cwd,
     });
-    let tools = filterToolsByPolicies(this.options.toolRegistry.list(), input.toolPolicy, resolvedPolicy);
+    const registeredTools = this.options.toolRegistry.listForContext
+      ? await this.options.toolRegistry.listForContext({
+        sessionId: input.sessionId,
+        turnId,
+        cwd: input.cwd,
+      })
+      : this.options.toolRegistry.list();
+    let tools = filterToolsByPolicies(registeredTools, input.toolPolicy, resolvedPolicy);
     if (input.preferExternalImageTools && tools.some(isExternalImageUnderstandingTool)) {
       tools = tools.filter((tool) => !isDirectImageBlockTool(tool));
       return tools;
@@ -360,11 +495,14 @@ export class SingleAgentRuntime implements AgentRunner {
   ): Promise<AssistantStreamResult> {
     const retryPolicy = normalizeRetryPolicy(this.options.retryPolicy);
     let attempt = 1;
+    let previousAttemptUsage: ModelUsage | undefined;
 
     while (true) {
       let assistantMutated = false;
       let latestUsage: ModelUsage | undefined;
       const state: AssistantStreamState = {
+        textParts: new Map(),
+        reasoningPartIds: new Map(),
         toolCalls: [],
         streamingToolCalls: new Map(),
       };
@@ -373,13 +511,19 @@ export class SingleAgentRuntime implements AgentRunner {
           if (input.signal?.aborted) throw abortError("Turn aborted");
           if (event.type === "text_delta") {
             assistantMutated = true;
-            await this.appendTextDelta(input, assistantMessageId, state, event.text);
+            await this.appendTextDelta(input, assistantMessageId, state, event.text, event.index, event.phase);
             continue;
           }
 
           if (event.type === "reasoning_delta") {
             assistantMutated = true;
-            await this.appendReasoningDelta(input, assistantMessageId, state, event.text, event.redacted);
+            await this.appendReasoningDelta(input, assistantMessageId, state, event.text, event.index, event.redacted);
+            continue;
+          }
+
+          if (event.type === "reasoning_item") {
+            assistantMutated = true;
+            await this.appendReasoningItem(input, assistantMessageId, event.output);
             continue;
           }
 
@@ -393,6 +537,7 @@ export class SingleAgentRuntime implements AgentRunner {
                 callId: this.id<ToolCallId>("toolcall"),
                 toolName: event.name,
                 input: event.input,
+                ...(event.inputParseError ? { inputParseError: event.inputParseError } : {}),
               },
               guard,
               state,
@@ -403,7 +548,7 @@ export class SingleAgentRuntime implements AgentRunner {
           if (event.type === "tool_call_start") {
             assistantMutated = true;
             const toolCall: StreamingToolCall = {
-              callId: event.toolCallId as ToolCallId,
+              callId: normalizeToolCallId(event.toolCallId, event.index),
               toolName: event.name,
               input: {},
             };
@@ -418,7 +563,7 @@ export class SingleAgentRuntime implements AgentRunner {
             if (!toolCall && event.name) {
               assistantMutated = true;
               toolCall = {
-                callId: event.toolCallId as ToolCallId,
+                callId: normalizeToolCallId(event.toolCallId, event.index),
                 toolName: event.name,
                 input: {},
               };
@@ -440,9 +585,10 @@ export class SingleAgentRuntime implements AgentRunner {
             const existing = state.streamingToolCalls.get(key);
             state.streamingToolCalls.delete(key);
             const toolCall = {
-              callId: (existing?.callId ?? event.toolCallId) as ToolCallId,
+              callId: existing?.callId ?? normalizeToolCallId(event.toolCallId, event.index),
               toolName: event.name || existing?.toolName || "",
               input: event.input,
+              ...(event.inputParseError ? { inputParseError: event.inputParseError } : {}),
             };
             await this.updateStreamingToolCall(input, toolCall);
             await this.queueToolCall(
@@ -457,45 +603,74 @@ export class SingleAgentRuntime implements AgentRunner {
           }
 
           if (event.type === "finish") {
-            if (event.usage) latestUsage = event.usage;
+            if (event.usage) latestUsage = persistedModelUsage(event.usage);
             if (event.responseId || event.usage) {
               await this.appendModelMetadata(input, turnId, event);
             }
-            await this.finishUnfinishedStreamingToolCalls(input, state, "failed", "Tool call stream ended before tool_call_end");
-            return { finishReason: event.reason, toolCalls: state.toolCalls, ...(latestUsage ? { usage: latestUsage } : {}) };
+            throwIfTurnAborted(input.signal);
+            if (typeof event.reason !== "string" || !event.reason.trim()) {
+              throw incompleteModelStreamError("Model finish event did not include a finish reason");
+            }
+            const finishReason = normalizePersistedError(event.reason).message.trim();
+            if (isOutputLimitFinishReason(finishReason)) {
+              throw Object.assign(
+                new Error(`Model response hit output token limit (finish reason: ${finishReason}); response is incomplete and tool calls were not executed.`),
+                { name: "ModelOutputLimitError", retryable: false },
+              );
+            }
+            if (state.streamingToolCalls.size > 0) {
+              throw incompleteModelStreamError("Tool call stream ended before tool_call_end");
+            }
+            const usage = addModelUsage(previousAttemptUsage, latestUsage);
+            return {
+              finishReason,
+              toolCalls: state.toolCalls,
+              ...(usage ? { usage } : {}),
+            };
           }
 
           if (event.type === "metadata") {
-            if (event.usage) latestUsage = event.usage;
+            if (event.usage) latestUsage = persistedModelUsage(event.usage);
             await this.appendModelMetadata(input, turnId, event);
             continue;
           }
 
+          if (event.usage) latestUsage = persistedModelUsage(event.usage);
+          if (event.responseId || event.usage) {
+            await this.appendModelMetadata(input, turnId, event);
+          }
           throw toError(event.error);
         }
-        await this.finishUnfinishedStreamingToolCalls(input, state, "failed", "Tool call stream ended before tool_call_end");
-        return { toolCalls: state.toolCalls, ...(latestUsage ? { usage: latestUsage } : {}) };
+        throwIfTurnAborted(input.signal);
+        throw incompleteModelStreamError("Model stream ended before an explicit finish event");
       } catch (error) {
         const err = toError(error);
+        const persistedError = normalizePersistedError(err);
+        previousAttemptUsage = addModelUsage(
+          previousAttemptUsage,
+          addModelUsage(latestUsage, takeModelUsage(err)),
+        );
         if (input.signal?.aborted || isAbortError(err)) {
-          await this.finishUnfinishedStreamingToolCalls(input, state, "cancelled", err.message);
-          throw err;
+          await this.finishUnfinishedStreamingToolCalls(input, state, "cancelled", persistedError);
+          await this.finishPendingToolCalls(input, turnId, assistantMessageId, state.toolCalls.splice(0), "cancelled", persistedError);
+          throw attachModelUsage(err, previousAttemptUsage);
         }
-        await this.finishUnfinishedStreamingToolCalls(input, state, "failed", err.message);
+        await this.finishUnfinishedStreamingToolCalls(input, state, "failed", persistedError);
+        await this.finishPendingToolCalls(input, turnId, assistantMessageId, state.toolCalls.splice(0), "failed", persistedError);
         if (!assistantMutated && attempt < retryPolicy.maxAttempts && retryPolicy.retryable(err)) {
-          const delayMs = retryDelay(retryPolicy, attempt);
+          const delayMs = retryDelay(retryPolicy, attempt, err);
           await this.append(input, "turn.retry_scheduled", {
             turnId,
             attempt: attempt + 1,
             delayMs,
-            reason: err.message,
+            reason: persistedError.message,
           });
-          await sleep(delayMs);
+          await sleep(delayMs, input.signal);
           attempt++;
           continue;
         }
         markAssistantMutation(err, assistantMutated);
-        throw err;
+        throw attachModelUsage(err, previousAttemptUsage);
       }
     }
   }
@@ -511,18 +686,22 @@ export class SingleAgentRuntime implements AgentRunner {
     turnId: TurnId,
     messages: readonly Message[],
     boundary: CompactionBoundary,
-  ): Promise<boolean> {
+  ): Promise<CompactionAttemptResult> {
     try {
-      await this.compactMessages(input, turnId, messages, boundary);
-      return true;
+      const result = await this.compactMessages(input, turnId, messages, boundary);
+      return { completed: true, ...(result.usage ? { usage: result.usage } : {}) };
     } catch (error) {
+      const err = toError(error);
+      const persistedError = normalizePersistedError(err);
+      const usage = takeModelUsage(err);
       await this.append(input, "turn.compaction_failed", {
         turnId,
         reason: boundary.reason,
         boundaryMessageId: boundary.boundaryMessageId,
-        error: toError(error).message,
+        error: persistedError.message,
       });
-      return false;
+      if (input.signal?.aborted || isAbortError(err)) throw signalAbortError(input.signal, persistedError.message);
+      return { completed: false, ...(usage ? { usage } : {}) };
     }
   }
 
@@ -531,7 +710,7 @@ export class SingleAgentRuntime implements AgentRunner {
     turnId: TurnId,
     messages: readonly Message[],
     boundary: CompactionBoundary,
-  ): Promise<{ messageId: MessageId; boundaryMessageId: MessageId; summaryChars: number }> {
+  ): Promise<{ messageId: MessageId; boundaryMessageId: MessageId; summaryChars: number; usage?: ModelUsage }> {
     await this.append(input, "turn.compaction_started", {
       turnId,
       reason: boundary.reason,
@@ -541,23 +720,30 @@ export class SingleAgentRuntime implements AgentRunner {
     });
     const compactInput: {
       sessionId: SessionId;
-      threadId: ThreadId;
       turnId: TurnId;
       messages: readonly Message[];
       boundary: CompactionBoundary;
       instructions?: string;
+      modelSelection?: ModelSelection;
+      reasoningLevel?: ReasoningLevel;
+      serviceTier?: ServiceTier;
       signal?: AbortSignal;
     } = {
       sessionId: input.sessionId,
-      threadId: input.threadId,
       turnId,
       messages,
       boundary,
     };
     if (input.instructions !== undefined) compactInput.instructions = input.instructions;
+    if (input.modelSelection !== undefined) compactInput.modelSelection = input.modelSelection;
+    if (input.reasoningLevel !== undefined) compactInput.reasoningLevel = input.reasoningLevel;
+    if (input.serviceTier !== undefined) compactInput.serviceTier = input.serviceTier;
     if (input.signal !== undefined) compactInput.signal = input.signal;
+    throwIfTurnAborted(input.signal);
     const result = await this.compactor().compact(compactInput);
+    throwIfTurnAborted(input.signal);
     const messageId = await this.appendCompactionMessage(input, turnId, result);
+    throwIfTurnAborted(input.signal);
     await this.append(input, "turn.compaction_completed", {
       turnId,
       messageId,
@@ -567,7 +753,12 @@ export class SingleAgentRuntime implements AgentRunner {
       estimatedCharsBefore: result.estimatedCharsBefore,
       estimatedCharsAfter: result.estimatedCharsAfter,
     });
-    return { messageId, boundaryMessageId: result.boundary.boundaryMessageId, summaryChars: result.summary.length };
+    return {
+      messageId,
+      boundaryMessageId: result.boundary.boundaryMessageId,
+      summaryChars: result.summary.length,
+      ...(result.usage ? { usage: result.usage } : {}),
+    };
   }
 
   private async appendCompactionMessage(input: EventContext, turnId: TurnId, result: ContextCompactionResult): Promise<MessageId> {
@@ -607,20 +798,31 @@ export class SingleAgentRuntime implements AgentRunner {
     assistantMessageId: MessageId,
     state: AssistantStreamState,
     text: string,
+    index?: number,
+    phase?: AssistantMessagePhase,
   ): Promise<void> {
-    if (!state.textPartId) {
-      state.textPartId = this.id<PartId>("part");
+    const textIndex = index ?? 0;
+    const existing = state.textParts.get(textIndex);
+    if (!existing) {
+      const partId = this.id<PartId>("part");
+      state.textParts.set(textIndex, { partId, ...(phase === undefined ? {} : { phase }) });
       await this.appendPart(input, assistantMessageId, {
-        id: state.textPartId,
+        id: partId,
         messageId: assistantMessageId,
         sessionId: input.sessionId,
         type: "text",
         text,
+        ...(phase === undefined ? {} : { phase }),
       });
       return;
     }
 
-    await this.appendPartDelta(input, assistantMessageId, state.textPartId, "text", text);
+    if (existing.phase !== phase) {
+      throw new Error(
+        `Model assistant text index ${textIndex} changed phase from ${String(existing.phase)} to ${String(phase)}`,
+      );
+    }
+    await this.appendPartDelta(input, assistantMessageId, existing.partId, "text", text);
   }
 
   private async appendReasoningDelta(
@@ -628,12 +830,16 @@ export class SingleAgentRuntime implements AgentRunner {
     assistantMessageId: MessageId,
     state: AssistantStreamState,
     text: string,
+    index?: number,
     redacted?: boolean,
   ): Promise<void> {
-    if (!state.reasoningPartId) {
-      state.reasoningPartId = this.id<PartId>("part");
+    const reasoningIndex = index ?? 0;
+    const existingPartId = state.reasoningPartIds.get(reasoningIndex);
+    if (!existingPartId) {
+      const partId = this.id<PartId>("part");
+      state.reasoningPartIds.set(reasoningIndex, partId);
       await this.appendPart(input, assistantMessageId, {
-        id: state.reasoningPartId,
+        id: partId,
         messageId: assistantMessageId,
         sessionId: input.sessionId,
         type: "reasoning",
@@ -643,7 +849,22 @@ export class SingleAgentRuntime implements AgentRunner {
       return;
     }
 
-    await this.appendPartDelta(input, assistantMessageId, state.reasoningPartId, "text", text);
+    await this.appendPartDelta(input, assistantMessageId, existingPartId, "text", text);
+  }
+
+  private async appendReasoningItem(
+    input: RunTurnInput,
+    assistantMessageId: MessageId,
+    modelOutput: NonNullable<Extract<MessagePart, { type: "reasoning" }>["modelOutput"]>,
+  ): Promise<void> {
+    await this.appendPart(input, assistantMessageId, {
+      id: this.id<PartId>("part"),
+      messageId: assistantMessageId,
+      sessionId: input.sessionId,
+      type: "reasoning",
+      text: "",
+      modelOutput,
+    });
   }
 
   private async queueToolCall(
@@ -654,14 +875,17 @@ export class SingleAgentRuntime implements AgentRunner {
     guard: DoomLoopGuard,
     state: AssistantStreamState,
   ): Promise<void> {
+    toolCall.callId = normalizeToolCallId(toolCall.callId);
+    const persistedInput = boundedToolInput(toolCall.input);
+    const persistedToolName = boundedToolName(toolCall.toolName);
     await this.appendPart(input, assistantMessageId, {
       id: this.id<PartId>("part"),
       messageId: assistantMessageId,
       sessionId: input.sessionId,
       type: "tool_call",
       callId: toolCall.callId,
-      toolName: toolCall.toolName,
-      input: toolCall.input,
+      toolName: persistedToolName,
+      input: persistedInput,
       status: "pending",
     });
 
@@ -675,19 +899,21 @@ export class SingleAgentRuntime implements AgentRunner {
       await this.append(input, "turn.guard_triggered", {
         turnId,
         reason: guardResult.reason,
-        toolName: toolCall.toolName,
+        toolName: persistedToolName,
         count: guardResult.count,
       });
       await this.append(input, "tool.call_started", {
         turnId,
         callId: toolCall.callId,
-        toolName: toolCall.toolName,
-        input: toolCall.input,
+        toolName: persistedToolName,
+        input: persistedInput,
       });
+      const persistedError = normalizePersistedError(error);
       await this.append(input, "tool.call_finished", {
         callId: toolCall.callId,
         status: "failed",
-        error: error.message,
+        error: persistedError.message,
+        ...persistedErrorDetailsPayload(persistedError),
         synthetic: true,
       });
       await this.appendPart(input, assistantMessageId, {
@@ -697,7 +923,7 @@ export class SingleAgentRuntime implements AgentRunner {
         type: "tool_result",
         callId: toolCall.callId,
         output: "",
-        error: error.message,
+        error: persistedError.message,
         synthetic: true,
       });
       throw error;
@@ -707,11 +933,12 @@ export class SingleAgentRuntime implements AgentRunner {
   }
 
   private async updateStreamingToolCall(input: EventContext, toolCall: StreamingToolCall): Promise<void> {
+    toolCall.callId = normalizeToolCallId(toolCall.callId);
     await this.append(input, "tool.call_updated", {
       callId: toolCall.callId,
       status: "running",
-      toolName: toolCall.toolName,
-      input: toolCall.input,
+      toolName: boundedToolName(toolCall.toolName),
+      input: boundedToolInput(toolCall.input),
     });
   }
 
@@ -719,8 +946,9 @@ export class SingleAgentRuntime implements AgentRunner {
     input: EventContext,
     state: AssistantStreamState,
     status: "failed" | "cancelled",
-    error: string,
+    error: unknown,
   ): Promise<void> {
+    const persistedError = normalizePersistedError(error);
     const unfinished = [...state.streamingToolCalls.values()];
     state.streamingToolCalls.clear();
     const seen = new Set<ToolCallId>();
@@ -730,7 +958,8 @@ export class SingleAgentRuntime implements AgentRunner {
       await this.append(input, "tool.call_finished", {
         callId: toolCall.callId,
         status,
-        error,
+        error: persistedError.message,
+        ...persistedErrorDetailsPayload(persistedError),
         synthetic: true,
       });
     }
@@ -741,28 +970,82 @@ export class SingleAgentRuntime implements AgentRunner {
     turnId: TurnId,
     assistantMessageId: MessageId,
     toolCalls: readonly PendingToolCall[],
+    pendingToolCalls: Set<PendingToolCall>,
+    envelopeHiddenToolNames: ReadonlySet<string>,
   ): Promise<void> {
     const concurrentLimit = this.options.maxConcurrentToolCalls ?? 10;
     let batch: PendingToolCall[] = [];
 
     const flush = async (): Promise<void> => {
       if (batch.length === 0) return;
+      throwIfTurnAborted(input.signal);
       const current = batch;
       batch = [];
-      const results = await Promise.all(
-        current.map((toolCall) => this.runToolCall(input, turnId, assistantMessageId, toolCall)),
+      const results = await Promise.allSettled(
+        current.map((toolCall) => {
+          // ToolExecutor owns terminal events once a call is dispatched.
+          pendingToolCalls.delete(toolCall);
+          return this.runToolCall(input, turnId, assistantMessageId, toolCall);
+        }),
       );
-      let cancelled: Error | undefined;
+      let failure: Error | undefined;
       for (const result of results) {
-        await this.appendPart(input, assistantMessageId, result.part);
-        if (result.cancelledError && !cancelled) cancelled = result.cancelledError;
+        if (result.status === "rejected") {
+          failure ??= toError(result.reason);
+          continue;
+        }
+        await this.appendPart(input, assistantMessageId, result.value.part);
+        failure ??= result.value.cancelledError;
       }
-      if (cancelled) throw cancelled;
+      if (failure) throw failure;
     };
 
     for (const toolCall of toolCalls) {
       if (input.signal?.aborted) throw abortError("Turn aborted");
-      const safe = await this.options.toolExecutor.canRunConcurrently(toolCall.toolName, toolCall.input);
+      if (input.toolMode === "disabled") {
+        await flush();
+        const part = await this.failToolCallWithoutExecution(
+          input,
+          turnId,
+          assistantMessageId,
+          toolCall,
+          "Tool use is disabled for this turn.",
+        );
+        pendingToolCalls.delete(toolCall);
+        await this.appendPart(input, assistantMessageId, part);
+        continue;
+      }
+      if (envelopeHiddenToolNames.has(toolCall.toolName)) {
+        await flush();
+        const part = await this.failToolCallWithoutExecution(
+          input,
+          turnId,
+          assistantMessageId,
+          toolCall,
+          "Tool was not advertised to the model because its definition exceeded the context envelope.",
+        );
+        pendingToolCalls.delete(toolCall);
+        await this.appendPart(input, assistantMessageId, part);
+        continue;
+      }
+      if (toolCall.inputParseError) {
+        await flush();
+        const part = await this.failToolCallWithoutExecution(
+          input,
+          turnId,
+          assistantMessageId,
+          toolCall,
+          toolCall.inputParseError,
+        );
+        pendingToolCalls.delete(toolCall);
+        await this.appendPart(input, assistantMessageId, part);
+        continue;
+      }
+      const safe = await this.options.toolExecutor.canRunConcurrently(toolCall.toolName, toolCall.input, {
+        sessionId: input.sessionId,
+        turnId,
+        cwd: input.cwd,
+      });
       if (safe) {
         batch.push(toolCall);
         if (batch.length >= concurrentLimit) await flush();
@@ -770,12 +1053,69 @@ export class SingleAgentRuntime implements AgentRunner {
       }
 
       await flush();
+      throwIfTurnAborted(input.signal);
+      pendingToolCalls.delete(toolCall);
       const result = await this.runToolCall(input, turnId, assistantMessageId, toolCall);
       await this.appendPart(input, assistantMessageId, result.part);
       if (result.cancelledError) throw result.cancelledError;
     }
 
     await flush();
+  }
+
+  private async failToolCallWithoutExecution(
+    input: EventContext,
+    turnId: TurnId,
+    assistantMessageId: MessageId,
+    toolCall: PendingToolCall,
+    error: unknown,
+    status: "failed" | "cancelled" = "failed",
+  ): Promise<MessagePart> {
+    const persistedError = normalizePersistedError(error);
+    await this.append(input, "tool.call_started", {
+      turnId,
+      callId: toolCall.callId,
+      toolName: boundedToolName(toolCall.toolName),
+      input: boundedToolInput(toolCall.input),
+    });
+    await this.append(input, "tool.call_finished", {
+      callId: toolCall.callId,
+      status,
+      error: persistedError.message,
+      ...persistedErrorDetailsPayload(persistedError),
+      synthetic: true,
+    });
+    return {
+      id: this.id<PartId>("part"),
+      messageId: assistantMessageId,
+      sessionId: input.sessionId,
+      type: "tool_result",
+      callId: toolCall.callId,
+      output: "",
+      error: persistedError.message,
+      synthetic: true,
+    };
+  }
+
+  private async finishPendingToolCalls(
+    input: EventContext,
+    turnId: TurnId,
+    assistantMessageId: MessageId,
+    toolCalls: readonly PendingToolCall[],
+    status: "failed" | "cancelled",
+    error: unknown,
+  ): Promise<void> {
+    for (const toolCall of toolCalls) {
+      const part = await this.failToolCallWithoutExecution(
+        input,
+        turnId,
+        assistantMessageId,
+        toolCall,
+        error,
+        status,
+      );
+      await this.appendPart(input, assistantMessageId, part);
+    }
   }
 
   private async runToolCall(
@@ -786,7 +1126,6 @@ export class SingleAgentRuntime implements AgentRunner {
   ): Promise<{ part: MessagePart; cancelledError?: Error }> {
     const executeInput = {
       sessionId: input.sessionId,
-      threadId: input.threadId,
       turnId,
       callId: toolCall.callId,
       toolName: toolCall.toolName,
@@ -803,6 +1142,7 @@ export class SingleAgentRuntime implements AgentRunner {
     const result = await this.options.toolExecutor.execute(executeInput);
 
     if (result.status === "completed") {
+      const executionContext = toolResultExecutionContext(result.result.metadata);
       const part: MessagePart = {
         id: this.id<PartId>("part"),
         messageId: assistantMessageId,
@@ -810,6 +1150,7 @@ export class SingleAgentRuntime implements AgentRunner {
         type: "tool_result",
         callId: toolCall.callId,
         output: result.result.output,
+        ...(executionContext ? { executionContext } : {}),
       };
       if (result.result.content) {
         part.content = result.result.content;
@@ -820,6 +1161,7 @@ export class SingleAgentRuntime implements AgentRunner {
       return { part };
     }
 
+    const persistedError = normalizePersistedError(result.error);
     const part: MessagePart = {
       id: this.id<PartId>("part"),
       messageId: assistantMessageId,
@@ -827,11 +1169,11 @@ export class SingleAgentRuntime implements AgentRunner {
       type: "tool_result",
       callId: toolCall.callId,
       output: "",
-      error: result.error.message,
+      error: persistedError.message,
       synthetic: true,
     };
     if (result.status === "cancelled") {
-      return { part, cancelledError: result.error };
+      return { part, cancelledError: persistedError };
     }
     return { part };
   }
@@ -861,16 +1203,30 @@ export class SingleAgentRuntime implements AgentRunner {
   private async appendModelMetadata(
     input: EventContext,
     turnId: TurnId,
-    metadata: Extract<ModelStreamEvent, { type: "metadata" | "finish" }>,
+    metadata: Extract<ModelStreamEvent, { type: "metadata" | "finish" | "error" }>,
   ): Promise<void> {
+    const provider = isModelMetadataEvent(metadata)
+      ? boundedModelMetadataText(unknownErrorField(metadata, "provider"), "model provider")
+      : undefined;
+    const model = isModelMetadataEvent(metadata)
+      ? boundedModelMetadataText(unknownErrorField(metadata, "model"), "model name")
+      : undefined;
+    const responseId = persistedModelResponseId(unknownErrorField(metadata, "responseId"));
+    const usage = persistedModelUsage(unknownErrorField(metadata, "usage"));
+    const contextWindowTokens = isModelMetadataEvent(metadata)
+      ? persistedModelMetadataNumber(unknownErrorField(metadata, "contextWindowTokens"))
+      : undefined;
+    const maxOutputTokens = isModelMetadataEvent(metadata)
+      ? persistedModelMetadataNumber(unknownErrorField(metadata, "maxOutputTokens"))
+      : undefined;
     await this.append(input, "turn.model_metadata", {
       turnId,
-      ...(isModelMetadataEvent(metadata) && metadata.provider ? { provider: metadata.provider } : {}),
-      ...(isModelMetadataEvent(metadata) && metadata.model ? { model: metadata.model } : {}),
-      ...(metadata.responseId ? { responseId: metadata.responseId } : {}),
-      ...(metadata.usage ? { usage: metadata.usage } : {}),
-      ...(isModelMetadataEvent(metadata) && metadata.contextWindowTokens !== undefined ? { contextWindowTokens: metadata.contextWindowTokens } : {}),
-      ...(isModelMetadataEvent(metadata) && metadata.maxOutputTokens !== undefined ? { maxOutputTokens: metadata.maxOutputTokens } : {}),
+      ...(provider ? { provider } : {}),
+      ...(model ? { model } : {}),
+      ...(responseId ? { responseId } : {}),
+      ...(usage ? { usage } : {}),
+      ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
+      ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
     });
   }
 
@@ -886,7 +1242,6 @@ export class SingleAgentRuntime implements AgentRunner {
       sessionId: input.sessionId,
       payload,
     };
-    if (input.threadId) event.threadId = input.threadId;
     await this.options.store.append(event as ChiliEvent);
   }
 
@@ -919,35 +1274,226 @@ function defaultCreateId(prefix: string): string {
   return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
 }
 
-function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+function toolResultExecutionContext(
+  metadata: Record<string, unknown> | undefined,
+): ToolResultExecutionContext | undefined {
+  if (!metadata) return undefined;
+  const context: ToolResultExecutionContext = {};
+
+  if (metadata.sandbox === "macos-seatbelt" || metadata.sandbox === "none") {
+    context.sandbox = metadata.sandbox;
+  }
+  if (metadata.executionMode === "sandboxed" || metadata.executionMode === "unsandboxed") {
+    context.executionMode = metadata.executionMode;
+  }
+  if (metadata.exitCode === null || isNonNegativeInteger(metadata.exitCode)) {
+    context.exitCode = metadata.exitCode;
+  }
+  if (typeof metadata.timedOut === "boolean") context.timedOut = metadata.timedOut;
+  if (typeof metadata.aborted === "boolean") context.aborted = metadata.aborted;
+  if (metadata.signal === null || isProcessSignal(metadata.signal)) context.signal = metadata.signal;
+
+  return Object.keys(context).length > 0 ? context : undefined;
 }
 
-interface AssistantMutationError extends Error {
-  assistantMutated?: boolean;
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
+
+function isProcessSignal(value: unknown): value is string {
+  return typeof value === "string" && /^SIG[A-Z0-9]{1,28}$/.test(value);
+}
+
+function toError(error: unknown): Error {
+  const usage = takeModelUsage(error);
+  const assistantMutated = didAssistantMutate(error);
+  const retryable = isRetryableTransientError(error);
+  const retryAfterMs = retryAfterDelayHint(error);
+  const contextLimit = isContextLimitErrorValue(error, new Set<object>(), 0);
+  const normalized = normalizePersistedError(error);
+  copyRuntimeErrorScalar(error, normalized, "retryable", "boolean");
+  copyRuntimeErrorScalar(error, normalized, "status", "number");
+  copyRuntimeErrorScalar(error, normalized, "statusCode", "number");
+  copyRuntimeErrorScalar(error, normalized, "httpStatus", "number");
+  copyRuntimeErrorScalar(error, normalized, "retryAfterMs", "number");
+  copyRuntimeErrorScalar(error, normalized, "errno", "string");
+  copyRuntimeErrorScalar(error, normalized, "category", "string");
+  copyRuntimeErrorScalar(error, normalized, "type", "string");
+  copyRuntimeErrorScalar(error, normalized, "reason", "string");
+  copyRuntimeErrorScalar(error, normalized, "errorCode", "string");
+  Object.defineProperty(normalized, "retryable", {
+    configurable: true,
+    enumerable: true,
+    value: retryable,
+    writable: true,
+  });
+  if (retryAfterMs !== undefined) {
+    Object.defineProperty(normalized, "retryAfterMs", {
+      configurable: true,
+      enumerable: true,
+      value: retryAfterMs,
+      writable: true,
+    });
+  }
+  if (contextLimit) {
+    Object.defineProperty(normalized, "type", {
+      configurable: true,
+      enumerable: true,
+      value: "context_length_exceeded",
+      writable: true,
+    });
+  }
+  if (usage) attachModelUsage(normalized, usage);
+  if (assistantMutated) markAssistantMutation(normalized, true);
+  return normalized;
+}
+
+function copyRuntimeErrorScalar(
+  source: unknown,
+  target: Error,
+  key: string,
+  expectedType: "boolean" | "number" | "string",
+): void {
+  if ((typeof source !== "object" && typeof source !== "function") || source === null) return;
+  let value: unknown;
+  try {
+    value = Reflect.get(source, key);
+  } catch {
+    return;
+  }
+  if (typeof value !== expectedType) return;
+  if (expectedType === "number" && !Number.isFinite(value)) return;
+  if (expectedType === "string" && !isSafeRuntimeErrorTag(value as string)) return;
+  Object.defineProperty(target, key, { configurable: true, enumerable: true, value, writable: true });
+}
+
+function isSafeRuntimeErrorTag(value: string): boolean {
+  if (Buffer.byteLength(value, "utf8") > 256 || !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/u.test(value)) return false;
+  const probe = normalizePersistedError(Object.assign(new Error("classification tag"), { code: value }));
+  return probe.code === value;
+}
+
+function persistedErrorDetailsPayload(
+  error: ReturnType<typeof normalizePersistedError>,
+): { errorDetails?: ReturnType<typeof normalizePersistedError>["persistedErrorDetails"] } {
+  const details = error.persistedErrorDetails;
+  return (details.name !== "Error" && details.name !== "AbortError")
+    || details.code !== undefined
+    || details.truncated === true
+    ? { errorDetails: details }
+    : {};
+}
+
+function terminalPersistedError(error: Error, aborted: boolean): ReturnType<typeof normalizePersistedError> {
+  const normalized = normalizePersistedError(error);
+  if (!aborted) return normalized;
+  normalized.name = "AbortError";
+  return normalizePersistedError(normalized);
+}
+
+const assistantMutationByError = new WeakMap<object, boolean>();
 
 function markAssistantMutation(error: Error, assistantMutated: boolean): void {
-  (error as AssistantMutationError).assistantMutated = assistantMutated;
+  assistantMutationByError.set(error, assistantMutated);
 }
 
-function didAssistantMutate(error: Error): boolean {
-  return (error as AssistantMutationError).assistantMutated === true;
+function didAssistantMutate(error: unknown): boolean {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) return false;
+  return assistantMutationByError.get(error) === true;
 }
 
 function isContextLimitError(error: Error): boolean {
-  const message = error.message.toLowerCase();
-  return (
-    message.includes("context window") ||
-    message.includes("context length") ||
-    message.includes("maximum context") ||
-    message.includes("prompt is too long") ||
-    message.includes("input is too long") ||
-    message.includes("too many tokens") ||
-    message.includes("request too large") ||
-    message.includes("http 413") ||
-    /\b413\b/.test(message)
-  );
+  return isContextLimitErrorValue(error, new Set<object>(), 0);
+}
+
+function isContextLimitErrorValue(value: unknown, seen: Set<object>, depth: number): boolean {
+  if (typeof value === "string") return isContextLimitMessage(value);
+  if (typeof value !== "object" || value === null || seen.has(value) || depth > 8 || seen.size >= 256) return false;
+  seen.add(value);
+
+  const status = numericErrorField(value, "status")
+    ?? numericErrorField(value, "statusCode")
+    ?? numericErrorField(value, "httpStatus");
+  if (status === 413) return true;
+
+  for (const key of ["code", "type", "reason", "errorCode"] as const) {
+    const tag = stringErrorField(value, key);
+    if (tag && isContextLimitTag(tag)) return true;
+  }
+
+  const name = stringErrorField(value, "name");
+  if (name && isContextLimitTag(name)) return true;
+  const message = stringErrorField(value, "message");
+  if (message && isContextLimitMessage(message)) return true;
+
+  const cause = unknownErrorField(value, "cause");
+  if (cause !== undefined && isContextLimitErrorValue(cause, seen, depth + 1)) return true;
+  const errors = unknownErrorField(value, "errors");
+  const errorCount = safeErrorArrayLength(errors);
+  for (let index = 0; index < Math.min(errorCount, 64); index += 1) {
+    if (isContextLimitErrorValue(unknownErrorField(errors, String(index)), seen, depth + 1)) return true;
+  }
+  return false;
+}
+
+function safeErrorArrayLength(value: unknown): number {
+  try {
+    if (!Array.isArray(value)) return 0;
+    const length = Reflect.get(value, "length");
+    return typeof length === "number" && Number.isSafeInteger(length) && length >= 0 ? length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function isContextLimitMessage(value: string): boolean {
+  const message = value.toLowerCase();
+  return message.includes("context window")
+    || message.includes("context length")
+    || message.includes("maximum context")
+    || message.includes("prompt is too long")
+    || message.includes("input is too long")
+    || message.includes("too many tokens")
+    || message.includes("request too large")
+    || message.includes("http 413")
+    || /\b413\b/.test(message);
+}
+
+function isContextLimitTag(value: string): boolean {
+  const tag = value.trim().toLowerCase().replace(/[.\s-]+/g, "_");
+  return tag === "context_length_exceeded"
+    || tag === "context_window_exceeded"
+    || tag === "max_context_length_exceeded"
+    || tag === "maximum_context_length"
+    || tag === "context_overflow"
+    || tag === "prompt_too_long"
+    || tag === "input_too_long"
+    || tag === "request_too_large"
+    || tag === "too_many_tokens"
+    || tag === "token_limit_exceeded"
+    || /(?:context|prompt|input|request).*(?:length|window|tokens?|size).*(?:error|exceed|limit|long|large|overflow)/.test(tag);
+}
+
+function stringErrorField(value: object, key: string): string | undefined {
+  const field = unknownErrorField(value, key);
+  return typeof field === "string" && field.trim() ? field : undefined;
+}
+
+function numericErrorField(value: object, key: string): number | undefined {
+  const field = unknownErrorField(value, key);
+  if (typeof field === "number" && Number.isFinite(field)) return field;
+  if (typeof field !== "string" || !field.trim()) return undefined;
+  const parsed = Number(field);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function unknownErrorField(value: unknown, key: string): unknown {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
 }
 
 function isExternalImageUnderstandingTool(tool: { name: string; description: string; mcp?: unknown }): boolean {
@@ -978,7 +1524,8 @@ function isMcpTool(tool: { mcp?: unknown }): tool is { mcp: Record<string, unkno
 }
 
 function isAbortError(error: Error): boolean {
-  return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
+  const persisted = normalizePersistedError(error);
+  return persisted.name === "AbortError" || persisted.message.toLowerCase().includes("aborted");
 }
 
 function abortError(message: string): Error {
@@ -987,12 +1534,116 @@ function abortError(message: string): Error {
   return error;
 }
 
+function throwIfTurnAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw signalAbortError(signal, "Turn aborted");
+}
+
+function signalAbortError(signal: AbortSignal | undefined, fallbackMessage: string): Error {
+  if (!signal?.aborted) return terminalPersistedError(toError(fallbackMessage), true);
+  let reason: unknown;
+  try {
+    reason = signal.reason;
+  } catch {
+    return abortError(fallbackMessage);
+  }
+  if (reason === undefined
+    || (typeof DOMException !== "undefined" && reason instanceof DOMException && reason.name === "AbortError")) {
+    return abortError(fallbackMessage);
+  }
+  return terminalPersistedError(toError(reason), true);
+}
+
+function boundedToolInput(value: unknown): unknown {
+  return boundPersistedJsonValue(value, {
+    maxBytes: PERSISTED_JSON_LIMITS.eventValueBytes,
+    maxStringBytes: PERSISTED_JSON_LIMITS.stringBytes,
+    maxItems: PERSISTED_JSON_LIMITS.items,
+    maxDepth: PERSISTED_JSON_LIMITS.depth,
+    maxNodes: PERSISTED_JSON_LIMITS.nodes,
+    label: "tool input",
+  });
+}
+
+function boundedToolName(value: string): string {
+  const sanitized = value.replace(/[\u0000-\u001f\u007f]/gu, " ").trim();
+  if (!sanitized) return "unknown_tool";
+  const bounded = boundPersistedJsonValue(sanitized, {
+    maxBytes: 514,
+    maxStringBytes: 512,
+    maxItems: 1,
+    maxDepth: 1,
+    maxNodes: 1,
+    label: "tool name",
+  });
+  return typeof bounded === "string" && bounded.trim() ? bounded : "unknown_tool";
+}
+
+function boundedModelMetadataText(value: unknown, label: string): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  const redacted = normalizePersistedError(value).message;
+  const sanitized = redacted.replace(/[\u0000-\u001f\u007f]/gu, " ").trim();
+  if (!sanitized) return undefined;
+  const bounded = boundPersistedJsonValue(sanitized, {
+    maxBytes: MAX_MODEL_METADATA_TEXT_BYTES,
+    maxStringBytes: MAX_MODEL_METADATA_TEXT_BYTES - 2,
+    maxItems: 1,
+    maxDepth: 1,
+    maxNodes: 1,
+    label,
+  });
+  return typeof bounded === "string" && bounded.trim() ? bounded : undefined;
+}
+
+function persistedModelResponseId(value: unknown): string | undefined {
+  if (typeof value !== "string"
+    || value.length === 0
+    || value.length > MAX_MODEL_RESPONSE_ID_CHARS
+    || value !== value.trim()
+    || /[\u0000-\u001f\u007f]/u.test(value)
+    || value === "__proto__"
+    || value === "prototype"
+    || value === "constructor") {
+    return undefined;
+  }
+  return value;
+}
+
+function persistedModelUsage(value: unknown): ModelUsage | undefined {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+  const result: ModelUsage = {};
+  for (const key of [
+    "inputTokens",
+    "outputTokens",
+    "cacheReadInputTokens",
+    "cacheCreationInputTokens",
+    "totalTokens",
+  ] as const) {
+    const candidate = persistedModelMetadataNumber(unknownErrorField(value, key));
+    if (candidate !== undefined) result[key] = candidate;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function persistedModelMetadataNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 function toolCallKey(toolCallId: string, index: number | undefined): string {
-  return `${toolCallId}:${index ?? ""}`;
+  return `${normalizeToolCallId(toolCallId, index)}:${index ?? ""}`;
+}
+
+function isOutputLimitFinishReason(reason: string | undefined): boolean {
+  if (!reason) return false;
+  const normalized = reason.toLowerCase();
+  return normalized === "length" || normalized === "max_tokens" || normalized === "max_output_tokens";
+}
+
+function incompleteModelStreamError(message: string): Error {
+  return Object.assign(new Error(message), { name: "ModelStreamIncompleteError", retryable: false });
 }
 
 function isModelMetadataEvent(
-  event: Extract<ModelStreamEvent, { type: "metadata" | "finish" }>,
+  event: Extract<ModelStreamEvent, { type: "metadata" | "finish" | "error" }>,
 ): event is Extract<ModelStreamEvent, { type: "metadata" }> {
   return "type" in event && event.type === "metadata";
 }
@@ -1009,7 +1660,7 @@ function filterToolsByPolicies(
 
 function renderContextSummary(result: ContextCompactionResult): string {
   return [
-    `<context_summary boundary_message_id="${result.boundary.boundaryMessageId}" reason="${result.boundary.reason}">`,
+    "<context_summary>",
     stripContextSummary(result.summary),
     "</context_summary>",
   ].join("\n");

@@ -1,4 +1,10 @@
-import type { Message, MessagePart } from "@chili/protocol";
+import {
+  formatToolResultForModel,
+  normalizeToolCallId,
+  type Message,
+  type MessagePart,
+  type ServiceTier,
+} from "@chili/protocol";
 import type {
   ChiliModel,
   ModelInputCapability,
@@ -8,6 +14,17 @@ import type {
   ModelUsage,
 } from "./types.js";
 import { assertImageInputSupported } from "./image-input.js";
+import {
+  sharedProviderBackpressureCoordinator,
+  type ProviderBackpressureCoordinator,
+  type ProviderRequestScope,
+} from "./provider-backpressure.js";
+import {
+  providerHttpError,
+  providerPayloadError,
+  providerStreamProtocolError,
+  type ProviderErrorDetails,
+} from "./provider-error.js";
 import { readSseEvents } from "./sse.js";
 import { normalizeAnthropicToolCallId, prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
 
@@ -21,15 +38,20 @@ export interface AnthropicCompatibleModelOptions {
   authScheme?: AnthropicAuthScheme;
   maxTokens?: number;
   temperature?: number;
+  reasoning?: boolean;
+  serviceTier?: ServiceTier;
   fetch?: typeof fetch;
   headers?: Record<string, string>;
   inputCapabilities?: readonly ModelInputCapability[];
+  backpressureCoordinator?: ProviderBackpressureCoordinator;
 }
 
 export interface AnthropicRequestBuildOptions {
   model: string;
   maxTokens?: number;
   temperature?: number;
+  reasoning?: boolean;
+  serviceTier?: ServiceTier;
   stream?: boolean;
   inputCapabilities?: readonly ModelInputCapability[];
 }
@@ -78,6 +100,11 @@ interface AnthropicResponse {
 interface AnthropicErrorPayload {
   message?: string;
   type?: string;
+  code?: string | number;
+  error_code?: string | number;
+  status_code?: string | number;
+  retry_after?: string | number;
+  retry_after_ms?: string | number;
 }
 
 interface AnthropicUsage {
@@ -119,10 +146,17 @@ interface ToolBlockState {
   initialInput: unknown;
 }
 
+interface FinalToolInput {
+  input: unknown;
+  inputParseError?: string;
+}
+
 export class AnthropicCompatibleModel implements ChiliModel {
   readonly provider: string;
   readonly model: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly backpressureCoordinator: ProviderBackpressureCoordinator;
+  private readonly requestScope: ProviderRequestScope;
 
   constructor(private readonly options: AnthropicCompatibleModelOptions) {
     if (!options.apiKey) throw new Error("Anthropic-compatible model requires an API key");
@@ -131,6 +165,12 @@ export class AnthropicCompatibleModel implements ChiliModel {
     this.provider = options.provider ?? "anthropic-compatible";
     this.model = options.model;
     this.fetchImpl = options.fetch ?? fetch;
+    this.backpressureCoordinator = options.backpressureCoordinator ?? sharedProviderBackpressureCoordinator;
+    this.requestScope = {
+      provider: this.provider,
+      endpoint: resolveMessagesUrl(options.baseUrl),
+      credential: options.apiKey,
+    };
   }
 
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
@@ -149,6 +189,14 @@ export class AnthropicCompatibleModel implements ChiliModel {
     const temperature = input.temperature ?? this.options.temperature;
     if (maxTokens !== undefined) requestOptions.maxTokens = maxTokens;
     if (temperature !== undefined) requestOptions.temperature = temperature;
+    const requestReasoning = this.provider === "minimax"
+      ? reasoningEnabledForInput(input) ?? this.options.reasoning
+      : this.options.reasoning;
+    const requestServiceTier = this.provider === "minimax"
+      ? input.serviceTier ?? this.options.serviceTier
+      : this.options.serviceTier;
+    if (requestReasoning !== undefined) requestOptions.reasoning = requestReasoning;
+    if (requestServiceTier !== undefined) requestOptions.serviceTier = requestServiceTier;
 
     const init: RequestInit = {
       method: "POST",
@@ -157,39 +205,58 @@ export class AnthropicCompatibleModel implements ChiliModel {
     };
     if (input.signal) init.signal = input.signal;
 
-    const response = await this.fetchImpl(resolveMessagesUrl(this.options.baseUrl), init);
+    await this.backpressureCoordinator.beforeRequest(this.requestScope, input.signal);
+    const response = await this.fetchImpl(this.requestScope.endpoint ?? resolveMessagesUrl(this.options.baseUrl), init);
     if (!response.ok) {
-      const text = await response.text();
-      const payload = parseJson<AnthropicResponse>(text, undefined);
-      throw new Error(payload?.error?.message ?? `Model request failed with HTTP ${response.status}: ${text}`);
+      const error = await providerHttpError(response, {
+        provider: this.provider,
+        label: "Model request",
+        selectJson: ({ json }) => anthropicErrorDetails(json),
+      });
+      this.backpressureCoordinator.recordError(this.requestScope, error);
+      throw error;
     }
 
     if (isEventStream(response) && response.body) {
-      yield* this.streamSseResponse(response.body, input.signal);
+      yield* this.streamSseResponse(response.body, response, input.signal);
       return;
     }
 
-    yield* this.streamJsonResponse(await response.text());
+    yield* this.streamJsonResponse(await response.text(), response);
   }
 
-  private async *streamSseResponse(body: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncIterable<ModelStreamEvent> {
+  private async *streamSseResponse(
+    body: ReadableStream<Uint8Array>,
+    response: Response,
+    signal?: AbortSignal,
+  ): AsyncIterable<ModelStreamEvent> {
     let responseId: string | undefined;
     let usage: ModelUsage | undefined;
     let finishReason = "stop";
-    let finished = false;
     const toolBlocks = new Map<number, ToolBlockState>();
 
     for await (const event of readSseEvents(body, signal)) {
       if (event.data === "[DONE]") break;
-      const fallback: AnthropicSsePayload = {};
-      if (event.event !== undefined) fallback.type = event.event;
-      const payload = parseJson<AnthropicSsePayload>(event.data, fallback);
-      if (!payload) continue;
-
-      if (payload.type === "error" || event.event === "error") {
-        yield errorEvent(payload.error ?? payload, responseId, usage);
+      const parsed = parseJson<AnthropicSsePayload>(event.data, undefined);
+      if (parsed?.type === "error" || event.event === "error") {
+        const details = anthropicErrorDetails(parsed);
+        const error = providerPayloadError(parsed, {
+          provider: this.provider,
+          label: "Model stream failed",
+          response,
+          ...(details ? { details } : {}),
+        });
+        this.backpressureCoordinator.recordError(this.requestScope, error);
+        yield errorEvent(error, responseId, usage);
         return;
       }
+
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        if (!event.data.trim()) continue;
+        throw providerStreamProtocolError(this.provider, "Model stream contained invalid JSON", response, "invalid_stream");
+      }
+      const payload = parsed;
+      if (payload.type === undefined && event.event !== undefined) payload.type = event.event;
 
       if (payload.type === "message_start") {
         responseId = payload.message?.id;
@@ -211,7 +278,7 @@ export class AnthropicCompatibleModel implements ChiliModel {
           continue;
         }
         if (block.type === "tool_use") {
-          const toolCallId = block.id ?? `tool_${payload.index}`;
+          const toolCallId = normalizeToolCallId(block.id ?? `tool_${payload.index}`, payload.index);
           const name = block.name ?? "";
           toolBlocks.set(payload.index, {
             toolCallId,
@@ -248,13 +315,16 @@ export class AnthropicCompatibleModel implements ChiliModel {
         const tool = toolBlocks.get(payload.index);
         if (tool) {
           toolBlocks.delete(payload.index);
-          yield {
+          const finalInput = finalToolInput(tool);
+          const event: ModelStreamEvent = {
             type: "tool_call_end",
             toolCallId: tool.toolCallId,
             name: tool.name,
-            input: finalToolInput(tool),
+            input: finalInput.input,
             index: payload.index,
           };
+          if (finalInput.inputParseError) event.inputParseError = finalInput.inputParseError;
+          yield event;
         }
         continue;
       }
@@ -268,21 +338,36 @@ export class AnthropicCompatibleModel implements ChiliModel {
       }
 
       if (payload.type === "message_stop") {
-        finished = true;
+        if (toolBlocks.size > 0) {
+          throw providerStreamProtocolError(this.provider, "Model stream stopped before tool content_block_stop", response, "incomplete_stream");
+        }
         yield finishEvent(finishReason, responseId, usage);
+        return;
       }
     }
 
-    if (!finished) {
-      yield finishEvent(finishReason, responseId, usage);
-    }
+    throw providerStreamProtocolError(this.provider, "Model stream ended before message_stop", response, "incomplete_stream");
   }
 
-  private async *streamJsonResponse(text: string): AsyncIterable<ModelStreamEvent> {
+  private async *streamJsonResponse(text: string, response: Response): AsyncIterable<ModelStreamEvent> {
     const payload = parseJson<AnthropicResponse>(text, undefined);
-    if (!payload) throw new Error(`Model response was not JSON: ${text}`);
+    if (!payload) {
+      throw providerPayloadError(undefined, {
+        provider: this.provider,
+        label: "Model response was not valid JSON",
+        response,
+      });
+    }
     if (payload.error) {
-      yield errorEvent(payload.error, payload.id, undefined);
+      const details = anthropicErrorDetails(payload);
+      const error = providerPayloadError(payload, {
+        provider: this.provider,
+        label: "Model response failed",
+        response,
+        ...(details ? { details } : {}),
+      });
+      this.backpressureCoordinator.recordError(this.requestScope, error);
+      yield errorEvent(error, payload.id, undefined);
       return;
     }
 
@@ -290,7 +375,7 @@ export class AnthropicCompatibleModel implements ChiliModel {
     const metadata = metadataEvent(this.provider, payload.model ?? this.model, payload.id, usage);
     if (metadata) yield metadata;
 
-    for (const block of payload.content ?? []) {
+    for (const [blockIndex, block] of (payload.content ?? []).entries()) {
       if (block.type === "text") {
         yield { type: "text_delta", text: block.text };
       } else if (block.type === "thinking") {
@@ -298,8 +383,9 @@ export class AnthropicCompatibleModel implements ChiliModel {
       } else if (block.type === "redacted_thinking") {
         yield { type: "reasoning_delta", text: "[Reasoning redacted]", redacted: true };
       } else if (block.type === "tool_use") {
-        yield { type: "tool_call_start", toolCallId: block.id, name: block.name };
-        yield { type: "tool_call_end", toolCallId: block.id, name: block.name, input: block.input };
+        const toolCallId = normalizeToolCallId(block.id, blockIndex);
+        yield { type: "tool_call_start", toolCallId, name: block.name };
+        yield { type: "tool_call_end", toolCallId, name: block.name, input: block.input };
       }
     }
 
@@ -320,6 +406,7 @@ export class AnthropicCompatibleModel implements ChiliModel {
     }
     return headers;
   }
+
 }
 
 export function buildAnthropicRequestBody(
@@ -345,14 +432,33 @@ export function buildAnthropicRequestBody(
   const system = [...(input.system ?? []), ...(input.developer ?? []), ...systemMessages(messages)].filter(Boolean).join("\n\n");
   if (system) body.system = system;
   if (options.temperature !== undefined) body.temperature = options.temperature;
+  if (options.reasoning !== undefined) {
+    body.thinking = { type: options.reasoning ? "adaptive" : "disabled" };
+  }
+  if (options.serviceTier === "fast") body.service_tier = "priority";
   return body;
 }
 
 export function resolveMessagesUrl(baseUrl: string): string {
-  const clean = baseUrl.replace(/\/+$/, "");
-  if (clean.endsWith("/v1/messages")) return clean;
-  if (clean.endsWith("/v1")) return `${clean}/messages`;
-  return `${clean}/v1/messages`;
+  const url = new URL(baseUrl);
+  url.hash = "";
+  const cleanPath = url.pathname.replace(/\/+$/, "");
+  if (cleanPath.endsWith("/v1/messages")) {
+    url.pathname = cleanPath;
+  } else if (cleanPath.endsWith("/v1")) {
+    url.pathname = `${cleanPath}/messages`;
+  } else {
+    url.pathname = `${cleanPath}/v1/messages`;
+  }
+  return url.toString();
+}
+
+function reasoningEnabledForInput(input: ModelStreamInput): boolean | undefined {
+  const reasoning = input.reasoning
+    ?? input.thinking
+    ?? input.selection?.reasoning
+    ?? input.selection?.thinking;
+  return reasoning === undefined ? undefined : reasoning !== "off";
 }
 
 function toAnthropicMessages(messages: readonly Message[], includeImageContent = true): AnthropicMessage[] {
@@ -370,7 +476,7 @@ function toAnthropicMessages(messages: readonly Message[], includeImageContent =
       } else if (part.type === "image" && includeImageContent) {
         userBlocks.push(formatImageBlock(part));
       } else if (part.type === "reasoning") {
-        assistantBlocks.push({ type: "text", text: part.text });
+        if (part.text) assistantBlocks.push({ type: "text", text: part.text });
       } else if (part.type === "tool_call") {
         assistantBlocks.push({
           type: "tool_use",
@@ -435,17 +541,13 @@ function formatImageBlock(part: Pick<Extract<MessagePart, { type: "image" }>, "d
   };
 }
 
-function formatToolResult(part: Extract<MessagePart, { type: "tool_result" }>): string {
-  if (part.error) return part.output ? `${part.output}\n\nError: ${part.error}` : `Error: ${part.error}`;
-  return part.output;
-}
-
 function formatToolResultContent(part: Extract<MessagePart, { type: "tool_result" }>, includeImageContent = true): AnthropicToolResultContent {
   if (part.error || !includeImageContent || !part.content?.some((item) => item.type === "image")) {
-    return formatToolResult(part);
+    return formatToolResultForModel(part);
   }
   const blocks: Exclude<AnthropicToolResultContent, string> = [];
-  if (part.output) blocks.push({ type: "text", text: part.output });
+  const output = formatToolResultForModel(part);
+  if (output) blocks.push({ type: "text", text: output });
   for (const item of part.content) {
     if (item.type === "text") {
       if (item.text) blocks.push({ type: "text", text: item.text });
@@ -453,7 +555,7 @@ function formatToolResultContent(part: Extract<MessagePart, { type: "tool_result
     }
     blocks.push(formatImageBlock(item));
   }
-  return blocks.length > 0 ? blocks : formatToolResult(part);
+  return blocks.length > 0 ? blocks : formatToolResultForModel(part);
 }
 
 function supportsImageInput(inputCapabilities: readonly ModelInputCapability[] | undefined): boolean {
@@ -470,6 +572,64 @@ function parseJson<T>(text: string, fallback: T | undefined): T | undefined {
   } catch {
     return fallback;
   }
+}
+
+function anthropicErrorDetails(value: unknown): ProviderErrorDetails | undefined {
+  const payload = extractAnthropicErrorPayload(value);
+  if (!payload) return undefined;
+  const message = stringField(payload, "message");
+  const code = codeField(payload, "code")
+    ?? codeField(payload, "error_code")
+    ?? codeField(payload, "status_code")
+    ?? (message ? errorCodeFromMessage(message) : undefined);
+  const type = stringField(payload, "type");
+  const retryAfterMs = retryAfterFromPayload(payload);
+  if (!message && code === undefined && !type && retryAfterMs === undefined) return undefined;
+  return {
+    ...(message ? { message } : {}),
+    ...(code !== undefined ? { code } : {}),
+    ...(type ? { type } : {}),
+    ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+  };
+}
+
+function extractAnthropicErrorPayload(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value)) return undefined;
+  return isRecord(value.error) ? value.error : value;
+}
+
+function errorCodeFromMessage(message: string): string | undefined {
+  return /\((\d{3,6})\)\s*[.!]?\s*$/.exec(message)?.[1]
+    ?? /\b(?:error|status)[ _-]?code\s*[:=]?\s*(\d{3,6})\b/i.exec(message)?.[1];
+}
+
+function retryAfterFromPayload(payload: Record<string, unknown>): number | undefined {
+  const milliseconds = finiteNumber(payload.retry_after_ms);
+  if (milliseconds !== undefined && milliseconds >= 0) return Math.round(milliseconds);
+  const seconds = finiteNumber(payload.retry_after);
+  return seconds !== undefined && seconds >= 0 ? Math.round(seconds * 1_000) : undefined;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function codeField(record: Record<string, unknown>, key: string): string | number | undefined {
+  const value = record[key];
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function toolCallDeltaEvent(
@@ -489,9 +649,23 @@ function toolCallDeltaEvent(
   return event;
 }
 
-function finalToolInput(tool: ToolBlockState): unknown {
-  if (!tool.partialJson) return tool.initialInput;
-  return parseJson(tool.partialJson, tool.initialInput);
+function finalToolInput(tool: ToolBlockState): FinalToolInput {
+  if (!tool.partialJson) return { input: tool.initialInput };
+  try {
+    return { input: JSON.parse(tool.partialJson) as unknown };
+  } catch (error) {
+    return {
+      input: tool.initialInput,
+      inputParseError: formatToolInputParseError(error),
+    };
+  }
+}
+
+function formatToolInputParseError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    ? `Tool call arguments were not valid JSON: ${message}`
+    : "Tool call arguments were not valid JSON.";
 }
 
 function mergeUsage(previous: ModelUsage | undefined, usage: AnthropicUsage | undefined): ModelUsage | undefined {

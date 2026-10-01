@@ -1,5 +1,18 @@
-import type { ApprovalId, MessageId, SessionId, ThreadId, TurnId } from "./ids.js";
+import type { ApprovalId, MessageId, SessionId, TurnId } from "./ids.js";
 import type { ApprovalDecisionAction } from "./tool.js";
+
+export const SESSION_TITLE_MAX_CHARS = 120;
+
+/** Normalize and validate a user-visible session title at every runtime boundary. */
+export function normalizeSessionTitle(title: string): string {
+  if (typeof title !== "string") throw new TypeError("Session title must be a string.");
+  const normalized = title.trim().replace(/\s+/gu, " ");
+  if (!normalized) throw new TypeError("Session title cannot be empty.");
+  if (normalized.length > SESSION_TITLE_MAX_CHARS) {
+    throw new TypeError(`Session title must be ${SESSION_TITLE_MAX_CHARS} characters or fewer.`);
+  }
+  return normalized;
+}
 
 export type RuntimeSessionStatus =
   | "idle"
@@ -9,13 +22,27 @@ export type RuntimeSessionStatus =
   | "cancelled"
   | "failed";
 
-export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
 export const THINKING_LEVELS = REASONING_LEVELS;
 
 export type ThinkingLevel = ReasoningLevel;
+
+export const DELEGATION_POLICIES = ["off", "explicit", "proactive"] as const;
+
+export type DelegationPolicy = (typeof DELEGATION_POLICIES)[number];
+
+export const DELEGATION_POLICY_SOURCES = ["default", "reasoning_legacy", "session"] as const;
+
+export type DelegationPolicySource = (typeof DELEGATION_POLICY_SOURCES)[number];
+
+export interface RuntimeDelegationConfig {
+  sessionId: SessionId;
+  policy: DelegationPolicy;
+  source: DelegationPolicySource;
+}
 
 export const SERVICE_TIERS = ["standard", "fast"] as const;
 
@@ -40,14 +67,25 @@ export interface RuntimeModelCapabilities {
   responseId?: boolean;
 }
 
+export const RUNTIME_MODEL_AUTH_SOURCES = ["none", "environment", "api_key", "oauth"] as const;
+export type RuntimeModelAuthSource = (typeof RUNTIME_MODEL_AUTH_SOURCES)[number];
+
 export interface RuntimeModelDescriptor extends ModelSelection {
   displayName?: string;
   providerDisplayName?: string;
+  /** A non-secret label for the effective model connection or profile. */
+  connectionLabel?: string;
+  /** The effective credential source, without credential material. */
+  authSource?: RuntimeModelAuthSource;
+  /** A sanitized endpoint origin. It must not contain userinfo, path, query, or fragment data. */
+  endpoint?: string;
   available?: boolean;
   capabilities?: RuntimeModelCapabilities;
   inputCapabilities?: string[];
   contextWindowTokens?: number;
   maxOutputTokens?: number;
+  reasoningLevels?: ReasoningLevel[];
+  serviceTiers?: ServiceTier[];
   default?: boolean;
 }
 
@@ -77,34 +115,52 @@ export interface RuntimePermissionConfig {
   profiles: RuntimePermissionProfileDescriptor[];
 }
 
-export type RuntimePromptCommandSource = "project" | "user" | "mcp" | "builtin";
+export type RuntimeCommandSource = "project" | "user" | "mcp" | "builtin";
 
-export interface RuntimePromptCommandDescriptor {
+export type RuntimeCommandArgumentMode = "none" | "optional" | "required" | "variadic";
+
+export type RuntimeCommandSelectionMode = "execute" | "complete" | "drilldown";
+
+export type RuntimeCommandConcurrency = "allow" | "deny";
+
+export type RuntimeCommandExecutionTarget = "client" | "runtime" | "prompt";
+
+export interface RuntimeCommandNode {
+  id: string;
   name: string;
-  aliases: string[];
+  path: string;
+  title: string;
   description: string;
-  category: string;
-  source: RuntimePromptCommandSource;
+  group: string;
+  source: RuntimeCommandSource;
+  argumentMode: RuntimeCommandArgumentMode;
   argumentHint: string;
+  selectionMode: RuntimeCommandSelectionMode;
+  concurrency: RuntimeCommandConcurrency;
   hidden: boolean;
+  enabled: boolean;
+  disabledReason?: string;
+  executionTarget: RuntimeCommandExecutionTarget;
+  children: RuntimeCommandNode[];
 }
 
-export interface RuntimePromptCommandDiagnostic {
+export interface RuntimeCommandDiagnostic {
   level: "warning" | "error";
   code: string;
   message: string;
+  path?: string;
   filePath?: string;
+  commandIds?: string[];
+  origins?: string[];
 }
 
-export interface RuntimePromptCommandList {
-  commands: RuntimePromptCommandDescriptor[];
-  diagnostics: RuntimePromptCommandDiagnostic[];
-  directories: string[];
-  skippedConflicts: string[];
+export interface RuntimeCommandCatalog {
+  roots: RuntimeCommandNode[];
+  diagnostics: RuntimeCommandDiagnostic[];
 }
 
-export interface RuntimePromptCommandInvocation {
-  name: string;
+export interface RuntimeCommandInvocation {
+  commandId: string;
   args?: string;
   cwd?: string;
 }
@@ -228,14 +284,12 @@ export type RuntimeCommand =
 export interface RuntimeCreateSessionCommand {
   type: "session.create";
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd: string;
 }
 
 export interface RuntimeSubmitPromptCommand {
   type: "session.prompt";
   sessionId: SessionId;
-  threadId: ThreadId;
   text: string;
   skillMentions?: RuntimeSkillMention[];
   maxTurns?: number;
@@ -270,6 +324,7 @@ export interface RuntimeStatusPayload {
 }
 
 export interface ModelUsage {
+  /** Non-cached input tokens. Cached reads and writes are reported separately. */
   inputTokens?: number;
   outputTokens?: number;
   cacheReadInputTokens?: number;
@@ -290,13 +345,11 @@ export interface ModelMetadataPayload {
 
 export interface RuntimeSessionRef {
   sessionId: SessionId;
-  threadId: ThreadId;
 }
 
 export interface RuntimePromptAccepted {
   status: "accepted";
   sessionId: SessionId;
-  threadId: ThreadId;
 }
 
 export interface RuntimeInterruptResult {

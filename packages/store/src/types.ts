@@ -5,13 +5,14 @@ import type {
   AgentMailboxStatus,
   AgentTaskMode,
   AgentTaskStatus,
+  TaskCompletionPolicy,
   ChiliEvent,
   EventEnvelope,
   Message,
   MessageId,
   SessionId,
-  ThreadGoal,
-  ThreadGoalStatus,
+  SessionGoal,
+  SessionGoalStatus,
   TaskId,
   TeamId,
   TeamMessageDelivery,
@@ -19,23 +20,29 @@ import type {
   TeamMemberStatus,
   TeamMessageKind,
   TeamTaskStatus,
-  ThreadId,
+  ToolCallId,
   ToolCallStatus,
+  TurnId,
   ApprovalDecisionAction,
+  ApprovalScope,
 } from "@chili/protocol";
 
 export interface EventQuery {
   sessionId?: SessionId;
-  threadId?: ThreadId;
   type?: string;
   afterEventId?: string;
+  /** Read events strictly before this durable cursor. */
+  beforeEventId?: string;
   limit?: number;
+  tail?: boolean;
 }
 
 export interface SessionRow {
   id: SessionId;
   cwd: string;
   title?: string;
+  preview?: string;
+  source?: "interactive" | "subagent";
   status: "active" | "archived";
   createdAt: number;
   updatedAt: number;
@@ -44,8 +51,7 @@ export interface SessionRow {
 export interface ToolCallRow {
   id: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
-  turnId?: string;
+  turnId?: TurnId;
   toolName: string;
   status: ToolCallStatus;
   input?: unknown;
@@ -59,10 +65,10 @@ export interface ToolCallRow {
 export interface ApprovalRow {
   id: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   callId?: string;
   permission: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   metadata?: Record<string, unknown>;
   status: "pending" | "resolved";
   decision?: ApprovalDecisionAction;
@@ -71,49 +77,52 @@ export interface ApprovalRow {
   resolvedAt?: number;
 }
 
-export interface ThreadGoalRow extends ThreadGoal {}
+export interface SessionGoalRow extends SessionGoal {}
 
-export interface ThreadGoalQuery {
+export interface SessionGoalQuery {
   sessionId?: SessionId;
-  threadId?: ThreadId;
-  status?: ThreadGoalStatus;
+  status?: SessionGoalStatus;
   limit?: number;
 }
 
 export interface AgentRunRow {
-  id: string;
+  id: AgentRunId;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   taskId?: TaskId;
   path: AgentPath;
   parentPath?: AgentPath;
   parentSessionId?: SessionId;
-  parentThreadId?: ThreadId;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   taskName: string;
   cwd?: string;
   mode?: AgentTaskMode;
-  status: "running" | "completed" | "failed" | "cancelled";
+  status: "running" | "completed" | "incomplete" | "failed" | "cancelled";
   createdAt: number;
   completedAt?: number;
 }
 
 export interface AgentTaskRow {
   id: TaskId;
+  dispatchId?: string;
+  reservedRunId?: AgentRunId;
   path: AgentPath;
   status: AgentTaskStatus;
   taskName: string;
   generation: number;
   parentPath?: AgentPath;
   parentSessionId?: SessionId;
-  parentThreadId?: ThreadId;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   cwd?: string;
   prompt?: string;
   mode?: AgentTaskMode;
-  currentRunId?: string;
+  workerPolicy?: Record<string, unknown>;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+  completionPolicy?: TaskCompletionPolicy;
+  maxConcurrency?: number;
+  currentRunId?: AgentRunId;
   summary?: string;
   error?: string;
   completion?: Record<string, unknown>;
@@ -132,8 +141,7 @@ export interface AgentMailboxRow {
   triggerTurn: boolean;
   status: AgentMailboxStatus;
   taskId?: TaskId;
-  childSessionId?: SessionId;
-  childThreadId?: ThreadId;
+  recipientSessionId?: SessionId;
   message?: AgentMailboxPayload;
   createdAt: number;
   consumedAt?: number;
@@ -144,6 +152,8 @@ export interface AgentTaskQuery {
   path?: AgentPath;
   parentSessionId?: SessionId;
   childSessionId?: SessionId;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
   status?: AgentTaskStatus;
   limit?: number;
 }
@@ -161,7 +171,8 @@ export interface AgentMailboxQuery {
   messageId?: string;
   taskId?: TaskId;
   path?: AgentPath;
-  childSessionId?: SessionId;
+  recipientSessionId?: SessionId;
+  triggerTurn?: boolean;
   status?: AgentMailboxStatus;
   limit?: number;
 }
@@ -171,8 +182,24 @@ export interface AgentTaskLeaseClaimInput {
   owner: string;
   ttlMs: number;
   now?: number;
-  runId?: string;
+  runId?: AgentRunId;
   generation?: number;
+}
+
+export interface AgentTaskAdmissionInput {
+  event: Extract<ChiliEvent, { type: "agent.task_created" }>;
+  /** Unique admission:v1: token reserved before publishing the pending task. */
+  owner: string;
+  ttlMs: number;
+  now?: number;
+  runClaim?: SessionRunClaimFence;
+}
+
+export interface AgentTaskAdmissionResult {
+  applied: boolean;
+  /** Authoritative state when returned; mirrors may delay the response. */
+  task?: AgentTaskRow;
+  events: ChiliEvent[];
 }
 
 export interface AgentTaskLeaseRenewInput {
@@ -202,30 +229,99 @@ export interface AgentTaskCompleteCasInput {
   path: AgentPath;
   status: AgentTaskFinalStatus;
   eventId: string;
+  /** Exact task generation owned by the caller. */
+  expectedGeneration: number;
+  /** Exact run owned by the caller, or null when closing an unspawned task. */
+  expectedRunId: AgentRunId | null;
+  /** Exact lease owner observed/owned by the caller, including null for no lease. */
+  expectedLeaseOwner: string | null;
+  /** Require the matching lease to still be unexpired (worker-owned finalization). */
+  requireActiveLease?: boolean;
   runId?: AgentRunId;
   generation?: number;
   owner?: string;
   summary?: string;
   error?: string;
   agentEventId?: string;
+  /** Delivering mailbox message completed by this task generation. */
+  mailboxMessageId?: string;
+  /** Event that consumes mailboxMessageId in the same transaction as task/run completion. */
+  mailboxConsumeEventId?: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   time?: number;
+  /** Optional root-session ownership fence for owner-driven completion. */
+  runClaim?: SessionRunClaimFence;
 }
 
 export interface AgentTaskCloseCasInput {
   taskId: TaskId;
   status: AgentTaskFinalStatus;
   eventId: string;
+  /** Exact task generation observed by the caller. */
+  expectedGeneration: number;
+  /** Exact current run observed by the caller, or null when no run exists. */
+  expectedRunId: AgentRunId | null;
+  /** Exact lease owner observed by the caller, including null for no lease. */
+  expectedLeaseOwner: string | null;
+  /** Require the matching lease to still be unexpired (worker-owned finalization). */
+  requireActiveLease?: boolean;
+  /** Exact lease expiry observed by a stale scanner or lease holder. */
+  expectedLeaseExpiresAt?: number | null;
+  /** Require the observed lease to still be absent or expired at commit time. */
+  requireExpiredLease?: boolean;
+  /** Require a non-empty owner and finite expiry to prove a durable lease existed. */
+  requireLeaseEvidence?: boolean;
+  /** Require the task to remain no newer than the stale-scan cutoff. */
+  updatedBeforeOrAt?: number;
   summary?: string;
   error?: string;
   agentEventId?: string;
+  /** Delivering mailbox message owned by the task generation being closed. */
+  mailboxMessageId?: string;
+  /** Event that consumes or requeues mailboxMessageId in the same transaction. */
+  mailboxEventId?: string;
+  mailboxDisposition?: "consume" | "requeue";
+  mailboxError?: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   time?: number;
+  /** Optional root-session ownership fence for owner-driven closure. */
+  runClaim?: SessionRunClaimFence;
 }
 
 export interface AgentTaskFinalizationResult {
+  applied: boolean;
+  task?: AgentTaskRow;
+  events: ChiliEvent[];
+}
+
+export interface AgentTaskBeginRunCasInput {
+  taskId: TaskId;
+  expectedGeneration: number;
+  expectedRunId: AgentRunId | null;
+  expectedLeaseOwner: string | null;
+  runId: AgentRunId;
+  generation: number;
+  leaseOwner: string;
+  leaseTtlMs: number;
+  spawnEventId: string;
+  /**
+   * Start the immutable run reserved by agent.task_created. This path accepts
+   * only pending generation 0 with no current run or lease, and verifies that
+   * runId matches the stored reservation.
+   */
+  reservedInitial?: boolean;
+  /** Start a pending generation-0 admission while retaining its active owner token. */
+  admittedInitial?: boolean;
+  sourceMailboxMessageId?: string;
+  messageEventId?: string;
+  messageClaimEventId?: string;
+  from?: AgentPath;
+  message?: AgentMailboxPayload;
+  sessionId?: SessionId;
+  time?: number;
+}
+
+export interface AgentTaskBeginRunResult {
   applied: boolean;
   task?: AgentTaskRow;
   events: ChiliEvent[];
@@ -236,7 +332,6 @@ export interface AgentMailboxClaimInput {
   eventId: string;
   claimedBy?: AgentPath;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   time?: number;
 }
 
@@ -245,7 +340,6 @@ export interface AgentMailboxConsumeInput {
   eventId: string;
   consumedBy?: AgentPath;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   time?: number;
 }
 
@@ -254,7 +348,15 @@ export interface AgentMailboxRequeueInput {
   eventId: string;
   error?: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
+  time?: number;
+}
+
+export interface AgentMailboxDiscardInput {
+  messageId: string;
+  eventId: string;
+  discardedBy?: AgentPath;
+  reason: string;
+  sessionId?: SessionId;
   time?: number;
 }
 
@@ -282,7 +384,6 @@ export interface TeamMemberRow {
   role: string;
   status: TeamMemberStatus;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   model?: string;
   toolScope?: string[];
   writeScope?: string[];
@@ -338,6 +439,7 @@ export interface TeamQuery {
 export interface TeamMemberQuery {
   teamId?: TeamId;
   path?: AgentPath;
+  childSessionId?: SessionId;
   status?: TeamMemberStatus;
   limit?: number;
 }
@@ -351,6 +453,7 @@ export interface TeamTaskQuery {
 }
 
 export interface TeamMessageQuery {
+  messageId?: string;
   teamId?: TeamId;
   path?: AgentPath;
   taskId?: TaskId;
@@ -365,7 +468,6 @@ export interface TeamMessageDeliveryRow {
   status: TeamMessageDeliveryStatus;
   triggerTurn: boolean;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   error?: string;
   queuedAt: number;
   updatedAt: number;
@@ -381,14 +483,36 @@ export interface TeamMessageDeliveryQuery {
   limit?: number;
 }
 
+/**
+ * A durable runtime claim that must still be owned when a write transaction
+ * commits. This is separate from event.sessionId so descendant actors can keep
+ * their provenance while the root session remains the operation authority.
+ */
+export interface SessionRunClaimFence {
+  sessionId: SessionId;
+  claimId: string;
+}
+
+/** A durable session-creation claim that must still be owned at commit time. */
+export interface SessionCreationClaimFence {
+  sessionId: SessionId;
+  claimId: string;
+}
+
+export interface EventAppendOptions {
+  runClaim?: SessionRunClaimFence;
+  creationClaim?: SessionCreationClaimFence;
+}
+
 export interface TeamTaskClaimInput {
   teamId: TeamId;
   taskId: TaskId;
   ownerPath: AgentPath;
   eventId: string;
   claimedBy?: AgentPath;
+  metadata?: Record<string, unknown>;
   sessionId?: SessionId;
-  threadId?: ThreadId;
+  runClaim?: SessionRunClaimFence;
   time?: number;
 }
 
@@ -405,7 +529,7 @@ export interface TeamTaskVerificationClaimInput {
   eventId: string;
   metadata: Record<string, unknown>;
   sessionId?: SessionId;
-  threadId?: ThreadId;
+  runClaim?: SessionRunClaimFence;
   stalePendingBefore?: number;
   time?: number;
 }
@@ -417,18 +541,114 @@ export interface TeamTaskVerificationClaimResult {
   reason?: "not_found" | "not_completed" | "already_verified" | "verification_pending" | "stale";
 }
 
+export interface TeamTaskAgentSyncInput {
+  teamId: TeamId;
+  taskId: TaskId;
+  agentTaskId: TaskId;
+  agentRunId: AgentRunId;
+  agentGeneration: number;
+  agentStatus: AgentTaskFinalStatus;
+  status: Exclude<TeamTaskStatus, "pending" | "in_progress">;
+  metadata: Record<string, unknown>;
+  taskEventId: string;
+  memberEventId: string;
+  sessionId?: SessionId;
+  runClaim?: SessionRunClaimFence;
+  summary?: string;
+  error?: string;
+  time?: number;
+}
+
+export interface TeamTaskAgentSyncResult {
+  applied: boolean;
+  task?: TeamTaskRow;
+  events: ChiliEvent[];
+  reason?: "not_found" | "not_in_progress" | "binding_mismatch" | "agent_not_terminal" | "stale";
+}
+
+export interface TeamOwnerSessionBindInput {
+  teamId: TeamId;
+  ownerSessionId: SessionId;
+  eventId: string;
+  runClaim?: SessionRunClaimFence;
+  time?: number;
+}
+
+export interface TeamOwnerSessionBindResult {
+  applied: boolean;
+  ownerSessionId?: SessionId;
+  team?: TeamRow;
+  events: ChiliEvent[];
+  reason?: "not_found" | "team_inactive" | "session_not_found" | "session_inactive" | "subagent_session" | "already_bound" | "conflict";
+}
+
 export interface EventStore {
-  append(event: ChiliEvent): Promise<void>;
-  appendMany(events: readonly ChiliEvent[]): Promise<void>;
+  append(event: ChiliEvent, options?: EventAppendOptions): Promise<void>;
+  appendMany(events: readonly ChiliEvent[], options?: EventAppendOptions): Promise<void>;
   events(query?: EventQuery): Promise<EventEnvelope[]>;
   sessions(): Promise<SessionRow[]>;
   messages(sessionId: SessionId): Promise<Message[]>;
-  pendingApprovals(sessionId?: SessionId): Promise<ApprovalRow[]>;
+  pendingApprovals(sessionId?: SessionId, limit?: number): Promise<ApprovalRow[]>;
+}
+
+/** Optional append receipts used by wrappers to suppress idempotent no-ops. */
+export interface EventCommitAwareStore {
+  appendCommitted(event: ChiliEvent, options?: EventAppendOptions): Promise<boolean>;
+  appendManyCommitted(
+    events: readonly ChiliEvent[],
+    options?: EventAppendOptions,
+  ): Promise<readonly ChiliEvent[]>;
+}
+
+export interface StaleTurnRecoveryInput {
+  staleBefore: number;
+  createId: (prefix: string) => string;
+  now?: number;
+  status?: "failed" | "cancelled";
+  reason?: string;
+}
+
+/** Optional atomic recovery capability for stores with durable turn state. */
+export interface StaleTurnRecoveryStore {
+  reconcileStaleTurns(input: StaleTurnRecoveryInput): Promise<ChiliEvent[]>;
+}
+
+export type GoalMutationEvent = Extract<ChiliEvent, { type: "goal.updated" | "goal.cleared" }>;
+
+export interface GoalMutationSnapshot {
+  readonly goal?: SessionGoalRow;
+  readonly updatedEvents: readonly Extract<ChiliEvent, { type: "goal.updated" }>[];
+}
+
+export interface GoalMutationDecision<T> {
+  value: T;
+  event?: GoalMutationEvent;
+}
+
+export interface GoalMutationResult<T> {
+  value: T;
+  /** Only events committed by this invocation; empty for an idempotent no-op. */
+  events: readonly GoalMutationEvent[];
+}
+
+/** Optional atomic Goal read/decide/append capability. */
+export interface GoalMutationStore {
+  /** decide must be synchronous, free of I/O, and safe to invoke on retry. */
+  mutateGoal<T>(
+    sessionId: SessionId,
+    decide: (snapshot: GoalMutationSnapshot) => GoalMutationDecision<T>,
+    options?: EventAppendOptions,
+  ): Promise<GoalMutationResult<T>>;
+}
+
+/** Wrappers report whether the complete inner chain supports atomic Goals. */
+export interface GoalMutationCapabilityStore {
+  supportsGoalMutation(): boolean;
 }
 
 export interface GoalProjectionStore {
-  threadGoal(threadId: ThreadId): Promise<ThreadGoalRow | undefined>;
-  threadGoals(query?: ThreadGoalQuery): Promise<ThreadGoalRow[]>;
+  sessionGoal(sessionId: SessionId): Promise<SessionGoalRow | undefined>;
+  sessionGoals(query?: SessionGoalQuery): Promise<SessionGoalRow[]>;
 }
 
 export interface SubagentProjectionStore {
@@ -444,15 +664,45 @@ export interface AgentTaskLeaseStore {
   releaseAgentTaskLease(input: AgentTaskLeaseReleaseInput): Promise<boolean>;
 }
 
+/** Atomically publishes a new ordinary task together with its initial ownership lease. */
+export interface AgentTaskAdmissionStore {
+  admitAgentTask(input: AgentTaskAdmissionInput): Promise<AgentTaskAdmissionResult>;
+}
+
 export interface AgentTaskFinalizationStore {
   completeAgentTaskCas(input: AgentTaskCompleteCasInput): Promise<AgentTaskFinalizationResult>;
   closeAgentTaskCas(input: AgentTaskCloseCasInput): Promise<AgentTaskFinalizationResult>;
+}
+
+export interface AgentTaskRunClaimStore {
+  beginAgentTaskRunCas(input: AgentTaskBeginRunCasInput): Promise<AgentTaskBeginRunResult>;
+}
+
+export type AgentTaskStoreCapability = "admission" | "lease" | "run-claim" | "finalization";
+
+/**
+ * Wrappers that always expose forwarding methods use this hook to report
+ * whether their inner store actually implements the optional capability.
+ */
+export interface AgentTaskCapabilityStore {
+  supportsAgentTaskCapability(capability: AgentTaskStoreCapability): boolean;
 }
 
 export interface AgentMailboxDeliveryStore {
   claimAgentMailboxMessage(input: AgentMailboxClaimInput): Promise<AgentMailboxMutationResult>;
   consumeAgentMailboxMessage(input: AgentMailboxConsumeInput): Promise<AgentMailboxMutationResult>;
   requeueAgentMailboxMessage(input: AgentMailboxRequeueInput): Promise<AgentMailboxMutationResult>;
+  discardAgentMailboxMessage(input: AgentMailboxDiscardInput): Promise<AgentMailboxMutationResult>;
+}
+
+export type AgentMailboxStoreCapability = "delivery";
+
+/**
+ * Wrappers that always expose mailbox CAS forwarding methods use this hook to
+ * report whether their inner store actually implements the capability.
+ */
+export interface AgentMailboxCapabilityStore {
+  supportsAgentMailboxCapability(capability: AgentMailboxStoreCapability): boolean;
 }
 
 export interface TeamProjectionStore {
@@ -467,8 +717,16 @@ export interface TeamTaskClaimStore {
   claimTeamTask(input: TeamTaskClaimInput): Promise<TeamTaskMutationResult>;
 }
 
+export interface TeamOwnerSessionBindStore {
+  bindTeamOwnerSession(input: TeamOwnerSessionBindInput): Promise<TeamOwnerSessionBindResult>;
+}
+
 export interface TeamTaskVerificationClaimStore {
   claimTeamTaskVerification(input: TeamTaskVerificationClaimInput): Promise<TeamTaskVerificationClaimResult>;
+}
+
+export interface TeamTaskAgentSyncStore {
+  syncTeamTaskFromAgentCas(input: TeamTaskAgentSyncInput): Promise<TeamTaskAgentSyncResult>;
 }
 
 export interface EventMirror {

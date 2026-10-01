@@ -80,6 +80,30 @@ test("activate_skill not found returns a clear error with available names", asyn
   });
 });
 
+test("activate_skill resolves project skills from the execution cwd", async () => {
+  const fixture = await tempFixture();
+  const otherCwd = path.join(fixture.root, "other-repo");
+  await writeSkill(fixture.cwd, "scoped-skill", "FIRST_WORKSPACE");
+  await writeSkill(otherCwd, "scoped-skill", "SECOND_WORKSPACE");
+  const registry = new InMemoryToolRegistry();
+  registry.register(createActivateSkillTool((context) => discoverSkills({
+    cwd: context.cwd,
+    homeDir: fixture.home,
+  })));
+  const executor = createExecutor(registry);
+
+  const first = await executor.execute(toolInput("activate_skill", { name: "scoped-skill" }, fixture.cwd));
+  const second = await executor.execute(toolInput("activate_skill", { name: "scoped-skill" }, otherCwd));
+
+  expect(first.status).toBe("completed");
+  expect(second.status).toBe("completed");
+  if (first.status !== "completed" || second.status !== "completed") return;
+  expect(first.result.output).toContain("FIRST_WORKSPACE");
+  expect(first.result.output).not.toContain("SECOND_WORKSPACE");
+  expect(second.result.output).toContain("SECOND_WORKSPACE");
+  expect(second.result.output).not.toContain("FIRST_WORKSPACE");
+});
+
 async function tempFixture(): Promise<{ root: string; cwd: string; home: string }> {
   const root = await mkdtemp(path.join(tmpdir(), "chili-activate-skill-"));
   return {

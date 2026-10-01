@@ -65,7 +65,7 @@ function localTranscriptSourceLines(item: LocalTranscriptItem): TranscriptSource
   if (item.kind === "local") {
     return [{
       key: item.id,
-      text: `${item.level}: ${item.text}`,
+      text: item.bare ? item.text : `${item.level}: ${item.text}`,
       tone: item.level === "error" ? "error" as const : "muted" as const,
     }];
   }

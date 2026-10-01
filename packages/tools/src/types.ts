@@ -1,11 +1,11 @@
 import type {
   ApprovalDecision,
   ApprovalId,
+  ApprovalScope,
   ChiliEvent,
   EventEnvelope,
   SessionId,
   SnapshotId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
   ToolDefinition,
@@ -39,14 +39,33 @@ export interface ChiliToolDefinition<Input = any, Output extends ToolResult = To
 export interface ToolApprovalSpec {
   permission?: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   metadata?: Record<string, unknown>;
 }
 
+export type ToolApprovalSpecWithDefaults =
+  & Required<Omit<ToolApprovalSpec, "maxApprovalScope">>
+  & Pick<ToolApprovalSpec, "maxApprovalScope">;
+
 export type ToolBooleanPredicate<Input = any> = boolean | ((input: Input) => boolean | Promise<boolean>);
 
+export interface PersistedToolOutputRegistration {
+  relativePath: string;
+  bytes: number;
+  originalBytes: number;
+  limitBytes: number;
+  truncated: boolean;
+}
+
 export interface ChiliToolExecutionContext extends ToolExecutionContext {
+  outputArtifactId: ToolCallId;
   fileReads?: FileReadStateStore;
   visibleTools?: () => Promise<ChiliToolDefinition[]> | ChiliToolDefinition[];
+  persistedOutputLimits?: {
+    maxBytes?: number;
+    maxDirectoryBytes?: number;
+  };
+  registerPersistedOutput(output: PersistedToolOutputRegistration): Promise<void>;
 }
 
 export interface ToolRegistryEntry {
@@ -68,11 +87,26 @@ export interface ToolRegistryListOptions {
   includeDeferred?: boolean;
 }
 
+export interface ToolRegistryContext {
+  sessionId: SessionId;
+  turnId: TurnId;
+  cwd: string;
+}
+
+export type ContextualToolProvider = (
+  context: ToolRegistryContext,
+) => Promise<readonly ChiliToolDefinition[]> | readonly ChiliToolDefinition[];
+
 export interface ToolRegistry {
   register(tool: ChiliToolDefinition, options?: ToolRegistryRegisterOptions): void;
   get(name: string): ChiliToolDefinition | undefined;
   list(options?: ToolRegistryListOptions): ChiliToolDefinition[];
   entries?(options?: ToolRegistryListOptions): ToolRegistryEntry[];
+  getForContext?(name: string, context: ToolRegistryContext): Promise<ChiliToolDefinition | undefined>;
+  listForContext?(
+    context: ToolRegistryContext,
+    options?: ToolRegistryListOptions,
+  ): Promise<ChiliToolDefinition[]>;
 }
 
 export interface MutableToolRegistry extends ToolRegistry {
@@ -81,6 +115,8 @@ export interface MutableToolRegistry extends ToolRegistry {
   unregisterSource(source: string): ChiliToolDefinition[];
   replaceMatching(selector: ToolRegistrySelector, tools: readonly ChiliToolDefinition[], options?: ToolRegistryRegisterOptions): ChiliToolDefinition[];
   replaceSource(source: string, tools: readonly ChiliToolDefinition[]): ChiliToolDefinition[];
+  replaceContextualSource(source: string, provider: ContextualToolProvider): void;
+  unregisterContextualSource(source: string): boolean;
 }
 
 export interface ToolEventSink {
@@ -90,12 +126,12 @@ export interface ToolEventSink {
 export interface ApprovalBrokerRequest {
   approvalId: ApprovalId;
   sessionId: SessionId;
-  threadId?: ThreadId;
   callId: ToolCallId;
   toolName: string;
   risk: ChiliToolDefinition["risk"];
   permission: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   metadata?: Record<string, unknown>;
 }
 
@@ -109,7 +145,7 @@ export interface ApprovalPreflightRequest extends Omit<ApprovalBrokerRequest, "a
 
 export interface ApprovalBroker {
   preflight?(request: ApprovalPreflightRequest): Promise<ApprovalPreflightDecision>;
-  decide(request: ApprovalBrokerRequest): Promise<ApprovalDecision>;
+  decide(request: ApprovalBrokerRequest, signal?: AbortSignal): Promise<ApprovalDecision>;
 }
 
 export interface ToolExecutorOptions {
@@ -121,13 +157,14 @@ export interface ToolExecutorOptions {
   snapshotPolicy?: SnapshotPolicy;
   fileReadState?: FileReadStateStore;
   maxResultOutputBytes?: number;
+  maxPersistedOutputBytes?: number;
+  maxPersistedOutputDirectoryBytes?: number;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
 }
 
 export interface ExecuteToolInput {
   sessionId: SessionId;
-  threadId?: ThreadId;
   turnId: TurnId;
   callId?: ToolCallId;
   toolName: string;
@@ -139,13 +176,13 @@ export interface ExecuteToolInput {
 
 export interface ToolPolicyContext {
   sessionId: SessionId;
-  threadId?: ThreadId;
   turnId?: TurnId;
   cwd: string;
 }
 
 export interface ToolAccessPolicy {
   allowedTools?: readonly string[];
+  deniedTools?: readonly string[];
   writeScope?: readonly string[];
   executeScope?: readonly string[];
   teamId?: string;
@@ -166,7 +203,6 @@ export type ExecuteToolResult =
 export interface SnapshotCreateRequest {
   cwd: string;
   sessionId: SessionId;
-  threadId?: ThreadId;
   callId: ToolCallId;
   toolName: string;
   patterns: string[];
@@ -199,7 +235,7 @@ export interface SnapshotProvider {
 
 export type SnapshotPolicy = (input: {
   tool: ChiliToolDefinition;
-  spec: Required<ToolApprovalSpec>;
+  spec: ToolApprovalSpecWithDefaults;
 }) => boolean;
 
 export type ToolContextFactory = (tool: ChiliToolDefinition, input: ExecuteToolInput, callId: ToolCallId) => ToolExecutionContext;

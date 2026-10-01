@@ -2,9 +2,14 @@ import type {
   AgentPath,
   AgentRunId,
   AgentTaskMode,
+  AgentTaskStatus,
   ApprovalId,
   ApprovalDecisionAction,
+  ApprovalScope,
+  AssistantMessagePhase,
   ChiliEvent,
+  DelegationPolicy,
+  DelegationPolicySource,
   EventEnvelope,
   MessageId,
   MessagePart,
@@ -12,8 +17,10 @@ import type {
   ModelMetadataPayload,
   ModelUsage,
   PartId,
+  RuntimeDelegationConfig,
   RuntimeSessionStatus,
   SessionId,
+  TaskCompletionPolicy,
   TaskId,
   TeamId,
   TeamMemberStatus,
@@ -23,19 +30,23 @@ import type {
   TeamRunLifecyclePhase,
   TeamRunStopReason,
   TeamRunSummaryCounts,
-  ThreadGoal,
-  ThreadId,
+  SessionGoal,
   ToolCallId,
   ToolCallStatus,
   ToolOutputStream,
   TurnId,
 } from "@chili/protocol";
+import { isTransientEvent } from "@chili/protocol";
 
 type ToolPartStatus = Extract<MessagePart, { type: "tool_call" }>["status"];
+
+export type ChatToolExecutionContext = NonNullable<Extract<MessagePart, { type: "tool_result" }>["executionContext"]>;
 
 export interface ChiliRuntimeView {
   sessionIds: SessionId[];
   sessions: Record<string, RuntimeSessionView>;
+  turnStatuses: Record<string, RuntimeTurnStatus>;
+  turnStartedAt: Record<string, number>;
   messages: Record<string, RuntimeMessageView>;
   toolCalls: Record<string, RuntimeToolCallView>;
   approvals: Record<string, RuntimeApprovalView>;
@@ -46,6 +57,7 @@ export interface ChiliRuntimeView {
   mailboxMessages: Record<string, RuntimeAgentMailboxMessageView>;
   taskIds: TaskId[];
   tasks: Record<string, RuntimeTaskView>;
+  teamIdByDelegatedTaskId: Record<string, TeamId>;
   teamIds: TeamId[];
   teams: Record<string, RuntimeTeamView>;
   teamMemberIds: string[];
@@ -57,14 +69,20 @@ export interface ChiliRuntimeView {
   teamRunIdsByTeam: Record<string, string[]>;
   modelMetadataTurnIds: TurnId[];
   modelMetadataByTurn: Record<string, RuntimeModelMetadataView>;
-  goalsByThread: Record<string, RuntimeThreadGoalView>;
+  goalsBySession: Record<string, RuntimeSessionGoalView>;
   partIndex: Record<string, RuntimePartIndexEntry>;
+  /** Stable durable/projection order for transcript rows across clock rollback. */
+  transcriptOrder: Record<string, number>;
+  nextTranscriptOrder: number;
   lastEventId?: string;
 }
+
+export type RuntimeTurnStatus = "running" | "completed" | "failed" | "cancelled";
 
 export interface RuntimeSessionView {
   id: SessionId;
   cwd: string;
+  title?: string;
   lifecycle: "active" | "archived";
   status: RuntimeSessionStatus;
   messageIds: MessageId[];
@@ -73,9 +91,22 @@ export interface RuntimeSessionView {
   agentRunIds: AgentRunId[];
   taskIds: TaskId[];
   updatedAt: number;
-  threadId?: ThreadId;
   currentTurnId?: TurnId;
   statusReason?: string;
+  /** Event that most recently established this session's projected lifecycle status. */
+  statusEventId?: string;
+  delegationPolicy?: DelegationPolicy;
+  /** True once session.status_changed establishes the modern lifecycle source. */
+  hasExplicitStatus?: boolean;
+  retry?: RuntimeTurnRetryView;
+}
+
+export interface RuntimeTurnRetryView {
+  turnId: TurnId;
+  attempt: number;
+  delayMs: number;
+  reason: string;
+  scheduledAt: number;
 }
 
 export interface RuntimeMessageView {
@@ -84,8 +115,9 @@ export interface RuntimeMessageView {
   role: MessageRole;
   parts: MessagePart[];
   createdAt: number;
-  threadId?: ThreadId;
   turnId?: TurnId;
+  updatedAt?: number;
+  lastTextAt?: number;
   completedAt?: number;
 }
 
@@ -94,9 +126,9 @@ export interface RuntimeToolCallView {
   status: ToolCallStatus | "completed" | "failed" | "cancelled";
   toolName: string;
   input: unknown;
+  startedAt?: number;
   updatedAt: number;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   turnId?: TurnId;
   output?: string;
   error?: string;
@@ -117,19 +149,18 @@ export interface RuntimeToolOutputDelta {
 export interface RuntimeModelMetadataView extends ModelMetadataPayload {
   updatedAt: number;
   sessionId?: SessionId;
-  threadId?: ThreadId;
 }
 
-export interface RuntimeThreadGoalView extends ThreadGoal {}
+export interface RuntimeSessionGoalView extends SessionGoal {}
 
 export interface RuntimeApprovalView {
   id: ApprovalId;
   permission: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   status: "pending" | "resolved";
   createdAt: number;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   callId?: ToolCallId;
   metadata?: Record<string, unknown>;
   decision?: ApprovalDecisionAction;
@@ -137,7 +168,7 @@ export interface RuntimeApprovalView {
   resolvedAt?: number;
 }
 
-export type RuntimeAgentStatus = "running" | "completed" | "failed" | "cancelled";
+export type RuntimeAgentStatus = Exclude<AgentTaskStatus, "pending">;
 
 export interface RuntimeAgentView {
   id: AgentRunId;
@@ -152,7 +183,10 @@ export interface RuntimeAgentView {
   updatedAt: number;
   parentPath?: AgentPath;
   sessionId?: SessionId;
-  threadId?: ThreadId;
+  mode?: AgentTaskMode;
+  childSessionId?: SessionId;
+  summary?: string;
+  error?: string;
   completedAt?: number;
 }
 
@@ -161,21 +195,34 @@ export interface RuntimeAgentMailboxMessageView {
   path: AgentPath;
   from: AgentPath;
   triggerTurn: boolean;
-  status: "queued" | "delivering" | "consumed";
+  status: "queued" | "delivering" | "consumed" | "discarded";
   queuedAt: number;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   teamId?: TeamId;
   teamMessageId?: string;
   taskId?: TaskId;
-  childSessionId?: SessionId;
-  childThreadId?: ThreadId;
+  recipientSessionId?: SessionId;
+  role?: MessageRole;
+  messageKind?: string;
+  preview?: string;
+  metadataSummary?: RuntimeAgentMailboxMetadataSummary;
   error?: string;
   claimedAt?: number;
   consumedAt?: number;
 }
 
-export type RuntimeTaskStatus = "pending" | "running" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
+export interface RuntimeAgentMailboxMetadataSummary {
+  kind?: string;
+  batchId?: string;
+  completionPolicy?: RuntimeTaskCompletionPolicy;
+  taskIds?: TaskId[];
+  total?: number;
+  expectedBatchSize?: number;
+}
+
+export type RuntimeTaskStatus = AgentTaskStatus | "in_progress" | "blocked";
+
+export type RuntimeTaskCompletionPolicy = TaskCompletionPolicy;
 
 export interface RuntimeTaskView {
   id: TaskId;
@@ -195,7 +242,14 @@ export interface RuntimeTaskView {
   ownerPath?: AgentPath;
   path?: AgentPath;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
+  mode?: AgentTaskMode;
+  taskPrompt?: string;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+  completionPolicy?: RuntimeTaskCompletionPolicy;
+  maxConcurrency?: number;
   completedAt?: number;
 }
 
@@ -226,7 +280,6 @@ export interface RuntimeTeamMemberView {
   createdAt: number;
   updatedAt: number;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   model?: string;
   toolScope?: string[];
   writeScope?: string[];
@@ -248,7 +301,6 @@ export interface RuntimeTeamMessageView {
   deliveredAt?: number;
   createdAt: number;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   taskId?: TaskId;
   summary?: string;
   metadata?: Record<string, unknown>;
@@ -259,6 +311,125 @@ export interface RuntimeAgentsSnapshot {
   tasks: RuntimeTaskView[];
   mailbox: RuntimeAgentMailboxMessageView[];
   lastEventId?: string;
+}
+
+export interface RuntimeDelegationStatusInput {
+  sessionId?: SessionId;
+  teamId?: TeamId;
+  delegationConfig?: RuntimeDelegationConfig;
+  generatedAt?: string;
+}
+
+export interface RuntimeDelegationStatusView {
+  delegation: RuntimeDelegationCapabilityView;
+  parent: RuntimeParentExecutionView;
+  agents: RuntimeDelegatedAgentsView;
+  team: RuntimeDelegationTeamView;
+  lastBatch?: RuntimeAgentBatchView;
+  generatedAt: string;
+  lastEventId?: string;
+}
+
+export interface RuntimeDelegationCapabilityView {
+  supported?: boolean;
+  observed: boolean;
+  policy?: DelegationPolicy;
+  source?: DelegationPolicySource;
+}
+
+export interface RuntimeParentExecutionView {
+  sessionId?: SessionId;
+  status: RuntimeSessionStatus | "unknown";
+  active: boolean;
+  statusReason?: string;
+}
+
+export interface RuntimeDelegatedAgentCounts {
+  total: number;
+  pending: number;
+  running: number;
+  active: number;
+  completed: number;
+  incomplete: number;
+  failed: number;
+  cancelled: number;
+}
+
+export interface RuntimeDelegatedAgentsView {
+  counts: RuntimeDelegatedAgentCounts;
+  items: RuntimeDelegatedAgent[];
+  active: RuntimeDelegatedAgent[];
+  errors: RuntimeDelegatedAgentError[];
+}
+
+export interface RuntimeDelegatedAgent {
+  taskId: TaskId;
+  runId?: AgentRunId;
+  path: AgentPath;
+  taskName: string;
+  status: AgentTaskStatus;
+  mode?: AgentTaskMode;
+  childSessionId?: SessionId;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+  completionPolicy?: RuntimeTaskCompletionPolicy;
+  maxConcurrency?: number;
+  summary?: string;
+  error?: string;
+  activity?: RuntimeDelegatedAgentActivity;
+  updatedAt: number;
+  completedAt?: number;
+}
+
+export interface RuntimeDelegatedAgentActivity {
+  kind: "tool" | "approval" | "task" | "waiting";
+  label: string;
+  status: string;
+  updatedAt: number;
+}
+
+export interface RuntimeDelegatedAgentError {
+  taskId: TaskId;
+  runId?: AgentRunId;
+  path: AgentPath;
+  status: Extract<AgentTaskStatus, "incomplete" | "failed" | "cancelled">;
+  message: string;
+  updatedAt: number;
+}
+
+export interface RuntimeDelegationTeamView {
+  count: number;
+  activeCount: number;
+  selectedTeamId?: TeamId;
+  selectedName?: string;
+}
+
+export type RuntimeAgentBatchStatus = "running" | "completed" | "incomplete" | "failed" | "cancelled" | "mixed" | "partial";
+
+export interface RuntimeAgentBatchView extends RuntimeDelegatedAgentCounts {
+  callId: ToolCallId;
+  batchId?: string;
+  taskIds: TaskId[];
+  expected: number;
+  untracked: number;
+  spawnedCount?: number;
+  spawnFailureCount?: number;
+  spawnFailures?: RuntimeAgentBatchSpawnFailure[];
+  completionPolicy?: RuntimeTaskCompletionPolicy;
+  maxConcurrency?: number;
+  mixed: boolean;
+  partial: boolean;
+  status: RuntimeAgentBatchStatus;
+  updatedAt: number;
+  error?: string;
+}
+
+export interface RuntimeAgentBatchSpawnFailure {
+  batchIndex?: number;
+  description?: string;
+  error: string;
 }
 
 export interface RuntimePartIndexEntry {
@@ -277,7 +448,6 @@ export interface RuntimeTeamRunView {
   createdAt: number;
   updatedAt: number;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   mode?: AgentTaskMode;
   once?: boolean;
   maxCycles?: number;
@@ -343,7 +513,6 @@ export interface TeamLiveMemberRow {
   deliveryIds: string[];
   updatedAt: number;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   model?: string;
   toolScope?: string[];
   writeScope?: string[];
@@ -434,6 +603,9 @@ export interface TeamLiveActivityItem {
   toolName?: string;
   taskId?: TaskId;
   teamId?: TeamId;
+  teamMessageId?: string;
+  from?: AgentPath;
+  to?: AgentPath | "*";
 }
 
 export type TeamLiveConnectionStatus = "unknown" | "connecting" | "streaming" | "reconnecting" | "offline" | "error";
@@ -533,7 +705,6 @@ export interface TeamLiveDispatchSummary {
   agentPath?: AgentPath;
   runId?: AgentRunId;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   mode?: string;
   agentStatus?: string;
   dispatchedAt?: number;
@@ -547,7 +718,6 @@ export interface TeamLiveToolSummary {
   status: RuntimeToolCallView["status"];
   updatedAt: number;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   turnId?: TurnId;
   waitingForApproval: boolean;
   error?: string;
@@ -557,10 +727,10 @@ export interface TeamLiveApprovalSummary {
   id: ApprovalId;
   permission: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   status: RuntimeApprovalView["status"];
   createdAt: number;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   callId?: ToolCallId;
   toolName?: string;
   decision?: RuntimeApprovalView["decision"];
@@ -612,23 +782,129 @@ export type TeamLiveAction =
 
 export interface ChatSessionInput {
   sessionId?: SessionId;
-  threadId?: ThreadId;
   limit?: number;
   generatedAt?: string;
   requireSession?: boolean;
 }
 
+export interface ChatAgentBatchesInput {
+  sessionId?: SessionId;
+  limit?: number;
+}
+
+export interface RuntimeInlineAgentBatchView {
+  id: string;
+  callId: ToolCallId;
+  batchId?: string;
+  toolStatus?: RuntimeToolCallView["status"];
+  status: RuntimeAgentBatchStatus;
+  expected: number;
+  tracked: number;
+  terminal: boolean;
+  progress: RuntimeInlineAgentBatchProgress;
+  counts: RuntimeDelegatedAgentCounts;
+  completionPolicy?: RuntimeTaskCompletionPolicy;
+  requestedMaxConcurrency?: number;
+  observedPeakConcurrency?: number;
+  spawnedCount?: number;
+  spawnFailureCount?: number;
+  spawnFailures: RuntimeInlineAgentSpawnFailure[];
+  agents: RuntimeInlineAgentView[];
+  messages: RuntimeInlineAgentMessage[];
+  integration: RuntimeInlineAgentIntegrationView;
+  createdAt: number;
+  updatedAt: number;
+  error?: string;
+}
+
+export interface RuntimeInlineAgentBatchProgress {
+  terminal: number;
+  expected: number;
+}
+
+export interface RuntimeInlineAgentSpawnFailure {
+  name: string;
+  task: string;
+  error: string;
+  batchIndex?: number;
+}
+
+export interface RuntimeInlineAgentView {
+  taskId: TaskId;
+  runId?: AgentRunId;
+  path: AgentPath;
+  name: string;
+  task: string;
+  taskPrompt?: string;
+  description?: string;
+  status: AgentTaskStatus;
+  turns: number;
+  followupCount: number;
+  activity?: RuntimeDelegatedAgentActivity;
+  summary?: string;
+  error?: string;
+  messages: RuntimeInlineAgentMessage[];
+  createdAt: number;
+  updatedAt: number;
+  completedAt?: number;
+}
+
+export type RuntimeInlineAgentMessageDirection = "parent_to_agent" | "agent_to_parent" | "agent_to_agent" | "related";
+
+export interface RuntimeInlineAgentMessage {
+  id: string;
+  direction: RuntimeInlineAgentMessageDirection;
+  from: AgentPath;
+  to: AgentPath;
+  status: RuntimeAgentMailboxMessageView["status"];
+  text: string;
+  time: number;
+  triggerTurn: boolean;
+  kind?: string;
+  metadataSummary?: RuntimeAgentMailboxMetadataSummary;
+}
+
+export type RuntimeInlineAgentIntegrationStatus =
+  | "pending"
+  | "ready"
+  | "integrating"
+  | "responded"
+  | "integrated"
+  | "not_required";
+
+export interface RuntimeInlineAgentIntegrationView {
+  required: boolean;
+  status: RuntimeInlineAgentIntegrationStatus;
+  updatedAt: number;
+  completionPolicy?: RuntimeTaskCompletionPolicy;
+  evidence?:
+    | "agent_work"
+    | "results_ready"
+    | "tool_result"
+    | "mailbox_queued"
+    | "mailbox_delivered"
+    | "parent_turn_started"
+    | "assistant_response_after_terminal_result"
+    | "explicit_integration";
+  turnId?: TurnId;
+  messageId?: string;
+}
+
 export interface ChatSessionView {
   sessionId?: SessionId;
-  threadId?: ThreadId;
+  cwd?: string;
   status: RuntimeSessionStatus | "unknown";
+  statusReason?: string;
+  /** Per-session status identity; unrelated sessions do not advance it. */
+  statusEventId?: string;
   items: ChatTranscriptItem[];
   pendingApprovals: ChatApprovalRow[];
   activeTools: ChatToolCallRow[];
-  goal?: ThreadGoal;
+  goal?: SessionGoal;
   generatedAt: string;
   latestModelMetadata?: ModelMetadataPayload;
   usageSummary?: ModelUsage;
+  retry?: RuntimeTurnRetryView;
   lastEventId?: string;
 }
 
@@ -643,16 +919,15 @@ export interface ChatMessageRow {
   role: MessageRole;
   parts: ChatMessagePart[];
   createdAt: number;
-  threadId?: ThreadId;
   completedAt?: number;
 }
 
 export type ChatMessagePart =
-  | { type: "text"; id: PartId; text: string; rawText?: string; synthetic?: boolean }
+  | { type: "text"; id: PartId; text: string; phase?: AssistantMessagePhase; rawText?: string; synthetic?: boolean }
   | { type: "image"; id: PartId; mimeType: string; filename?: string; sourcePath?: string; displayText?: string }
   | { type: "reasoning"; id: PartId; text: string; redacted?: boolean }
   | { type: "tool_call"; id: PartId; callId: ToolCallId; toolName: string; status: ToolPartStatus; input?: unknown; displayStatus?: ChatToolDisplayStatus }
-  | { type: "tool_result"; id: PartId; callId: ToolCallId; output: string; content?: Extract<MessagePart, { type: "tool_result" }>["content"]; error?: string; synthetic?: boolean }
+  | { type: "tool_result"; id: PartId; callId: ToolCallId; output: string; content?: Extract<MessagePart, { type: "tool_result" }>["content"]; error?: string; executionContext?: ChatToolExecutionContext; synthetic?: boolean }
   | { type: "summary"; id: PartId; text: string };
 
 export type ChatToolDisplayStatus =
@@ -697,9 +972,9 @@ export interface ChatToolCallRow {
   input?: unknown;
   output?: string;
   error?: string;
+  executionContext?: ChatToolExecutionContext;
   liveOutput?: RuntimeToolOutputDelta[];
   sessionId?: SessionId;
-  threadId?: ThreadId;
   approvalId?: ApprovalId;
   approvalStatus?: RuntimeApprovalView["status"];
   approvalDecision?: RuntimeApprovalView["decision"];
@@ -710,10 +985,10 @@ export interface ChatApprovalRow {
   kind: "approval";
   permission: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   status: RuntimeApprovalView["status"];
   createdAt: number;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   callId?: ToolCallId;
   toolName?: string;
   toolInput?: unknown;
@@ -729,31 +1004,40 @@ export interface ChatApprovalRow {
 export function createRuntimeView(): ChiliRuntimeView {
   return {
     sessionIds: [],
-    sessions: {},
-    messages: {},
-    toolCalls: {},
-    approvals: {},
+    sessions: nullPrototypeRecord(),
+    turnStatuses: nullPrototypeRecord(),
+    turnStartedAt: nullPrototypeRecord(),
+    messages: nullPrototypeRecord(),
+    toolCalls: nullPrototypeRecord(),
+    approvals: nullPrototypeRecord(),
     agentRunIds: [],
-    agents: {},
-    agentRunIdsByPath: {},
+    agents: nullPrototypeRecord(),
+    agentRunIdsByPath: nullPrototypeRecord(),
     mailboxMessageIds: [],
-    mailboxMessages: {},
+    mailboxMessages: nullPrototypeRecord(),
     taskIds: [],
-    tasks: {},
+    tasks: nullPrototypeRecord(),
+    teamIdByDelegatedTaskId: nullPrototypeRecord(),
     teamIds: [],
-    teams: {},
+    teams: nullPrototypeRecord(),
     teamMemberIds: [],
-    teamMembers: {},
+    teamMembers: nullPrototypeRecord(),
     teamMessageIds: [],
-    teamMessages: {},
+    teamMessages: nullPrototypeRecord(),
     teamRunIds: [],
-    teamRuns: {},
-    teamRunIdsByTeam: {},
+    teamRuns: nullPrototypeRecord(),
+    teamRunIdsByTeam: nullPrototypeRecord(),
     modelMetadataTurnIds: [],
-    modelMetadataByTurn: {},
-    goalsByThread: {},
-    partIndex: {},
+    modelMetadataByTurn: nullPrototypeRecord(),
+    goalsBySession: nullPrototypeRecord(),
+    partIndex: nullPrototypeRecord(),
+    transcriptOrder: nullPrototypeRecord(),
+    nextTranscriptOrder: 0,
   };
+}
+
+function nullPrototypeRecord<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
 }
 
 export function reduceRuntimeEvents(
@@ -767,48 +1051,111 @@ export function reduceRuntimeEvents(
 }
 
 export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvelope): ChiliRuntimeView {
-  view.lastEventId = inputEvent.id;
+  normalizeRuntimeViewIndexes(view);
+  if (!isTransientEvent(inputEvent)) view.lastEventId = inputEvent.id;
   applyTeamProjectionEvent(view, inputEvent);
   applySubagentProjectionEvent(view, inputEvent);
 
   const event = inputEvent as ChiliEvent;
   switch (event.type) {
     case "session.created": {
-      const session = upsertSession(view, event.payload.sessionId, event.time);
+      const sessionId = matchingEnvelopeSessionId(event.sessionId, event.payload?.sessionId);
+      if (!sessionId) break;
+      const session = upsertSession(view, sessionId, event.time);
       session.cwd = event.payload.cwd;
       session.lifecycle = "active";
       session.updatedAt = event.time;
-      assignOptional(session, "threadId", event.threadId);
+      break;
+    }
+    case "session.renamed": {
+      const sessionId = matchingEnvelopeSessionId(event.sessionId, event.payload?.sessionId);
+      if (!sessionId) break;
+      const session = upsertSession(view, sessionId, event.time);
+      session.title = event.payload.title;
+      session.updatedAt = event.time;
       break;
     }
     case "session.status_changed": {
-      const session = upsertSession(view, event.payload.sessionId, event.time);
-      session.status = event.payload.status;
+      const sessionId = matchingEnvelopeSessionId(event.sessionId, event.payload?.sessionId);
+      if (!sessionId) break;
+      const session = upsertSession(view, sessionId, event.time);
+      session.hasExplicitStatus = true;
+      setSessionStatus(session, event.payload.status, event.payload.reason);
+      session.statusEventId = event.id;
+      clearSessionRetry(view, sessionId, event.payload.turnId);
       session.updatedAt = event.time;
       assignOptional(session, "currentTurnId", event.payload.turnId);
-      assignOptional(session, "statusReason", event.payload.reason);
+      if (event.payload.turnId && event.payload.status === "cancelled") {
+        view.turnStatuses[event.payload.turnId] = "cancelled";
+      }
+      break;
+    }
+    case "session.delegation_changed": {
+      const sessionId = matchingEnvelopeSessionId(event.sessionId, event.payload?.sessionId);
+      if (!sessionId) break;
+      const session = upsertSession(view, sessionId, event.time);
+      session.delegationPolicy = event.payload.policy;
+      session.updatedAt = event.time;
       break;
     }
     case "session.archived": {
-      const session = upsertSession(view, event.payload.sessionId, event.time);
+      const sessionId = matchingEnvelopeSessionId(event.sessionId, event.payload?.sessionId);
+      if (!sessionId) break;
+      const session = upsertSession(view, sessionId, event.time);
       session.lifecycle = "archived";
       session.updatedAt = event.time;
       break;
     }
     case "turn.started": {
+      view.turnStatuses[event.payload.turnId] = "running";
+      view.turnStartedAt[event.payload.turnId] = event.time;
       if (event.sessionId) {
         const session = upsertSession(view, event.sessionId, event.time);
-        session.status = "running";
+        if (!session.hasExplicitStatus) {
+          setSessionStatus(session, "running");
+          session.statusEventId = event.id;
+        }
+        clearSessionRetry(view, event.sessionId, event.payload.turnId);
         session.currentTurnId = event.payload.turnId;
         session.updatedAt = event.time;
       }
       break;
     }
     case "turn.completed": {
+      view.turnStatuses[event.payload.turnId] = event.payload.status;
       if (event.sessionId) {
         const session = upsertSession(view, event.sessionId, event.time);
-        session.status = event.payload.status === "completed" ? "idle" : event.payload.status;
-        session.currentTurnId = event.payload.turnId;
+        const isCurrentTurn = session.currentTurnId === undefined || session.currentTurnId === event.payload.turnId;
+        if (!session.hasExplicitStatus) {
+          setSessionStatus(session, event.payload.status === "completed" ? "idle" : event.payload.status);
+          session.statusEventId = event.id;
+        } else if (
+          isCurrentTurn
+          && (event.payload.status === "failed" || event.payload.status === "cancelled")
+          && !isTerminalSessionStatus(session.status)
+        ) {
+          // A turn terminal event is persisted before the matching session
+          // terminal event. Preserve the session event as the normal source of
+          // truth, but fail closed if a crash leaves only the turn terminal.
+          setSessionStatus(session, event.payload.status);
+          session.statusEventId = event.id;
+        }
+        clearSessionRetry(view, event.sessionId, event.payload.turnId);
+        if (isCurrentTurn) session.currentTurnId = event.payload.turnId;
+        session.updatedAt = event.time;
+      }
+      break;
+    }
+    case "turn.retry_scheduled": {
+      if (event.sessionId) {
+        const session = upsertSession(view, event.sessionId, event.time);
+        session.retry = {
+          turnId: event.payload.turnId,
+          attempt: event.payload.attempt,
+          delayMs: event.payload.delayMs,
+          reason: event.payload.reason,
+          scheduledAt: event.time,
+        };
         session.updatedAt = event.time;
       }
       break;
@@ -818,9 +1165,12 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       if (!existing) {
         view.modelMetadataTurnIds.push(event.payload.turnId);
       }
-      view.modelMetadataByTurn[event.payload.turnId] = runtimeModelMetadata(event.payload, event.time, event.sessionId, event.threadId, existing);
+      view.modelMetadataByTurn[event.payload.turnId] = runtimeModelMetadata(event.payload, event.time, event.sessionId, existing);
       const sessionId = event.sessionId ?? existing?.sessionId;
-      if (sessionId) touchSession(view, sessionId, event.time);
+      if (sessionId) {
+        clearSessionRetry(view, sessionId, event.payload.turnId);
+        touchSession(view, sessionId, event.time);
+      }
       break;
     }
     case "message.created": {
@@ -833,10 +1183,11 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
           role: event.payload.role,
           parts: [],
           createdAt: event.time,
+          updatedAt: event.time,
         };
-        assignOptional(message, "threadId", event.threadId);
         assignOptional(message, "turnId", event.payload.turnId);
         view.messages[message.id] = message;
+        assignTranscriptOrder(view, "message", message.id);
         session.messageIds.push(message.id);
       }
       session.updatedAt = event.time;
@@ -845,6 +1196,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
     case "message.part_added": {
       const message = view.messages[event.payload.messageId];
       if (!message) break;
+      if (message.turnId) clearSessionRetry(view, message.sessionId, message.turnId);
       const existingIndex = message.parts.findIndex((part) => part.id === event.payload.part.id);
       if (existingIndex >= 0) {
         message.parts[existingIndex] = event.payload.part;
@@ -853,26 +1205,40 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
         message.parts.push(event.payload.part);
         view.partIndex[event.payload.part.id] = { messageId: message.id, index: message.parts.length - 1 };
       }
+      message.updatedAt = event.time;
+      if (event.payload.part.type === "text" && (event.payload.part.displayText ?? event.payload.part.text).trim().length > 0) {
+        message.lastTextAt = event.time;
+      }
       touchSession(view, message.sessionId, event.time);
       break;
     }
     case "message.part_delta": {
+      const entry = view.partIndex[event.payload.partId];
+      const message = entry ? view.messages[entry.messageId] : undefined;
+      if (message?.turnId) clearSessionRetry(view, message.sessionId, message.turnId);
       applyPartDelta(view, event.payload.partId as PartId, event.payload.field, event.payload.delta);
+      if (message && entry) {
+        message.updatedAt = event.time;
+        const part = message.parts[entry.index];
+        if (part?.type === "text" && (part.displayText ?? part.text).trim().length > 0) message.lastTextAt = event.time;
+      }
       if (event.sessionId) touchSession(view, event.sessionId, event.time);
       break;
     }
     case "tool.call_started": {
+      if (event.sessionId) clearSessionRetry(view, event.sessionId, event.payload.turnId);
       const toolCall: RuntimeToolCallView = {
         id: event.payload.callId,
         status: "running",
         toolName: event.payload.toolName,
         input: event.payload.input,
+        startedAt: event.time,
         updatedAt: event.time,
       };
       assignOptional(toolCall, "sessionId", event.sessionId);
-      assignOptional(toolCall, "threadId", event.threadId);
       assignOptional(toolCall, "turnId", event.payload.turnId);
       view.toolCalls[toolCall.id] = toolCall;
+      assignTranscriptOrder(view, "tool", toolCall.id);
       linkToolCallToSession(view, toolCall, event.time);
       setToolPartStatus(view, event.payload.callId, "running");
       break;
@@ -883,15 +1249,28 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       if (event.payload.toolName !== undefined) toolCall.toolName = event.payload.toolName;
       if (hasOwn(event.payload, "input")) toolCall.input = event.payload.input;
       assignOptional(toolCall, "sessionId", event.sessionId);
-      assignOptional(toolCall, "threadId", event.threadId);
       assignOptional(toolCall, "metadata", event.payload.metadata);
       toolCall.updatedAt = event.time;
       linkToolCallToSession(view, toolCall, event.time);
       setToolPartStatus(view, event.payload.callId, event.payload.status);
       if (event.payload.status === "waiting_for_approval" && toolCall.sessionId) {
         const session = upsertSession(view, toolCall.sessionId, event.time);
-        session.status = "waiting_for_approval";
+        if (!session.hasExplicitStatus) {
+          setSessionStatus(session, "waiting_for_approval");
+          session.statusEventId = event.id;
+        }
         session.updatedAt = event.time;
+      } else if (
+        event.payload.status === "running"
+        && toolCall.sessionId
+        && !hasPendingApprovalForSession(view, toolCall.sessionId)
+      ) {
+        const session = upsertSession(view, toolCall.sessionId, event.time);
+        if (!session.hasExplicitStatus && session.status === "waiting_for_approval") {
+          setSessionStatus(session, "running");
+          session.statusEventId = event.id;
+          session.updatedAt = event.time;
+        }
       }
       break;
     }
@@ -906,7 +1285,6 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
         ...(event.payload.sequence === undefined ? {} : { sequence: event.payload.sequence }),
       });
       assignOptional(toolCall, "sessionId", event.sessionId);
-      assignOptional(toolCall, "threadId", event.threadId);
       toolCall.updatedAt = event.time;
       linkToolCallToSession(view, toolCall, event.time);
       break;
@@ -931,11 +1309,12 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
         createdAt: event.time,
       };
       assignOptional(approval, "sessionId", event.sessionId);
-      assignOptional(approval, "threadId", event.threadId);
       assignOptional(approval, "callId", event.payload.callId);
+      assignOptional(approval, "maxApprovalScope", event.payload.maxApprovalScope);
       assignOptional(approval, "metadata", event.payload.metadata);
       view.approvals[approval.id] = approval;
-      linkApprovalToSession(view, approval, event.time);
+      assignTranscriptOrder(view, "approval", approval.id);
+      linkApprovalToSession(view, approval, event.time, event.id);
       break;
     }
     case "approval.resolved": {
@@ -949,20 +1328,60 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       break;
     }
     case "goal.updated": {
-      const goal = cloneThreadGoal(event.payload.goal);
-      view.goalsByThread[goal.threadId] = goal;
-      const sessionId = goal.sessionId ?? event.sessionId;
-      if (sessionId) touchSession(view, sessionId, event.time);
+      const sourceGoal = event.payload?.goal;
+      const sessionId = matchingEnvelopeSessionId(event.sessionId, sourceGoal?.sessionId);
+      if (!sessionId || !sourceGoal) break;
+      const goal = cloneSessionGoal(sourceGoal);
+      goal.sessionId = sessionId;
+      view.goalsBySession[sessionId] = goal;
+      touchSession(view, sessionId, event.time);
       break;
     }
     case "goal.cleared": {
-      delete view.goalsByThread[event.payload.threadId];
-      if (event.sessionId) touchSession(view, event.sessionId, event.time);
+      const sessionId = matchingEnvelopeSessionId(event.sessionId, event.payload?.sessionId);
+      if (!sessionId) break;
+      delete view.goalsBySession[sessionId];
+      touchSession(view, sessionId, event.time);
       break;
     }
   }
 
   return view;
+}
+
+function normalizeRuntimeViewIndexes(view: ChiliRuntimeView): void {
+  view.sessions = nullPrototypeIndex(view.sessions);
+  view.turnStatuses = nullPrototypeIndex(view.turnStatuses);
+  view.turnStartedAt = nullPrototypeIndex(view.turnStartedAt);
+  view.messages = nullPrototypeIndex(view.messages);
+  view.toolCalls = nullPrototypeIndex(view.toolCalls);
+  view.approvals = nullPrototypeIndex(view.approvals);
+  view.agents = nullPrototypeIndex(view.agents);
+  view.agentRunIdsByPath = nullPrototypeIndex(view.agentRunIdsByPath);
+  view.mailboxMessages = nullPrototypeIndex(view.mailboxMessages);
+  view.tasks = nullPrototypeIndex(view.tasks);
+  view.teamIdByDelegatedTaskId = nullPrototypeIndex(view.teamIdByDelegatedTaskId);
+  view.teams = nullPrototypeIndex(view.teams);
+  view.teamMembers = nullPrototypeIndex(view.teamMembers);
+  view.teamMessages = nullPrototypeIndex(view.teamMessages);
+  view.teamRuns = nullPrototypeIndex(view.teamRuns);
+  view.teamRunIdsByTeam = nullPrototypeIndex(view.teamRunIdsByTeam);
+  view.modelMetadataByTurn = nullPrototypeIndex(view.modelMetadataByTurn);
+  view.goalsBySession = nullPrototypeIndex(view.goalsBySession);
+  view.partIndex = nullPrototypeIndex(view.partIndex);
+  view.transcriptOrder = nullPrototypeIndex(view.transcriptOrder ?? {});
+  if (!Number.isSafeInteger(view.nextTranscriptOrder) || view.nextTranscriptOrder < 0) {
+    let nextOrder = 0;
+    for (const order of Object.values(view.transcriptOrder)) {
+      if (Number.isSafeInteger(order) && order >= nextOrder) nextOrder = order + 1;
+    }
+    view.nextTranscriptOrder = nextOrder;
+  }
+}
+
+function nullPrototypeIndex<T>(index: Record<string, T>): Record<string, T> {
+  if (Object.getPrototypeOf(index) === null) return index;
+  return Object.assign(nullPrototypeRecord<T>(), index);
 }
 
 export function sessionMessages(view: ChiliRuntimeView, sessionId: SessionId): RuntimeMessageView[] {
@@ -1006,55 +1425,204 @@ export function runtimeAgentsSnapshot(view: ChiliRuntimeView, sessionId?: Sessio
   return snapshot;
 }
 
+/**
+ * Projects parent execution, ad-hoc delegation, and persistent teams without
+ * conflating their lifecycles. Parent execution may be idle while background
+ * agents remain active.
+ */
+export function runtimeDelegationStatus(
+  view: ChiliRuntimeView,
+  input: RuntimeDelegationStatusInput = {},
+): RuntimeDelegationStatusView {
+  const requestedSessionId = input.sessionId ?? input.delegationConfig?.sessionId;
+  const session = requestedSessionId
+    ? view.sessions[requestedSessionId]
+    : latestDelegationParentSession(view);
+  const sessionId = requestedSessionId ?? session?.id;
+  const items = delegatedAgentsForScope(view, sessionId);
+  const counts = delegatedAgentCounts(items.map((item) => item.status));
+  const active = items.filter((item) => item.status === "pending" || item.status === "running");
+  const errors = delegatedAgentErrors(items);
+  const teams = visibleTeamSummaries(view, sessionId);
+  const selectedTeam = input.teamId ? teams.find((team) => team.id === input.teamId) : teams[0];
+  const lastBatch = latestAgentBatch(view, sessionId);
+  const configured = input.delegationConfig?.sessionId === sessionId ? input.delegationConfig : undefined;
+  const policy = configured?.policy ?? session?.delegationPolicy;
+  const observed = items.length > 0 || teams.length > 0 || lastBatch !== undefined;
+  const delegation: RuntimeDelegationCapabilityView = { observed };
+  if (configured || policy || observed) delegation.supported = true;
+  assignOptional(delegation, "policy", policy);
+  assignOptional(delegation, "source", configured?.source ?? (session?.delegationPolicy ? "session" : undefined));
+
+  const parent: RuntimeParentExecutionView = {
+    status: session?.status ?? "unknown",
+    active: isActiveParentStatus(session?.status),
+  };
+  assignOptional(parent, "sessionId", sessionId);
+  assignOptional(parent, "statusReason", session?.statusReason);
+
+  const team: RuntimeDelegationTeamView = {
+    count: teams.length,
+    activeCount: teams.filter((item) => item.status === "active").length,
+  };
+  assignOptional(team, "selectedTeamId", selectedTeam?.id);
+  assignOptional(team, "selectedName", selectedTeam?.name || undefined);
+
+  const output: RuntimeDelegationStatusView = {
+    delegation,
+    parent,
+    agents: { counts, items, active, errors },
+    team,
+    generatedAt: input.generatedAt ?? new Date().toISOString(),
+  };
+  assignOptional(output, "lastBatch", lastBatch);
+  assignOptional(output, "lastEventId", view.lastEventId);
+  return output;
+}
+
+/**
+ * Projects ad-hoc task lifecycles for inline chat cards. The result is kept
+ * separate from ChatSessionView.items so callers can attach a card to the
+ * originating tool call without changing persisted transcript item shapes.
+ */
+export function chatAgentBatches(
+  view: ChiliRuntimeView,
+  input: ChatAgentBatchesInput = {},
+): RuntimeInlineAgentBatchView[] {
+  const session = input.sessionId
+    ? view.sessions[input.sessionId]
+    : latestDelegationParentSession(view);
+  const sessionId = input.sessionId ?? session?.id;
+  const candidates = agentBatchCandidates(view, sessionId);
+  const delegatedByTaskId = new Map(
+    delegatedAgentsForScope(view, sessionId).map((agent) => [agent.taskId, agent]),
+  );
+  const limit = Math.max(1, input.limit ?? 20);
+  return candidates
+    .slice(0, limit)
+    .map((candidate, index) => inlineAgentBatchView(
+      view,
+      candidate,
+      delegatedByTaskId,
+      candidates[index - 1]?.startedAt,
+    ))
+    .sort((left, right) => left.createdAt - right.createdAt || left.callId.localeCompare(right.callId));
+}
+
 export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput = {}): ChatSessionView {
   const limit = Math.max(1, input.limit ?? 80);
   const session = input.sessionId ? view.sessions[input.sessionId] : input.requireSession ? undefined : latestSession(view);
   const sessionId = input.sessionId ?? session?.id;
+  const hiddenTurnIds = session ? outputFreeCancelledTurnIds(view, session) : new Set<string>();
   const messages = session
     ? session.messageIds.flatMap((messageId) => {
       const message = view.messages[messageId];
-      if (!message || !matchesThread(message.threadId, input.threadId)) return [];
+      if (!message || (message.turnId && hiddenTurnIds.has(message.turnId))) return [];
       return [chatMessageRow(message)];
     })
     : [];
+  const executionContexts = session
+    ? toolResultExecutionContexts(view, session)
+    : new Map<ToolCallId, ChatToolExecutionContext>();
   const tools = session
     ? session.toolCallIds.flatMap((callId) => {
       const toolCall = view.toolCalls[callId];
-      if (!toolCall || !matchesThread(toolCall.threadId, input.threadId)) return [];
-      return [chatToolCallRow(view, toolCall)];
+      if (!toolCall || (toolCall.turnId && hiddenTurnIds.has(toolCall.turnId))) return [];
+      return [chatToolCallRow(view, toolCall, executionContexts.get(callId))];
     })
     : [];
   const approvals = session
     ? session.approvalIds.flatMap((approvalId) => {
       const approval = view.approvals[approvalId];
-      if (!approval || !matchesThread(approval.threadId, input.threadId)) return [];
+      if (!approval) return [];
+      const turnId = approval.callId ? view.toolCalls[approval.callId]?.turnId : undefined;
+      if (turnId && hiddenTurnIds.has(turnId)) return [];
       return [chatApprovalRow(view, approval)];
     })
     : [];
   const modelMetadata = session
-    ? modelMetadataForSession(view, session.id, input.threadId)
+    ? modelMetadataForSession(view, session.id)
     : [];
   const latestModelMetadata = modelMetadata.at(-1);
   const usageSummary = modelUsageSummary(modelMetadata);
-  const threadId = input.threadId ?? session?.threadId;
-  const goal = threadId ? view.goalsByThread[threadId] : undefined;
+  const goal = sessionId ? view.goalsBySession[sessionId] : undefined;
   const items = [...messages, ...tools, ...approvals]
-    .sort((left, right) => chatItemTime(left) - chatItemTime(right))
+    .sort((left, right) => (
+      chatTranscriptOrder(view, left) - chatTranscriptOrder(view, right)
+      || chatItemTime(left) - chatItemTime(right)
+    ))
     .slice(-limit);
+  const pendingApprovalRows = approvals.filter((approval) => approval.status === "pending");
+  const effectiveStatus = session?.status === "running"
+    && (pendingApprovalRows.length > 0
+      || tools.some((tool) => tool.status === "waiting_for_approval"))
+    ? "waiting_for_approval"
+    : session?.status ?? "unknown";
   const output: ChatSessionView = {
-    status: session?.status ?? "unknown",
+    status: effectiveStatus,
     items,
-    pendingApprovals: approvals.filter((approval) => approval.status === "pending"),
+    pendingApprovals: pendingApprovalRows,
     activeTools: tools.filter((tool) => tool.status === "running" || tool.status === "waiting_for_approval" || tool.status === "validating"),
     generatedAt: input.generatedAt ?? new Date().toISOString(),
   };
   assignOptional(output, "sessionId", sessionId);
-  assignOptional(output, "threadId", threadId);
-  assignOptional(output, "goal", goal ? cloneThreadGoal(goal) : undefined);
+  assignOptional(output, "cwd", session?.cwd || undefined);
+  assignOptional(output, "statusReason", session?.statusReason);
+  assignOptional(output, "statusEventId", session?.statusEventId);
+  assignOptional(output, "goal", goal ? cloneSessionGoal(goal) : undefined);
   assignOptional(output, "latestModelMetadata", latestModelMetadata ? chatModelMetadata(latestModelMetadata) : undefined);
   assignOptional(output, "usageSummary", usageSummary);
+  assignOptional(output, "retry", session?.retry ? { ...session.retry } : undefined);
   assignOptional(output, "lastEventId", view.lastEventId);
   return output;
+}
+
+function outputFreeCancelledTurnIds(
+  view: ChiliRuntimeView,
+  session: RuntimeSessionView,
+): Set<string> {
+  const cancelledTurnIds = new Set(
+    Object.entries(view.turnStatuses)
+      .filter(([, status]) => status === "cancelled")
+      .map(([turnId]) => turnId),
+  );
+  if (session.status === "cancelled" && session.currentTurnId) {
+    cancelledTurnIds.add(session.currentTurnId);
+  }
+  if (cancelledTurnIds.size === 0) return cancelledTurnIds;
+
+  for (const messageId of session.messageIds) {
+    const message = view.messages[messageId];
+    if (
+      !message?.turnId
+      || message.role === "user"
+      || !cancelledTurnIds.has(message.turnId)
+    ) {
+      continue;
+    }
+    if (message.parts.some(isMeaningfulAssistantOutput)) cancelledTurnIds.delete(message.turnId);
+  }
+  for (const callId of session.toolCallIds) {
+    const toolCall = view.toolCalls[callId];
+    if (toolCall?.turnId) {
+      cancelledTurnIds.delete(toolCall.turnId);
+    }
+  }
+  return cancelledTurnIds;
+}
+
+function isMeaningfulAssistantOutput(part: MessagePart): boolean {
+  if (part.type === "reasoning") return false;
+  if (part.type === "text") return part.text.trim().length > 0;
+  if (part.type === "tool_result") {
+    return (
+      part.output.trim().length > 0
+      || (part.error?.trim().length ?? 0) > 0
+      || (part.content?.length ?? 0) > 0
+      || (part.artifactIds?.length ?? 0) > 0
+    );
+  }
+  return true;
 }
 
 function latestSession(view: ChiliRuntimeView): RuntimeSessionView | undefined {
@@ -1065,11 +1633,1140 @@ function latestSession(view: ChiliRuntimeView): RuntimeSessionView | undefined {
   return undefined;
 }
 
+function latestDelegationParentSession(view: ChiliRuntimeView): RuntimeSessionView | undefined {
+  const childSessionIds = new Set<SessionId>();
+  for (const task of Object.values(view.tasks)) {
+    if (task.childSessionId) childSessionIds.add(task.childSessionId);
+  }
+  for (const member of Object.values(view.teamMembers)) {
+    if (member.childSessionId) childSessionIds.add(member.childSessionId);
+  }
+  for (let index = view.sessionIds.length - 1; index >= 0; index -= 1) {
+    const session = view.sessions[view.sessionIds[index] ?? ""];
+    if (session && !childSessionIds.has(session.id)) return session;
+  }
+  return latestSession(view);
+}
+
+function isActiveParentStatus(status: RuntimeSessionStatus | undefined): boolean {
+  return status === "running" || status === "waiting_for_approval" || status === "cancelling";
+}
+
+function delegatedAgentsForScope(
+  view: ChiliRuntimeView,
+  sessionId: SessionId | undefined,
+): RuntimeDelegatedAgent[] {
+  const teamAgentTaskIds = linkedTeamAgentTaskIds(view);
+  const agentsByTaskId = new Map<TaskId, RuntimeAgentView>();
+  for (const runId of view.agentRunIds) {
+    const agent = view.agents[runId];
+    if (!agent || !matchesSessionScope(agent.sessionId, sessionId)) continue;
+    for (const taskId of agent.taskIds) {
+      if (teamAgentTaskIds.has(taskId)) continue;
+      const current = agentsByTaskId.get(taskId);
+      if (
+        !current
+        || agent.generation > current.generation
+        || (agent.generation === current.generation && agent.updatedAt > current.updatedAt)
+      ) {
+        agentsByTaskId.set(taskId, agent);
+      }
+    }
+  }
+
+  const items = view.taskIds.flatMap((taskId) => {
+    const task = view.tasks[taskId];
+    const agent = agentsByTaskId.get(taskId);
+    if (
+      !task
+      || task.teamId
+      || teamAgentTaskIds.has(taskId)
+      || (!task.childSessionId && !agent)
+      || !matchesSessionScope(task.sessionId ?? agent?.sessionId, sessionId)
+    ) {
+      return [];
+    }
+    const path = task.path ?? task.ownerPath ?? agent?.path;
+    if (!path) return [];
+    const status = delegatedAgentStatus(task, agent);
+    if (!status) return [];
+    const item: RuntimeDelegatedAgent = {
+      taskId,
+      path,
+      taskName: task.title ?? agent?.taskName ?? taskId,
+      status,
+      updatedAt: Math.max(task.updatedAt, agent?.updatedAt ?? 0),
+    };
+    assignOptional(item, "runId", agent?.id);
+    assignOptional(item, "mode", task.mode ?? agent?.mode);
+    assignOptional(item, "childSessionId", task.childSessionId ?? agent?.childSessionId);
+    assignOptional(item, "sourceCallId", task.sourceCallId);
+    assignOptional(item, "batchId", task.batchId);
+    assignOptional(item, "batchIndex", task.batchIndex);
+    assignOptional(item, "expectedBatchSize", task.expectedBatchSize);
+    assignOptional(item, "completionPolicy", task.completionPolicy);
+    assignOptional(item, "maxConcurrency", task.maxConcurrency);
+    assignOptional(item, "summary", task.summary ?? agent?.summary);
+    assignOptional(item, "error", task.error ?? agent?.error);
+    assignOptional(item, "completedAt", task.completedAt ?? agent?.completedAt);
+    if (status === "pending" || status === "running") {
+      assignOptional(item, "activity", delegatedAgentActivity(view, item));
+    }
+    return [item];
+  });
+
+  return items.sort((left, right) => {
+    const activeRank = (item: RuntimeDelegatedAgent) => item.status === "pending" || item.status === "running" ? 0 : 1;
+    return activeRank(left) - activeRank(right) || right.updatedAt - left.updatedAt || left.taskId.localeCompare(right.taskId);
+  });
+}
+
+function matchesSessionScope(valueSessionId: SessionId | undefined, sessionId: SessionId | undefined): boolean {
+  return sessionId ? valueSessionId === sessionId : true;
+}
+
+function linkedTeamAgentTaskIds(view: ChiliRuntimeView): Set<TaskId> {
+  const ids = new Set<TaskId>(Object.keys(view.teamIdByDelegatedTaskId) as TaskId[]);
+  for (const team of Object.values(view.teams)) {
+    for (const teamTaskId of team.taskIds) {
+      const task = view.tasks[teamTaskId];
+      if (!task) continue;
+      ids.add(teamTaskId);
+      if (!task.metadata) continue;
+      for (const linkedTaskId of metadataLinkedTaskIds(task.metadata)) ids.add(linkedTaskId);
+    }
+  }
+  return ids;
+}
+
+function delegatedAgentStatus(
+  task: RuntimeTaskView,
+  agent: RuntimeAgentView | undefined,
+): AgentTaskStatus | undefined {
+  if (isAgentTaskStatus(task.status) && task.status !== "pending" && task.status !== "running") return task.status;
+  const sameGenerationAgent = agent?.generation === task.generation ? agent : undefined;
+  if (sameGenerationAgent?.status && sameGenerationAgent.status !== "running") return sameGenerationAgent.status;
+  if (task.status === "pending") return sameGenerationAgent?.status === "running" ? "running" : "pending";
+  return task.status === "running" ? "running" : undefined;
+}
+
+function delegatedAgentActivity(
+  view: ChiliRuntimeView,
+  agent: RuntimeDelegatedAgent,
+): RuntimeDelegatedAgentActivity {
+  const childSessionId = agent.childSessionId;
+  if (childSessionId) {
+    const childSession = view.sessions[childSessionId];
+    const currentTurnId = childSession?.currentTurnId;
+    const approval = Object.values(view.approvals)
+      .filter((item) => {
+        if (item.sessionId !== childSessionId || item.status !== "pending") return false;
+        if (!currentTurnId || !item.callId) return true;
+        return view.toolCalls[item.callId]?.turnId === currentTurnId;
+      })
+      .sort((left, right) => right.createdAt - left.createdAt)[0];
+    if (approval) {
+      return { kind: "approval", label: approval.permission, status: "pending", updatedAt: approval.createdAt };
+    }
+    const tool = Object.values(view.toolCalls)
+      .filter((item) => {
+        return item.sessionId === childSessionId
+          && (!currentTurnId || item.turnId === currentTurnId)
+          && !isFinalToolStatus(item.status);
+      })
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    if (tool) {
+      return { kind: "tool", label: tool.toolName || "tool", status: tool.status, updatedAt: tool.updatedAt };
+    }
+    if (childSession?.status === "waiting_for_approval") {
+      return { kind: "waiting", label: "approval", status: childSession.status, updatedAt: childSession.updatedAt };
+    }
+    if (childSession && childSession.status !== "running") {
+      return { kind: "waiting", label: "worker", status: childSession.status, updatedAt: childSession.updatedAt };
+    }
+  }
+  return { kind: "task", label: agent.taskName, status: agent.status, updatedAt: agent.updatedAt };
+}
+
+function delegatedAgentCounts(statuses: readonly AgentTaskStatus[]): RuntimeDelegatedAgentCounts {
+  const counts: RuntimeDelegatedAgentCounts = {
+    total: statuses.length,
+    pending: 0,
+    running: 0,
+    active: 0,
+    completed: 0,
+    incomplete: 0,
+    failed: 0,
+    cancelled: 0,
+  };
+  for (const status of statuses) {
+    counts[status] += 1;
+    if (status === "pending" || status === "running") counts.active += 1;
+  }
+  return counts;
+}
+
+function delegatedAgentErrors(items: readonly RuntimeDelegatedAgent[]): RuntimeDelegatedAgentError[] {
+  return items.flatMap((item) => {
+    if (!isAgentErrorStatus(item.status)) return [];
+    const error: RuntimeDelegatedAgentError = {
+      taskId: item.taskId,
+      path: item.path,
+      status: item.status,
+      message: item.error ?? item.summary ?? `${item.taskName} ${item.status}`,
+      updatedAt: item.updatedAt,
+    };
+    assignOptional(error, "runId", item.runId);
+    return [error];
+  });
+}
+
+function isAgentErrorStatus(
+  status: AgentTaskStatus,
+): status is Extract<AgentTaskStatus, "incomplete" | "failed" | "cancelled"> {
+  return status === "incomplete" || status === "failed" || status === "cancelled";
+}
+
+function latestAgentBatch(
+  view: ChiliRuntimeView,
+  sessionId: SessionId | undefined,
+): RuntimeAgentBatchView | undefined {
+  const latest = agentBatchCandidates(view, sessionId)[0];
+  return latest ? agentBatchFromTasks(view, latest.callId, latest.tasks, latest.call) : undefined;
+}
+
+interface RuntimeAgentBatchCandidate {
+  callId: ToolCallId;
+  call: RuntimeToolCallView | undefined;
+  tasks: RuntimeTaskView[];
+  startedAt: number;
+}
+
+function agentBatchCandidates(
+  view: ChiliRuntimeView,
+  sessionId: SessionId | undefined,
+): RuntimeAgentBatchCandidate[] {
+  const provenanceGroups = new Map<string, RuntimeTaskView[]>();
+  for (const taskId of view.taskIds) {
+    const task = view.tasks[taskId];
+    if (!task?.sourceCallId || task.teamId || view.teamIdByDelegatedTaskId[taskId]) continue;
+    if (!matchesSessionScope(task.sessionId, sessionId)) continue;
+    const key = `${task.sourceCallId}\0${task.batchId ?? "single"}`;
+    const tasks = provenanceGroups.get(key) ?? [];
+    tasks.push(task);
+    provenanceGroups.set(key, tasks);
+  }
+
+  const candidates: RuntimeAgentBatchCandidate[] = [];
+  const callsWithProvenance = new Set<ToolCallId>();
+  for (const tasks of provenanceGroups.values()) {
+    const callId = tasks[0]?.sourceCallId;
+    if (!callId) continue;
+    const call = view.toolCalls[callId];
+    callsWithProvenance.add(callId);
+    candidates.push({ callId, call, tasks, startedAt: batchStartedAt(call, tasks) });
+  }
+  for (const call of Object.values(view.toolCalls)) {
+    if (
+      callsWithProvenance.has(call.id)
+      || !isTaskDelegationTool(call.toolName)
+      || !matchesSessionScope(call.sessionId, sessionId)
+    ) {
+      continue;
+    }
+    const tasks = taskIdsFromBatchToolCall(call).flatMap((taskId) => {
+      const task = view.tasks[taskId];
+      return task && !task.teamId && !view.teamIdByDelegatedTaskId[taskId] ? [task] : [];
+    });
+    candidates.push({ callId: call.id, call, tasks, startedAt: batchStartedAt(call, tasks) });
+  }
+  return candidates.sort((left, right) => {
+    return right.startedAt - left.startedAt || right.callId.localeCompare(left.callId);
+  });
+}
+
+function inlineAgentBatchView(
+  view: ChiliRuntimeView,
+  candidate: RuntimeAgentBatchCandidate,
+  delegatedByTaskId: ReadonlyMap<TaskId, RuntimeDelegatedAgent>,
+  nextBatchStartedAt: number | undefined,
+): RuntimeInlineAgentBatchView {
+  const batch = agentBatchFromTasks(view, candidate.callId, candidate.tasks, candidate.call);
+  const taskIds = new Set(candidate.tasks.map((task) => task.id));
+  const taskPaths = new Set(candidate.tasks.flatMap((task) => {
+    const delegated = delegatedByTaskId.get(task.id);
+    const path = task.path ?? task.ownerPath ?? delegated?.path;
+    return path ? [path] : [];
+  }));
+  const rawMessages = inlineBatchMailboxMessages(
+    view,
+    candidate,
+    taskIds,
+    taskPaths,
+    batch.batchId,
+    nextBatchStartedAt,
+  );
+  const messages = rawMessages.map((message) => inlineAgentMessage(message, taskPaths));
+  const agents = candidate.tasks
+    .map((task) => inlineAgentView(view, task, delegatedByTaskId.get(task.id), messages))
+    .sort((left, right) => {
+      const leftTask = view.tasks[left.taskId];
+      const rightTask = view.tasks[right.taskId];
+      return (leftTask?.batchIndex ?? Number.MAX_SAFE_INTEGER) - (rightTask?.batchIndex ?? Number.MAX_SAFE_INTEGER)
+        || left.createdAt - right.createdAt
+        || left.taskId.localeCompare(right.taskId);
+    });
+  const spawnFailures = inlineSpawnFailures(candidate.call, batch.spawnFailures ?? []);
+  const terminalTaskCount = batch.completed + batch.incomplete + batch.failed + batch.cancelled;
+  const outputStatus = delegatedTaskStatusFromToolOutput(candidate.call);
+  const structuralFailureCount = candidate.tasks.length === 0
+    && (candidate.call?.status === "failed" || candidate.call?.status === "cancelled")
+    ? batch.expected
+    : 0;
+  const outputTerminalCount = candidate.tasks.length === 0 && outputStatus && isFinalTaskStatus(outputStatus)
+    ? batch.expected
+    : 0;
+  const resolved = Math.min(
+    batch.expected,
+    Math.max(
+      terminalTaskCount + (batch.spawnFailureCount ?? 0),
+      structuralFailureCount,
+      outputTerminalCount,
+    ),
+  );
+  const terminal = batch.active === 0
+    && batch.expected > 0
+    && resolved >= batch.expected;
+  const status = !terminal && (
+    batch.status === "completed"
+    || outputStatus === "pending"
+    || outputStatus === "running"
+  ) ? "running" : batch.status;
+  const completionPolicy = batch.completionPolicy ?? defaultCompletionPolicy(candidate.call);
+  const integration = inlineAgentIntegration(
+    view,
+    candidate,
+    terminal,
+    completionPolicy,
+    rawMessages,
+  );
+  const updatedAt = Math.max(
+    batch.updatedAt,
+    integration.updatedAt,
+    ...messages.map((message) => message.time),
+  );
+  const output: RuntimeInlineAgentBatchView = {
+    id: `agent_batch:${candidate.callId}:${batch.batchId ?? "single"}`,
+    callId: candidate.callId,
+    status,
+    expected: batch.expected,
+    tracked: batch.total,
+    terminal,
+    progress: { terminal: resolved, expected: batch.expected },
+    counts: inlineAgentCounts(batch),
+    spawnFailures,
+    agents,
+    messages,
+    integration,
+    createdAt: candidate.startedAt,
+    updatedAt,
+  };
+  assignOptional(output, "batchId", batch.batchId);
+  assignOptional(output, "toolStatus", candidate.call?.status);
+  assignOptional(output, "completionPolicy", completionPolicy);
+  assignOptional(output, "requestedMaxConcurrency", batch.maxConcurrency ?? maxConcurrencyFromToolCall(candidate.call));
+  assignOptional(output, "observedPeakConcurrency", observedPeakConcurrency(view, taskIds));
+  assignOptional(output, "spawnedCount", batch.spawnedCount);
+  assignOptional(output, "spawnFailureCount", batch.spawnFailureCount);
+  assignOptional(output, "error", batch.error);
+  return output;
+}
+
+function inlineAgentCounts(batch: RuntimeAgentBatchView): RuntimeDelegatedAgentCounts {
+  return {
+    total: batch.total,
+    pending: batch.pending,
+    running: batch.running,
+    active: batch.active,
+    completed: batch.completed,
+    incomplete: batch.incomplete,
+    failed: batch.failed,
+    cancelled: batch.cancelled,
+  };
+}
+
+function inlineAgentView(
+  view: ChiliRuntimeView,
+  task: RuntimeTaskView,
+  delegated: RuntimeDelegatedAgent | undefined,
+  batchMessages: readonly RuntimeInlineAgentMessage[],
+): RuntimeInlineAgentView {
+  const path = task.path ?? task.ownerPath ?? delegated?.path ?? (`/root/${task.id}` as AgentPath);
+  const taskRuns = view.agentRunIds.flatMap((runId) => {
+    const run = view.agents[runId];
+    return run?.taskIds.includes(task.id) ? [run] : [];
+  });
+  const turns = Math.max(1, taskRuns.length);
+  const status = delegated?.status ?? inlineTaskStatus(task.status);
+  const name = task.title ?? delegated?.taskName ?? agentPathLeaf(path);
+  const taskText = task.taskPrompt ?? task.description ?? task.title ?? delegated?.taskName ?? task.id;
+  const output: RuntimeInlineAgentView = {
+    taskId: task.id,
+    path,
+    name,
+    task: taskText,
+    status,
+    turns,
+    followupCount: Math.max(0, turns - 1),
+    messages: batchMessages.filter((message) => {
+      const metadataTaskIds = message.metadataSummary?.taskIds;
+      return (metadataTaskIds?.length === 1 && metadataTaskIds[0] === task.id)
+        || message.from === path
+        || message.to === path;
+    }),
+    createdAt: task.createdAt,
+    updatedAt: Math.max(task.updatedAt, delegated?.updatedAt ?? 0),
+  };
+  assignOptional(output, "runId", delegated?.runId);
+  assignOptional(output, "taskPrompt", task.taskPrompt);
+  assignOptional(output, "description", task.description ?? task.taskPrompt);
+  assignOptional(output, "activity", delegated?.activity);
+  assignOptional(output, "summary", task.summary ?? delegated?.summary);
+  assignOptional(output, "error", task.error ?? delegated?.error);
+  assignOptional(output, "completedAt", task.completedAt ?? delegated?.completedAt);
+  return output;
+}
+
+function inlineTaskStatus(status: RuntimeTaskStatus): AgentTaskStatus {
+  if (isAgentTaskStatus(status)) return status;
+  return status === "in_progress" ? "running" : "pending";
+}
+
+function agentPathLeaf(path: AgentPath): string {
+  return path.split("/").filter(Boolean).at(-1) ?? path;
+}
+
+function inlineBatchMailboxMessages(
+  view: ChiliRuntimeView,
+  candidate: RuntimeAgentBatchCandidate,
+  taskIds: ReadonlySet<TaskId>,
+  taskPaths: ReadonlySet<AgentPath>,
+  batchId: string | undefined,
+  nextBatchStartedAt: number | undefined,
+): RuntimeAgentMailboxMessageView[] {
+  const firstTask = candidate.tasks[0];
+  return view.mailboxMessageIds.flatMap((messageId) => {
+    const message = view.mailboxMessages[messageId];
+    if (!message || message.teamId) return [];
+    if (!matchesSessionScope(message.sessionId, firstTask?.sessionId ?? candidate.call?.sessionId)) return [];
+    const metadata = message.metadataSummary;
+    const strongMatch = (message.taskId !== undefined && taskIds.has(message.taskId))
+      || (batchId !== undefined && metadata?.batchId === batchId)
+      || metadata?.taskIds?.some((taskId) => taskIds.has(taskId)) === true
+      || candidate.tasks.some(
+        (task) => task.childSessionId === message.recipientSessionId && message.recipientSessionId !== undefined,
+      );
+    const pathMatch = taskPaths.has(message.path) || taskPaths.has(message.from);
+    const withinWindow = message.queuedAt >= candidate.startedAt
+      && (nextBatchStartedAt === undefined || message.queuedAt < nextBatchStartedAt);
+    return strongMatch || (pathMatch && withinWindow) ? [message] : [];
+  }).sort((left, right) => left.queuedAt - right.queuedAt || left.id.localeCompare(right.id));
+}
+
+function inlineAgentMessage(
+  message: RuntimeAgentMailboxMessageView,
+  taskPaths: ReadonlySet<AgentPath>,
+): RuntimeInlineAgentMessage {
+  const fromAgent = taskPaths.has(message.from);
+  const toAgent = taskPaths.has(message.path);
+  const direction: RuntimeInlineAgentMessageDirection = fromAgent && toAgent
+    ? "agent_to_agent"
+    : fromAgent
+      ? "agent_to_parent"
+      : toAgent
+        ? "parent_to_agent"
+        : "related";
+  const output: RuntimeInlineAgentMessage = {
+    id: message.id,
+    direction,
+    from: message.from,
+    to: message.path,
+    status: message.status,
+    text: message.preview ?? message.messageKind ?? "Agent message",
+    time: message.queuedAt,
+    triggerTurn: message.triggerTurn,
+  };
+  assignOptional(output, "kind", message.messageKind);
+  assignOptional(output, "metadataSummary", message.metadataSummary);
+  return output;
+}
+
+function inlineSpawnFailures(
+  call: RuntimeToolCallView | undefined,
+  failures: readonly RuntimeAgentBatchSpawnFailure[],
+): RuntimeInlineAgentSpawnFailure[] {
+  const requests = taskRequestsFromToolCall(call);
+  return failures.map((failure, index) => {
+    const batchIndex = failure.batchIndex ?? index;
+    const request = requests[batchIndex];
+    const name = failure.description ?? request?.description ?? `agent ${batchIndex + 1}`;
+    const output: RuntimeInlineAgentSpawnFailure = {
+      name,
+      task: request?.prompt ?? request?.description ?? failure.description ?? name,
+      error: failure.error,
+    };
+    assignOptional(output, "batchIndex", failure.batchIndex);
+    return output;
+  });
+}
+
+function taskRequestsFromToolCall(
+  call: RuntimeToolCallView | undefined,
+): Array<{ description?: string; prompt?: string }> {
+  const input = recordObjectValue(call?.input);
+  const raw = Array.isArray(input?.tasks) ? input.tasks : input ? [input] : [];
+  return raw.map((item) => {
+    const record = recordObjectValue(item);
+    const request: { description?: string; prompt?: string } = {};
+    assignOptional(request, "description", stringValue(record?.description));
+    assignOptional(request, "prompt", stringValue(record?.prompt));
+    return request;
+  });
+}
+
+function observedPeakConcurrency(
+  view: ChiliRuntimeView,
+  taskIds: ReadonlySet<TaskId>,
+): number | undefined {
+  const intervals = view.agentRunIds.flatMap((runId) => {
+    const run = view.agents[runId];
+    if (!run || !run.taskIds.some((taskId) => taskIds.has(taskId))) return [];
+    return [{ start: run.createdAt, end: Math.max(run.completedAt ?? Number.POSITIVE_INFINITY, run.createdAt + 1) }];
+  });
+  if (intervals.length === 0) return undefined;
+  let peak = 0;
+  for (const point of intervals.map((interval) => interval.start)) {
+    peak = Math.max(peak, intervals.filter((interval) => interval.start <= point && point < interval.end).length);
+  }
+  return peak;
+}
+
+function inlineAgentIntegration(
+  view: ChiliRuntimeView,
+  candidate: RuntimeAgentBatchCandidate,
+  terminal: boolean,
+  completionPolicy: RuntimeTaskCompletionPolicy | undefined,
+  messages: readonly RuntimeAgentMailboxMessageView[],
+): RuntimeInlineAgentIntegrationView {
+  const batchUpdatedAt = Math.max(
+    candidate.call?.updatedAt ?? 0,
+    batchTasksUpdatedAt(candidate.tasks),
+    candidate.startedAt,
+  );
+  const required = completionPolicy !== "detached";
+  if (!required) {
+    const output: RuntimeInlineAgentIntegrationView = {
+      required: false,
+      status: "not_required",
+      updatedAt: batchUpdatedAt,
+    };
+    assignOptional(output, "completionPolicy", completionPolicy);
+    return output;
+  }
+  if (!terminal) {
+    const output: RuntimeInlineAgentIntegrationView = {
+      required: true,
+      status: "pending",
+      updatedAt: batchUpdatedAt,
+      evidence: "agent_work",
+    };
+    assignOptional(output, "completionPolicy", completionPolicy);
+    return output;
+  }
+
+  const taskIds = new Set(candidate.tasks.map((task) => task.id));
+  const batchId = candidate.tasks.find((task) => task.batchId)?.batchId ?? batchIdFromToolCall(candidate.call);
+  const completionMessage = [...messages]
+    .filter((message) => message.metadataSummary?.kind === "subagent_completion_batch")
+    .sort((left, right) => right.queuedAt - left.queuedAt)[0];
+  const waitCall = latestMatchingTaskWaitCall(view, candidate, taskIds, batchId, completionPolicy);
+  const terminalTasksAt = candidate.tasks.reduce((latest, task) => {
+    if (!isFinalTaskStatus(task.status)) return latest;
+    return Math.max(latest, task.completedAt ?? task.updatedAt);
+  }, candidate.startedAt);
+  const waitResultAt = waitCall && waitCall.updatedAt >= terminalTasksAt ? waitCall.updatedAt : undefined;
+  if (completionPolicy === "supervised" && waitResultAt === undefined) {
+    return {
+      required: true,
+      status: "pending",
+      updatedAt: terminalTasksAt,
+      evidence: "results_ready",
+      completionPolicy,
+    };
+  }
+  const followupCall = latestMatchingTaskFollowupCall(view, candidate, taskIds, terminalTasksAt);
+  const followupResultAt = followupCall?.updatedAt;
+  const candidateOutputStatus = delegatedTaskStatusFromToolOutput(candidate.call);
+  const candidateReturnedTerminalResults = candidate.call
+    && isFinalToolStatus(candidate.call.status)
+    && (
+      (candidateOutputStatus !== undefined && isFinalTaskStatus(candidateOutputStatus))
+      || (
+        completionPolicy === "join"
+        && candidate.tasks.length > 0
+        && candidate.tasks.every((task) => isFinalTaskStatus(task.status) && (task.completedAt ?? task.updatedAt) <= candidate.call!.updatedAt)
+      )
+      || ((batchSpawnInfo(candidate.call).spawnFailureCount ?? 0) > 0 && batchSpawnInfo(candidate.call).spawnedCount === 0)
+      || ((candidate.call.status === "failed" || candidate.call.status === "cancelled") && candidate.tasks.length === 0)
+    );
+  const candidateResultAt = candidateReturnedTerminalResults
+    && candidate.call
+    && candidate.call.updatedAt >= terminalTasksAt
+    ? candidate.call.updatedAt
+    : undefined;
+  const evidenceCalls = [
+    followupCall && followupResultAt !== undefined ? { call: followupCall, time: followupResultAt } : undefined,
+    waitCall && waitResultAt !== undefined ? { call: waitCall, time: waitResultAt } : undefined,
+    candidate.call && candidateResultAt !== undefined ? { call: candidate.call, time: candidateResultAt } : undefined,
+  ].filter((item): item is { call: RuntimeToolCallView; time: number } => item !== undefined)
+    .sort((left, right) => right.time - left.time || right.call.id.localeCompare(left.call.id));
+  const evidenceCall = evidenceCalls[0];
+  const toolResultAt = evidenceCall?.time;
+  const readyAt = Math.max(
+    terminalTasksAt,
+    completionMessage?.queuedAt ?? 0,
+    toolResultAt ?? 0,
+  );
+  const firstTask = candidate.tasks[0];
+  const sessionId = firstTask?.sessionId ?? candidate.call?.sessionId;
+  const prompt = completionMessage
+    ? matchingCompletionPrompt(view, completionMessage, sessionId)
+    : undefined;
+  const turnId = prompt?.turnId
+    ?? evidenceCall?.call.turnId;
+  const responseInEvidenceTurn = turnId
+    ? matchingAssistantResponse(view, turnId, sessionId, readyAt)
+    : undefined;
+  const continuationCall = evidenceCall?.call;
+  const continuationEligible = !completionMessage && (continuationCall !== undefined || completionPolicy === "supervised");
+  const response = responseInEvidenceTurn ?? (
+    continuationEligible
+      ? matchingToolContinuationResponse(
+        view,
+        sessionId,
+        readyAt,
+      )
+      : undefined
+  );
+  if (response) {
+    const output: RuntimeInlineAgentIntegrationView = {
+      required: true,
+      status: "responded",
+      updatedAt: response.lastTextAt ?? response.updatedAt ?? response.createdAt,
+      evidence: "assistant_response_after_terminal_result",
+      messageId: response.id,
+    };
+    assignOptional(output, "completionPolicy", completionPolicy);
+    assignOptional(output, "turnId", response.turnId ?? turnId);
+    return output;
+  }
+  if (turnId && view.turnStatuses[turnId] === "running") {
+    const output: RuntimeInlineAgentIntegrationView = {
+      required: true,
+      status: "integrating",
+      updatedAt: Math.max(readyAt, prompt?.updatedAt ?? prompt?.createdAt ?? readyAt),
+      evidence: "parent_turn_started",
+      turnId,
+    };
+    assignOptional(output, "completionPolicy", completionPolicy);
+    assignOptional(output, "messageId", prompt?.id);
+    return output;
+  }
+  const continuationTurnId = continuationEligible
+    ? matchingToolContinuationTurn(view, sessionId, readyAt)
+    : undefined;
+  if (continuationTurnId) {
+    const output: RuntimeInlineAgentIntegrationView = {
+      required: true,
+      status: "integrating",
+      updatedAt: view.turnStartedAt[continuationTurnId] ?? readyAt,
+      evidence: "parent_turn_started",
+      turnId: continuationTurnId,
+    };
+    assignOptional(output, "completionPolicy", completionPolicy);
+    return output;
+  }
+
+  const output: RuntimeInlineAgentIntegrationView = {
+    required: true,
+    status: "ready",
+    updatedAt: readyAt,
+    evidence: completionMessage
+      ? completionMessage.status === "consumed" || completionMessage.status === "delivering"
+        ? "mailbox_delivered"
+        : "mailbox_queued"
+      : toolResultAt !== undefined
+        ? "tool_result"
+        : "results_ready",
+  };
+  assignOptional(output, "completionPolicy", completionPolicy);
+  assignOptional(output, "turnId", turnId);
+  assignOptional(output, "messageId", completionMessage?.id);
+  return output;
+}
+
+function latestMatchingTaskWaitCall(
+  view: ChiliRuntimeView,
+  candidate: RuntimeAgentBatchCandidate,
+  taskIds: ReadonlySet<TaskId>,
+  batchId: string | undefined,
+  completionPolicy: RuntimeTaskCompletionPolicy | undefined,
+): RuntimeToolCallView | undefined {
+  return Object.values(view.toolCalls)
+    .filter((call) => {
+      if (!isTaskWaitTool(call.toolName) || !isFinalToolStatus(call.status)) return false;
+      if (completionPolicy === "supervised" && !isSupervisedAllWait(call)) return false;
+      if (!matchesSessionScope(call.sessionId, candidate.tasks[0]?.sessionId ?? candidate.call?.sessionId)) return false;
+      const input = recordObjectValue(call.input);
+      const inputBatchId = stringValue(input?.batchId) ?? stringValue(input?.batch_id);
+      const waitedTaskIds = taskIdsFromWaitCall(call);
+      if (completionPolicy === "supervised" && ![...taskIds].every((taskId) => waitedTaskIds.includes(taskId))) {
+        return false;
+      }
+      if (batchId && inputBatchId === batchId) return true;
+      return waitedTaskIds.some((taskId) => taskIds.has(taskId));
+    })
+    .sort((left, right) => right.updatedAt - left.updatedAt || right.id.localeCompare(left.id))[0];
+}
+
+function latestMatchingTaskFollowupCall(
+  view: ChiliRuntimeView,
+  candidate: RuntimeAgentBatchCandidate,
+  taskIds: ReadonlySet<TaskId>,
+  terminalTasksAt: number,
+): RuntimeToolCallView | undefined {
+  return Object.values(view.toolCalls)
+    .filter((call) => {
+      if (!isTaskFollowupTool(call.toolName) || call.status !== "completed" || call.updatedAt < terminalTasksAt) return false;
+      if (!matchesSessionScope(call.sessionId, candidate.tasks[0]?.sessionId ?? candidate.call?.sessionId)) return false;
+      const input = recordObjectValue(call.input);
+      const inputTaskId = stringValue(input?.taskId) ?? stringValue(input?.task_id) ?? stringValue(input?.id);
+      if (!inputTaskId || !taskIds.has(inputTaskId as TaskId)) return false;
+      const task = view.tasks[inputTaskId];
+      const output = jsonRecord(call.output);
+      const outputTaskId = stringValue(output?.taskId) ?? stringValue(output?.task_id);
+      const outputStatus = taskStatusValue(output?.status);
+      if (!task || outputTaskId !== inputTaskId || !outputStatus || !isFinalTaskStatus(outputStatus)) return false;
+      if (!isFinalTaskStatus(task.status) || outputStatus !== task.status) return false;
+      const outputGeneration = finiteNumberValue(output?.generation);
+      return outputGeneration === undefined || outputGeneration === task.generation;
+    })
+    .sort((left, right) => right.updatedAt - left.updatedAt || right.id.localeCompare(left.id))[0];
+}
+
+function matchingCompletionPrompt(
+  view: ChiliRuntimeView,
+  completionMessage: RuntimeAgentMailboxMessageView,
+  sessionId: SessionId | undefined,
+): RuntimeMessageView | undefined {
+  const preview = completionMessage.preview;
+  const needle = preview?.slice(0, Math.min(96, preview.length));
+  if (!needle) return undefined;
+  return Object.values(view.messages)
+    .filter((message) => {
+      if (message.role === "assistant" || !message.turnId) return false;
+      if (!matchesSessionScope(message.sessionId, sessionId)) return false;
+      if ((message.updatedAt ?? message.createdAt) < completionMessage.queuedAt) return false;
+      const text = boundedSingleLine(runtimeMessageText(message), 320);
+      return text?.includes(needle) === true;
+    })
+    .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))[0];
+}
+
+function matchingAssistantResponse(
+  view: ChiliRuntimeView,
+  turnId: TurnId,
+  sessionId: SessionId | undefined,
+  readyAt: number,
+): RuntimeMessageView | undefined {
+  return Object.values(view.messages)
+    .filter((message) => {
+      if (message.role !== "assistant" || message.turnId !== turnId) return false;
+      if (!matchesSessionScope(message.sessionId, sessionId)) return false;
+      if (!runtimeMessageHasFinalResponse(view, message)) return false;
+      return (message.lastTextAt ?? message.updatedAt ?? message.createdAt) >= readyAt;
+    })
+    .sort((left, right) => {
+      return (left.lastTextAt ?? left.updatedAt ?? left.createdAt) - (right.lastTextAt ?? right.updatedAt ?? right.createdAt)
+        || left.id.localeCompare(right.id);
+    })[0];
+}
+
+function matchingToolContinuationResponse(
+  view: ChiliRuntimeView,
+  sessionId: SessionId | undefined,
+  readyAt: number,
+): RuntimeMessageView | undefined {
+  const nextUserAt = Object.values(view.messages).reduce((earliest, message) => {
+    if (message.role !== "user" || message.createdAt <= readyAt) return earliest;
+    if (!matchesSessionScope(message.sessionId, sessionId)) return earliest;
+    return Math.min(earliest, message.createdAt);
+  }, Number.POSITIVE_INFINITY);
+  const boundary = nextUserAt;
+  return Object.values(view.messages)
+    .filter((message) => {
+      if (message.role !== "assistant" || !runtimeMessageHasFinalResponse(view, message)) return false;
+      if (!matchesSessionScope(message.sessionId, sessionId)) return false;
+      const outputAt = message.lastTextAt ?? message.updatedAt ?? message.createdAt;
+      return outputAt >= readyAt && outputAt < boundary;
+    })
+    .sort((left, right) => {
+      return (left.lastTextAt ?? left.updatedAt ?? left.createdAt) - (right.lastTextAt ?? right.updatedAt ?? right.createdAt)
+        || left.id.localeCompare(right.id);
+    })[0];
+}
+
+function matchingToolContinuationTurn(
+  view: ChiliRuntimeView,
+  sessionId: SessionId | undefined,
+  readyAt: number,
+): TurnId | undefined {
+  const nextUserAt = Object.values(view.messages).reduce((earliest, message) => {
+    if (message.role !== "user" || message.createdAt <= readyAt) return earliest;
+    if (!matchesSessionScope(message.sessionId, sessionId)) return earliest;
+    return Math.min(earliest, message.createdAt);
+  }, Number.POSITIVE_INFINITY);
+  const boundary = nextUserAt;
+  const session = sessionId ? view.sessions[sessionId] : undefined;
+  return (Object.entries(view.turnStartedAt) as Array<[TurnId, number]>)
+    .filter(([turnId, startedAt]) => {
+      if (view.turnStatuses[turnId] !== "running" || startedAt < readyAt || startedAt >= boundary) return false;
+      if (session?.currentTurnId === turnId) return true;
+      return Object.values(view.messages).some((message) => {
+        return message.turnId === turnId
+          && matchesSessionScope(message.sessionId, sessionId);
+      });
+    })
+    .sort((left, right) => left[1] - right[1] || left[0].localeCompare(right[0]))[0]?.[0];
+}
+
+function runtimeMessageHasFinalResponse(view: ChiliRuntimeView, message: RuntimeMessageView): boolean {
+  if (!message.turnId) return false;
+  const turnStatus = view.turnStatuses[message.turnId];
+  if (!turnStatus || turnStatus === "running") return false;
+  return message.parts.some((part) => {
+    if (part.type !== "text" || (part.displayText ?? part.text).trim().length === 0) return false;
+    return part.phase === "final_answer" || part.phase === undefined;
+  });
+}
+
+function runtimeMessageText(message: RuntimeMessageView): string | undefined {
+  const text = message.parts.flatMap((part) => {
+    if (part.type !== "text") return [];
+    const value = part.displayText ?? part.text;
+    return value.trim().length > 0 ? [value] : [];
+  }).join(" ");
+  return text || undefined;
+}
+
+function taskIdsFromWaitCall(call: RuntimeToolCallView): TaskId[] {
+  const input = recordObjectValue(call.input);
+  const list = taskIdArrayValue(input?.taskIds) ?? taskIdArrayValue(input?.task_ids);
+  if (list) return list;
+  const single = stringValue(input?.taskId) ?? stringValue(input?.task_id) ?? stringValue(input?.id);
+  return single ? [single as TaskId] : [];
+}
+
+function agentBatchFromTasks(
+  view: ChiliRuntimeView,
+  callId: ToolCallId,
+  tasks: readonly RuntimeTaskView[],
+  inputCall?: RuntimeToolCallView,
+): RuntimeAgentBatchView {
+  const call = inputCall ?? view.toolCalls[callId];
+  const orderedTasks = [...tasks].sort((left, right) => {
+    return (left.batchIndex ?? Number.MAX_SAFE_INTEGER) - (right.batchIndex ?? Number.MAX_SAFE_INTEGER)
+      || left.createdAt - right.createdAt;
+  });
+  const statuses = orderedTasks.flatMap((task) => isAgentTaskStatus(task.status) ? [task.status] : []);
+  const counts = delegatedAgentCounts(statuses);
+  const statusGroups = [counts.active, counts.completed, counts.incomplete, counts.failed, counts.cancelled]
+    .filter((count) => count > 0).length;
+  const mixed = statusGroups > 1;
+  const first = orderedTasks[0];
+  const provenanceExpected = orderedTasks.reduce((expected, task) => {
+    return Math.max(expected, task.expectedBatchSize ?? 0);
+  }, 0);
+  const expected = Math.max(counts.total, provenanceExpected, expectedBatchSizeFromToolCall(call) ?? 0);
+  const untracked = Math.max(0, expected - counts.total);
+  const spawn = batchSpawnInfo(call);
+  const allSpawnsFailed = (spawn.spawnFailureCount ?? 0) > 0 && spawn.spawnedCount === 0;
+  const partialSpawn = (spawn.spawnFailureCount ?? 0) > 0 && (spawn.spawnedCount ?? counts.total) > 0;
+  const partial = partialSpawn || (
+    untracked > 0
+    && counts.total > 0
+    && counts.active === 0
+    && (call ? isFinalToolStatus(call.status) : true)
+  );
+  const status = agentBatchStatus(counts, call?.status, { allSpawnsFailed, mixed, partial, untracked });
+  const batch: RuntimeAgentBatchView = {
+    callId,
+    taskIds: orderedTasks.map((task) => task.id),
+    expected,
+    untracked,
+    ...counts,
+    mixed,
+    partial,
+    status,
+    updatedAt: Math.max(call?.updatedAt ?? 0, batchTasksUpdatedAt(orderedTasks)),
+  };
+  assignOptional(batch, "batchId", first?.batchId ?? batchIdFromToolCall(call));
+  assignOptional(batch, "spawnedCount", spawn.spawnedCount);
+  assignOptional(batch, "spawnFailureCount", spawn.spawnFailureCount);
+  assignOptional(batch, "spawnFailures", spawn.spawnFailures.length > 0 ? spawn.spawnFailures : undefined);
+  assignOptional(batch, "completionPolicy", first?.completionPolicy ?? completionPolicyFromToolCall(call));
+  assignOptional(batch, "maxConcurrency", first?.maxConcurrency ?? maxConcurrencyFromToolCall(call));
+  assignOptional(batch, "error", call?.error ?? spawnFailureSummary(spawn, expected));
+  return batch;
+}
+
+function agentBatchStatus(
+  counts: RuntimeDelegatedAgentCounts,
+  toolStatus: RuntimeToolCallView["status"] | undefined,
+  state: { allSpawnsFailed: boolean; mixed: boolean; partial: boolean; untracked: number },
+): RuntimeAgentBatchStatus {
+  if (state.allSpawnsFailed) return "failed";
+  if (state.partial) return "partial";
+  if (counts.active > 0) return "running";
+  if (state.untracked > 0 && toolStatus !== undefined && !isFinalToolStatus(toolStatus)) return "running";
+  if (state.mixed) return "mixed";
+  if (counts.completed > 0) return "completed";
+  if (counts.incomplete > 0) return "incomplete";
+  if (counts.failed > 0) return "failed";
+  if (counts.cancelled > 0) return "cancelled";
+  if (toolStatus === "failed") return "failed";
+  if (toolStatus === "cancelled") return "cancelled";
+  if (toolStatus === "completed") return "completed";
+  return "running";
+}
+
+interface RuntimeAgentBatchSpawnInfo {
+  spawnedCount: number | undefined;
+  spawnFailureCount: number | undefined;
+  spawnFailures: RuntimeAgentBatchSpawnFailure[];
+}
+
+function batchSpawnInfo(call: RuntimeToolCallView | undefined): RuntimeAgentBatchSpawnInfo {
+  if (!call) return { spawnedCount: undefined, spawnFailureCount: undefined, spawnFailures: [] };
+  const output = jsonRecord(call.output);
+  const spawnFailures = spawnFailureArrayValue(
+    call.metadata?.spawnFailures
+      ?? call.metadata?.spawn_failures
+      ?? output?.spawnFailures
+      ?? output?.spawn_failures,
+  );
+  const declaredSpawnFailureCount = firstBatchCount(
+    call.metadata?.spawnFailureCount,
+    call.metadata?.spawn_failure_count,
+    output?.spawnFailureCount,
+    output?.spawn_failure_count,
+  );
+  const spawnFailureCount = declaredSpawnFailureCount === undefined && spawnFailures.length === 0
+    ? undefined
+    : Math.max(declaredSpawnFailureCount ?? 0, spawnFailures.length);
+  const outputTaskCount = Array.isArray(output?.tasks) ? output.tasks.length : undefined;
+  const metadataTaskCount = taskIdArrayValue(call.metadata?.taskIds ?? call.metadata?.task_ids)?.length;
+  const spawnedCount = firstBatchCount(
+    call.metadata?.spawnedCount,
+    call.metadata?.spawned_count,
+    output?.spawnedCount,
+    output?.spawned_count,
+    outputTaskCount,
+    metadataTaskCount,
+  );
+  return { spawnedCount, spawnFailureCount, spawnFailures };
+}
+
+function firstBatchCount(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const count = finiteNumberValue(value);
+    if (count !== undefined && count >= 0) return Math.floor(count);
+  }
+  return undefined;
+}
+
+function spawnFailureArrayValue(value: unknown): RuntimeAgentBatchSpawnFailure[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const record = recordObjectValue(item);
+    if (!record) return [];
+    const error = stringValue(record.error) ?? "spawn failed";
+    const failure: RuntimeAgentBatchSpawnFailure = { error };
+    const batchIndex = firstBatchCount(record.batchIndex, record.batch_index);
+    assignOptional(failure, "batchIndex", batchIndex);
+    assignOptional(failure, "description", stringValue(record.description));
+    return [failure];
+  });
+}
+
+function spawnFailureSummary(spawn: RuntimeAgentBatchSpawnInfo, expected: number): string | undefined {
+  const count = spawn.spawnFailureCount ?? 0;
+  if (count <= 0) return undefined;
+  const scope = expected > 0 ? `${count} of ${expected}` : String(count);
+  const details = [...new Set(spawn.spawnFailures.map((failure) => {
+    return failure.description ? `${failure.description}: ${failure.error}` : failure.error;
+  }))].slice(0, 3);
+  return `${scope} agent ${count === 1 ? "task" : "tasks"} failed to spawn${details.length > 0 ? `: ${details.join("; ")}` : ""}`;
+}
+
+function batchStartedAt(
+  call: RuntimeToolCallView | undefined,
+  tasks: readonly RuntimeTaskView[],
+): number {
+  if (call?.startedAt !== undefined) return call.startedAt;
+  const firstTaskAt = tasks.reduce((earliest, task) => Math.min(earliest, task.createdAt), Number.POSITIVE_INFINITY);
+  return Number.isFinite(firstTaskAt) ? firstTaskAt : call?.updatedAt ?? 0;
+}
+
+function batchTasksUpdatedAt(tasks: readonly RuntimeTaskView[]): number {
+  return tasks.reduce((latest, task) => Math.max(latest, task.updatedAt), 0);
+}
+
+function isTaskBatchTool(toolName: string): boolean {
+  const normalized = toolName.trim().toLowerCase().split(/[./:]/).at(-1);
+  return normalized === "task_batch" || normalized === "agent_batch" || normalized === "spawn_tasks" || normalized === "spawn_agents";
+}
+
+function isSingleTaskTool(toolName: string): boolean {
+  const normalized = toolName.trim().toLowerCase().split(/[./:]/).at(-1);
+  return normalized === "task" || normalized === "agent";
+}
+
+function isTaskDelegationTool(toolName: string): boolean {
+  return isTaskBatchTool(toolName) || isSingleTaskTool(toolName);
+}
+
+function isTaskWaitTool(toolName: string): boolean {
+  const normalized = toolName.trim().toLowerCase().split(/[./:]/).at(-1);
+  return normalized === "task_wait"
+    || normalized === "wait_task"
+    || normalized === "agent_wait"
+    || normalized === "task_wait_batch"
+    || normalized === "wait_tasks"
+    || normalized === "agent_wait_batch";
+}
+
+function isTaskFollowupTool(toolName: string): boolean {
+  const normalized = toolName.trim().toLowerCase().split(/[./:]/).at(-1);
+  return normalized === "task_followup" || normalized === "followup_task" || normalized === "agent_followup";
+}
+
+function isSupervisedAllWait(call: RuntimeToolCallView): boolean {
+  const normalized = call.toolName.trim().toLowerCase().split(/[./:]/).at(-1);
+  if (normalized !== "task_wait_batch" && normalized !== "wait_tasks" && normalized !== "agent_wait_batch") {
+    return false;
+  }
+  const input = recordObjectValue(call.input);
+  const waitFor = stringValue(input?.waitFor) ?? stringValue(input?.wait_for) ?? "all";
+  return waitFor === "all";
+}
+
+function taskIdsFromBatchToolCall(call: RuntimeToolCallView): TaskId[] {
+  const metadataIds = taskIdArrayValue(call.metadata?.taskIds) ?? taskIdArrayValue(call.metadata?.task_ids);
+  if (metadataIds) return metadataIds;
+  const metadataTaskId = stringValue(call.metadata?.taskId) ?? stringValue(call.metadata?.task_id);
+  if (metadataTaskId) return [metadataTaskId as TaskId];
+  const output = jsonRecord(call.output);
+  const tasks = Array.isArray(output?.tasks) ? output.tasks : [];
+  const taskIds = tasks.flatMap((item) => {
+    const record = recordObjectValue(item);
+    const taskId = stringValue(record?.taskId) ?? stringValue(record?.task_id);
+    return taskId ? [taskId as TaskId] : [];
+  });
+  if (taskIds.length > 0) return taskIds;
+  const outputTaskId = stringValue(output?.taskId) ?? stringValue(output?.task_id);
+  return outputTaskId ? [outputTaskId as TaskId] : [];
+}
+
+function batchIdFromToolCall(call: RuntimeToolCallView | undefined): string | undefined {
+  if (!call) return undefined;
+  const input = recordObjectValue(call.input);
+  const output = jsonRecord(call.output);
+  return stringValue(call.metadata?.batchId)
+    ?? stringValue(call.metadata?.batch_id)
+    ?? stringValue(input?.batchId)
+    ?? stringValue(input?.batch_id)
+    ?? stringValue(output?.batchId)
+    ?? stringValue(output?.batch_id);
+}
+
+function completionPolicyFromToolCall(call: RuntimeToolCallView | undefined): RuntimeTaskCompletionPolicy | undefined {
+  if (!call) return undefined;
+  const input = recordObjectValue(call.input);
+  const output = jsonRecord(call.output);
+  return taskCompletionPolicyValue(call.metadata?.completionPolicy)
+    ?? taskCompletionPolicyValue(call.metadata?.completion_policy)
+    ?? taskCompletionPolicyValue(input?.completionPolicy)
+    ?? taskCompletionPolicyValue(input?.completion_policy)
+    ?? taskCompletionPolicyValue(output?.completionPolicy)
+    ?? taskCompletionPolicyValue(output?.completion_policy);
+}
+
+function defaultCompletionPolicy(call: RuntimeToolCallView | undefined): RuntimeTaskCompletionPolicy | undefined {
+  if (!call || !isTaskDelegationTool(call.toolName)) return undefined;
+  if (isTaskBatchTool(call.toolName)) return "join";
+  const input = recordObjectValue(call.input);
+  const mode = stringValue(input?.mode) ?? stringValue(input?.subagent_type);
+  return mode === "background" ? "notify" : "join";
+}
+
+function delegatedTaskStatusFromToolOutput(call: RuntimeToolCallView | undefined): AgentTaskStatus | undefined {
+  const output = jsonRecord(call?.output);
+  const status = taskStatusValue(output?.status);
+  return status && isAgentTaskStatus(status) ? status : undefined;
+}
+
+function maxConcurrencyFromToolCall(call: RuntimeToolCallView | undefined): number | undefined {
+  if (!call) return undefined;
+  const input = recordObjectValue(call.input);
+  const output = jsonRecord(call.output);
+  return finiteNumberValue(call.metadata?.maxConcurrency)
+    ?? finiteNumberValue(call.metadata?.max_concurrency)
+    ?? finiteNumberValue(input?.maxConcurrency)
+    ?? finiteNumberValue(input?.max_concurrency)
+    ?? finiteNumberValue(output?.maxConcurrency)
+    ?? finiteNumberValue(output?.max_concurrency);
+}
+
+function expectedBatchSizeFromToolCall(call: RuntimeToolCallView | undefined): number | undefined {
+  if (!call) return undefined;
+  const input = recordObjectValue(call.input);
+  const output = jsonRecord(call.output);
+  const inputTasks = Array.isArray(input?.tasks) ? input.tasks.length : undefined;
+  return finiteNumberValue(call.metadata?.expectedBatchSize)
+    ?? finiteNumberValue(call.metadata?.expected_batch_size)
+    ?? finiteNumberValue(input?.expectedBatchSize)
+    ?? finiteNumberValue(input?.expected_batch_size)
+    ?? finiteNumberValue(output?.expectedBatchSize)
+    ?? finiteNumberValue(output?.expected_batch_size)
+    ?? finiteNumberValue(output?.count)
+    ?? inputTasks
+    ?? (isSingleTaskTool(call.toolName) ? 1 : undefined);
+}
+
+function jsonRecord(value: string | undefined): Record<string, unknown> | undefined {
+  if (!value) return undefined;
+  try {
+    return recordObjectValue(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
+}
+
 function runtimeModelMetadata(
   payload: ModelMetadataPayload,
   updatedAt: number,
   sessionId: SessionId | undefined,
-  threadId: ThreadId | undefined,
   existing: RuntimeModelMetadataView | undefined,
 ): RuntimeModelMetadataView {
   const output: RuntimeModelMetadataView = {
@@ -1083,7 +2780,6 @@ function runtimeModelMetadata(
   assignOptional(output, "contextWindowTokens", payload.contextWindowTokens ?? existing?.contextWindowTokens);
   assignOptional(output, "maxOutputTokens", payload.maxOutputTokens ?? existing?.maxOutputTokens);
   assignOptional(output, "sessionId", sessionId ?? existing?.sessionId);
-  assignOptional(output, "threadId", threadId ?? existing?.threadId);
   return output;
 }
 
@@ -1103,14 +2799,13 @@ function chatModelMetadata(metadata: RuntimeModelMetadataView): ModelMetadataPay
 function modelMetadataForSession(
   view: ChiliRuntimeView,
   sessionId: SessionId,
-  threadId: ThreadId | undefined,
 ): RuntimeModelMetadataView[] {
   return view.modelMetadataTurnIds
     .flatMap((turnId) => {
       const metadata = view.modelMetadataByTurn[turnId];
       return metadata ? [metadata] : [];
     })
-    .filter((metadata) => metadata.sessionId === sessionId && matchesThread(metadata.threadId, threadId))
+    .filter((metadata) => metadata.sessionId === sessionId)
     .sort((left, right) => left.updatedAt - right.updatedAt);
 }
 
@@ -1133,7 +2828,12 @@ function modelUsageSummary(metadata: readonly RuntimeModelMetadataView[]): Model
 }
 
 function usageTokenTotal(usage: ModelUsage): number | undefined {
-  const parts = [usage.inputTokens, usage.outputTokens].filter(isFiniteNumber);
+  const parts = [
+    usage.inputTokens,
+    usage.outputTokens,
+    usage.cacheReadInputTokens,
+    usage.cacheCreationInputTokens,
+  ].filter(isFiniteNumber);
   if (parts.length === 0) return undefined;
   return parts.reduce((total, value) => total + value, 0);
 }
@@ -1155,9 +2855,9 @@ function cloneModelUsage(usage: ModelUsage): ModelUsage {
   return output;
 }
 
-function cloneThreadGoal(goal: ThreadGoal): ThreadGoal {
-  const output: ThreadGoal = {
-    threadId: goal.threadId,
+function cloneSessionGoal(goal: SessionGoal): SessionGoal {
+  const output: SessionGoal = {
+    sessionId: goal.sessionId,
     objective: goal.objective,
     status: goal.status,
     tokensUsed: goal.tokensUsed,
@@ -1165,19 +2865,21 @@ function cloneThreadGoal(goal: ThreadGoal): ThreadGoal {
     createdAt: goal.createdAt,
     updatedAt: goal.updatedAt,
   };
-  assignOptional(output, "sessionId", goal.sessionId);
   assignOptional(output, "tokenBudget", goal.tokenBudget);
   assignOptional(output, "completedAt", goal.completedAt);
   assignOptional(output, "lastReason", goal.lastReason);
   return output;
 }
 
-function isFiniteNumber(value: number | undefined): value is number {
-  return typeof value === "number" && Number.isFinite(value);
+function matchingEnvelopeSessionId(
+  envelopeSessionId: SessionId | undefined,
+  duplicateSessionId: unknown,
+): SessionId | undefined {
+  return envelopeSessionId && duplicateSessionId === envelopeSessionId ? envelopeSessionId : undefined;
 }
 
-function matchesThread(value: ThreadId | undefined, requested: ThreadId | undefined): boolean {
-  return requested ? !value || value === requested : true;
+function isFiniteNumber(value: number | undefined): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 function chatMessageRow(message: RuntimeMessageView): ChatMessageRow {
@@ -1188,7 +2890,6 @@ function chatMessageRow(message: RuntimeMessageView): ChatMessageRow {
     parts: message.parts.map((part) => chatMessagePart(part)),
     createdAt: message.createdAt,
   };
-  assignOptional(row, "threadId", message.threadId);
   assignOptional(row, "completedAt", message.completedAt);
   return row;
 }
@@ -1197,6 +2898,7 @@ function chatMessagePart(part: MessagePart): ChatMessagePart {
   if (part.type === "text") {
     const output: ChatMessagePart = { type: "text", id: part.id, text: part.displayText ?? part.text };
     if (part.displayText && part.displayText !== part.text) output.rawText = part.text;
+    assignOptional(output, "phase", part.phase);
     assignOptional(output, "synthetic", part.synthetic);
     return output;
   }
@@ -1227,6 +2929,7 @@ function chatMessagePart(part: MessagePart): ChatMessagePart {
     const output: ChatMessagePart = { type: "tool_result", id: part.id, callId: part.callId, output: part.output };
     assignOptional(output, "content", part.content);
     assignOptional(output, "error", part.error);
+    assignOptional(output, "executionContext", chatToolExecutionContext(part.executionContext));
     assignOptional(output, "synthetic", part.synthetic);
     return output;
   }
@@ -1236,7 +2939,11 @@ function chatMessagePart(part: MessagePart): ChatMessagePart {
   return { type: "summary", id: part.id, text: `agent handoff: ${part.agentPath}` };
 }
 
-function chatToolCallRow(view: ChiliRuntimeView, toolCall: RuntimeToolCallView): ChatToolCallRow {
+function chatToolCallRow(
+  view: ChiliRuntimeView,
+  toolCall: RuntimeToolCallView,
+  executionContext: ChatToolExecutionContext | undefined,
+): ChatToolCallRow {
   const linkedApprovals = approvalsForToolCall(view, toolCall.id);
   const pendingApproval = linkedApprovals.find((approval) => approval.status === "pending");
   const latestApproval = latestApprovalForToolCall(linkedApprovals);
@@ -1246,7 +2953,9 @@ function chatToolCallRow(view: ChiliRuntimeView, toolCall: RuntimeToolCallView):
     kind: "tool",
     toolName: toolCall.toolName,
     status,
-    displayStatus: chatToolDisplayStatus(status, latestApproval),
+    displayStatus: status === "completed" && chatToolExecutionFailed(executionContext)
+      ? "failed"
+      : chatToolDisplayStatus(status, latestApproval),
     waitingForApproval: Boolean(pendingApproval),
     updatedAt: toolCall.updatedAt,
     inputSummary: chatToolInputSummary(toolCall.toolName, toolCall.input, pendingApproval?.patterns ?? latestApproval?.patterns ?? []),
@@ -1254,13 +2963,53 @@ function chatToolCallRow(view: ChiliRuntimeView, toolCall: RuntimeToolCallView):
   assignOptional(row, "input", toolCall.input);
   assignOptional(row, "output", toolCall.output);
   assignOptional(row, "error", toolCall.error);
+  assignOptional(row, "executionContext", executionContext);
   assignOptional(row, "liveOutput", toolCall.liveOutput ? toolCall.liveOutput.map((delta) => ({ ...delta })) : undefined);
   assignOptional(row, "sessionId", toolCall.sessionId);
-  assignOptional(row, "threadId", toolCall.threadId);
   assignOptional(row, "approvalId", pendingApproval?.id ?? latestApproval?.id);
   assignOptional(row, "approvalStatus", pendingApproval?.status ?? latestApproval?.status);
   assignOptional(row, "approvalDecision", latestApproval?.decision);
   return row;
+}
+
+function chatToolExecutionFailed(context: ChatToolExecutionContext | undefined): boolean {
+  if (!context) return false;
+  return (typeof context.exitCode === "number" && context.exitCode !== 0)
+    || context.timedOut === true
+    || context.aborted === true
+    || (typeof context.signal === "string" && context.signal.length > 0);
+}
+
+function toolResultExecutionContexts(
+  view: ChiliRuntimeView,
+  session: RuntimeSessionView,
+): Map<ToolCallId, ChatToolExecutionContext> {
+  const contexts = new Map<ToolCallId, ChatToolExecutionContext>();
+  for (const messageId of session.messageIds) {
+    const message = view.messages[messageId];
+    if (!message) continue;
+    for (const part of message.parts) {
+      if (part.type !== "tool_result") continue;
+      const context = chatToolExecutionContext(part.executionContext);
+      if (context) contexts.set(part.callId, context);
+    }
+  }
+  return contexts;
+}
+
+function chatToolExecutionContext(value: unknown): ChatToolExecutionContext | undefined {
+  const record = recordObjectValue(value);
+  if (!record) return undefined;
+  const context: ChatToolExecutionContext = {};
+  if (record.sandbox === "macos-seatbelt" || record.sandbox === "none") context.sandbox = record.sandbox;
+  if (record.executionMode === "sandboxed" || record.executionMode === "unsandboxed") context.executionMode = record.executionMode;
+  if (record.exitCode === null || (typeof record.exitCode === "number" && Number.isFinite(record.exitCode))) {
+    context.exitCode = record.exitCode;
+  }
+  if (typeof record.timedOut === "boolean") context.timedOut = record.timedOut;
+  if (typeof record.aborted === "boolean") context.aborted = record.aborted;
+  if (record.signal === null || typeof record.signal === "string") context.signal = record.signal;
+  return Object.keys(context).length > 0 ? context : undefined;
 }
 
 function chatApprovalRow(view: ChiliRuntimeView, approval: RuntimeApprovalView): ChatApprovalRow {
@@ -1277,8 +3026,8 @@ function chatApprovalRow(view: ChiliRuntimeView, approval: RuntimeApprovalView):
     inputSummary: chatToolInputSummary(toolName, toolCall?.input, approval.patterns),
   };
   assignOptional(row, "sessionId", approval.sessionId);
-  assignOptional(row, "threadId", approval.threadId);
   assignOptional(row, "callId", approval.callId);
+  assignOptional(row, "maxApprovalScope", approval.maxApprovalScope);
   assignOptional(row, "toolName", toolName);
   assignOptional(row, "toolInput", toolCall?.input);
   assignOptional(row, "toolStatus", toolStatus);
@@ -1710,7 +3459,6 @@ function teamMemberRows(view: ChiliRuntimeView, team: RuntimeTeamView, tasks: re
         updatedAt: member.updatedAt,
       };
       assignOptional(row, "childSessionId", member.childSessionId);
-      assignOptional(row, "childThreadId", member.childThreadId);
       assignOptional(row, "model", member.model);
       assignOptional(row, "toolScope", member.toolScope);
       assignOptional(row, "writeScope", member.writeScope);
@@ -1891,8 +3639,8 @@ function approvalSummariesForScope(view: ChiliRuntimeView, sessionScope: Readonl
         createdAt: approval.createdAt,
       };
       assignOptional(summary, "sessionId", approval.sessionId);
-      assignOptional(summary, "threadId", approval.threadId);
       assignOptional(summary, "callId", approval.callId);
+      assignOptional(summary, "maxApprovalScope", approval.maxApprovalScope);
       assignOptional(summary, "toolName", toolCall?.toolName);
       assignOptional(summary, "decision", approval.decision);
       assignOptional(summary, "feedback", approval.feedback);
@@ -1916,7 +3664,6 @@ function activeToolSummariesForScope(view: ChiliRuntimeView, sessionScope: Reado
         waitingForApproval: toolCall.status === "waiting_for_approval",
       };
       assignOptional(summary, "sessionId", toolCall.sessionId);
-      assignOptional(summary, "threadId", toolCall.threadId);
       assignOptional(summary, "turnId", toolCall.turnId);
       assignOptional(summary, "error", toolCall.error);
       return summary;
@@ -2096,7 +3843,6 @@ function dispatchSummary(value: Record<string, unknown> | undefined): TeamLiveDi
   assignOptional(summary, "agentPath", stringValue(value.agentPath) as AgentPath | undefined);
   assignOptional(summary, "runId", stringValue(value.runId) as AgentRunId | undefined);
   assignOptional(summary, "childSessionId", stringValue(value.childSessionId) as SessionId | undefined);
-  assignOptional(summary, "childThreadId", stringValue(value.childThreadId) as ThreadId | undefined);
   assignOptional(summary, "mode", stringValue(value.mode));
   assignOptional(summary, "agentStatus", stringValue(value.agentStatus));
   assignOptional(summary, "dispatchedAt", finiteNumberValue(value.dispatchedAt));
@@ -2203,6 +3949,9 @@ function teamRecentActivity(
       detail: message.summary ?? message.content,
       taskId: message.taskId,
       teamId: message.teamId,
+      teamMessageId: message.id,
+      from: message.from,
+      to: message.to,
     }));
   }
   for (const mailbox of teamMailboxRows(view, team.id)) {
@@ -2214,6 +3963,9 @@ function teamRecentActivity(
       status: mailbox.status,
       taskId: mailbox.taskId,
       teamId: mailbox.teamId,
+      teamMessageId: mailbox.teamMessageId,
+      from: mailbox.from,
+      to: mailbox.path,
     }));
   }
   for (const task of team.taskIds.flatMap((taskId) => (view.tasks[taskId] ? [view.tasks[taskId]] : []))) {
@@ -2292,6 +4044,16 @@ function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope):
     return;
   }
 
+  if (event.type === "team.owner_session_bound") {
+    const teamId = stringValue(payload.teamId) as TeamId | undefined;
+    const ownerSessionId = stringValue(payload.ownerSessionId) as SessionId | undefined;
+    if (!teamId || !ownerSessionId || event.sessionId !== ownerSessionId) return;
+    const team = upsertTeam(view, teamId, event.time);
+    team.sessionId = ownerSessionId;
+    team.updatedAt = event.time;
+    return;
+  }
+
   if (event.type === "team.member_added") {
     const teamId = stringValue(payload.teamId) as TeamId | undefined;
     const path = stringValue(payload.path) as AgentPath | undefined;
@@ -2305,7 +4067,6 @@ function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope):
     member.status = teamMemberStatusValue(payload.status) ?? "idle";
     member.updatedAt = event.time;
     assignOptional(member, "childSessionId", stringValue(payload.childSessionId) as SessionId | undefined);
-    assignOptional(member, "childThreadId", stringValue(payload.childThreadId) as ThreadId | undefined);
     assignOptional(member, "model", stringValue(payload.model));
     assignOptional(member, "toolScope", stringArrayValue(payload.toolScope));
     assignOptional(member, "writeScope", stringArrayValue(payload.writeScope));
@@ -2354,6 +4115,7 @@ function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope):
     assignOptional(task, "metadata", recordObjectValue(payload.metadata));
     assignOptional(task, "summary", stringValue(payload.summary));
     assignOptional(task, "error", stringValue(payload.error));
+    if (task.metadata) recordTeamDelegatedTasks(view, teamId, task.metadata);
 
     const ownerPath = stringValue(payload.ownerPath) as AgentPath | undefined;
     if (ownerPath) {
@@ -2387,7 +4149,6 @@ function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope):
     };
     assignOptional(message, "delivery", teamMessageDeliveryValue(payload.delivery));
     assignOptional(message, "sessionId", event.sessionId);
-    assignOptional(message, "threadId", event.threadId);
     assignOptional(message, "taskId", stringValue(payload.taskId) as TaskId | undefined);
     assignOptional(message, "summary", stringValue(payload.summary));
     assignOptional(message, "metadata", recordObjectValue(payload.metadata));
@@ -2412,7 +4173,6 @@ function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope):
     run.counts = emptyTeamRunCounts();
     run.updatedAt = event.time;
     assignOptional(run, "sessionId", event.sessionId);
-    assignOptional(run, "threadId", event.threadId);
     assignOptional(run, "mode", agentTaskModeValue(payload.mode));
     assignOptional(run, "once", booleanValue(payload.once));
     assignOptional(run, "maxCycles", finiteNumberValue(payload.maxCycles));
@@ -2441,7 +4201,6 @@ function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope):
     run.counts = teamRunSummaryCountsValue(payload.counts) ?? run.counts;
     run.updatedAt = event.time;
     assignOptional(run, "sessionId", event.sessionId);
-    assignOptional(run, "threadId", event.threadId);
     assignOptional(run, "phase", teamRunLifecyclePhaseValue(payload.phase));
     assignOptional(run, "stopReason", teamRunStopReasonValue(payload.stopReason));
     linkTeamRunToTeam(view, run, event.time);
@@ -2462,7 +4221,6 @@ function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope):
     run.counts = teamRunSummaryCountsValue(payload.counts) ?? run.counts;
     run.updatedAt = event.time;
     assignOptional(run, "sessionId", event.sessionId);
-    assignOptional(run, "threadId", event.threadId);
     assignOptional(run, "stopReason", teamRunStopReasonValue(payload.stopReason));
     assignOptional(run, "startedAt", finiteNumberValue(payload.startedAt));
     assignOptional(run, "endedAt", finiteNumberValue(payload.endedAt));
@@ -2494,22 +4252,34 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     agent.taskName = taskName;
     agent.status = "running";
     agent.generation = generation ?? agent.generation;
+    delete agent.completedAt;
     agent.updatedAt = event.time;
     assignOptional(agent, "parentPath", stringValue(payload.parentPath) as AgentPath | undefined);
     assignOptional(agent, "sessionId", event.sessionId);
-    assignOptional(agent, "threadId", event.threadId);
+    assignOptional(agent, "mode", agentTaskModeValue(payload.mode));
+    assignOptional(agent, "childSessionId", stringValue(payload.childSessionId) as SessionId | undefined);
+    delete agent.summary;
+    delete agent.error;
     if (taskId) {
       if (!agent.taskIds.includes(taskId)) agent.taskIds.push(taskId);
       const task = upsertTask(view, taskId, event.time);
+      const previousGeneration = task.generation;
+      const nextGeneration = generation ?? task.generation;
       task.status = "running";
-      task.generation = generation ?? task.generation;
+      task.generation = nextGeneration;
       delete task.completedAt;
+      if (nextGeneration > previousGeneration) {
+        delete task.summary;
+        delete task.error;
+      }
       task.updatedAt = event.time;
       task.path = path;
       task.ownerPath = path;
       assignOptional(task, "sessionId", (stringValue(payload.parentSessionId) as SessionId | undefined) ?? event.sessionId);
       assignOptional(task, "childSessionId", stringValue(payload.childSessionId) as SessionId | undefined);
-      assignOptional(task, "childThreadId", stringValue(payload.childThreadId) as ThreadId | undefined);
+      assignOptional(task, "title", stringValue(payload.taskName));
+      assignOptional(task, "mode", agentTaskModeValue(payload.mode));
+      applyAgentTaskProvenance(task, payload);
       linkTaskToSession(view, task, event.time);
       linkTaskToOwnerAgent(view, task, event.time);
     }
@@ -2528,7 +4298,7 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     const generation = generationValue(payload.generation);
 
     const agent = upsertAgentRun(view, runId, path, event.time);
-    if (agent.completedAt !== undefined) return;
+    if (agent.completedAt !== undefined && (generation === undefined || generation <= agent.generation)) return;
     if (generation !== undefined && generation < agent.generation) return;
     agent.path = path;
     agent.status = status;
@@ -2536,7 +4306,8 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     agent.completedAt = event.time;
     agent.updatedAt = event.time;
     assignOptional(agent, "sessionId", event.sessionId);
-    assignOptional(agent, "threadId", event.threadId);
+    assignOptional(agent, "summary", stringValue(payload.summary));
+    assignOptional(agent, "error", stringValue(payload.error));
     const taskId = stringValue(payload.taskId) as TaskId | undefined;
     if (taskId && !agent.taskIds.includes(taskId)) agent.taskIds.push(taskId);
     view.agentRunIdsByPath[path] = runId;
@@ -2558,10 +4329,17 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
       queuedAt: event.time,
     };
     assignOptional(message, "sessionId", event.sessionId);
-    assignOptional(message, "threadId", event.threadId);
     assignOptional(message, "taskId", stringValue(payload.taskId) as TaskId | undefined);
-    assignOptional(message, "childSessionId", stringValue(payload.childSessionId) as SessionId | undefined);
-    assignOptional(message, "childThreadId", stringValue(payload.childThreadId) as ThreadId | undefined);
+    assignOptional(
+      message,
+      "recipientSessionId",
+      stringValue(payload.recipientSessionId ?? payload.childSessionId) as SessionId | undefined,
+    );
+    const mailboxPayload = runtimeAgentMailboxPayload(payload.message);
+    assignOptional(message, "role", mailboxPayload.role);
+    assignOptional(message, "messageKind", mailboxPayload.messageKind);
+    assignOptional(message, "preview", mailboxPayload.preview);
+    assignOptional(message, "metadataSummary", mailboxPayload.metadataSummary);
     const teamMetadata = teamMailboxMetadata(payload.message);
     if (teamMetadata) {
       message.teamId = teamMetadata.teamId;
@@ -2620,15 +4398,22 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     const path = stringValue(payload.path) as AgentPath | undefined;
     if (!taskId || !path) return;
 
-    const task = upsertTask(view, taskId, event.time);
-    task.status = "pending";
-    task.generation = 0;
-    task.updatedAt = event.time;
+    const existing = view.tasks[taskId];
+    const task = existing ?? upsertTask(view, taskId, event.time);
+    task.createdAt = Math.min(task.createdAt, event.time);
+    if (!existing) {
+      task.status = "pending";
+      task.generation = 0;
+      task.updatedAt = event.time;
+    }
     task.path = path;
     task.ownerPath = path;
     assignOptional(task, "sessionId", stringValue(payload.parentSessionId) as SessionId | undefined);
     assignOptional(task, "childSessionId", stringValue(payload.childSessionId) as SessionId | undefined);
-    assignOptional(task, "childThreadId", stringValue(payload.childThreadId) as ThreadId | undefined);
+    assignOptional(task, "title", stringValue(payload.taskName));
+    assignOptional(task, "taskPrompt", stringValue(payload.prompt));
+    assignOptional(task, "mode", agentTaskModeValue(payload.mode));
+    applyAgentTaskProvenance(task, payload);
     linkTaskToSession(view, task, event.time);
     linkTaskToOwnerAgent(view, task, event.time);
     return;
@@ -2649,7 +4434,7 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     assignOptional(task, "description", stringValue(payload.description));
     assignOptional(task, "dependsOn", taskIdArrayValue(payload.dependsOn));
     assignOptional(task, "metadata", recordObjectValue(payload.metadata));
-    if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") task.completedAt = event.time;
+    if (task.status === "completed" || task.status === "incomplete" || task.status === "failed" || task.status === "cancelled") task.completedAt = event.time;
     linkTaskToSession(view, task, event.time);
     linkTaskToOwnerAgent(view, task, event.time);
     return;
@@ -2689,14 +4474,18 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     const task = existing ?? upsertTask(view, taskId, event.time);
     const generation = generationValue(payload.generation);
     if (event.type === "agent.task_completed") {
-      if (existing && isFinalTaskStatus(existing.status)) return;
+      if (existing && isFinalTaskStatus(existing.status) && (generation === undefined || generation <= existing.generation)) return;
       if (existing && generation !== undefined && generation < existing.generation) return;
+      if (existing && generation !== undefined && generation > existing.generation) {
+        delete task.summary;
+        delete task.error;
+      }
     }
     if (teamId) task.teamId = teamId;
     task.status = status;
     if (generation !== undefined) task.generation = Math.max(task.generation, generation);
     task.updatedAt = event.time;
-    if (status === "completed" || status === "failed" || status === "cancelled") task.completedAt = event.time;
+    if (status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled") task.completedAt = event.time;
     assignOptional(task, "sessionId", event.sessionId);
     assignOptional(task, "ownerPath", stringValue(payload.ownerPath) as AgentPath | undefined);
     assignOptional(task, "path", stringValue(payload.path) as AgentPath | undefined);
@@ -2726,10 +4515,28 @@ function upsertSession(view: ChiliRuntimeView, sessionId: SessionId, time: numbe
     agentRunIds: [],
     taskIds: [],
     updatedAt: time,
+    hasExplicitStatus: false,
   };
   view.sessions[sessionId] = session;
   view.sessionIds.push(sessionId);
   return session;
+}
+
+function setSessionStatus(
+  session: RuntimeSessionView,
+  status: RuntimeSessionStatus,
+  reason?: string,
+): void {
+  session.status = status;
+  if (reason === undefined) {
+    delete session.statusReason;
+  } else {
+    session.statusReason = reason;
+  }
+}
+
+function isTerminalSessionStatus(status: RuntimeSessionStatus): boolean {
+  return status === "idle" || status === "failed" || status === "cancelled";
 }
 
 function upsertAgentRun(view: ChiliRuntimeView, runId: AgentRunId, path: AgentPath, time: number): RuntimeAgentView {
@@ -2846,6 +4653,7 @@ function upsertToolCall(view: ChiliRuntimeView, callId: ToolCallId, time: number
     updatedAt: time,
   };
   view.toolCalls[callId] = toolCall;
+  assignTranscriptOrder(view, "tool", callId);
   return toolCall;
 }
 
@@ -2855,9 +4663,33 @@ function appendToolOutputDelta(toolCall: RuntimeToolCallView, delta: RuntimeTool
   if (!delta.delta) return;
   const liveOutput = toolCall.liveOutput ? [...toolCall.liveOutput, delta] : [delta];
   if (liveOutput.length > MAX_TOOL_OUTPUT_DELTAS) {
-    liveOutput.splice(0, liveOutput.length - MAX_TOOL_OUTPUT_DELTAS);
+    const dropped = liveOutput.splice(0, liveOutput.length - MAX_TOOL_OUTPUT_DELTAS);
+    const first = liveOutput[0];
+    if (first && (dropped.length > 0 || dropped.some((entry) => entry.truncated === true))) {
+      liveOutput[0] = { ...first, truncated: true };
+    }
   }
   toolCall.liveOutput = liveOutput;
+}
+
+function assignTranscriptOrder(
+  view: ChiliRuntimeView,
+  kind: "message" | "tool" | "approval",
+  id: string,
+): void {
+  const key = transcriptOrderKey(kind, id);
+  if (view.transcriptOrder[key] !== undefined) return;
+  view.transcriptOrder[key] = view.nextTranscriptOrder;
+  view.nextTranscriptOrder += 1;
+}
+
+function chatTranscriptOrder(view: ChiliRuntimeView, item: ChatTranscriptItem): number {
+  const kind = item.kind === "message" ? "message" : item.kind === "tool" ? "tool" : "approval";
+  return view.transcriptOrder[transcriptOrderKey(kind, String(item.id))] ?? Number.MAX_SAFE_INTEGER;
+}
+
+function transcriptOrderKey(kind: "message" | "tool" | "approval", id: string): string {
+  return `${kind}\u0000${id}`;
 }
 
 function touchSession(view: ChiliRuntimeView, sessionId: SessionId, time: number): void {
@@ -2872,12 +4704,33 @@ function linkToolCallToSession(view: ChiliRuntimeView, toolCall: RuntimeToolCall
   session.updatedAt = time;
 }
 
-function linkApprovalToSession(view: ChiliRuntimeView, approval: RuntimeApprovalView, time: number): void {
+function linkApprovalToSession(
+  view: ChiliRuntimeView,
+  approval: RuntimeApprovalView,
+  time: number,
+  eventId?: string,
+): void {
   if (!approval.sessionId) return;
   const session = upsertSession(view, approval.sessionId, time);
   if (!session.approvalIds.includes(approval.id)) session.approvalIds.push(approval.id);
-  session.status = "waiting_for_approval";
+  if (!session.hasExplicitStatus) {
+    setSessionStatus(session, "waiting_for_approval");
+    assignOptional(session, "statusEventId", eventId);
+  }
   session.updatedAt = time;
+}
+
+function clearSessionRetry(view: ChiliRuntimeView, sessionId: SessionId, turnId?: TurnId): void {
+  const session = view.sessions[sessionId];
+  if (!session?.retry) return;
+  if (turnId !== undefined && session.retry.turnId !== turnId) return;
+  delete session.retry;
+}
+
+function hasPendingApprovalForSession(view: ChiliRuntimeView, sessionId: SessionId): boolean {
+  return Object.values(view.approvals).some(
+    (approval) => approval.sessionId === sessionId && approval.status === "pending",
+  );
 }
 
 function linkAgentToSession(view: ChiliRuntimeView, agent: RuntimeAgentView, time: number): void {
@@ -3027,14 +4880,34 @@ function agentTaskModeValue(value: unknown): AgentTaskMode | undefined {
   return value === "one_shot" || value === "resumable" || value === "background" ? value : undefined;
 }
 
+function taskCompletionPolicyValue(value: unknown): RuntimeTaskCompletionPolicy | undefined {
+  return value === "join" || value === "notify" || value === "detached" || value === "supervised" ? value : undefined;
+}
+
+function applyAgentTaskProvenance(task: RuntimeTaskView, payload: Record<string, unknown>): void {
+  assignOptional(task, "sourceCallId", stringValue(payload.sourceCallId) as ToolCallId | undefined);
+  assignOptional(task, "batchId", stringValue(payload.batchId));
+  const batchIndex = finiteNumberValue(payload.batchIndex);
+  if (batchIndex !== undefined && batchIndex >= 0) task.batchIndex = batchIndex;
+  const expectedBatchSize = finiteNumberValue(payload.expectedBatchSize);
+  if (expectedBatchSize !== undefined && expectedBatchSize >= 0) task.expectedBatchSize = expectedBatchSize;
+  assignOptional(task, "completionPolicy", taskCompletionPolicyValue(payload.completionPolicy));
+  const maxConcurrency = finiteNumberValue(payload.maxConcurrency);
+  if (maxConcurrency !== undefined && maxConcurrency > 0) task.maxConcurrency = maxConcurrency;
+}
+
 function agentStatusValue(value: unknown): RuntimeAgentStatus | undefined {
-  return value === "running" || value === "completed" || value === "failed" || value === "cancelled" ? value : undefined;
+  return value === "running" || value === "completed" || value === "incomplete" || value === "failed" || value === "cancelled" ? value : undefined;
 }
 
 function taskStatusValue(value: unknown): RuntimeTaskStatus | undefined {
-  return value === "pending" || value === "running" || value === "in_progress" || value === "blocked" || value === "completed" || value === "failed" || value === "cancelled"
+  return value === "pending" || value === "running" || value === "in_progress" || value === "blocked" || value === "completed" || value === "incomplete" || value === "failed" || value === "cancelled"
     ? value
     : undefined;
+}
+
+function isAgentTaskStatus(status: RuntimeTaskStatus): status is AgentTaskStatus {
+  return status === "pending" || status === "running" || status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled";
 }
 
 function teamMemberStatusValue(value: unknown): TeamMemberStatus | undefined {
@@ -3226,6 +5099,16 @@ function metadataLinkedTaskIds(metadata: Record<string, unknown>): TaskId[] {
   return ids;
 }
 
+function recordTeamDelegatedTasks(
+  view: ChiliRuntimeView,
+  teamId: TeamId,
+  metadata: Record<string, unknown>,
+): void {
+  for (const taskId of metadataLinkedTaskIds(metadata)) {
+    view.teamIdByDelegatedTaskId[taskId] = teamId;
+  }
+}
+
 function metadataLinkedSessionIds(metadata: Record<string, unknown>): SessionId[] {
   const ids: SessionId[] = [];
   const dispatch = metadataRecord(metadata, "chiliTeamDispatch");
@@ -3244,6 +5127,9 @@ function activityItem(input: {
   toolName?: string | undefined;
   taskId?: TaskId | undefined;
   teamId?: TeamId | undefined;
+  teamMessageId?: string | undefined;
+  from?: AgentPath | undefined;
+  to?: AgentPath | "*" | undefined;
 }): TeamLiveActivityItem {
   const item: TeamLiveActivityItem = {
     id: input.id,
@@ -3256,6 +5142,9 @@ function activityItem(input: {
   assignOptional(item, "toolName", input.toolName);
   assignOptional(item, "taskId", input.taskId);
   assignOptional(item, "teamId", input.teamId);
+  assignOptional(item, "teamMessageId", input.teamMessageId);
+  assignOptional(item, "from", input.from);
+  assignOptional(item, "to", input.to);
   return item;
 }
 
@@ -3310,6 +5199,69 @@ function teamMailboxMetadata(value: unknown): { teamId: TeamId; teamMessageId: s
   return { teamId, teamMessageId };
 }
 
+function runtimeAgentMailboxPayload(value: unknown): {
+  role: MessageRole | undefined;
+  messageKind: string | undefined;
+  preview: string | undefined;
+  metadataSummary: RuntimeAgentMailboxMetadataSummary | undefined;
+} {
+  const message = recordObjectValue(value);
+  if (!message) return { role: undefined, messageKind: undefined, preview: undefined, metadataSummary: undefined };
+  const metadata = recordObjectValue(message.metadata);
+  const role = messageRoleValue(message.role);
+  const messageKind = stringValue(metadata?.kind);
+  const preview = boundedSingleLine(mailboxPayloadText(message), 320);
+  return {
+    role,
+    messageKind,
+    preview,
+    metadataSummary: runtimeAgentMailboxMetadataSummary(metadata),
+  };
+}
+
+function mailboxPayloadText(message: Record<string, unknown>): string | undefined {
+  const content = stringValue(message.content);
+  if (content) return content;
+  if (!Array.isArray(message.parts)) return undefined;
+  const text = message.parts.flatMap((part) => {
+    const record = recordObjectValue(part);
+    if (!record) return [];
+    const value = stringValue(record.text)
+      ?? stringValue(record.output)
+      ?? stringValue(record.displayText)
+      ?? stringValue(record.filename);
+    return value ? [value] : [];
+  }).join(" ");
+  return text || undefined;
+}
+
+function runtimeAgentMailboxMetadataSummary(
+  metadata: Record<string, unknown> | undefined,
+): RuntimeAgentMailboxMetadataSummary | undefined {
+  if (!metadata) return undefined;
+  const summary: RuntimeAgentMailboxMetadataSummary = {};
+  assignOptional(summary, "kind", stringValue(metadata.kind));
+  assignOptional(summary, "batchId", stringValue(metadata.batchId) ?? stringValue(metadata.batch_id));
+  assignOptional(summary, "completionPolicy", taskCompletionPolicyValue(metadata.completionPolicy ?? metadata.completion_policy));
+  assignOptional(summary, "taskIds", taskIdArrayValue(metadata.taskIds) ?? taskIdArrayValue(metadata.task_ids));
+  const total = finiteNumberValue(metadata.total);
+  if (total !== undefined && total >= 0) summary.total = total;
+  const expectedBatchSize = finiteNumberValue(metadata.expectedBatchSize ?? metadata.expected_batch_size);
+  if (expectedBatchSize !== undefined && expectedBatchSize >= 0) summary.expectedBatchSize = expectedBatchSize;
+  return Object.keys(summary).length > 0 ? summary : undefined;
+}
+
+function messageRoleValue(value: unknown): MessageRole | undefined {
+  return value === "system" || value === "user" || value === "assistant" || value === "tool" ? value : undefined;
+}
+
+function boundedSingleLine(value: string | undefined, limit: number): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!normalized) return undefined;
+  return normalized.length <= limit ? normalized : `${normalized.slice(0, Math.max(0, limit - 1))}…`;
+}
+
 function teamMemberKey(teamId: TeamId, path: AgentPath): string {
   return `${teamId}:${path}`;
 }
@@ -3320,7 +5272,7 @@ function isStaleTaskSpawn(task: RuntimeTaskView, generation: number | undefined)
 }
 
 function isFinalTaskStatus(status: RuntimeTaskStatus): boolean {
-  return status === "completed" || status === "failed" || status === "cancelled";
+  return status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled";
 }
 
 function isFinalToolStatus(status: RuntimeToolCallView["status"]): boolean {

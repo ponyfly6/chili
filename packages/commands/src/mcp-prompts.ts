@@ -1,3 +1,4 @@
+import { createPromptNamespace, createPromptRoot, normalizeCommandSegment } from "./prompt-tree.js";
 import { defineCommand } from "./registry.js";
 import { splitCommandArguments } from "./template.js";
 import type { CommandContext, CommandDefinition, CommandRunInput, CommandRunResult } from "./types.js";
@@ -38,34 +39,31 @@ export interface McpPromptController {
   renderPrompt(request: McpPromptRenderRequest, context: CommandContext): Promise<McpPromptRenderResult> | McpPromptRenderResult;
 }
 
-export function createMcpPromptCommand(
-  prompt: McpPromptDefinition,
-  controller: McpPromptController,
-): CommandDefinition {
-  const commandName = mcpPromptCommandName(prompt);
-  return defineCommand({
-    name: commandName,
-    category: "mcp",
-    description: prompt.description ?? `MCP prompt from ${prompt.serverName}`,
-    source: "mcp",
-    hidden: prompt.hidden ?? false,
-    argumentMode: (prompt.arguments?.length ?? 0) > 0 ? "variadic" : "none",
-    argumentHint: mcpPromptArgumentHint(prompt.arguments ?? []),
-    metadata: {
-      kind: "mcp_prompt",
-      serverName: prompt.serverName,
-      promptName: prompt.name,
-      title: prompt.title,
-    },
-    run: async (ctx, args) => runMcpPromptCommand(prompt, commandName, controller, ctx, args),
-  });
-}
-
 export function createMcpPromptCommands(
   prompts: readonly McpPromptDefinition[],
   controller: McpPromptController,
 ): CommandDefinition[] {
-  return prompts.map((prompt) => createMcpPromptCommand(prompt, controller));
+  const servers = new Map<string, { rawName: string; prompts: McpPromptDefinition[] }>();
+  for (const prompt of prompts) {
+    const segment = normalizeCommandSegment(prompt.serverName);
+    const server = servers.get(segment) ?? { rawName: prompt.serverName, prompts: [] };
+    server.prompts.push(prompt);
+    servers.set(segment, server);
+  }
+  if (servers.size === 0) return [];
+
+  const serverNodes = [...servers.entries()].map(([serverSegment, server]) => defineCommand({
+    id: `prompt.mcp.${serverSegment}`,
+    name: serverSegment,
+    title: server.rawName,
+    description: `MCP prompts from ${server.rawName}`,
+    group: "prompt",
+    source: "mcp",
+    selectionMode: "drilldown",
+    executionTarget: "prompt",
+    children: server.prompts.map((prompt) => mcpPromptLeaf(prompt, serverSegment, controller)),
+  }));
+  return [createPromptRoot([createPromptNamespace("mcp", serverNodes)])];
 }
 
 export function parseMcpPromptArguments(
@@ -75,74 +73,85 @@ export function parseMcpPromptArguments(
   const tokens = splitCommandArguments(input);
   const named = new Map<string, string>();
   const positional: string[] = [];
-
   for (const token of tokens) {
     const separator = token.indexOf("=");
-    if (separator > 0) {
-      named.set(token.slice(0, separator), token.slice(separator + 1));
-    } else {
-      positional.push(token);
-    }
+    if (separator > 0) named.set(token.slice(0, separator), token.slice(separator + 1));
+    else positional.push(token);
   }
 
   const output: Record<string, string> = {};
   let positionalIndex = 0;
   for (const definition of definitions) {
-    const name = definition.name;
-    const namedValue = named.get(name);
+    const namedValue = named.get(definition.name);
     const value = namedValue ?? positional[positionalIndex];
     if (namedValue === undefined && value !== undefined) positionalIndex += 1;
-    if (value !== undefined) output[name] = value;
-    if (definition.required && (value === undefined || value.length === 0)) {
-      throw new Error(`Missing required MCP prompt argument: ${name}`);
-    }
+    if (value !== undefined) output[definition.name] = value;
+    if (definition.required && !value) throw new Error(`Missing required MCP prompt argument: ${definition.name}`);
   }
-
-  for (const [key, value] of named.entries()) {
+  for (const [key, value] of named) {
     if (output[key] === undefined) output[key] = value;
   }
-
   return output;
 }
 
+function mcpPromptLeaf(
+  prompt: McpPromptDefinition,
+  serverSegment: string,
+  controller: McpPromptController,
+): CommandDefinition {
+  const promptSegment = normalizeCommandSegment(prompt.name);
+  const commandId = `prompt.mcp.${serverSegment}.${promptSegment}`;
+  const commandPath = `/prompt mcp ${serverSegment} ${promptSegment}`;
+  const argumentDefinitions = prompt.arguments ?? [];
+  return defineCommand({
+    id: commandId,
+    name: promptSegment,
+    title: prompt.title ?? prompt.name,
+    description: prompt.description ?? `MCP prompt from ${prompt.serverName}`,
+    group: "prompt",
+    source: "mcp",
+    argumentMode: argumentDefinitions.some((argument) => argument.required)
+      ? "required"
+      : argumentDefinitions.length > 0 ? "optional" : "none",
+    argumentHint: mcpPromptArgumentHint(argumentDefinitions),
+    selectionMode: argumentDefinitions.length > 0 ? "complete" : "execute",
+    hidden: prompt.hidden ?? false,
+    executionTarget: "prompt",
+    metadata: { kind: "mcp_prompt", serverName: prompt.serverName, promptName: prompt.name },
+    run: (context, args) => runMcpPromptCommand(prompt, commandId, commandPath, controller, context, args),
+  });
+}
+
 function mcpPromptArgumentHint(definitions: readonly McpPromptArgumentDefinition[]): string {
-  if (definitions.length === 0) return "";
-  return definitions
-    .map((definition) => definition.required ? `<${definition.name}>` : `[${definition.name}]`)
-    .join(" ");
+  return definitions.map((definition) => definition.required ? `<${definition.name}>` : `[${definition.name}]`).join(" ");
 }
 
 async function runMcpPromptCommand(
   prompt: McpPromptDefinition,
-  commandName: string,
+  commandId: string,
+  commandPath: string,
   controller: McpPromptController,
-  ctx: CommandContext,
+  context: CommandContext,
   args: CommandRunInput,
 ): Promise<CommandRunResult> {
   const rendered = await controller.renderPrompt({
     serverName: prompt.serverName,
     promptName: prompt.name,
-    arguments: parseMcpPromptArguments(args.input, prompt.arguments ?? []),
-  }, ctx);
-
-  const metadata: CommandRunResult["metadata"] = {
-    commandName,
-    source: "mcp",
-  };
+    arguments: parseMcpPromptArguments(args.raw, prompt.arguments ?? []),
+  }, context);
   const model = stringMetadata(rendered.metadata?.model);
   const allowedTools = stringArrayMetadata(rendered.metadata?.allowedTools);
-  if (model !== undefined) metadata.model = model;
-  if (allowedTools !== undefined) metadata.allowedTools = allowedTools;
-
   return {
     type: "prompt",
     prompt: formatMcpPromptResult(rendered),
-    metadata,
+    metadata: {
+      commandId,
+      commandPath,
+      source: "mcp",
+      ...(model !== undefined ? { model } : {}),
+      ...(allowedTools !== undefined ? { allowedTools } : {}),
+    },
   };
-}
-
-function mcpPromptCommandName(prompt: McpPromptDefinition): string {
-  return `${prompt.serverName} ${prompt.name}`;
 }
 
 function formatMcpPromptResult(result: McpPromptRenderResult): string {
@@ -150,16 +159,13 @@ function formatMcpPromptResult(result: McpPromptRenderResult): string {
   if (prompt) return prompt;
   return (result.messages ?? [])
     .map((message) => `${message.role.toUpperCase()}: ${messageContentText(message.content)}`)
-    .filter((message) => message.trim().length > 0)
+    .filter((message) => message.trim())
     .join("\n\n");
 }
 
 function messageContentText(content: McpPromptMessage["content"]): string {
   if (typeof content === "string") return content;
-  return content
-    .map((part) => part.text)
-    .filter((text): text is string => typeof text === "string" && text.length > 0)
-    .join("\n");
+  return content.map((part) => part.text).filter((text): text is string => Boolean(text)).join("\n");
 }
 
 function stringMetadata(value: unknown): string | undefined {
@@ -167,7 +173,5 @@ function stringMetadata(value: unknown): string | undefined {
 }
 
 function stringArrayMetadata(value: unknown): readonly string[] | undefined {
-  return Array.isArray(value) && value.every((item) => typeof item === "string")
-    ? value
-    : undefined;
+  return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : undefined;
 }

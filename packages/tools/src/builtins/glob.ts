@@ -1,6 +1,7 @@
 import { opendir, stat } from "node:fs/promises";
-import { relative, resolve } from "node:path";
+import { resolve } from "node:path";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
+import { assertExistingPathInsideWorkspace, resolveWorkspacePath, toPosixPath, toPosixRelative } from "../workspace-path.js";
 
 export interface GlobInput {
   pattern: string;
@@ -13,7 +14,7 @@ export function createGlobTool(): ChiliToolDefinition<GlobInput> {
     name: "glob",
     aliases: ["file_glob"],
     searchHint: "Find workspace files by glob pattern such as **/*.ts or packages/*/package.json.",
-    description: "Find files in the workspace using a glob pattern.",
+    description: "Find files in the workspace using a glob pattern. Supports *, **, and ?; use separate calls instead of brace expansion.",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -22,7 +23,10 @@ export function createGlobTool(): ChiliToolDefinition<GlobInput> {
       type: "object",
       required: ["pattern"],
       properties: {
-        pattern: { type: "string" },
+        pattern: {
+          type: "string",
+          description: "Glob pattern using *, **, or ?. Brace expansion such as *.{ts,tsx} is not supported; use separate glob calls. Literal braces remain supported.",
+        },
         path: { type: "string" },
         limit: { type: "number" },
       },
@@ -35,6 +39,12 @@ export function createGlobTool(): ChiliToolDefinition<GlobInput> {
 
       if (typeof pattern !== "string" || pattern.trim().length === 0) {
         return { ok: false, message: "pattern must be a non-empty string" };
+      }
+      if (hasBraceExpansionSyntax(pattern)) {
+        return {
+          ok: false,
+          message: "glob brace expansion is not supported; use separate glob calls instead",
+        };
       }
       if (path !== undefined && (typeof path !== "string" || path.trim().length === 0)) {
         return { ok: false, message: "path must be a non-empty string" };
@@ -60,7 +70,8 @@ export function createGlobTool(): ChiliToolDefinition<GlobInput> {
     },
     async execute(input, context) {
       const workspace = resolve(context.cwd);
-      const root = input.path ? resolveWorkspacePath(workspace, input.path) : { absolutePath: workspace, relativePath: "." };
+      const root = input.path ? resolveWorkspacePath(workspace, input.path, { allowWorkspaceRoot: true }) : { absolutePath: workspace, relativePath: "." };
+      await assertExistingPathInsideWorkspace(workspace, root, input.path ?? ".");
       const info = await stat(root.absolutePath);
       if (!info.isDirectory()) {
         throw new Error(`glob path must be a directory: ${root.relativePath}`);
@@ -139,33 +150,47 @@ function globToRegex(pattern: string): string {
   return regex;
 }
 
-function resolveWorkspacePath(workspace: string, path: string): { absolutePath: string; relativePath: string } {
-  const absolutePath = resolve(workspace, path);
-  const relativePath = relative(workspace, absolutePath);
-  if (relativePath === "") {
-    return { absolutePath, relativePath: "." };
-  }
-  if (!isSafeRelativePath(relativePath)) {
-    throw new Error(`Path must stay inside the workspace: ${path}`);
-  }
-  return { absolutePath, relativePath: toPosixPath(relativePath) };
-}
-
-function toPosixRelative(from: string, to: string): string {
-  const rel = relative(from, to);
-  return rel.length === 0 ? "." : toPosixPath(rel);
-}
-
-function toPosixPath(path: string): string {
-  return path.split(/[\\/]/).join("/");
-}
-
-function isSafeRelativePath(path: string): boolean {
-  return path.length > 0 && !path.startsWith("/") && !path.split(/[\\/]/).includes("..");
-}
-
 function escapeRegex(value: string): string {
   return value.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+}
+
+function hasBraceExpansionSyntax(pattern: string): boolean {
+  for (let start = 0; start < pattern.length; start++) {
+    if (pattern[start] !== "{") continue;
+    let depth = 1;
+    for (let end = start + 1; end < pattern.length; end++) {
+      const char = pattern[end];
+      if (char === "{") {
+        depth++;
+        continue;
+      }
+      if (char !== "}") continue;
+      depth--;
+      if (depth !== 0) continue;
+
+      const body = pattern.slice(start + 1, end);
+      if (hasTopLevelBraceAlternatives(body) || isBraceSequence(body) || hasBraceExpansionSyntax(body)) {
+        return true;
+      }
+      start = end;
+      break;
+    }
+  }
+  return false;
+}
+
+function hasTopLevelBraceAlternatives(body: string): boolean {
+  let depth = 0;
+  for (const char of body) {
+    if (char === "{") depth++;
+    else if (char === "}") depth--;
+    else if (char === "," && depth === 0) return true;
+  }
+  return false;
+}
+
+function isBraceSequence(body: string): boolean {
+  return /^(?:(?:[+-]?\d+)\.\.(?:[+-]?\d+)|[A-Za-z]\.\.[A-Za-z])(?:\.\.[+-]?\d+)?$/u.test(body);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

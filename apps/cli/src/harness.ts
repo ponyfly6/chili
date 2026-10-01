@@ -1,10 +1,13 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   AgentRunnerSubagentRunner,
   AgentMailboxDeliveryPump,
   AgentTreeControlService,
   AgentTaskControlService,
+  DelegationPolicyGate,
+  DEFAULT_LOCAL_SUBAGENT_MAX_ACTIVE_RUNS,
+  LocalSubagentConcurrencyLimiter,
   LocalSubagentManager,
   RuntimeService,
   SingleAgentRuntime,
@@ -19,25 +22,36 @@ import {
   chiliBasePromptFragment,
   createMemoryTool,
   defaultScopedWorkerPolicy,
-  mcpServerStatusPromptFragment,
+  type ModelRouter,
   type PromptFragment,
   type RuntimePromptTurnContext,
   type WorkerToolPolicy,
 } from "@chili/core";
-import type { AgentPath, ApprovalDecision, ChiliEvent, EventEnvelope, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { AgentPath, ApprovalDecision, ChiliEvent, EventEnvelope, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId, TaskId, TeamId } from "@chili/protocol";
 import { ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
 import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
   DeferredApprovalQueue,
+  DeferredUserInputQueue,
+  DELEGATION_OFF_DENIED_TOOL_NAMES,
   FileSystemSnapshotProvider,
   InMemoryToolRegistry,
+  ManagedProcessManager,
   PolicyApprovalBroker,
+  PolicyApprovalState,
+  type AgentMessageRecord,
+  type AgentMessageToolController,
   type SubagentController,
   type SubagentControlController,
   ToolExecutor,
   createApplyPatchTool,
   createActivateSkillTool,
+  createAgentMessageListTool,
+  createAgentMessageSendTool,
   createBashTool,
+  createProcessTool,
+  createDelegationSetTool,
+  createDelegationStatusTool,
   createMailboxConsumeTool,
   createMailboxListTool,
   createCompleteTaskTool,
@@ -54,11 +68,13 @@ import {
   createMcpResourcesListTool,
   createReadFileTool,
   createReadImageTool,
+  createRequestUserInputTool,
   createTaskCloseTool,
   createTaskBatchTool,
   createTaskFollowupTool,
   createTaskListTool,
   createTaskTool,
+  createTaskWaitBatchTool,
   createTaskWaitTool,
   createTeamCreateTool,
   createTeamListTool,
@@ -80,6 +96,8 @@ import {
   createTeamTaskUpdateTool,
   createToolSearchTool,
   createWriteFileTool,
+  type BashRunner,
+  type DelegationToolController,
   type GoalToolController,
   type MailboxListToolInput,
   type SubagentMailboxRecord,
@@ -99,6 +117,7 @@ import {
   type TeamTaskSyncRecord,
   type TeamToolController,
   type ToolAccessPolicyResolver,
+  type ToolAccessPolicy,
 } from "@chili/tools";
 import {
   discoverSkills,
@@ -113,12 +132,25 @@ import {
 } from "@chili/skills";
 import { defaultChiliHome } from "@chili/providers";
 import { createFilesystemPromptCommandControl, type PromptCommandControl } from "@chili/server";
-import { createCliApprovalBroker, createCliApprovalRulesets, dangerousShellCommandsForProfile, persistAllowAlwaysDecision, runtimePermissionConfig } from "./approval.js";
+import {
+  createCliApprovalBroker,
+  createCliApprovalRulesets,
+  createRequestScopedPolicyApprovalBroker,
+  dangerousShellCommandsForProfile,
+  persistAllowAlwaysDecision,
+  runtimePermissionConfig,
+  type CliApprovalRulesetResolver,
+} from "./approval.js";
+import { createCliBashRunner } from "./bash-runner.js";
 import { loadCliConfig, type CliConfig } from "./config.js";
 import { createIdFactory } from "./id.js";
 import type { CliModelName, CliReasoningLevel } from "./model.js";
 import { createCliModel, resolveCliRuntimeModelSelection } from "./model.js";
-import { createCliMcpRuntime, type CliMcpRuntime } from "./mcp-control.js";
+import {
+  createCliMcpRuntime,
+  type CliMcpRuntime,
+  type CliMcpRuntimeOptions,
+} from "./mcp-control.js";
 import { CliPrinter, PrintingEventStore } from "./printing-store.js";
 import { readUserModelSelection, writeUserModelSelection } from "./user-model-state.js";
 
@@ -127,6 +159,25 @@ const DEV_MAX_REPEATED_TOOL_CALLS = 20;
 const DEV_MAX_TOOL_CALLS_PER_TURN = 200;
 const DEV_MAX_CONCURRENT_TOOL_CALLS = 32;
 const STALE_TURN_RECOVERY_MS = 30 * 60 * 1000;
+const STALE_TURN_RECOVERY_INTERVAL_MS = 30_000;
+const CLI_DEFAULT_READ_MAX_BYTES = 32 * 1024;
+const CLI_READ_MAX_BYTES_LIMIT = 256 * 1024;
+
+async function canonicalSkillWorkspace(cwd: string): Promise<string> {
+  const absolute = resolve(cwd);
+  try {
+    return await realpath(absolute);
+  } catch (error) {
+    if (
+      error instanceof Error
+      && "code" in error
+      && ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR")
+    ) {
+      return absolute;
+    }
+    throw error;
+  }
+}
 
 export interface CliHarnessOptions {
   cwd: string;
@@ -137,9 +188,21 @@ export interface CliHarnessOptions {
   yes?: boolean;
   quiet?: boolean;
   approvalQueue?: DeferredApprovalQueue;
+  userInputQueue?: DeferredUserInputQueue;
   chiliHome?: string;
   deferMcpConnect?: boolean;
   mcpConnectMode?: "eager" | "background" | "manual";
+  bashRunner?: BashRunner;
+  modelRouter?: ModelRouter;
+  staleTurnRecoveryMs?: number;
+  staleTurnRecoveryIntervalMs?: number | false;
+  sessionClaimLeaseMs?: number;
+  sessionClaimHeartbeatMs?: number;
+  onStaleTurnRecoveryError?: (error: unknown) => void;
+  mcpRuntimeFactory?: (
+    options: CliMcpRuntimeOptions,
+    baseCommands: PromptCommandControl,
+  ) => Promise<CliMcpRuntime>;
 }
 
 export interface CliHarness {
@@ -162,6 +225,7 @@ export interface CliHarness {
   defaultModelSelection?: ModelSelection;
   defaultReasoningLevel?: CliReasoningLevel;
   defaultServiceTier?: ServiceTier;
+  waitForBackgroundTasks(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -188,7 +252,74 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const printer = new CliPrinter();
   const printableStore = options.quiet ? sqliteStore : new PrintingEventStore(sqliteStore, printer);
   const eventStore = new ObservableEventStore(printableStore);
-  const childToolPolicyResolver = createWorkerToolPolicyResolver(eventStore);
+  const staleTurnRecoveryMs = nonNegativeDuration(
+    options.staleTurnRecoveryMs,
+    STALE_TURN_RECOVERY_MS,
+    "staleTurnRecoveryMs",
+  );
+  const staleTurnRecoveryIntervalMs = options.staleTurnRecoveryIntervalMs === false
+    ? false
+    : positiveDuration(
+        options.staleTurnRecoveryIntervalMs,
+        STALE_TURN_RECOVERY_INTERVAL_MS,
+        "staleTurnRecoveryIntervalMs",
+      );
+  let staleTurnRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  let staleTurnRecoveryRun: Promise<void> | undefined;
+  let harnessClosing = false;
+  const reconcileStaleRuntimeState = async (): Promise<void> => {
+    const now = Date.now();
+    await tasks.reconcileStaleTasks({
+      staleAfterMs: staleTurnRecoveryMs,
+      modes: ["one_shot", "resumable", "background"],
+      liveTaskIds: subagents.liveTaskIds(),
+      requireLeaseEvidence: true,
+      limit: 500,
+      summary: "Recovered after the owning runtime stopped",
+      error: "stale_agent_worker",
+    });
+    await eventStore.reconcileStaleTurns({
+      staleBefore: now - staleTurnRecoveryMs,
+      now,
+      createId,
+      status: "failed",
+      reason: "stale_turn_recovered",
+    });
+  };
+  const scheduleStaleTurnRecovery = (): void => {
+    if (harnessClosing || staleTurnRecoveryIntervalMs === false) return;
+    staleTurnRecoveryTimer = setTimeout(() => {
+      staleTurnRecoveryTimer = undefined;
+      if (harnessClosing) return;
+      const run = reconcileStaleRuntimeState();
+      staleTurnRecoveryRun = run;
+      void run.catch((error: unknown) => {
+        if (!harnessClosing) {
+          try {
+            options.onStaleTurnRecoveryError?.(error);
+          } catch {
+            // Recovery diagnostics must not turn a retryable maintenance error
+            // into an unhandled rejection that crashes the host process.
+          }
+        }
+      }).finally(() => {
+        if (staleTurnRecoveryRun === run) staleTurnRecoveryRun = undefined;
+        scheduleStaleTurnRecovery();
+      }).catch(() => undefined);
+    }, staleTurnRecoveryIntervalMs);
+    (staleTurnRecoveryTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  };
+  const childToolPolicyResolver = createWorkerToolPolicyResolver(eventStore, Boolean(options.userInputQueue));
+  let delegationPolicyGate: DelegationPolicyGate | undefined;
+  const delegationToolPolicyResolver = createDelegationToolPolicyResolver(() => delegationPolicyGate);
+  const combinedChildToolPolicyResolver = combineToolAccessPolicyResolvers(
+    childToolPolicyResolver,
+    delegationToolPolicyResolver,
+  );
+  const assertDelegationEnabled = (input: { sessionId: SessionId; action: string }): Promise<void> => {
+    if (!delegationPolicyGate) throw new Error("Delegation policy gate is not initialized");
+    return delegationPolicyGate.assertEnabled(input);
+  };
   const cliModelInput: { provider?: string; model?: CliModelName; reasoningLevel?: CliReasoningLevel; serviceTier?: ServiceTier } = {};
   if (options.provider !== undefined) cliModelInput.provider = options.provider;
   if (options.model !== undefined) cliModelInput.model = options.model;
@@ -201,48 +332,99 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     modelInput.provider = persistedUserModelSelection.provider;
     modelInput.model = persistedUserModelSelection.model;
   }
-  const model = await createCliModel(modelInput);
+  const model = options.modelRouter ?? await createCliModel(modelInput);
   const runtimeModelSelection = explicitModelSelection ? resolveCliRuntimeModelSelection(cliModelInput) : undefined;
   const serviceDefaultModelSelection = runtimeModelSelection ?? persistedUserModelSelection;
   const persistUserModelSelection = async (input: { modelSelection: ModelSelection }): Promise<void> => {
     await writeUserModelSelection(input.modelSelection, { chiliHome }).catch(() => undefined);
   };
-  const skillRegistry = await discoverSkills({ cwd });
+  const skillRegistryForCwd = async (requestedCwd: string): Promise<SkillRegistry> => {
+    const canonicalCwd = await canonicalSkillWorkspace(requestedCwd);
+    return discoverSkills({ cwd: canonicalCwd });
+  };
+  await skillRegistryForCwd(cwd);
   const config = await loadCliConfig(cwd, { chiliHome });
-  const permissions = createPermissionProfileControl(config, options.yes ? "full-access" : "default");
-  const registry = createToolRegistry(skillRegistry);
-  const childRegistry = createChildToolRegistry(skillRegistry);
+  const approvalState = new PolicyApprovalState();
+  const approvalRootBySession = new Map<SessionId, SessionId>();
+  const sandboxedShell = options.bashRunner === undefined && process.platform === "darwin";
+  const permissions = createPermissionProfileControl(
+    config,
+    options.yes ? "full-access" : "default",
+    sandboxedShell,
+  );
+  const approvalRulesetsForRequest: CliApprovalRulesetResolver = async (request) => {
+    if (!delegationPolicyGate) throw new Error("Delegation policy gate is not initialized");
+    const rootSessionId = await delegationPolicyGate.rootSessionId(request.sessionId);
+    const sessions = await eventStore.sessions();
+    const session = sessions.find((candidate) => candidate.id === request.sessionId);
+    if (!session) throw new Error(`Session not found: ${request.sessionId}`);
+    if (session.status !== "active") {
+      throw new Error(`Session is not active: ${request.sessionId} (${session.status})`);
+    }
+    const rootSession = sessions.find((candidate) => candidate.id === rootSessionId);
+    if (!rootSession) throw new Error(`Approval root session not found: ${rootSessionId}`);
+    if (rootSession.status !== "active") {
+      throw new Error(`Approval root session is not active: ${rootSessionId} (${rootSession.status})`);
+    }
+    if (rootSession.source === "subagent") {
+      throw new Error(`Approval root session cannot be a subagent: ${rootSessionId}`);
+    }
+    const sessionCwd = await canonicalSkillWorkspace(session.cwd);
+    const sessionConfig = await loadCliConfig(sessionCwd, { chiliHome });
+    const rulesets = createCliApprovalRulesets(permissions.get().profile, sessionConfig, { sandboxedShell });
+    const previousRootSessionId = approvalRootBySession.get(request.sessionId);
+    if (previousRootSessionId && previousRootSessionId !== rootSessionId) {
+      throw new Error(
+        `Approval ancestry changed for session ${request.sessionId}: ${previousRootSessionId} -> ${rootSessionId}`,
+      );
+    }
+    approvalRootBySession.set(request.sessionId, rootSessionId);
+    approvalState.linkSession(rootSessionId, request.sessionId);
+    return rulesets;
+  };
+  const bashRunner = options.bashRunner ?? createCliBashRunner({
+    permissionProfile: () => permissions.get().profile,
+  });
+  const processes = new ManagedProcessManager();
+  // A scoped worker may only receive Bash when Chili owns a concrete host
+  // sandbox. An injected runner is opaque, and non-macOS platforms currently
+  // have no equivalent sandbox implementation, so fail closed by omitting it.
+  const childBashRunner = options.bashRunner || process.platform !== "darwin"
+    ? undefined
+    : createCliBashRunner({
+        permissionProfile: () => permissions.get().profile,
+        allowHostSandboxEscape: false,
+      });
+  const registry = createToolRegistry(skillRegistryForCwd, bashRunner, processes);
+  const childRegistry = createChildToolRegistry(skillRegistryForCwd, childBashRunner);
+  if (options.userInputQueue) {
+    const userInputTool = createRequestUserInputTool(
+      options.userInputQueue,
+      { publish: (event) => eventStore.append(event) },
+      createId,
+    );
+    registry.register(userInputTool);
+    childRegistry.register(userInputTool);
+  }
   let mcpRuntime: CliMcpRuntime | undefined;
-  const promptFragments = async (context: { cwd: string; turn?: RuntimePromptTurnContext }) => {
-    const fragments = await buildCliPromptFragments({
+  const promptFragments = async (context: { cwd: string; turn?: RuntimePromptTurnContext }) =>
+    buildCliPromptFragments({
       cwd: context.cwd,
-      skillRegistry,
+      skillRegistry: await skillRegistryForCwd(context.cwd),
       ...(context.turn ? { turn: context.turn } : {}),
     });
-    const mcpFragment = mcpRuntime ? mcpServerStatusPromptFragment((await mcpRuntime.control.status?.())?.servers.map((server) => ({
-      serverName: server.name,
-      status: server.status,
-      ...(server.error ? { detail: server.error } : {}),
-    })) ?? []) : undefined;
-    return mcpFragment ? [...fragments, mcpFragment] : fragments;
-  };
-  const childPromptFragments = async (context: { sessionId: SessionId; threadId: ThreadId; cwd: string; turn?: RuntimePromptTurnContext }) => {
-    const fragments = await buildCliChildPromptFragments({
+  const childPromptFragments = async (context: { sessionId: SessionId; cwd: string; turn?: RuntimePromptTurnContext }) =>
+    buildCliChildPromptFragments({
       cwd: context.cwd,
       sessionId: context.sessionId,
-      threadId: context.threadId,
-      skillRegistry,
+      skillRegistry: await skillRegistryForCwd(context.cwd),
       store: eventStore,
       ...(context.turn ? { turn: context.turn } : {}),
     });
-    const mcpFragment = mcpRuntime ? mcpServerStatusPromptFragment((await mcpRuntime.control.status?.())?.servers.map((server) => ({
-      serverName: server.name,
-      status: server.status,
-      ...(server.error ? { detail: server.error } : {}),
-    })) ?? []) : undefined;
-    return mcpFragment ? [...fragments, mcpFragment] : fragments;
-  };
-  const subagentPromptFragments = (context: { cwd: string }) => buildCliPromptFragments({ cwd: context.cwd, skillRegistry });
+  const subagentPromptFragments = async (context: { cwd: string }) => buildCliPromptFragments({
+    cwd: context.cwd,
+    skillRegistry: await skillRegistryForCwd(context.cwd),
+  });
   const snapshotProvider = new FileSystemSnapshotProvider({
     rootDir: join(stateDir, "snapshots"),
     createId,
@@ -250,8 +432,8 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const childToolExecutor = new ToolExecutor({
     registry: childRegistry,
     events: { publish: (event: ChiliEvent) => eventStore.append(event) },
-    approvals: createApprovalBroker(options, config, permissions),
-    policyResolver: childToolPolicyResolver,
+    approvals: createApprovalBroker(options, config, approvalState, permissions, approvalRulesetsForRequest),
+    policyResolver: combinedChildToolPolicyResolver,
     snapshotProvider,
     createId,
     maxResultOutputBytes: 128_000,
@@ -266,7 +448,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     model,
     toolRegistry: childRegistry,
     toolExecutor: childToolExecutor,
-    toolPolicyResolver: childToolPolicyResolver,
+    toolPolicyResolver: combinedChildToolPolicyResolver,
     createId,
     contextBudget: childContextBudget,
     retryPolicy: {
@@ -291,7 +473,11 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
     ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
     onModelChanged: persistUserModelSelection,
+    allowSubagentSessions: true,
+    ...(options.sessionClaimLeaseMs !== undefined ? { sessionClaimLeaseMs: options.sessionClaimLeaseMs } : {}),
+    ...(options.sessionClaimHeartbeatMs !== undefined ? { sessionClaimHeartbeatMs: options.sessionClaimHeartbeatMs } : {}),
   });
+  const childRunLimiter = new LocalSubagentConcurrencyLimiter(DEFAULT_LOCAL_SUBAGENT_MAX_ACTIVE_RUNS);
   const subagents = new LocalSubagentManager({
     store: eventStore,
     runner: new AgentRunnerSubagentRunner({
@@ -299,61 +485,28 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
       store: eventStore,
       maxTurns: DEV_MAX_TURNS,
       promptFragments: subagentPromptFragments,
+      modelConfig: ({ sessionId }) => childService.getModelConfig(sessionId),
     }),
     createId,
+    runLimiter: childRunLimiter,
+    assertDelegationEnabled,
   });
   const tasks = new AgentTaskControlService({
     store: eventStore,
     runtime: childService,
-    interruptTask: (taskId) => subagents.interruptTask(taskId),
+    interruptTask: (taskId, fence) => subagents.interruptTask(taskId, fence),
     createId,
+    runLimiter: childRunLimiter,
+    assertDelegationEnabled,
   });
-  const teams = new TeamControlService({
-    store: eventStore,
-    createId,
-  });
-  const teamWorktrees = new TeamWorktreeService({
-    teams,
-    cwd,
-  });
-  const teamDispatcher = new TeamTaskDispatchService({
-    teams,
-    subagents,
-    store: eventStore,
-    worktrees: teamWorktrees,
-    cwd,
-  });
-  const teamVerifier = new TeamTaskVerificationService({
-    teams,
-    subagents,
-    cwd,
-  });
-  const teamMerger = new TeamMergeService({
-    teams,
-    cwd,
-  });
-  const completeTaskController: SubagentController = {
-    spawnTask(input, context) {
-      return subagents.spawnTask(input, context);
-    },
-    async completeTask(input) {
-      try {
-        return await tasks.completeTask(input);
-      } catch (error) {
-        if (error instanceof Error && error.name === "AgentTaskNotRunnableError") {
-          return subagents.completeTask(input);
-        }
-        throw error;
-      }
-    },
-  };
+  const completeTaskController = createCompleteTaskController(tasks, subagents);
   registry.register(createTaskTool(subagents));
-  registry.register(createTaskBatchTool(subagents));
   childRegistry.register(createCompleteTaskTool(completeTaskController));
   const toolExecutor = new ToolExecutor({
     registry,
     events: { publish: (event) => eventStore.append(event) },
-    approvals: createApprovalBroker(options, config, permissions),
+    approvals: createApprovalBroker(options, config, approvalState, permissions, approvalRulesetsForRequest),
+    policyResolver: delegationToolPolicyResolver,
     snapshotProvider,
     createId,
     maxResultOutputBytes: 256_000,
@@ -368,6 +521,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     model,
     toolRegistry: registry,
     toolExecutor,
+    toolPolicyResolver: delegationToolPolicyResolver,
     createId,
     contextBudget: runtimeContextBudget,
     retryPolicy: {
@@ -397,17 +551,61 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
     ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
     onModelChanged: persistUserModelSelection,
+    stopSessionResources: (sessionId, reason) => processes.stopSession(sessionId, reason),
+    ...(options.sessionClaimLeaseMs !== undefined ? { sessionClaimLeaseMs: options.sessionClaimLeaseMs } : {}),
+    ...(options.sessionClaimHeartbeatMs !== undefined ? { sessionClaimHeartbeatMs: options.sessionClaimHeartbeatMs } : {}),
+  });
+  const teams = new TeamControlService({
+    store: eventStore,
+    createId,
+    sessionOperations: service,
+  });
+  const resolveTeamSession = async (sessionId: SessionId) => {
+    await service.assertSessionTurnAllowed(sessionId);
+    const session = (await eventStore.sessions()).find((candidate) => candidate.id === sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    return session;
+  };
+  const teamWorktrees = new TeamWorktreeService({
+    teams,
+    cwd,
+    resolveSession: resolveTeamSession,
+    sessionOperations: service,
+  });
+  const teamVerifier = new TeamTaskVerificationService({
+    teams,
+    subagents,
+    cwd,
+    resolveSession: resolveTeamSession,
+    sessionOperations: service,
+  });
+  delegationPolicyGate = new DelegationPolicyGate({
+    store: eventStore,
+    getDelegationConfig: (sessionId) => service.getDelegationConfig(sessionId),
+  });
+  const teamMerger = new TeamMergeService({
+    teams,
+    cwd,
+    resolveSession: resolveTeamSession,
+    sessionOperations: service,
+  });
+  const teamDispatcher = new TeamTaskDispatchService({
+    teams,
+    subagents,
+    store: eventStore,
+    worktrees: teamWorktrees,
+    cwd,
+    assertDelegationEnabled,
+    resolveSession: resolveTeamSession,
+    sessionOperations: service,
   });
   for (const tool of createGoalTools(createGoalToolController(service))) {
     registry.register(tool);
   }
-  await sqliteStore.reconcileStaleTurns({
-    staleBefore: Date.now() - STALE_TURN_RECOVERY_MS,
-    now: Date.now(),
-    createId,
-    status: "failed",
-    reason: "stale_turn_recovered",
-  });
+  const delegationController = createDelegationToolController(service);
+  registry.register(createDelegationStatusTool(delegationController));
+  registry.register(createDelegationSetTool(delegationController));
+  await reconcileStaleRuntimeState();
   const teamRunner = new TeamExecutionRunner({
     teams,
     dispatcher: teamDispatcher,
@@ -415,11 +613,24 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     merger: teamMerger,
     events: eventStore,
     cwd,
-    createSession: async (input) => service.createSession({ cwd: input.cwd }),
+    resolveSession: resolveTeamSession,
+    createSession: async (input) => {
+      const session = await service.createSession({ cwd: input.cwd });
+      return {
+        sessionId: session.sessionId,
+        discard: () => service.archiveSession(session.sessionId),
+      };
+    },
+    assertDelegationEnabled,
+    sessionOperations: service,
   });
   const agents = new AgentTreeControlService({
     store: eventStore,
     runtime: childService,
+    rootRuntime: service,
+    taskTurns: tasks,
+    runLimiter: childRunLimiter,
+    delegationPolicyGate,
     createId,
   });
   const mailboxPump = new AgentMailboxDeliveryPump({
@@ -428,19 +639,22 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   });
   mailboxPump.start();
   const controlController = createSubagentControlController(tasks, agents);
+  registry.register(createTaskBatchTool(subagents, controlController));
   registry.register(createTaskListTool(controlController));
+  registry.register(createTaskWaitBatchTool(controlController));
   registry.register(createTaskWaitTool(controlController));
   registry.register(createTaskFollowupTool(controlController));
   registry.register(createTaskCloseTool(controlController));
   registry.register(createMailboxListTool(controlController));
   registry.register(createMailboxConsumeTool(controlController));
-  const teamController = createTeamToolController(teams);
-  registerTeamTools(registry, teamController);
-  registerTeamTools(childRegistry, teamController);
-  const teamDispatchController = createTeamTaskDispatchToolController(teamDispatcher);
+  registerAgentMessageTools(registry, createAgentMessageToolController(tasks, agents, "root"));
+  registerAgentMessageTools(childRegistry, createAgentMessageToolController(tasks, agents, "child"));
+  registerTeamTools(registry, createTeamToolController(teams, tasks, "root"));
+  registerTeamTools(childRegistry, createTeamToolController(teams, tasks, "child"));
+  const teamDispatchController = createTeamTaskDispatchToolController(teamDispatcher, teams);
   registerTeamDispatchTools(registry, teamDispatchController);
-  registry.register(createTeamRunLoopTool(createTeamRunLoopToolController(teamRunner)));
-  mcpRuntime = await createCliMcpRuntime({
+  registry.register(createTeamRunLoopTool(createTeamRunLoopToolController(teamRunner, teams)));
+  mcpRuntime = await (options.mcpRuntimeFactory ?? createCliMcpRuntime)({
     cwd,
     chiliHome,
     registries: [registry, childRegistry],
@@ -451,6 +665,70 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   commands = mcpRuntime.commands;
   registerMcpResourceTools(registry, mcpRuntime);
   registerMcpResourceTools(childRegistry, mcpRuntime);
+  scheduleStaleTurnRecovery();
+
+  let closePromise: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    if (closePromise) return closePromise;
+
+    let resolveClose!: () => void;
+    let rejectClose!: (error: unknown) => void;
+    closePromise = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolveClose = resolvePromise;
+      rejectClose = rejectPromise;
+    });
+
+    // Publish the one close promise before any shutdown call can synchronously
+    // abort a model/tool and let its listener reenter close().
+    harnessClosing = true;
+    if (staleTurnRecoveryTimer) clearTimeout(staleTurnRecoveryTimer);
+    staleTurnRecoveryTimer = undefined;
+    const errors: unknown[] = [];
+    const pendingDrains: Promise<unknown>[] = [];
+    const startDrain = (operation: () => unknown): void => {
+      try {
+        pendingDrains.push(Promise.resolve(operation()));
+      } catch (error) {
+        errors.push(error);
+      }
+    };
+
+    // Start every admission/abort path even if one of its peers throws
+    // synchronously. The single cleanup actor below observes all outcomes.
+    startDrain(() => service.shutdown("runtime_closed"));
+    startDrain(() => childService.shutdown("runtime_closed"));
+    startDrain(() => subagents.shutdown("runtime_closed"));
+    startDrain(() => tasks.shutdown("runtime_closed"));
+    startDrain(() => processes.close("runtime_closed"));
+    startDrain(() => options.approvalQueue?.denyAll("Runtime closed while waiting for approval."));
+    startDrain(() => options.userInputQueue?.denyAll("Runtime closed while waiting for user input."));
+    startDrain(() => mailboxPump.stop());
+    startDrain(() => staleTurnRecoveryRun?.catch(() => undefined));
+
+    const cleanupActor = (async (): Promise<void> => {
+      const drainResults = await Promise.allSettled(pendingDrains);
+      for (const result of drainResults) {
+        if (result.status === "rejected") errors.push(result.reason);
+      }
+      try {
+        await mcpRuntime?.close();
+      } catch (error) {
+        errors.push(error);
+      } finally {
+        try {
+          sqliteStore.close();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) {
+        throw new AggregateError(errors, "CLI harness shutdown encountered multiple errors");
+      }
+    })();
+    void cleanupActor.then(resolveClose, rejectClose);
+    return closePromise;
+  };
 
   return {
     cwd,
@@ -472,13 +750,25 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     ...(runtimeModelSelection ? { defaultModelSelection: runtimeModelSelection } : {}),
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
     ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
-    close: async () => {
-      await mailboxPump.stop();
-      await subagents.waitForBackgroundTasks();
-      await mcpRuntime?.close();
-      sqliteStore.close();
-    },
+    waitForBackgroundTasks: () => subagents.waitForBackgroundTasks(),
+    close,
   };
+}
+
+function nonNegativeDuration(value: number | undefined, fallback: number, name: string): number {
+  const duration = value ?? fallback;
+  if (!Number.isFinite(duration) || duration < 0) {
+    throw new Error(`${name} must be a non-negative finite number`);
+  }
+  return duration;
+}
+
+function positiveDuration(value: number | undefined, fallback: number, name: string): number {
+  const duration = value ?? fallback;
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error(`${name} must be a positive finite number`);
+  }
+  return duration;
 }
 
 async function readPersistedUserModelSelection(chiliHome: string): Promise<ModelSelection | undefined> {
@@ -496,64 +786,107 @@ function registerMcpResourceTools(registry: InMemoryToolRegistry, runtime: CliMc
   registry.register(createMcpResourceReadTool(runtime.resources));
 }
 
-export async function latestThreadId(store: SqliteEventStore, sessionId: SessionId): Promise<ThreadId | undefined> {
-  const events = await store.events({ sessionId, limit: 5000 });
-  for (let index = events.length - 1; index >= 0; index--) {
-    const event = events[index];
-    if (event?.threadId) return event.threadId;
-  }
-  return undefined;
-}
-
-export function newThreadId(): ThreadId {
-  return createIdFactory()("thread") as ThreadId;
-}
-
-function createWorkerToolPolicyResolver(store: ObservableEventStore): ToolAccessPolicyResolver {
+function createWorkerToolPolicyResolver(
+  store: ObservableEventStore,
+  allowUserInput = false,
+): ToolAccessPolicyResolver {
   return {
     async resolve(context) {
-      const policy = await findWorkerToolPolicy(store, context.sessionId, context.threadId);
-      return policy ?? defaultScopedWorkerPolicy();
+      const policy = await findWorkerToolPolicy(store, context.sessionId);
+      const resolved = policy ?? defaultScopedWorkerPolicy();
+      if (!allowUserInput || !resolved.allowedTools || resolved.allowedTools.includes("request_user_input")) {
+        return resolved;
+      }
+      return { ...resolved, allowedTools: [...resolved.allowedTools, "request_user_input"] };
     },
   };
+}
+
+function createDelegationToolPolicyResolver(
+  gate: () => DelegationPolicyGate | undefined,
+): ToolAccessPolicyResolver {
+  return {
+    async resolve(context) {
+      const current = gate();
+      if (!current || !(await current.isOff(context.sessionId))) return undefined;
+      return { deniedTools: DELEGATION_OFF_DENIED_TOOL_NAMES };
+    },
+  };
+}
+
+function combineToolAccessPolicyResolvers(
+  worker: ToolAccessPolicyResolver,
+  delegation: ToolAccessPolicyResolver,
+): ToolAccessPolicyResolver {
+  return {
+    async resolve(context) {
+      const [workerPolicy, delegationPolicy] = await Promise.all([
+        worker.resolve(context),
+        delegation.resolve(context),
+      ]);
+      if (!workerPolicy) return delegationPolicy;
+      if (!delegationPolicy) return workerPolicy;
+      const deniedTools = uniqueStrings([
+        ...(workerPolicy.deniedTools ?? []),
+        ...(delegationPolicy.deniedTools ?? []),
+      ]);
+      const combined: ToolAccessPolicy = {
+        ...workerPolicy,
+        ...delegationPolicy,
+        deniedTools,
+        metadata: {
+          ...workerPolicy.metadata,
+          ...delegationPolicy.metadata,
+        },
+      };
+      return combined;
+    },
+  };
+}
+
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values)];
 }
 
 function createGoalToolController(service: RuntimeService): GoalToolController {
   return {
     async getGoal(context) {
-      const threadId = requireToolThreadId(context.threadId);
-      return service.getGoal({ sessionId: context.sessionId, threadId });
+      return service.getGoal({ sessionId: context.sessionId });
     },
     async createGoal(input, context) {
-      const threadId = requireToolThreadId(context.threadId);
       return service.setGoal({
         sessionId: context.sessionId,
-        threadId,
         objective: input.objective,
         ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
         replace: false,
       });
     },
     async updateGoal(input, context) {
-      const threadId = requireToolThreadId(context.threadId);
       return service.updateGoal({
         sessionId: context.sessionId,
-        threadId,
         status: input.status,
       });
     },
   };
 }
 
-function requireToolThreadId(threadId: ThreadId | undefined): ThreadId {
-  if (!threadId) throw new Error("Goal tools require a thread id.");
-  return threadId;
+function createDelegationToolController(service: RuntimeService): DelegationToolController {
+  return {
+    getDelegationConfig(context) {
+      return service.getDelegationConfig(context.sessionId);
+    },
+    setDelegationPolicy(input, context) {
+      return service.setDelegationPolicy({
+        sessionId: context.sessionId,
+        policy: input.policy,
+      });
+    },
+  };
 }
 
 async function findWorkerToolPolicy(
   store: ObservableEventStore,
   sessionId: SessionId,
-  threadId: ThreadId | undefined,
 ): Promise<WorkerToolPolicy | undefined> {
   let afterEventId: string | undefined;
   let found: WorkerToolPolicy | undefined;
@@ -563,7 +896,7 @@ async function findWorkerToolPolicy(
     if (afterEventId) query.afterEventId = afterEventId;
     const events = await store.events(query);
     for (const event of events) {
-      const policy = workerToolPolicyFromEvent(event, sessionId, threadId);
+      const policy = workerToolPolicyFromEvent(event, sessionId);
       if (policy) found = policy;
     }
     if (events.length < query.limit) return found;
@@ -576,12 +909,10 @@ async function findWorkerToolPolicy(
 function workerToolPolicyFromEvent(
   event: EventEnvelope | undefined,
   sessionId: SessionId,
-  threadId: ThreadId | undefined,
 ): WorkerToolPolicy | undefined {
   const payload = event?.payload;
   if (!isRecord(payload)) return undefined;
   if (payload.childSessionId !== sessionId) return undefined;
-  if (threadId && payload.childThreadId !== threadId) return undefined;
   const policy = payload.workerPolicy;
   if (!isRecord(policy)) return undefined;
   return {
@@ -627,7 +958,6 @@ export async function buildCliPromptFragments(input: {
 export async function buildCliChildPromptFragments(input: {
   cwd: string;
   sessionId: SessionId;
-  threadId: ThreadId;
   skillRegistry: SkillRegistry;
   store: ObservableEventStore;
   turn?: RuntimePromptTurnContext;
@@ -643,7 +973,7 @@ export async function buildCliChildPromptFragments(input: {
       ...(input.projectRoot ? { projectRoot: input.projectRoot } : {}),
     })),
     chiliChildRuntimeBasePromptFragment(),
-    ...(await buildTaskFollowupPromptFragments(input.store, input.sessionId, input.threadId)),
+    ...(await buildTaskFollowupPromptFragments(input.store, input.sessionId, input.cwd)),
   ];
 }
 
@@ -663,15 +993,19 @@ function chiliChildRuntimeBasePromptFragment(): PromptFragment {
 async function buildTaskFollowupPromptFragments(
   store: ObservableEventStore,
   sessionId: SessionId,
-  threadId: ThreadId,
+  cwd: string,
 ): Promise<PromptFragment[]> {
   const tasks = await store.agentTasks({ childSessionId: sessionId, limit: 10 });
-  const task = tasks.find((candidate) => candidate.childThreadId === threadId);
-  return task ? [taskFollowupPromptFragment(task)] : [];
+  if (tasks.length === 0) return [];
+  if (tasks.length > 1) {
+    throw new Error(
+      `Agent task metadata invariant violated: child session ${sessionId} maps to ${tasks.length} tasks`,
+    );
+  }
+  return [taskFollowupPromptFragment(tasks[0] as AgentTaskRow, cwd)];
 }
 
-function taskFollowupPromptFragment(task: AgentTaskRow): PromptFragment {
-  const cwd = task.cwd ? ` Repository cwd: ${task.cwd}.` : "";
+function taskFollowupPromptFragment(task: AgentTaskRow, cwd: string): PromptFragment {
   return {
     id: `chili.task.followup.${task.id}`,
     layer: "developer",
@@ -680,7 +1014,7 @@ function taskFollowupPromptFragment(task: AgentTaskRow): PromptFragment {
     lifecycle: "turn",
     trust: "system",
     content: [
-      `Subagent task id: ${task.id}.${cwd}`,
+      `Subagent task id: ${task.id}. Repository cwd: ${cwd}.`,
       `Agent path: ${task.path} (logical agent identifier, not a filesystem path).`,
       "Use repository-relative paths, or absolute paths under the repository cwd; never prefix file paths with the agent path.",
       "This is a follow-up for an existing task; answer in the task context and call complete_task with this task id when finished.",
@@ -767,18 +1101,23 @@ function shortHash(value: string): string {
   return (hash >>> 0).toString(16).padStart(8, "0").slice(0, 8);
 }
 
-function createToolRegistry(skillRegistry: SkillRegistry): InMemoryToolRegistry {
+function createToolRegistry(
+  skillRegistryForCwd: (cwd: string) => Promise<SkillRegistry>,
+  bashRunner: BashRunner,
+  processes: ManagedProcessManager,
+): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
-  registry.register(createReadFileTool());
+  registry.register(createReadFileTool({ defaultMaxBytes: CLI_DEFAULT_READ_MAX_BYTES, maxBytesLimit: CLI_READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
   registry.register(createMemoryTool());
-  registry.register(createActivateSkillTool(skillRegistry));
+  registry.register(createActivateSkillTool((context) => skillRegistryForCwd(context.cwd)));
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
-  registry.register(createBashTool());
+  registry.register(createBashTool({ runner: bashRunner, processes }));
+  registry.register(createProcessTool(processes));
   registerGitTools(registry);
   registry.register(createToolSearchTool(registry));
   return registry;
@@ -794,18 +1133,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function createChildToolRegistry(skillRegistry: SkillRegistry): InMemoryToolRegistry {
+function createChildToolRegistry(
+  skillRegistryForCwd: (cwd: string) => Promise<SkillRegistry>,
+  bashRunner?: BashRunner,
+): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
-  registry.register(createReadFileTool());
+  registry.register(createReadFileTool({ defaultMaxBytes: CLI_DEFAULT_READ_MAX_BYTES, maxBytesLimit: CLI_READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
   registry.register(createMemoryTool());
-  registry.register(createActivateSkillTool(skillRegistry));
+  registry.register(createActivateSkillTool((context) => skillRegistryForCwd(context.cwd)));
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
-  registry.register(createBashTool());
+  if (bashRunner) {
+    registry.register(createBashTool({ runner: bashRunner, allowEscalation: false }));
+  }
   registerGitTools(registry);
   registry.register(createToolSearchTool(registry));
   return registry;
@@ -835,6 +1179,11 @@ function registerTeamTools(registry: InMemoryToolRegistry, controller: TeamToolC
   registry.register(createTeamMessageListTool(controller));
 }
 
+function registerAgentMessageTools(registry: InMemoryToolRegistry, controller: AgentMessageToolController): void {
+  registry.register(createAgentMessageSendTool(controller));
+  registry.register(createAgentMessageListTool(controller));
+}
+
 function registerTeamDispatchTools(registry: InMemoryToolRegistry, controller: TeamTaskDispatchToolController): void {
   registry.register(createTeamTaskDispatchTool(controller));
   registry.register(createTeamTaskDispatchBatchTool(controller));
@@ -851,6 +1200,7 @@ interface MutableCliPermissionProfileControl extends CliPermissionProfileControl
 function createPermissionProfileControl(
   config: CliConfig,
   initialProfile: RuntimePermissionProfileId,
+  sandboxedShell: boolean,
 ): MutableCliPermissionProfileControl {
   let profile = initialProfile;
   const brokers = new Set<PolicyApprovalBroker>();
@@ -875,7 +1225,7 @@ function createPermissionProfileControl(
       broker.setDangerousShellCommands(control.dangerousShellCommands());
     },
     rulesets() {
-      return createCliApprovalRulesets(profile, config);
+      return createCliApprovalRulesets(profile, config, { sandboxedShell });
     },
     dangerousShellCommands() {
       return dangerousShellCommandsForProfile(profile);
@@ -887,65 +1237,119 @@ function createPermissionProfileControl(
 function createApprovalBroker(
   options: CliHarnessOptions,
   config: CliConfig,
+  approvalState: PolicyApprovalState,
   permissions?: MutableCliPermissionProfileControl,
+  rulesetsForRequest?: CliApprovalRulesetResolver,
 ): PolicyApprovalBroker {
+  const sandboxedShell = options.bashRunner === undefined && process.platform === "darwin";
   if (!options.approvalQueue) {
     const broker = createCliApprovalBroker({
       ...(options.yes === undefined ? {} : { yes: options.yes }),
       config,
       ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
+      sandboxedShell,
+      approvalState,
+      ...(rulesetsForRequest ? { rulesetsForRequest } : {}),
     });
     permissions?.register(broker);
     return broker;
   }
 
   let broker: PolicyApprovalBroker;
-  broker = new PolicyApprovalBroker({
-    rulesets: permissions?.rulesets() ?? createCliApprovalRulesets(options.yes ?? false, config),
+  const brokerOptions: import("@chili/tools").PolicyApprovalBrokerOptions = {
+    rulesets: permissions?.rulesets() ?? createCliApprovalRulesets(options.yes ?? false, config, { sandboxedShell }),
     ...(permissions ? { dangerousShellCommands: permissions.dangerousShellCommands() } : {}),
-    ask: async (request) => {
+    state: approvalState,
+    allowOneShotPolicyBypass: () => (
+      permissions?.get().profile ?? (options.yes ? "full-access" : "default")
+    ) === "full-access",
+    ask: async (request, signal) => {
       const decision: ApprovalDecision = options.approvalQueue
-        ? await options.approvalQueue.ask(request)
+        ? await options.approvalQueue.ask(request, signal)
         : { action: "deny", feedback: "Approval queue is unavailable." };
-      return persistAllowAlwaysDecision(request, decision, options.chiliHome ? { chiliHome: options.chiliHome } : {});
+      return persistAllowAlwaysDecision(request, decision, {
+        ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
+        onPersisted: (persistedRequest) => approvalState.addPersistentGrant({
+          permission: persistedRequest.permission,
+          patterns: persistedRequest.patterns,
+        }),
+      });
     },
     onSessionGrant: async () => {
       await options.approvalQueue?.recheckPending((request) => broker.preflight(request));
     },
-  });
+  };
+  broker = rulesetsForRequest
+    ? createRequestScopedPolicyApprovalBroker({ ...brokerOptions, rulesetsForRequest })
+    : new PolicyApprovalBroker(brokerOptions);
   permissions?.register(broker);
   return broker;
 }
 
-function createSubagentControlController(
+export function createSubagentControlController(
   tasks: AgentTaskControlService,
   agents: AgentTreeControlService,
 ): SubagentControlController {
   return {
     async listTasks(input, context) {
+      if (input.taskIds) {
+        const visible = (await Promise.all(input.taskIds.map((taskId) => tasks.getTask(taskId as TaskId))))
+          .filter((task) => task.parentSessionId === context.sessionId)
+          .filter((task) => !input.status || task.status === input.status)
+          .map(toSubagentTaskRecord);
+        return limitItems(visible, input.limit);
+      }
       const query: AgentTaskQuery = {};
       if (input.status) query.status = input.status;
       if (input.limit !== undefined) query.limit = input.limit;
-      if (!input.all) query.parentSessionId = context.sessionId;
-      return (await tasks.listTasks(query)).map(toSubagentTaskRecord);
+      query.parentSessionId = context.sessionId;
+      return (await tasks.listTasks(query))
+        .filter((task) => task.parentSessionId === context.sessionId)
+        .map(toSubagentTaskRecord);
     },
-    async waitTask(input) {
+    async waitTask(input, context) {
+      const visibleTask = await tasks.getTask(input.taskId as TaskId);
+      if (visibleTask.parentSessionId !== context.sessionId) {
+        throw new Error(`Agent task is not visible to this session: ${input.taskId}`);
+      }
       return toSubagentTaskRecord(
         await tasks.waitForTask({
           taskId: input.taskId as TaskId,
           ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+          signal: context.signal,
         }),
       );
     },
-    async followupTask(input) {
+    async waitTasks(input, context) {
+      const taskIds = input.taskIds.map((taskId) => taskId as TaskId);
+      const visibleTasks = await Promise.all(taskIds.map((taskId) => tasks.getTask(taskId)));
+      const hiddenTask = visibleTasks.find((task) => task.parentSessionId !== context.sessionId);
+      if (hiddenTask) throw new Error(`Agent task is not visible to this session: ${hiddenTask.id}`);
+      const waited = await tasks.waitForTasks({
+        taskIds,
+        waitFor: input.waitFor ?? "all",
+        ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+        signal: context.signal,
+      });
+      return {
+        waitFor: waited.waitFor,
+        satisfied: waited.satisfied,
+        timedOut: waited.timedOut,
+        tasks: waited.tasks.map(toSubagentTaskRecord),
+      };
+    },
+    async followupTask(input, context) {
+      await requireVisibleAgentTask(tasks, input.taskId as TaskId, context.sessionId);
       const result = await tasks.followupTask({
         taskId: input.taskId as TaskId,
         text: input.prompt,
         ...(input.maxTurns !== undefined ? { maxTurns: input.maxTurns } : {}),
+        signal: context.signal,
       });
       return toSubagentTaskRecord(result.task);
     },
-    async closeTask(input) {
+    async closeTask(input, context) {
+      await requireVisibleAgentTask(tasks, input.taskId as TaskId, context.sessionId);
       return toSubagentTaskRecord(
         await tasks.closeTask({
           taskId: input.taskId as TaskId,
@@ -957,24 +1361,48 @@ function createSubagentControlController(
       );
     },
     async listMailbox(input, context) {
+      const taskQuery: AgentTaskQuery = {
+        parentSessionId: context.sessionId,
+        limit: mailboxTaskLimit(input),
+      };
+      if (input.taskId) taskQuery.taskId = input.taskId as TaskId;
+      if (input.path) taskQuery.path = input.path as AgentPath;
+      const visibleTasks = (await tasks.listTasks(taskQuery))
+        .filter((task) => task.parentSessionId === context.sessionId)
+        .filter((task) => (input.taskId ? task.id === input.taskId : true))
+        .filter((task) => (input.path ? task.path === input.path : true));
+      if ((input.taskId || input.path) && visibleTasks.length === 0) return [];
+      const visibleTaskIds = new Set(visibleTasks.map((task) => task.id));
+      const visibleRecipientSessionIds = new Set<SessionId>([context.sessionId]);
+      for (const task of visibleTasks) {
+        if (task.childSessionId) visibleRecipientSessionIds.add(task.childSessionId);
+      }
+
       const messages = await agents.mailbox({
         status: input.status ?? "queued",
-        ...(input.taskId ? { taskId: input.taskId as TaskId } : {}),
-        ...(input.path ? { path: input.path as AgentPath } : {}),
-        ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        limit: mailboxTaskLimit(input),
       });
-      if (input.all || input.taskId || input.path) return messages.map(toSubagentMailboxRecord);
-
-      const visibleTaskIds = new Set(
-        (await tasks.listTasks({ parentSessionId: context.sessionId, limit: mailboxTaskLimit(input) })).map((task) => task.id),
-      );
-      return messages.filter((message) => message.taskId && visibleTaskIds.has(message.taskId)).map(toSubagentMailboxRecord);
+      return messages
+        .filter((message) => mailboxMessageMatchesScope(
+          message,
+          visibleTaskIds,
+          visibleRecipientSessionIds,
+        ))
+        .filter((message) => (input.taskId ? message.taskId === input.taskId : true))
+        .filter((message) => (input.path ? message.path === input.path : true))
+        .slice(0, input.limit ?? 500)
+        .map(toSubagentMailboxRecord);
     },
     async consumeMailbox(input, context) {
       const message = (await agents.mailbox({ messageId: input.messageId, limit: 1 }))[0];
       if (!message?.taskId) throw new Error(`Mailbox message is not visible to this session: ${input.messageId}`);
       const task = await tasks.getTask(message.taskId);
-      if (task.parentSessionId !== context.sessionId) {
+      const visibleRecipients = new Set<SessionId>([context.sessionId]);
+      if (task.childSessionId) visibleRecipients.add(task.childSessionId);
+      if (
+        task.parentSessionId !== context.sessionId ||
+        (message.recipientSessionId !== undefined && !visibleRecipients.has(message.recipientSessionId))
+      ) {
         throw new Error(`Mailbox message is not visible to this session: ${input.messageId}`);
       }
       return toSubagentMailboxRecord(await agents.consumeMailbox({ messageId: input.messageId }));
@@ -982,15 +1410,246 @@ function createSubagentControlController(
   };
 }
 
-function createTeamToolController(teams: TeamControlService): TeamToolController {
+export function createCompleteTaskController(
+  tasks: AgentTaskControlService,
+  subagents: SubagentController,
+): SubagentController {
+  return {
+    spawnTask(input, context) {
+      return subagents.spawnTask(input, context);
+    },
+    async completeTask(input, context) {
+      const taskId = input.taskId as TaskId;
+      const task = await tasks.getTask(taskId);
+      const mappings = (await tasks.listTasks({ childSessionId: context.sessionId, limit: 2 }))
+        .filter((candidate) => candidate.childSessionId === context.sessionId);
+      if (
+        task.childSessionId !== context.sessionId ||
+        mappings.length !== 1 ||
+        mappings[0]?.id !== taskId
+      ) {
+        throw new Error(`Agent task cannot be completed by this session: ${taskId}`);
+      }
+      try {
+        return await tasks.completeTask(input);
+      } catch (error) {
+        if (error instanceof Error && error.name === "AgentTaskNotRunnableError") {
+          return subagents.completeTask(input, context);
+        }
+        throw error;
+      }
+    },
+  };
+}
+
+function createAgentMessageToolController(
+  tasks: AgentTaskControlService,
+  agents: AgentTreeControlService,
+  role: "root" | "child",
+): AgentMessageToolController {
+  return {
+    async sendAgentMessage(input, context) {
+      const sender = await resolveAgentMessageSender(
+        tasks,
+        role,
+        context.sessionId,
+        input.from,
+      );
+      const message = await agents.sendMessage({
+        ...(input.messageId ? { messageId: input.messageId } : {}),
+        from: sender,
+        to: input.to,
+        content: input.content,
+        delivery: input.delivery ?? "queueOnly",
+        ...(input.taskId ? { taskId: input.taskId as TaskId } : {}),
+        ...(input.metadata ? { metadata: input.metadata } : {}),
+        sessionId: context.sessionId,
+      });
+      return toAgentMessageRecord(message);
+    },
+    async listAgentMessages(input, context) {
+      await resolveAgentMessageSender(
+        tasks,
+        role,
+        context.sessionId,
+        undefined,
+      );
+      const visibleTasks = await listAgentMessageScopeTasks(tasks, context.sessionId);
+      const visibleTaskIds = new Set(visibleTasks.map((task) => task.id));
+      const visibleSessionIds = new Set<SessionId>([context.sessionId]);
+      for (const task of visibleTasks) {
+        if (task.childSessionId) visibleSessionIds.add(task.childSessionId);
+      }
+      const messages = await agents.mailbox({
+        ...(input.status ? { status: input.status } : {}),
+        ...(input.taskId ? { taskId: input.taskId as TaskId } : {}),
+        ...(input.path ? { path: input.path as AgentPath } : {}),
+        limit: Math.max(input.limit ?? 500, 1000),
+      });
+      return messages
+        .filter((message) => {
+          const taskMatches = message.taskId === undefined ? undefined : visibleTaskIds.has(message.taskId);
+          const sessionMatches = message.recipientSessionId === undefined
+            ? undefined
+            : visibleSessionIds.has(message.recipientSessionId);
+          if (taskMatches !== undefined && sessionMatches !== undefined) {
+            return taskMatches && sessionMatches;
+          }
+          return taskMatches ?? sessionMatches ?? false;
+        })
+        .filter((message) => (input.from ? message.fromPath === input.from : true))
+        .slice(0, input.limit ?? 500)
+        .map(toAgentMessageRecord);
+    },
+  };
+}
+
+async function resolveAgentMessageSender(
+  tasks: AgentTaskControlService,
+  role: "root" | "child",
+  sessionId: SessionId,
+  requested: string | undefined,
+): Promise<AgentPath> {
+  if (role === "root") {
+    const root = "/root" as AgentPath;
+    if (requested && requested !== root) {
+      throw new Error(`Agent message sender ${requested} does not match current agent ${root}`);
+    }
+    return root;
+  }
+
+  const ownTasks = await tasks.listTasks({ childSessionId: sessionId, limit: 1000 });
+  if (ownTasks.length === 0) {
+    throw new Error(`Agent message sender is unavailable for child session ${sessionId}`);
+  }
+  if (ownTasks.length > 1) {
+    throw new Error(`Agent message sender is ambiguous for session ${sessionId}: ${ownTasks.map((task) => task.id).join(", ")}`);
+  }
+  const inferred = ownTasks[0]?.path as AgentPath;
+  if (requested && requested !== inferred) {
+    throw new Error(`Agent message sender ${requested} does not match current agent ${inferred}`);
+  }
+  return inferred;
+}
+
+async function listAgentMessageScopeTasks(
+  tasks: AgentTaskControlService,
+  sessionId: SessionId,
+): Promise<AgentTaskRow[]> {
+  const allTasks = await tasks.listTasks({ limit: 2_147_483_647 });
+  const visible = new Map<TaskId, AgentTaskRow>();
+  const endpoints: SessionId[] = [sessionId];
+  const visitedEndpoints = new Set<SessionId>();
+
+  for (const task of allTasks) {
+    if (task.childSessionId === sessionId) {
+      visible.set(task.id, task);
+    }
+  }
+
+  for (let index = 0; index < endpoints.length; index += 1) {
+    const endpoint = endpoints[index] as SessionId;
+    if (visitedEndpoints.has(endpoint)) continue;
+    visitedEndpoints.add(endpoint);
+    for (const task of allTasks) {
+      if (task.parentSessionId !== endpoint) continue;
+      visible.set(task.id, task);
+      if (task.childSessionId) {
+        endpoints.push(task.childSessionId);
+      }
+    }
+  }
+
+  return [...visible.values()];
+}
+
+async function visibleTeamsForSession(
+  teams: TeamControlService,
+  sessionId: SessionId,
+): Promise<TeamRow[]> {
+  const allTeams = await teams.listTeams();
+  const visibility = await Promise.all(allTeams.map(async (team) => {
+    if (team.sessionId === sessionId) return true;
+    return (await teams.members(team.id)).some((member) => member.childSessionId === sessionId);
+  }));
+  return allTeams.filter((_team, index) => visibility[index]);
+}
+
+async function requireVisibleTeam(
+  teams: TeamControlService,
+  teamId: TeamId,
+  sessionId: SessionId,
+): Promise<TeamRow> {
+  const team = (await visibleTeamsForSession(teams, sessionId)).find((candidate) => candidate.id === teamId);
+  if (!team) throw new Error(`Team is not visible to this session: ${teamId}`);
+  return team;
+}
+
+async function requireTeamOwnerOrLead(
+  teams: TeamControlService,
+  teamId: TeamId,
+  sessionId: SessionId,
+): Promise<TeamRow> {
+  const team = (await teams.listTeams()).find((candidate) => candidate.id === teamId);
+  if (!team) throw new Error(`Team is not visible to this session: ${teamId}`);
+  if (team.sessionId === sessionId) return team;
+  const lead = (await teams.members(teamId)).find((member) => member.path === team.leadPath);
+  if (lead?.childSessionId !== sessionId) {
+    throw new Error(`Team membership cannot be changed by this session: ${teamId}`);
+  }
+  return team;
+}
+
+async function requireUniqueDescendantAgentTask(
+  tasks: AgentTaskControlService,
+  childSessionId: SessionId,
+  path: AgentPath,
+  parentSessionId: SessionId,
+): Promise<AgentTaskRow> {
+  if (childSessionId === parentSessionId) {
+    throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
+  }
+
+  const visited = new Set<SessionId>();
+  let endpoint = childSessionId;
+  let descendant: AgentTaskRow | undefined;
+  while (endpoint !== parentSessionId) {
+    if (visited.has(endpoint)) {
+      throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
+    }
+    visited.add(endpoint);
+    const mappings = (await tasks.listTasks({ childSessionId: endpoint, limit: 2 }))
+      .filter((task) => task.childSessionId === endpoint);
+    if (mappings.length !== 1) {
+      throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
+    }
+    const task = mappings[0] as AgentTaskRow;
+    descendant ??= task;
+    if (!task.parentSessionId) {
+      throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
+    }
+    endpoint = task.parentSessionId;
+  }
+
+  if (!descendant || descendant.path !== path) {
+    throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
+  }
+  return descendant;
+}
+
+export function createTeamToolController(
+  teams: TeamControlService,
+  tasks: AgentTaskControlService,
+  role: "root" | "child",
+): TeamToolController {
   return {
     async createTeam(input, context) {
+      const leadPath = await resolveAgentMessageSender(tasks, role, context.sessionId, input.leadPath);
       const createInput: Parameters<TeamControlService["createTeam"]>[0] = {
         name: input.name,
-        leadPath: input.leadPath as AgentPath,
+        leadPath,
         sessionId: context.sessionId,
       };
-      if (context.threadId) createInput.threadId = context.threadId;
       if (input.teamId) createInput.teamId = input.teamId as TeamId;
       if (input.description) createInput.description = input.description;
       if (input.leadName) createInput.leadName = input.leadName;
@@ -999,16 +1658,27 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       if (input.leadWriteScope) createInput.leadWriteScope = input.leadWriteScope;
       return toTeamRecord(await teams.createTeam(createInput));
     },
-    async listTeams(input) {
+    async listTeams(input, context) {
+      const visible = await visibleTeamsForSession(teams, context.sessionId);
       return limitItems(
-        (await teams.listTeams()).filter((team) => (input.status ? team.status === input.status : true)).map(toTeamRecord),
+        visible.filter((team) => (input.status ? team.status === input.status : true)).map(toTeamRecord),
         input.limit,
       );
     },
-    async snapshotTeam(input) {
+    async snapshotTeam(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       return toTeamSnapshotRecord(await teams.snapshot(input.teamId as TeamId));
     },
     async addMember(input, context) {
+      await requireTeamOwnerOrLead(teams, input.teamId as TeamId, context.sessionId);
+      if (input.childSessionId) {
+        await requireUniqueDescendantAgentTask(
+          tasks,
+          input.childSessionId as SessionId,
+          input.path as AgentPath,
+          context.sessionId,
+        );
+      }
       const addInput: Parameters<TeamControlService["addMember"]>[0] = {
         teamId: input.teamId as TeamId,
         path: input.path as AgentPath,
@@ -1016,16 +1686,15 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
         role: input.role,
         sessionId: context.sessionId,
       };
-      if (context.threadId) addInput.threadId = context.threadId;
       if (input.status) addInput.status = input.status;
       if (input.childSessionId) addInput.childSessionId = input.childSessionId as SessionId;
-      if (input.childThreadId) addInput.childThreadId = input.childThreadId as ThreadId;
       if (input.model) addInput.model = input.model;
       if (input.toolScope) addInput.toolScope = input.toolScope;
       if (input.writeScope) addInput.writeScope = input.writeScope;
       return toTeamMemberRecord(await teams.addMember(addInput));
     },
-    async listMembers(input) {
+    async listMembers(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       return limitItems(
         (await teams.members(input.teamId as TeamId))
           .filter((member) => (input.status ? member.status === input.status : true))
@@ -1034,12 +1703,12 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       );
     },
     async createTask(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const createInput: Parameters<TeamControlService["createTask"]>[0] = {
         teamId: input.teamId as TeamId,
         title: input.title,
         sessionId: context.sessionId,
       };
-      if (context.threadId) createInput.threadId = context.threadId;
       if (input.taskId) createInput.taskId = input.taskId as TaskId;
       if (input.description) createInput.description = input.description;
       if (input.createdBy) createInput.createdBy = input.createdBy as AgentPath;
@@ -1049,7 +1718,8 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       if (input.metadata) createInput.metadata = input.metadata;
       return toTeamTaskRecord(await teams.createTask(createInput));
     },
-    async listTasks(input) {
+    async listTasks(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       return limitItems(
         (await teams.tasks(input.teamId as TeamId))
           .filter((task) => (input.status ? task.status === input.status : true))
@@ -1059,13 +1729,13 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       );
     },
     async assignTask(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const assignInput: Parameters<TeamControlService["assignTask"]>[0] = {
         teamId: input.teamId as TeamId,
         taskId: input.taskId as TaskId,
         ownerPath: input.ownerPath as AgentPath,
         sessionId: context.sessionId,
       };
-      if (context.threadId) assignInput.threadId = context.threadId;
       if (input.assignedBy) assignInput.assignedBy = input.assignedBy as AgentPath;
       if (input.message) assignInput.message = input.message;
       if (input.messageDelivery) assignInput.messageDelivery = input.messageDelivery;
@@ -1073,13 +1743,13 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       return toTeamTaskRecord(await teams.assignTask(assignInput));
     },
     async claimTask(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const claimInput: Parameters<TeamControlService["claimTask"]>[0] = {
         teamId: input.teamId as TeamId,
         taskId: input.taskId as TaskId,
         ownerPath: input.ownerPath as AgentPath,
         sessionId: context.sessionId,
       };
-      if (context.threadId) claimInput.threadId = context.threadId;
       if (input.claimedBy) claimInput.claimedBy = input.claimedBy as AgentPath;
       const claim = await teams.claimTask(claimInput);
       const result: TeamTaskClaimRecord = { applied: claim.applied };
@@ -1088,12 +1758,13 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       return result;
     },
     async updateTask(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const updateInput: Parameters<TeamControlService["updateTask"]>[0] = {
         teamId: input.teamId as TeamId,
         taskId: input.taskId as TaskId,
         sessionId: context.sessionId,
       };
-      if (context.threadId) updateInput.threadId = context.threadId;
+      if (role === "child") updateInput.actorScope = "scoped_worker";
       if (input.status) updateInput.status = input.status;
       if (input.ownerPath) updateInput.ownerPath = input.ownerPath as AgentPath;
       if (input.title) updateInput.title = input.title;
@@ -1105,6 +1776,7 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       return toTeamTaskRecord(await teams.updateTask(updateInput));
     },
     async sendMessage(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const messageInput: Parameters<TeamControlService["sendMessage"]>[0] = {
         teamId: input.teamId as TeamId,
         from: input.from as AgentPath,
@@ -1112,7 +1784,6 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
         content: input.content,
         sessionId: context.sessionId,
       };
-      if (context.threadId) messageInput.threadId = context.threadId;
       if (input.messageId) messageInput.messageId = input.messageId;
       if (input.kind) messageInput.kind = input.kind;
       if (input.delivery) messageInput.delivery = input.delivery;
@@ -1121,7 +1792,8 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       if (input.metadata) messageInput.metadata = input.metadata;
       return toTeamMessageRecord(await teams.sendMessage(messageInput));
     },
-    async listMessages(input) {
+    async listMessages(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       return limitItems(
         (await teams.messages(input.teamId as TeamId))
           .filter((message) => (input.path ? message.fromPath === input.path || message.toPath === input.path || message.toPath === "*" : true))
@@ -1133,9 +1805,13 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
   };
 }
 
-function createTeamTaskDispatchToolController(dispatcher: TeamTaskDispatchService): TeamTaskDispatchToolController {
+function createTeamTaskDispatchToolController(
+  dispatcher: TeamTaskDispatchService,
+  teams: TeamControlService,
+): TeamTaskDispatchToolController {
   return {
     async dispatchTask(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const dispatchInput: Parameters<TeamTaskDispatchService["dispatchTask"]>[0] = {
         teamId: input.teamId as TeamId,
         taskId: input.taskId as TaskId,
@@ -1143,26 +1819,55 @@ function createTeamTaskDispatchToolController(dispatcher: TeamTaskDispatchServic
         cwd: context.cwd,
         signal: context.signal,
       };
-      if (context.threadId) dispatchInput.threadId = context.threadId;
       if (input.ownerPath) dispatchInput.ownerPath = input.ownerPath as AgentPath;
       if (input.mode) dispatchInput.mode = input.mode;
       if (input.prompt) dispatchInput.prompt = input.prompt;
+      if (input.sourceCallId !== undefined) dispatchInput.sourceCallId = input.sourceCallId;
+      if (input.batchId !== undefined) dispatchInput.batchId = input.batchId;
+      if (input.batchIndex !== undefined) dispatchInput.batchIndex = input.batchIndex;
+      if (input.expectedBatchSize !== undefined) dispatchInput.expectedBatchSize = input.expectedBatchSize;
+      if (input.maxConcurrency !== undefined) dispatchInput.maxConcurrency = input.maxConcurrency;
       return toTeamTaskDispatchRecord(await dispatcher.dispatchTask(dispatchInput));
     },
     async syncTask(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const syncInput: Parameters<TeamTaskDispatchService["syncTask"]>[0] = {
         teamId: input.teamId as TeamId,
         taskId: input.taskId as TaskId,
         sessionId: context.sessionId,
       };
-      if (context.threadId) syncInput.threadId = context.threadId;
       return toTeamTaskSyncRecord(await dispatcher.syncTask(syncInput));
     },
     async reconcileTasks(input, context) {
+      if (input.teamId) {
+        await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
+      } else {
+        const visibleTeams = (await visibleTeamsForSession(teams, context.sessionId))
+          .filter((team) => team.status === "active");
+        const reconciled: TeamTaskReconcileRecord = {
+          scanned: 0,
+          synced: [],
+          skipped: [],
+          errors: [],
+        };
+        const limit = input.limit ?? 500;
+        for (const team of visibleTeams) {
+          if (reconciled.scanned >= limit) break;
+          const result = toTeamTaskReconcileRecord(await dispatcher.reconcileTasks({
+            teamId: team.id,
+            sessionId: context.sessionId,
+            limit: limit - reconciled.scanned,
+          }));
+          reconciled.scanned += result.scanned;
+          reconciled.synced.push(...result.synced);
+          reconciled.skipped.push(...result.skipped);
+          reconciled.errors.push(...result.errors);
+        }
+        return reconciled;
+      }
       const reconcileInput: Parameters<TeamTaskDispatchService["reconcileTasks"]>[0] = {
         sessionId: context.sessionId,
       };
-      if (context.threadId) reconcileInput.threadId = context.threadId;
       if (input.teamId) reconcileInput.teamId = input.teamId as TeamId;
       if (input.limit !== undefined) reconcileInput.limit = input.limit;
       return toTeamTaskReconcileRecord(await dispatcher.reconcileTasks(reconcileInput));
@@ -1170,9 +1875,13 @@ function createTeamTaskDispatchToolController(dispatcher: TeamTaskDispatchServic
   };
 }
 
-function createTeamRunLoopToolController(teamRunner: TeamExecutionRunner): TeamRunLoopToolController {
+function createTeamRunLoopToolController(
+  teamRunner: TeamExecutionRunner,
+  teams: TeamControlService,
+): TeamRunLoopToolController {
   return {
     async runTeam(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const runInput: Parameters<TeamExecutionRunner["run"]>[0] = {
         teamId: input.teamId as TeamId,
         sessionId: context.sessionId,
@@ -1180,7 +1889,6 @@ function createTeamRunLoopToolController(teamRunner: TeamExecutionRunner): TeamR
         once: input.once ?? true,
         signal: context.signal,
       };
-      if (context.threadId) runInput.threadId = context.threadId;
       if (input.mode) runInput.mode = input.mode;
       if (input.maxCycles !== undefined) runInput.maxCycles = input.maxCycles;
       if (input.timeoutMs !== undefined) runInput.timeoutMs = input.timeoutMs;
@@ -1196,6 +1904,35 @@ function mailboxTaskLimit(input: MailboxListToolInput): number {
   return Math.max(input.limit ?? 500, 500);
 }
 
+async function requireVisibleAgentTask(
+  tasks: AgentTaskControlService,
+  taskId: TaskId,
+  sessionId: SessionId,
+): Promise<AgentTaskRow> {
+  const task = await tasks.getTask(taskId);
+  if (task.parentSessionId !== sessionId) {
+    throw new Error(`Agent task is not visible to this session: ${taskId}`);
+  }
+  return task;
+}
+
+function mailboxMessageMatchesScope(
+  message: AgentMailboxRow,
+  visibleTaskIds: ReadonlySet<TaskId>,
+  visibleRecipientSessionIds: ReadonlySet<SessionId>,
+): boolean {
+  const taskMatches = message.taskId === undefined
+    ? undefined
+    : visibleTaskIds.has(message.taskId);
+  const recipientMatches = message.recipientSessionId === undefined
+    ? undefined
+    : visibleRecipientSessionIds.has(message.recipientSessionId);
+  if (taskMatches !== undefined && recipientMatches !== undefined) {
+    return taskMatches && recipientMatches;
+  }
+  return taskMatches ?? recipientMatches ?? false;
+}
+
 function toSubagentTaskRecord(task: AgentTaskRow): SubagentTaskRecord {
   return {
     taskId: task.id,
@@ -1206,7 +1943,6 @@ function toSubagentTaskRecord(task: AgentTaskRow): SubagentTaskRecord {
     generation: task.generation,
     ...(task.currentRunId ? { currentRunId: task.currentRunId } : {}),
     ...(task.childSessionId ? { childSessionId: task.childSessionId } : {}),
-    ...(task.childThreadId ? { childThreadId: task.childThreadId } : {}),
     ...(task.summary ? { summary: task.summary } : {}),
     ...(task.error ? { error: task.error } : {}),
     createdAt: task.createdAt,
@@ -1223,9 +1959,26 @@ function toSubagentMailboxRecord(message: AgentMailboxRow): SubagentMailboxRecor
     status: message.status,
     triggerTurn: message.triggerTurn,
     ...(message.taskId ? { taskId: message.taskId } : {}),
-    ...(message.childSessionId ? { childSessionId: message.childSessionId } : {}),
-    ...(message.childThreadId ? { childThreadId: message.childThreadId } : {}),
+    ...(message.recipientSessionId ? { recipientSessionId: message.recipientSessionId } : {}),
     ...(message.message ? { message: message.message } : {}),
+    createdAt: message.createdAt,
+    ...(message.consumedAt ? { consumedAt: message.consumedAt } : {}),
+  };
+}
+
+function toAgentMessageRecord(message: AgentMailboxRow): AgentMessageRecord {
+  const content = message.message && "content" in message.message ? message.message.content : undefined;
+  const metadata = message.message?.metadata;
+  return {
+    messageId: message.id,
+    fromPath: message.fromPath,
+    toPath: message.path,
+    delivery: message.triggerTurn ? "triggerTurn" : "queueOnly",
+    status: message.status,
+    ...(message.taskId ? { taskId: message.taskId } : {}),
+    ...(message.recipientSessionId ? { recipientSessionId: message.recipientSessionId } : {}),
+    ...(content ? { content } : {}),
+    ...(metadata ? { metadata } : {}),
     createdAt: message.createdAt,
     ...(message.consumedAt ? { consumedAt: message.consumedAt } : {}),
   };
@@ -1287,7 +2040,6 @@ function toTeamMemberRecord(member: TeamMemberRow): TeamMemberRecord {
     role: member.role,
     status: member.status,
     ...(member.childSessionId ? { childSessionId: member.childSessionId } : {}),
-    ...(member.childThreadId ? { childThreadId: member.childThreadId } : {}),
     ...(member.model ? { model: member.model } : {}),
     ...(member.toolScope ? { toolScope: member.toolScope } : {}),
     ...(member.writeScope ? { writeScope: member.writeScope } : {}),
@@ -1387,7 +2139,6 @@ function toTeamDispatchAgentTaskRecord(task: TeamDispatchAgentTaskLike): TeamDis
   const runId = task.runId ?? task.currentRunId;
   if (runId) record.runId = runId;
   if (task.childSessionId) record.childSessionId = task.childSessionId;
-  if (task.childThreadId) record.childThreadId = task.childThreadId;
   if (task.summary) record.summary = task.summary;
   const error = task.error;
   if (error) record.error = error instanceof Error ? error.message : error;
@@ -1425,7 +2176,6 @@ function toTeamMessageDeliveryRecord(
     status: delivery.status,
     triggerTurn: delivery.triggerTurn,
     ...(delivery.childSessionId ? { childSessionId: delivery.childSessionId } : {}),
-    ...(delivery.childThreadId ? { childThreadId: delivery.childThreadId } : {}),
     ...(delivery.error ? { error: delivery.error } : {}),
     queuedAt: delivery.queuedAt,
     updatedAt: delivery.updatedAt,
@@ -1451,7 +2201,6 @@ type TeamDispatchAgentTaskLike = (
   runId?: string;
   currentRunId?: string;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   status: string;
   summary?: string;
   error?: string | Error;

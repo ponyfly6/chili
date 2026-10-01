@@ -1,5 +1,6 @@
 import { decodePasteBytes, stripAnsiSequences } from "@opentui/core";
 import { execFile, spawn } from "node:child_process";
+import type { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, isAbsolute, join } from "node:path";
@@ -10,6 +11,10 @@ const CLIPBOARD_TIMEOUT_MS = 1200;
 const CLIPBOARD_MAX_BUFFER = 32 * 1024 * 1024;
 const CLIPBOARD_MAX_APPLESCRIPT_BUFFER = CLIPBOARD_MAX_BUFFER * 3;
 const IMAGE_EXTENSION_REGEX = /\.(png|jpe?g|gif|webp)$/i;
+type ClipboardProcessEvents = Pick<EventEmitter<{
+  error: [error: Error];
+  close: [code: number | null, signal: NodeJS.Signals | null];
+}>, "on">;
 const MIME_BY_EXTENSION: Record<string, string> = {
   ".gif": "image/gif",
   ".jpeg": "image/jpeg",
@@ -371,6 +376,7 @@ function isJpeg(bytes: Uint8Array): boolean {
 async function writeToCommand(command: string, args: string[], text: string): Promise<boolean> {
   return new Promise((resolve) => {
     const child = spawn(command, args, { stdio: ["pipe", "ignore", "ignore"] });
+    const events = child as typeof child & ClipboardProcessEvents;
     let settled = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const finish = (ok: boolean) => {
@@ -384,10 +390,10 @@ async function writeToCommand(command: string, args: string[], text: string): Pr
       finish(false);
     }, CLIPBOARD_TIMEOUT_MS);
 
-    child.on("error", () => {
+    events.on("error", () => {
       finish(false);
     });
-    child.on("close", (code) => {
+    events.on("close", (code) => {
       finish(code === 0);
     });
     child.stdin.on("error", () => finish(false));
@@ -398,6 +404,7 @@ async function writeToCommand(command: string, args: string[], text: string): Pr
 async function readBinaryCommand(command: string, args: string[]): Promise<Buffer | undefined> {
   return new Promise((resolve) => {
     const child = spawn(command, args, { stdio: ["ignore", "pipe", "ignore"] });
+    const events = child as typeof child & ClipboardProcessEvents;
     const chunks: Buffer[] = [];
     let bytes = 0;
     let settled = false;
@@ -424,8 +431,8 @@ async function readBinaryCommand(command: string, args: string[]): Promise<Buffe
       }
       chunks.push(chunk);
     });
-    child.on("error", () => finish(undefined));
-    child.on("close", (code) => {
+    events.on("error", () => finish(undefined));
+    events.on("close", (code) => {
       if (code !== 0 || chunks.length === 0) {
         finish(undefined);
         return;

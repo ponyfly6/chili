@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, relative, resolve } from "node:path";
+import { dirname } from "node:path";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
+import { assertDirectWritablePathInsideWorkspace, resolveWorkspacePath } from "../workspace-path.js";
 
 export interface EditInput {
   filePath: string;
@@ -84,14 +85,16 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
       };
     },
     async execute(input, context) {
-      const workspace = resolve(context.cwd);
+      const workspace = context.cwd;
       const target = resolveWorkspacePath(workspace, input.filePath);
+      await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
       const existing = await readTextIfExists(target.absolutePath);
 
       if (input.oldString === "") {
         if (existing !== undefined) {
           await context.fileReads?.assertFresh(workspace, target.absolutePath);
         }
+        await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
         await mkdir(dirname(target.absolutePath), { recursive: true });
         await writeFile(target.absolutePath, input.newString, "utf8");
         await context.fileReads?.recordTextRead(workspace, target.absolutePath, input.newString);
@@ -124,6 +127,7 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
       }
 
       const next = input.replaceAll ? existing.split(oldString).join(newString) : existing.replace(oldString, newString);
+      await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
       await writeFile(target.absolutePath, next, "utf8");
       await context.fileReads?.recordTextRead(workspace, target.absolutePath, next);
 
@@ -137,24 +141,6 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
       };
     },
   };
-}
-
-interface WorkspacePath {
-  absolutePath: string;
-  relativePath: string;
-}
-
-function resolveWorkspacePath(workspace: string, path: string): WorkspacePath {
-  const absolutePath = resolve(workspace, path);
-  const relativePath = relative(workspace, absolutePath);
-  if (!isSafeRelativePath(relativePath)) {
-    throw new Error(`Path must stay inside the workspace: ${path}`);
-  }
-  return { absolutePath, relativePath };
-}
-
-function isSafeRelativePath(path: string): boolean {
-  return path.length > 0 && !path.startsWith("/") && !path.split(/[\\/]/).includes("..");
 }
 
 async function readTextIfExists(path: string): Promise<string | undefined> {

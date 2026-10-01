@@ -27,7 +27,6 @@ export interface McpResourceReadResult {
 
 export interface McpToolControllerContext {
   sessionId: ChiliToolExecutionContext["sessionId"];
-  threadId?: ChiliToolExecutionContext["threadId"];
   turnId: ChiliToolExecutionContext["turnId"];
   callId: ChiliToolExecutionContext["callId"];
   cwd: string;
@@ -135,7 +134,6 @@ function mcpControllerContext(context: ChiliToolExecutionContext): McpToolContro
     cwd: context.cwd,
     signal: context.signal,
   };
-  if (context.threadId !== undefined) controllerContext.threadId = context.threadId;
   return controllerContext;
 }
 

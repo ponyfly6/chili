@@ -5,6 +5,7 @@ import type {
   ChatSessionView,
   ChatToolCallRow,
   ChatToolDisplayStatus,
+  ChatToolExecutionContext,
   ChatToolInputSummary,
   ChatTranscriptItem,
   RuntimeToolOutputDelta,
@@ -13,19 +14,29 @@ import {
   explorationToolKind,
   inputSummaryFromUnknown,
   isExplorationTool,
+  isNoMatchOutput,
   renderToolActivity,
   type ToolActivityDetail,
   type ToolRenderBodyKind,
   type ToolRenderMode,
 } from "./tool-renderers.js";
+import type { InlineAgentBatchDisplay } from "./AgentBatchCells.js";
+import { publicSyntheticAssistantText } from "./public-error.js";
 
 export type ChatDisplayItem =
-  | { kind: "user_text"; id: string; text: string; time?: number }
-  | { kind: "user_image"; id: string; label: string; time?: number }
-  | { kind: "assistant_text"; id: string; text: string; streaming?: boolean; time?: number }
+  | { kind: "user_message"; id: string; text: string; imageLabels: string[]; time?: number }
+  | {
+      kind: "assistant_text";
+      id: string;
+      text: string;
+      phase?: Extract<ChatMessagePart, { type: "text" }>["phase"];
+      streaming?: boolean;
+      time?: number;
+    }
   | { kind: "reasoning"; id: string; text: string; collapsed: true; active?: boolean; time?: number }
   | { kind: "tool_activity"; id: string; activity: ToolActivityDisplay; time?: number }
   | { kind: "tool_group"; id: string; label: string; tone: ToolActivityTone; metadata: ToolGroupMetadata; activities: ToolActivityDisplay[]; time?: number }
+  | { kind: "agent_batch"; id: string; batch: InlineAgentBatchDisplay; time?: number }
   | { kind: "approval"; id: string; approval: ChatApprovalRow; time?: number }
   | { kind: "summary"; id: string; text: string; time?: number };
 
@@ -51,6 +62,7 @@ export interface ToolActivityDisplay {
   input?: unknown;
   output?: string;
   error?: string;
+  executionContext?: ChatToolExecutionContext;
   liveOutput?: RuntimeToolOutputDelta[];
   outputHint?: string;
   compactErrorLines?: string[];
@@ -65,6 +77,8 @@ export interface ToolGroupMetadata {
   listCount: number;
   activeCount: number;
   errorCount: number;
+  failedCount: number;
+  compactFailureLines?: string[];
 }
 
 interface BuildOptions {
@@ -73,6 +87,8 @@ interface BuildOptions {
   sessionStatus?: ChatSessionView["status"];
   activeToolCount?: number;
   groupExplorationTools?: boolean;
+  cwd?: string;
+  agentBatches?: readonly InlineAgentBatchDisplay[];
 }
 
 interface ToolCallPartInfo {
@@ -82,9 +98,12 @@ interface ToolCallPartInfo {
 
 export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], options: BuildOptions = {}): ChatDisplayItem[] {
   const showToolDetails = options.showToolDetails === true;
+  const cwd = options.cwd ?? process.cwd();
   const streamingMessageId = streamingAssistantMessageId(items, options);
   const toolRowsById = new Set<string>();
   const toolCallParts = new Map<string, ToolCallPartInfo>();
+  const agentBatchesByCallId = new Map((options.agentBatches ?? []).flatMap((batch) => batch.callId ? [[batch.callId, batch] as const] : []));
+  const renderedAgentBatchIds = new Set<string>();
 
   for (const item of items) {
     if (item.kind === "tool") {
@@ -104,14 +123,20 @@ export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], opti
   const output: ChatDisplayItem[] = [];
   for (const item of items) {
     if (item.kind === "message") {
-      output.push(...messageDisplayItems(item, toolRowsById, toolCallParts, showToolDetails, options.hideThinking === true, item.id === streamingMessageId));
+      output.push(...messageDisplayItems(item, toolRowsById, toolCallParts, showToolDetails, options.hideThinking === true, item.id === streamingMessageId, cwd));
       continue;
     }
     if (item.kind === "tool") {
+      const agentBatch = agentBatchesByCallId.get(item.id);
+      if (agentBatch && isAgentSpawnToolName(item.toolName)) {
+        output.push({ kind: "agent_batch", id: `agent-batch:${agentBatch.id}`, batch: agentBatch, time: agentBatch.createdAt });
+        renderedAgentBatchIds.add(agentBatch.id);
+        continue;
+      }
       output.push({
         kind: "tool_activity",
         id: `tool:${item.id}`,
-        activity: toolActivityFromRow(item, showToolDetails),
+        activity: toolActivityFromRow(item, showToolDetails, cwd),
         time: item.updatedAt,
       });
       continue;
@@ -119,7 +144,31 @@ export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], opti
     output.push({ kind: "approval", id: `approval:${item.id}`, approval: item, time: item.resolvedAt ?? item.createdAt });
   }
 
+  for (const batch of options.agentBatches ?? []) {
+    if (renderedAgentBatchIds.has(batch.id)) continue;
+    const sourceCallStillVisible = batch.callId ? toolCallParts.has(batch.callId) : false;
+    const lifecycleActive = batch.counts.active > 0 || batch.status === "pending" || batch.status === "running";
+    if (batch.kind !== "team" && !sourceCallStillVisible && !lifecycleActive) continue;
+    output.push({ kind: "agent_batch", id: `agent-batch:${batch.id}`, batch, time: batch.createdAt });
+  }
+
+  output.sort((left, right) => displayItemTime(left) - displayItemTime(right));
+
   return options.groupExplorationTools === false ? output : groupExplorationTools(output);
+}
+
+function isAgentSpawnToolName(toolName: string): boolean {
+  const name = toolName.toLowerCase().replace(/^tool\./, "");
+  return name === "task"
+    || name === "agent"
+    || name === "task_batch"
+    || name === "agent_batch"
+    || name === "spawn_tasks"
+    || name === "spawn_agents";
+}
+
+function displayItemTime(item: ChatDisplayItem): number {
+  return typeof item.time === "number" && Number.isFinite(item.time) ? item.time : Number.MAX_SAFE_INTEGER;
 }
 
 function messageDisplayItems(
@@ -129,11 +178,24 @@ function messageDisplayItems(
   showToolDetails: boolean,
   hideThinking: boolean,
   streaming: boolean,
+  cwd: string,
 ): ChatDisplayItem[] {
+  if (message.role === "user") {
+    const text = message.parts
+      .filter((part): part is Extract<ChatMessagePart, { type: "text" }> => part.type === "text")
+      .map((part) => part.text)
+      .join("\n")
+      .trimEnd();
+    const imageLabels = message.parts.flatMap((part) => {
+      if (part.type !== "image") return [];
+      return [part.displayText ?? part.sourcePath ?? part.filename ?? part.mimeType];
+    });
+    if (!text && imageLabels.length === 0) return [];
+    return [{ kind: "user_message", id: message.id, text, imageLabels, time: message.createdAt }];
+  }
+
   const output: ChatDisplayItem[] = [];
-  const streamingTextPartIndex = streaming ? lastTextPartIndex(message.parts) : -1;
-  const hideStreamingAssistantText = hideThinking && message.role === "assistant" && streaming;
-  const hideAssistantTrace = hideThinking && message.role === "assistant" && (hideStreamingAssistantText || message.parts.some((part) => part.type === "tool_call"));
+  const hideAssistantThinking = hideThinking && message.role === "assistant";
   let hiddenTraceShown = false;
   const showHiddenTrace = (active: boolean) => {
     if (hiddenTraceShown) return;
@@ -144,24 +206,32 @@ function messageDisplayItems(
   for (const [index, part] of message.parts.entries()) {
     const id = `${message.id}:${part.id}:${index}`;
     if (part.type === "text") {
-      if (hideAssistantTrace && part.text.trim()) {
-        showHiddenTrace(hideStreamingAssistantText);
+      if (hideAssistantThinking && part.phase === "commentary") {
+        if (part.text.trim()) showHiddenTrace(streaming);
         continue;
       }
-      if (message.role === "user") output.push({ kind: "user_text", id, text: part.text, time: message.createdAt });
-      else if (message.role === "assistant") output.push({ kind: "assistant_text", id, text: part.text, time: message.createdAt, ...(index === streamingTextPartIndex ? { streaming: true } : {}) });
+      if (message.role === "assistant") {
+        output.push({
+          kind: "assistant_text",
+          id,
+          text: publicSyntheticAssistantText(part.text, part.synthetic),
+          time: message.createdAt,
+          ...(part.phase === undefined ? {} : { phase: part.phase }),
+          ...(streaming ? { streaming: true } : {}),
+        });
+      }
       else output.push({ kind: "summary", id, text: `${message.role}: ${part.text}`, time: message.createdAt });
       continue;
     }
     if (part.type === "image") {
       const label = part.displayText ?? part.sourcePath ?? part.filename ?? part.mimeType;
-      if (message.role === "user") output.push({ kind: "user_image", id, label, time: message.createdAt });
-      else output.push({ kind: "summary", id, text: `image: ${label}`, time: message.createdAt });
+      output.push({ kind: "summary", id, text: `image: ${label}`, time: message.createdAt });
       continue;
     }
     if (part.type === "reasoning") {
-      if (hideAssistantTrace) {
-        if (part.text.trim()) showHiddenTrace(hideStreamingAssistantText);
+      if (!part.text.trim()) continue;
+      if (hideAssistantThinking) {
+        if (part.text.trim()) showHiddenTrace(streaming);
         continue;
       }
       output.push({ kind: "reasoning", id, text: part.text, collapsed: true, time: message.createdAt, ...(streaming ? { active: true } : {}) });
@@ -176,7 +246,7 @@ function messageDisplayItems(
         output.push({
           kind: "tool_activity",
           id: `tool-result:${id}`,
-          activity: fallbackToolResultActivity(part, toolCallParts.get(part.callId), showToolDetails),
+          activity: fallbackToolResultActivity(part, toolCallParts.get(part.callId), showToolDetails, cwd),
           time: message.createdAt,
         });
       }
@@ -189,7 +259,7 @@ function messageDisplayItems(
   return output;
 }
 
-function toolActivityFromRow(row: ChatToolCallRow, showToolDetails: boolean): ToolActivityDisplay {
+function toolActivityFromRow(row: ChatToolCallRow, showToolDetails: boolean, cwd: string): ToolActivityDisplay {
   return toolActivity({
     id: row.id,
     callId: row.id,
@@ -198,10 +268,12 @@ function toolActivityFromRow(row: ChatToolCallRow, showToolDetails: boolean): To
     displayStatus: row.displayStatus,
     source: "row",
     inputSummary: row.inputSummary,
+    cwd,
     showToolDetails,
     ...(row.input === undefined ? {} : { input: row.input }),
     ...(row.output === undefined ? {} : { output: row.output }),
     ...(row.error === undefined ? {} : { error: row.error }),
+    ...(row.executionContext === undefined ? {} : { executionContext: row.executionContext }),
     ...(row.liveOutput === undefined ? {} : { liveOutput: row.liveOutput }),
   });
 }
@@ -210,21 +282,32 @@ function fallbackToolResultActivity(
   part: Extract<ChatMessagePart, { type: "tool_result" }>,
   call: ToolCallPartInfo | undefined,
   showToolDetails: boolean,
+  cwd: string,
 ): ToolActivityDisplay {
   const toolName = call?.toolName ?? "tool";
+  const failed = Boolean(part.error) || failedExecutionContext(part.executionContext);
   return toolActivity({
     id: part.callId,
     callId: part.callId,
     toolName,
-    status: part.error ? "failed" : "completed",
-    displayStatus: part.error ? "failed" : "succeeded",
+    status: failed ? "failed" : "completed",
+    displayStatus: failed ? "failed" : "succeeded",
     source: "fallback",
     inputSummary: inputSummaryFromUnknown(toolName, call?.input),
+    cwd,
     output: part.output,
     showToolDetails,
     ...(call?.input === undefined ? {} : { input: call.input }),
     ...(part.error === undefined ? {} : { error: part.error }),
+    ...(part.executionContext === undefined ? {} : { executionContext: part.executionContext }),
   });
+}
+
+function failedExecutionContext(context: ChatToolExecutionContext | undefined): boolean {
+  return context?.timedOut === true
+    || context?.aborted === true
+    || (typeof context?.exitCode === "number" && context.exitCode !== 0)
+    || (typeof context?.signal === "string" && context.signal.length > 0);
 }
 
 function toolActivity(input: {
@@ -235,10 +318,12 @@ function toolActivity(input: {
   displayStatus: ChatToolDisplayStatus;
   source: "row" | "fallback";
   showToolDetails: boolean;
+  cwd?: string;
   inputSummary?: ChatToolInputSummary;
   input?: unknown;
   output?: string;
   error?: string;
+  executionContext?: ChatToolExecutionContext;
   liveOutput?: RuntimeToolOutputDelta[];
 }): ToolActivityDisplay {
   const summary = input.inputSummary ?? inputSummaryFromUnknown(input.toolName, input.input);
@@ -251,9 +336,11 @@ function toolActivity(input: {
     source: input.source,
     inputSummary: summary,
     showToolDetails: input.showToolDetails,
+    ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
     ...(input.input === undefined ? {} : { input: input.input }),
     ...(input.output === undefined ? {} : { output: input.output }),
     ...(input.error === undefined ? {} : { error: input.error }),
+    ...(input.executionContext === undefined ? {} : { executionContext: input.executionContext }),
     ...(input.liveOutput === undefined ? {} : { liveOutput: input.liveOutput }),
   });
 
@@ -277,6 +364,7 @@ function toolActivity(input: {
     ...(input.input === undefined ? {} : { input: input.input }),
     ...(input.output === undefined ? {} : { output: input.output }),
     ...(input.error === undefined ? {} : { error: input.error }),
+    ...(input.executionContext === undefined ? {} : { executionContext: input.executionContext }),
     ...(input.liveOutput === undefined ? {} : { liveOutput: input.liveOutput }),
     ...(rendered.outputHint === undefined ? {} : { outputHint: rendered.outputHint }),
     ...(rendered.compactErrorLines === undefined ? {} : { compactErrorLines: rendered.compactErrorLines }),
@@ -310,7 +398,11 @@ export function groupExplorationTools(items: readonly ChatDisplayItem[]): ChatDi
   };
 
   for (const item of items) {
-    if (item.kind === "tool_activity" && isExplorationTool(item.activity.toolName)) {
+    if (
+      item.kind === "tool_activity"
+      && isExplorationTool(item.activity.toolName)
+      && item.activity.displayStatus === "succeeded"
+    ) {
       pending.push(item);
       continue;
     }
@@ -330,16 +422,34 @@ function explorationGroupLabel(activities: readonly ToolActivityDisplay[]): stri
   if (searches > 0) parts.push(`searched ${searches} ${plural(searches, "pattern", "patterns")}`);
   if (lists > 0) parts.push(`listed ${lists} ${plural(lists, "path", "paths")}`);
   const verb = activities.some((activity) => activity.tone === "pending") ? "Exploring" : "Explored";
-  const suffix = activities.some((activity) => activity.tone === "error") ? " with errors" : "";
+  const statusParts = [
+    noMatchStatus(activities),
+    countStatus(activities, "failed", "failed"),
+    countStatus(activities, "rejected", "rejected"),
+    countStatus(activities, "cancelled", "cancelled"),
+  ].filter((part): part is string => part !== undefined);
+  const suffix = statusParts.length > 0 ? ` · ${statusParts.join(", ")}` : "";
   return parts.length > 0 ? `${verb} ${parts.join(", ")}${suffix}` : `${verb} ${activities.length} tools${suffix}`;
+}
+
+function noMatchStatus(activities: readonly ToolActivityDisplay[]): string | undefined {
+  const count = activities.filter((activity) => isNoMatchOutput(activity.output)).length;
+  if (count === 0) return undefined;
+  return count === 1 ? "No matches" : `${count} no-match results`;
 }
 
 function explorationGroupMetadata(activities: readonly ToolActivityDisplay[]): ToolGroupMetadata {
   const active = activities.filter((activity) => activity.tone === "pending");
   const errors = activities.filter((activity) => activity.tone === "error");
+  const failed = activities.filter((activity) => activity.displayStatus === "failed");
   const readCount = activities.filter((activity) => explorationToolKind(activity.toolName) === "read").length;
   const searchCount = activities.filter((activity) => explorationToolKind(activity.toolName) === "search").length;
   const listCount = activities.filter((activity) => explorationToolKind(activity.toolName) === "list").length;
+  const compactFailureLines = failed.flatMap((activity) => activity.compactErrorLines ?? []).slice(0, 1);
+  if (compactFailureLines[0]) {
+    if (failed.length === 1) compactFailureLines[0] = `${compactFailureLines[0]} (Ctrl+O for details)`;
+    else compactFailureLines.push(`+${failed.length - 1} more failures (Ctrl+O for details)`);
+  }
   return {
     ...(active.length > 0 ? { activeHint: active.length === 1 ? active[0]?.label ?? "Tool running" : `${active.length} tools running` } : {}),
     hasErrors: errors.length > 0,
@@ -349,7 +459,14 @@ function explorationGroupMetadata(activities: readonly ToolActivityDisplay[]): T
     listCount,
     activeCount: active.length,
     errorCount: errors.length,
+    failedCount: failed.length,
+    ...(compactFailureLines.length === 0 ? {} : { compactFailureLines }),
   };
+}
+
+function countStatus(activities: readonly ToolActivityDisplay[], status: ChatToolDisplayStatus, label: string): string | undefined {
+  const count = activities.filter((activity) => activity.displayStatus === status).length;
+  return count > 0 ? `${count} ${label}` : undefined;
 }
 
 function groupTone(activities: readonly ToolActivityDisplay[]): ToolActivityTone {
@@ -374,14 +491,7 @@ function streamingAssistantMessageId(items: readonly ChatTranscriptItem[], optio
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
     if (item?.kind !== "message" || item.role !== "assistant" || item.completedAt !== undefined) continue;
-    if (lastTextPartIndex(item.parts) >= 0) return item.id;
+    if (item.parts.some((part) => part.type === "text")) return item.id;
   }
   return undefined;
-}
-
-function lastTextPartIndex(parts: readonly ChatMessagePart[]): number {
-  for (let index = parts.length - 1; index >= 0; index -= 1) {
-    if (parts[index]?.type === "text") return index;
-  }
-  return -1;
 }

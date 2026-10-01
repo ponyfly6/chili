@@ -1,9 +1,18 @@
-import type { Message, MessagePart } from "@chili/protocol";
+import { formatToolResultForModel, normalizeToolCallId, type Message, type MessagePart } from "@chili/protocol";
 import { resolveChatCompletionsCompatibility, type ChatCompletionsCompatibility } from "./compat.js";
 import { assertImageInputSupported } from "./image-input.js";
-import { readSseEvents } from "./sse.js";
+import { providerHttpError, providerPayloadError, providerStreamProtocolError } from "./provider-error.js";
+import { readSseEvents, throwIfStreamAborted } from "./sse.js";
 import { prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
-import type { ChiliModel, ModelInputCapability, ModelStreamEvent, ModelStreamInput, ModelTool, ModelUsage } from "./types.js";
+import type {
+  ChiliModel,
+  ModelInputCapability,
+  ModelStreamEvent,
+  ModelStreamInput,
+  ModelTool,
+  ModelUsage,
+  ReasoningLevel,
+} from "./types.js";
 
 export interface OpenAICompletionsModelOptions {
   provider?: string;
@@ -15,6 +24,7 @@ export interface OpenAICompletionsModelOptions {
   fetch?: typeof fetch;
   headers?: Record<string, string>;
   reasoning?: boolean;
+  reasoningEffort?: ReasoningLevel;
   compatibility?: Partial<ChatCompletionsCompatibility>;
   inputCapabilities?: readonly ModelInputCapability[];
 }
@@ -27,11 +37,17 @@ export interface OpenAICompletionsRequestBuildOptions {
   temperature?: number;
   stream?: boolean;
   reasoning?: boolean;
+  reasoningEffort?: ReasoningLevel;
   compatibility?: Partial<ChatCompletionsCompatibility>;
 }
 
+type OpenAIUserContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 type OpenAIMessage =
-  | { role: "system" | "developer" | "user"; content: string }
+  | { role: "system" | "developer"; content: string }
+  | { role: "user"; content: string | OpenAIUserContentPart[] }
   | { role: "assistant"; content: string | null; tool_calls?: OpenAIToolCall[]; reasoning_content?: string }
   | { role: "tool"; tool_call_id: string; content: string };
 
@@ -100,6 +116,7 @@ interface OpenAIUsage {
   prompt_cache_miss_tokens?: number | null;
   prompt_tokens_details?: {
     cached_tokens?: number | null;
+    cache_write_tokens?: number | null;
   };
 }
 
@@ -113,6 +130,11 @@ interface ToolStreamState {
   name: string;
   partialJson: string;
   started: boolean;
+}
+
+interface FinalToolInput {
+  input: unknown;
+  inputParseError?: string;
 }
 
 export class OpenAICompletionsModel implements ChiliModel {
@@ -142,7 +164,14 @@ export class OpenAICompletionsModel implements ChiliModel {
       baseUrl: this.options.baseUrl,
       stream: true,
     };
-    if (this.options.reasoning !== undefined) requestOptions.reasoning = this.options.reasoning;
+    const inputReasoningLevel = resolveInputReasoningLevel(input);
+    if (inputReasoningLevel !== undefined) {
+      requestOptions.reasoning = inputReasoningLevel !== "off";
+      requestOptions.reasoningEffort = inputReasoningLevel;
+    } else {
+      if (this.options.reasoning !== undefined) requestOptions.reasoning = this.options.reasoning;
+      if (this.options.reasoningEffort !== undefined) requestOptions.reasoningEffort = this.options.reasoningEffort;
+    }
     if (this.options.compatibility !== undefined) requestOptions.compatibility = this.options.compatibility;
     const maxTokens = input.maxTokens ?? this.options.maxTokens;
     const temperature = input.temperature ?? this.options.temperature;
@@ -158,37 +187,55 @@ export class OpenAICompletionsModel implements ChiliModel {
 
     const response = await this.fetchImpl(resolveChatCompletionsUrl(this.options.baseUrl), init);
     if (!response.ok) {
-      const text = await response.text();
-      const payload = parseJson<OpenAIChatCompletionResponse>(text, undefined);
-      throw new Error(payload?.error?.message ?? `Model request failed with HTTP ${response.status}: ${text}`);
+      throw await providerHttpError(response, {
+        provider: this.provider,
+        label: "Model request",
+      });
     }
 
     if (isEventStream(response) && response.body) {
-      yield* this.streamSseResponse(response.body, input.signal);
+      yield* this.streamSseResponse(response.body, response, input.signal);
       return;
     }
 
-    yield* this.streamJsonResponse(await response.text());
+    yield* this.streamJsonResponse(await response.text(), response);
   }
 
   private async *streamSseResponse(
     body: ReadableStream<Uint8Array>,
+    response: Response,
     signal?: AbortSignal,
   ): AsyncIterable<ModelStreamEvent> {
     let responseId: string | undefined;
     let usage: ModelUsage | undefined;
     let finishReason = "stop";
-    let finished = false;
     let emittedInitialMetadata = false;
     const toolCalls = new Map<number, ToolStreamState>();
+    const unfinishedChoices = new Set<number>();
+    const finishedChoices = new Set<number>();
 
     for await (const event of readSseEvents(body, signal)) {
       if (event.data === "[DONE]") break;
       const payload = parseJson<OpenAIChatCompletionResponse>(event.data, undefined);
-      if (!payload) continue;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        if (event.event === "error") {
+          yield errorEvent(providerPayloadError(undefined, {
+            provider: this.provider,
+            label: "Model stream failed",
+            response,
+          }), responseId, usage);
+          return;
+        }
+        if (!event.data.trim()) continue;
+        throw providerStreamProtocolError(this.provider, "Model stream contained invalid JSON", response, "invalid_stream");
+      }
 
-      if (payload.error) {
-        yield errorEvent(payload.error, responseId, usage);
+      if (event.event === "error" || payload.error) {
+        yield errorEvent(providerPayloadError(payload, {
+          provider: this.provider,
+          label: "Model stream failed",
+          response,
+        }), responseId, usage);
         return;
       }
 
@@ -203,6 +250,10 @@ export class OpenAICompletionsModel implements ChiliModel {
 
       for (const choice of payload.choices ?? []) {
         const index = choice.index ?? 0;
+        if (!finishedChoices.has(index)) unfinishedChoices.add(index);
+        else if (choice.delta?.content || choice.delta?.reasoning_content || choice.delta?.tool_calls?.length) {
+          throw providerStreamProtocolError(this.provider, "Model stream continued a finished choice", response, "invalid_stream");
+        }
         if (choice.delta?.reasoning_content) {
           yield { type: "reasoning_delta", text: choice.delta.reasoning_content, index };
         }
@@ -212,24 +263,43 @@ export class OpenAICompletionsModel implements ChiliModel {
         for (const toolCall of choice.delta?.tool_calls ?? []) {
           yield* applyToolCallDelta(toolCalls, toolCall, index);
         }
-        if (choice.finish_reason) finishReason = choice.finish_reason;
+        if (choice.finish_reason) {
+          finishReason = choice.finish_reason;
+          unfinishedChoices.delete(index);
+          finishedChoices.add(index);
+        }
       }
     }
 
+    throwIfStreamAborted(signal);
+    // Keep reading after finish_reason to collect the optional usage-only tail.
+    // [DONE] or EOF alone does not establish that a choice finished generating.
+    if (finishedChoices.size === 0 || unfinishedChoices.size > 0) {
+      throw providerStreamProtocolError(this.provider, "Model stream ended before finish_reason", response, "incomplete_stream");
+    }
     for (const [index, tool] of toolCalls) {
+      throwIfStreamAborted(signal);
       yield finishToolCallEvent(tool, index);
     }
-    if (!finished) {
-      finished = true;
-      yield finishEvent(finishReason, responseId, usage);
-    }
+    throwIfStreamAborted(signal);
+    yield finishEvent(finishReason, responseId, usage);
   }
 
-  private async *streamJsonResponse(text: string): AsyncIterable<ModelStreamEvent> {
+  private async *streamJsonResponse(text: string, response: Response): AsyncIterable<ModelStreamEvent> {
     const payload = parseJson<OpenAIChatCompletionResponse>(text, undefined);
-    if (!payload) throw new Error(`Model response was not JSON: ${text}`);
+    if (!payload) {
+      throw providerPayloadError(undefined, {
+        provider: this.provider,
+        label: "Model response was not valid JSON",
+        response,
+      });
+    }
     if (payload.error) {
-      yield errorEvent(payload.error, payload.id, undefined);
+      yield errorEvent(providerPayloadError(payload, {
+        provider: this.provider,
+        label: "Model response failed",
+        response,
+      }), payload.id, undefined);
       return;
     }
 
@@ -247,8 +317,8 @@ export class OpenAICompletionsModel implements ChiliModel {
       if (message?.content) {
         yield { type: "text_delta", text: message.content, index };
       }
-      for (const toolCall of message?.tool_calls ?? []) {
-        const tool = toolStateFromCompleteToolCall(toolCall, index);
+      for (const [toolIndex, toolCall] of (message?.tool_calls ?? []).entries()) {
+        const tool = toolStateFromCompleteToolCall(toolCall, index, toolIndex);
         yield { type: "tool_call_start", toolCallId: tool.toolCallId, name: tool.name, index };
         yield finishToolCallEvent(tool, index);
       }
@@ -266,6 +336,14 @@ export class OpenAICompletionsModel implements ChiliModel {
       ...this.options.headers,
     };
   }
+}
+
+function resolveInputReasoningLevel(input: ModelStreamInput): ReasoningLevel | undefined {
+  return input.reasoningLevel
+    ?? input.reasoning
+    ?? input.thinking
+    ?? input.selection?.reasoning
+    ?? input.selection?.thinking;
 }
 
 export function buildOpenAICompletionsRequestBody(
@@ -292,10 +370,17 @@ export function buildOpenAICompletionsRequestBody(
   if ((options.stream ?? true) && compatibility.supportsUsageInStreaming) {
     body.stream_options = { include_usage: true };
   }
-  if (options.reasoning !== undefined) applyReasoningOptions(body, compatibility, options.reasoning);
+  if (options.reasoning !== undefined || compatibility.reasoningParameterStyle === "zai-5.3") {
+    applyReasoningOptions(body, compatibility, options.reasoning ?? true, options.reasoningEffort);
+  }
 
   const tools = toOpenAITools(input.tools ?? []);
-  if (tools.length > 0) body.tools = tools;
+  if (tools.length > 0) {
+    body.tools = tools;
+    if ((options.stream ?? true) && compatibility.toolCallDeltaMode === "zai-tool-stream") {
+      body.tool_stream = true;
+    }
+  }
   return body;
 }
 
@@ -303,18 +388,59 @@ function applyReasoningOptions(
   body: Record<string, unknown>,
   compatibility: ChatCompletionsCompatibility,
   reasoning: boolean,
+  reasoningEffort?: ReasoningLevel,
 ): void {
-  if (compatibility.reasoningParameterStyle !== "deepseek" && compatibility.reasoningParameterStyle !== "moonshot") return;
-  body.thinking = { type: reasoning ? "enabled" : "disabled" };
-  if (compatibility.reasoningParameterStyle === "deepseek" && reasoning && compatibility.supportsReasoningEffort) {
-    body.reasoning_effort = compatibility.reasoningEffortMap.high ?? "high";
+  const style = compatibility.reasoningParameterStyle;
+  const alwaysReasons = style === "moonshot-k3" || style === "zai-5.3" || style === "xai";
+  if (style === "zai-5.3") {
+    body.thinking = { type: "enabled", clear_thinking: false };
+  } else if (style === "deepseek" || style === "moonshot" || style === "zai") {
+    body.thinking = { type: reasoning ? "enabled" : "disabled" };
+  } else if (!alwaysReasons) {
+    return;
   }
+
+  if (!compatibility.supportsReasoningEffort) return;
+  let requestedEffort: ReasoningLevel | undefined;
+  if (alwaysReasons) {
+    requestedEffort = !reasoning || reasoningEffort === "off" ? "off" : reasoningEffort;
+  } else if (reasoning) {
+    requestedEffort = reasoningEffort ?? (style === "deepseek" ? "high" : undefined);
+  }
+  if (!requestedEffort) return;
+  body.reasoning_effort = normalizeReasoningEffort(style, requestedEffort, compatibility.reasoningEffortMap);
+}
+
+function normalizeReasoningEffort(
+  style: ChatCompletionsCompatibility["reasoningParameterStyle"],
+  effort: ReasoningLevel,
+  effortMap: ChatCompletionsCompatibility["reasoningEffortMap"],
+): string {
+  const mapped = effortMap[effort];
+  if (mapped) return mapped;
+  if (style === "moonshot-k3" || style === "zai-5.3") {
+    if (effort === "off" || effort === "minimal" || effort === "low") return "low";
+    if (effort === "medium" || effort === "high") return "high";
+    return "max";
+  }
+  if (style === "xai") {
+    if (effort === "off" || effort === "minimal" || effort === "low") return "low";
+    if (effort === "medium") return "medium";
+    if (effort === "high") return "high";
+    return "xhigh";
+  }
+  if (style === "deepseek") {
+    if (effort === "off" || effort === "minimal" || effort === "low") return "low";
+    if (effort === "max" || effort === "ultra") return "max";
+    return "high";
+  }
+  return effort === "ultra" ? "max" : effort;
 }
 
 export function resolveChatCompletionsUrl(baseUrl: string): string {
   const clean = baseUrl.replace(/\/+$/, "");
   if (clean.endsWith("/chat/completions")) return clean;
-  if (clean.endsWith("/v1")) return `${clean}/chat/completions`;
+  if (clean.endsWith("/v1") || clean.endsWith("/v4")) return `${clean}/chat/completions`;
   return `${clean}/v1/chat/completions`;
 }
 
@@ -356,11 +482,13 @@ function toOpenAIAssistantMessage(
   compatibility: ChatCompletionsCompatibility,
 ): OpenAIMessage | undefined {
   const text = message.parts
-    .filter((part): part is Extract<MessagePart, { type: "text" | "reasoning" }> =>
-      part.type === "text" || part.type === "reasoning",
-    )
+    .filter((part): part is Extract<MessagePart, { type: "text" }> => part.type === "text")
     .map((part) => part.text)
     .join("\n");
+  const reasoning = message.parts
+    .filter((part): part is Extract<MessagePart, { type: "reasoning" }> => part.type === "reasoning")
+    .map((part) => part.text)
+    .join("");
   const toolCalls = message.parts
     .filter((part): part is Extract<MessagePart, { type: "tool_call" }> => part.type === "tool_call")
     .map((part) => ({
@@ -372,13 +500,15 @@ function toOpenAIAssistantMessage(
       },
     }));
 
-  if (!text && toolCalls.length === 0) return undefined;
+  if (!text && toolCalls.length === 0 && !(compatibility.requiresReasoningContentOnAssistantMessages && reasoning)) {
+    return undefined;
+  }
   const result: OpenAIMessage = {
     role: "assistant",
-    content: text || null,
+    content: text || (compatibility.reasoningParameterStyle === "deepseek" && toolCalls.length > 0 ? "" : null),
   };
   if (toolCalls.length > 0) result.tool_calls = toolCalls;
-  if (compatibility.requiresReasoningContentOnAssistantMessages) result.reasoning_content = "";
+  if (compatibility.requiresReasoningContentOnAssistantMessages) result.reasoning_content = reasoning;
   return result;
 }
 
@@ -390,17 +520,44 @@ function toOpenAIUserOrToolMessages(message: Message): OpenAIMessage[] {
     )
     .map((part) => part.text)
     .join("\n");
-  if (text) result.push({ role: "user", content: text });
+  const hasImages = message.parts.some((part) => part.type === "image");
+  if (hasImages) {
+    const content = toOpenAIUserContentParts(message.parts);
+    if (content.length > 0) result.push({ role: "user", content });
+  } else if (text) {
+    result.push({ role: "user", content: text });
+  }
 
   for (const part of message.parts) {
     if (part.type !== "tool_result") continue;
     result.push({
       role: "tool",
       tool_call_id: part.callId,
-      content: formatToolResult(part),
+      content: formatToolResultForModel(part),
     });
   }
   return result;
+}
+
+function toOpenAIUserContentParts(parts: readonly MessagePart[]): OpenAIUserContentPart[] {
+  const content: OpenAIUserContentPart[] = [];
+  for (const part of parts) {
+    if (part.type === "text" || part.type === "reasoning") {
+      if (part.text) content.push({ type: "text", text: part.text });
+      continue;
+    }
+    if (part.type === "image") {
+      content.push({
+        type: "image_url",
+        image_url: { url: imageDataUrl(part) },
+      });
+    }
+  }
+  return content;
+}
+
+function imageDataUrl(image: Pick<Extract<MessagePart, { type: "image" }>, "data" | "mimeType">): string {
+  return `data:${image.mimeType};base64,${image.data}`;
 }
 
 function systemMessages(messages: readonly Message[]): string[] {
@@ -429,13 +586,13 @@ function* applyToolCallDelta(
 ): Iterable<ModelStreamEvent> {
   const index = delta.index ?? fallbackIndex;
   const tool = toolCalls.get(index) ?? {
-    toolCallId: delta.id ?? `tool_${index}`,
+    toolCallId: normalizeToolCallId(delta.id ?? `tool_${index}`, index),
     name: delta.function?.name ?? "",
     partialJson: "",
     started: false,
   };
 
-  if (delta.id) tool.toolCallId = delta.id;
+  if (delta.id && !tool.started) tool.toolCallId = normalizeToolCallId(delta.id, index);
   if (delta.function?.name) tool.name = delta.function.name;
   toolCalls.set(index, tool);
 
@@ -452,10 +609,14 @@ function* applyToolCallDelta(
   }
 }
 
-function toolStateFromCompleteToolCall(toolCall: OpenAIChoiceToolCall, fallbackIndex: number): ToolStreamState {
+function toolStateFromCompleteToolCall(
+  toolCall: OpenAIChoiceToolCall,
+  fallbackIndex: number,
+  discriminator: number = toolCall.index ?? fallbackIndex,
+): ToolStreamState {
   const index = toolCall.index ?? fallbackIndex;
   return {
-    toolCallId: toolCall.id ?? `tool_${index}`,
+    toolCallId: normalizeToolCallId(toolCall.id ?? `tool_${index}`, discriminator),
     name: toolCall.function?.name ?? "",
     partialJson: toolCall.function?.arguments ?? "",
     started: true,
@@ -480,18 +641,35 @@ function toolCallDeltaEvent(
 }
 
 function finishToolCallEvent(tool: ToolStreamState, index: number): ModelStreamEvent {
-  return {
+  const finalInput = finalToolInput(tool);
+  const event: ModelStreamEvent = {
     type: "tool_call_end",
     toolCallId: tool.toolCallId,
     name: tool.name,
-    input: finalToolInput(tool),
+    input: finalInput.input,
     index,
   };
+  if (finalInput.inputParseError) event.inputParseError = finalInput.inputParseError;
+  return event;
 }
 
-function finalToolInput(tool: ToolStreamState): unknown {
-  if (!tool.partialJson) return {};
-  return parseJson(tool.partialJson, {});
+function finalToolInput(tool: ToolStreamState): FinalToolInput {
+  if (!tool.partialJson) return { input: {} };
+  try {
+    return { input: JSON.parse(tool.partialJson) as unknown };
+  } catch (error) {
+    return {
+      input: {},
+      inputParseError: formatToolInputParseError(error),
+    };
+  }
+}
+
+function formatToolInputParseError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    ? `Tool call arguments were not valid JSON: ${message}`
+    : "Tool call arguments were not valid JSON.";
 }
 
 function stringifyToolInput(input: unknown): string {
@@ -500,11 +678,6 @@ function stringifyToolInput(input: unknown): string {
   } catch {
     return "{}";
   }
-}
-
-function formatToolResult(part: Extract<MessagePart, { type: "tool_result" }>): string {
-  if (part.error) return part.output ? `${part.output}\n\nError: ${part.error}` : `Error: ${part.error}`;
-  return part.output;
 }
 
 function isEventStream(response: Response): boolean {
@@ -529,22 +702,32 @@ function mergeUsage(previous: ModelUsage | undefined, usage: OpenAIUsage | undef
       next.totalTokens ??
       (next.inputTokens ?? previous?.inputTokens ?? 0) +
         (next.outputTokens ?? previous?.outputTokens ?? 0) +
-        (next.cacheReadInputTokens ?? previous?.cacheReadInputTokens ?? 0),
+        (next.cacheReadInputTokens ?? previous?.cacheReadInputTokens ?? 0) +
+        (next.cacheCreationInputTokens ?? previous?.cacheCreationInputTokens ?? 0),
   };
 }
 
 function toModelUsage(usage: OpenAIUsage | undefined): ModelUsage | undefined {
   if (!usage) return undefined;
   const modelUsage: ModelUsage = { raw: usage };
-  if (usage.prompt_tokens != null) modelUsage.inputTokens = usage.prompt_tokens;
-  if (usage.completion_tokens != null) modelUsage.outputTokens = usage.completion_tokens;
-  if (usage.prompt_tokens_details?.cached_tokens != null) {
-    modelUsage.cacheReadInputTokens = usage.prompt_tokens_details.cached_tokens;
+  const cacheReadInputTokens = usage.prompt_cache_hit_tokens
+    ?? usage.prompt_tokens_details?.cached_tokens
+    ?? 0;
+  const cacheCreationInputTokens = usage.prompt_tokens_details?.cache_write_tokens ?? 0;
+  const reportedNonCachedInput = usage.prompt_cache_miss_tokens
+    ?? (usage.prompt_tokens == null ? undefined : usage.prompt_tokens - cacheReadInputTokens);
+  if (reportedNonCachedInput !== undefined) {
+    modelUsage.inputTokens = Math.max(0, reportedNonCachedInput - cacheCreationInputTokens);
   }
-  if (usage.prompt_cache_hit_tokens != null) modelUsage.cacheReadInputTokens = usage.prompt_cache_hit_tokens;
+  if (usage.completion_tokens != null) modelUsage.outputTokens = usage.completion_tokens;
+  if (cacheReadInputTokens > 0) modelUsage.cacheReadInputTokens = cacheReadInputTokens;
+  if (cacheCreationInputTokens > 0) modelUsage.cacheCreationInputTokens = cacheCreationInputTokens;
   modelUsage.totalTokens =
     usage.total_tokens ??
-    (modelUsage.inputTokens ?? 0) + (modelUsage.outputTokens ?? 0) + (modelUsage.cacheReadInputTokens ?? 0);
+    (modelUsage.inputTokens ?? 0) +
+      (modelUsage.outputTokens ?? 0) +
+      (modelUsage.cacheReadInputTokens ?? 0) +
+      (modelUsage.cacheCreationInputTokens ?? 0);
   return modelUsage;
 }
 

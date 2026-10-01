@@ -1,5 +1,5 @@
 import type { AgentPath, ToolResult } from "@chili/protocol";
-import { ROOT_AGENT_PATH, normalizeAgentPath } from "@chili/protocol";
+import { ROOT_AGENT_PATH, normalizeAgentPath, normalizePersistedError } from "@chili/protocol";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 import type {
   TeamCreateToolInput,
@@ -48,9 +48,10 @@ export interface TeamToolResult extends ToolResult {
 }
 
 const MAX_TEAM_TASK_CREATE_BATCH_TASKS = 64;
-const DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY = 8;
+const DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY = 3;
 const MAX_TEAM_DISPATCH_BATCH_CONCURRENCY = 32;
 const MAX_TEAM_DISPATCH_BATCH_TASKS = 64;
+const DEFAULT_TEAM_RUN_LOOP_CONCURRENCY = 3;
 const MAX_TEAM_RUN_LOOP_CONCURRENCY = 64;
 const MAX_TEAM_RUN_LOOP_VERIFICATIONS = 4;
 
@@ -156,8 +157,6 @@ export function createTeamMemberAddTool(
         status: { type: "string" },
         childSessionId: { type: "string" },
         child_session_id: { type: "string" },
-        childThreadId: { type: "string" },
-        child_thread_id: { type: "string" },
         model: { type: "string" },
         toolScope: { type: "array", items: { type: "string" } },
         tool_scope: { type: "array", items: { type: "string" } },
@@ -507,7 +506,8 @@ export function createTeamTaskDispatchBatchTool(
   return {
     name: "team_task_dispatch_batch",
     aliases: ["dispatch_team_tasks", "team_dispatch_batch"],
-    description: "Dispatch multiple persistent team tasks to background local subagents in parallel.",
+    description:
+      "Dispatch multiple persistent team tasks to background local subagents. max_concurrency defaults to 3 and caps the full child execution lifetime for this batch; the runtime-wide agent limit may reduce actual live concurrency further.",
     risk: "execute",
     isConcurrencySafe: true,
     inputSchema: {
@@ -535,15 +535,16 @@ export function createTeamTaskDispatchBatchTool(
         taskIds: { type: "array", items: { type: "string" } },
         task_ids: { type: "array", items: { type: "string" } },
         mode: { type: "string", enum: ["background"] },
-        maxConcurrency: { type: "number" },
-        max_concurrency: { type: "number" },
+        maxConcurrency: { type: "number", description: "Full batch child-lifecycle cap; defaults to 3 and remains subject to the runtime-wide child limit." },
+        max_concurrency: { type: "number", description: "Full batch child-lifecycle cap; defaults to 3 and remains subject to the runtime-wide child limit." },
       },
     },
     validate: validateTeamTaskDispatchBatchInput,
     approval(input) {
+      const maxConcurrency = input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY;
       return {
         permission: "team_task_dispatch",
-        patterns: [input.teamId, `count:${input.tasks.length}`, `concurrency:${input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY}`, "background"],
+        patterns: [input.teamId, `count:${input.tasks.length}`, `concurrency:${maxConcurrency}`, "background"],
         metadata: {
           teamId: input.teamId,
           team_id: input.teamId,
@@ -551,12 +552,16 @@ export function createTeamTaskDispatchBatchTool(
           task_ids: input.tasks.map((task) => task.taskId),
           mode: "background",
           count: input.tasks.length,
-          maxConcurrency: input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY,
-          max_concurrency: input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY,
+          maxConcurrency,
+          max_concurrency: maxConcurrency,
+          requestedMaxConcurrency: maxConcurrency,
+          concurrencyLimitScope: "batch_lifecycle_capped_by_runtime_global",
         },
       };
     },
     async execute(input, context) {
+      const maxConcurrency = input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY;
+      const batchId = context.callId;
       await context.metadata({
         metadata: {
           teamId: input.teamId,
@@ -564,11 +569,18 @@ export function createTeamTaskDispatchBatchTool(
           taskIds: input.tasks.map((task) => task.taskId),
           task_ids: input.tasks.map((task) => task.taskId),
           count: input.tasks.length,
-          maxConcurrency: input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY,
-          max_concurrency: input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY,
+          maxConcurrency,
+          max_concurrency: maxConcurrency,
+          requestedMaxConcurrency: maxConcurrency,
+          concurrencyLimitScope: "batch_lifecycle_capped_by_runtime_global",
+          sourceCallId: context.callId,
+          source_call_id: context.callId,
+          batchId,
+          batch_id: batchId,
+          expectedBatchSize: input.tasks.length,
         },
       });
-      const result = await runTeamTaskDispatchBatch(input, context, (task) =>
+      const result = await runTeamTaskDispatchBatch(input, context, (task, batchIndex) =>
         controller.dispatchTask(
           {
             teamId: input.teamId,
@@ -576,6 +588,11 @@ export function createTeamTaskDispatchBatchTool(
             ...(task.ownerPath ? { ownerPath: task.ownerPath } : {}),
             mode: "background",
             ...(task.prompt ? { prompt: task.prompt } : {}),
+            sourceCallId: context.callId,
+            batchId,
+            batchIndex,
+            expectedBatchSize: input.tasks.length,
+            maxConcurrency,
           },
           context,
         )
@@ -645,7 +662,7 @@ export function createTeamRunLoopTool(
     name: "team_run_loop",
     aliases: ["run_team", "team_run"],
     description:
-      "Run the persistent team scheduler: reconcile running tasks, auto-assign scoped pending tasks, dispatch eligible tasks in parallel, and verify or merge completed work. Defaults to one scheduling cycle; set until_drained to run until stable.",
+      "Run the persistent team scheduler: reconcile running tasks, auto-assign scoped pending tasks, dispatch eligible tasks in parallel, and verify or merge completed work. max_concurrent_dispatches defaults to 3; explicit higher values remain subject to the runtime-wide child limit. Defaults to one scheduling cycle; set until_drained to run until stable.",
     risk: "execute",
     inputSchema: {
       type: "object",
@@ -663,21 +680,22 @@ export function createTeamRunLoopTool(
         timeout_ms: { type: "number" },
         pollIntervalMs: { type: "number" },
         poll_interval_ms: { type: "number" },
-        maxConcurrentDispatches: { type: "number" },
-        max_concurrent_dispatches: { type: "number" },
+        maxConcurrentDispatches: { type: "number", description: "Scheduler dispatch cap; defaults to 3 and remains subject to the runtime-wide child limit." },
+        max_concurrent_dispatches: { type: "number", description: "Scheduler dispatch cap; defaults to 3 and remains subject to the runtime-wide child limit." },
         maxConcurrentVerifications: { type: "number" },
         max_concurrent_verifications: { type: "number" },
       },
     },
     validate: validateTeamRunLoopInput,
     approval(input) {
+      const maxConcurrentDispatches = input.maxConcurrentDispatches ?? DEFAULT_TEAM_RUN_LOOP_CONCURRENCY;
       return {
         permission: "team_run_loop",
         patterns: [
           input.teamId,
           `once:${input.once ?? true}`,
           `drain:${input.untilDrained ?? input.once === false}`,
-          `concurrency:${input.maxConcurrentDispatches ?? "default"}`,
+          `concurrency:${maxConcurrentDispatches}`,
           `verify:${input.maxConcurrentVerifications ?? "default"}`,
           input.mode ?? "background",
         ],
@@ -694,14 +712,17 @@ export function createTeamRunLoopTool(
           timeout_ms: input.timeoutMs,
           pollIntervalMs: input.pollIntervalMs,
           poll_interval_ms: input.pollIntervalMs,
-          maxConcurrentDispatches: input.maxConcurrentDispatches,
-          max_concurrent_dispatches: input.maxConcurrentDispatches,
+          maxConcurrentDispatches,
+          max_concurrent_dispatches: maxConcurrentDispatches,
+          requestedMaxConcurrentDispatches: maxConcurrentDispatches,
+          concurrencyLimitScope: "team_scheduler_capped_by_runtime_global",
           maxConcurrentVerifications: input.maxConcurrentVerifications,
           max_concurrent_verifications: input.maxConcurrentVerifications,
         },
       };
     },
     async execute(input, context) {
+      const maxConcurrentDispatches = input.maxConcurrentDispatches ?? DEFAULT_TEAM_RUN_LOOP_CONCURRENCY;
       await context.metadata({
         metadata: {
           teamId: input.teamId,
@@ -710,8 +731,10 @@ export function createTeamRunLoopTool(
           once: input.once ?? true,
           untilDrained: input.untilDrained ?? input.once === false,
           until_drained: input.untilDrained ?? input.once === false,
-          maxConcurrentDispatches: input.maxConcurrentDispatches,
-          max_concurrent_dispatches: input.maxConcurrentDispatches,
+          maxConcurrentDispatches,
+          max_concurrent_dispatches: maxConcurrentDispatches,
+          requestedMaxConcurrentDispatches: maxConcurrentDispatches,
+          concurrencyLimitScope: "team_scheduler_capped_by_runtime_global",
           maxConcurrentVerifications: input.maxConcurrentVerifications,
           max_concurrent_verifications: input.maxConcurrentVerifications,
         },
@@ -726,8 +749,9 @@ export function createTeamMessageSendTool(
 ): ChiliToolDefinition<TeamMessageSendToolInput, TeamToolResult> {
   return {
     name: "team_message_send",
-    aliases: ["send_team_message", "send_message"],
-    description: "Send a durable message to a team member or broadcast to the team.",
+    aliases: ["send_team_message"],
+    description:
+      "Send a durable message to a team member by canonical path or unique member name, or broadcast with *. queueOnly (default) records without waking; triggerTurn starts a live member turn.",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -853,7 +877,6 @@ function validateTeamMemberAddInput(input: unknown): ValidationResult<TeamMember
   const value: TeamMemberAddToolInput = { teamId: teamId.value, path: path.value, name: name.value, role: role.value };
   if (status.value) value.status = status.value;
   assignString(value, "childSessionId", pickString(input, ["childSessionId", "child_session_id"]));
-  assignString(value, "childThreadId", pickString(input, ["childThreadId", "child_thread_id"]));
   assignString(value, "model", pickString(input, ["model"]));
   if (toolScope.value) value.toolScope = toolScope.value;
   if (writeScope.value) value.writeScope = writeScope.value;
@@ -1143,7 +1166,7 @@ function validateTeamMessageSendInput(input: unknown): ValidationResult<TeamMess
   if (!isRecord(input)) return { ok: false, message: "expected an object" };
   const teamId = requiredString(input, ["teamId", "team_id"], "teamId");
   if (!teamId.ok) return teamId;
-  const from = requiredPath(input, ["from"], "from");
+  const from = requiredString(input, ["from"], "from");
   if (!from.ok) return from;
   const to = requiredTeamMessageTarget(input, ["to"], "to");
   if (!to.ok) return to;
@@ -1158,7 +1181,7 @@ function validateTeamMessageSendInput(input: unknown): ValidationResult<TeamMess
   const value: TeamMessageSendToolInput = { teamId: teamId.value, from: from.value, to: to.value, content: content.value };
   assignString(value, "messageId", pickString(input, ["messageId", "message_id"]));
   if (kind.value) value.kind = kind.value;
-  if (delivery.value) value.delivery = delivery.value;
+  value.delivery = delivery.value ?? "queueOnly";
   assignString(value, "taskId", pickString(input, ["taskId", "task_id"]));
   assignString(value, "summary", pickString(input, ["summary"]));
   if (metadata.value) value.metadata = metadata.value;
@@ -1308,20 +1331,33 @@ function teamTaskDispatchToolResult(result: TeamTaskDispatchRecord): TeamToolRes
 function teamTaskDispatchBatchToolResult(result: TeamTaskDispatchBatchRecord): TeamToolResult {
   const output = {
     count: result.count,
+    batch_id: result.batchId,
+    batchId: result.batchId,
+    source_call_id: result.sourceCallId,
+    sourceCallId: result.sourceCallId,
+    max_concurrency: result.maxConcurrency,
+    maxConcurrency: result.maxConcurrency,
+    requested_max_concurrency: result.maxConcurrency,
+    concurrency_limit_scope: result.concurrencyLimitScope,
     dispatched: result.dispatched.map(teamTaskDispatchOutput),
     errors: result.errors.map((error) => pruneUndefined({
       task_id: error.taskId,
       taskId: error.taskId,
       owner_path: error.ownerPath,
       ownerPath: error.ownerPath,
-      error: error.error,
+      error: normalizePersistedError(error.error).message,
     })),
   };
   return {
-    title: `team_task_dispatch_batch dispatched=${result.dispatched.length} errors=${result.errors.length}`,
+    title: `team_task_dispatch_batch lifecycle-cap=${result.maxConcurrency} child-cap=runtime dispatched=${result.dispatched.length} errors=${result.errors.length}`,
     output: JSON.stringify(output),
     metadata: {
       count: result.count,
+      batchId: result.batchId,
+      sourceCallId: result.sourceCallId,
+      maxConcurrency: result.maxConcurrency,
+      requestedMaxConcurrency: result.maxConcurrency,
+      concurrencyLimitScope: result.concurrencyLimitScope,
       dispatched: result.dispatched.length,
       errors: result.errors.length,
       task_ids: result.dispatched.map((item) => item.teamTask.taskId),
@@ -1358,7 +1394,7 @@ function teamTaskReconcileToolResult(result: TeamTaskReconcileRecord): TeamToolR
       teamId: error.teamId,
       task_id: error.taskId,
       taskId: error.taskId,
-      error: error.error,
+      error: normalizePersistedError(error.error).message,
     })),
   };
   return {
@@ -1376,7 +1412,7 @@ function teamTaskReconcileToolResult(result: TeamTaskReconcileRecord): TeamToolR
 function teamRunLoopToolResult(result: TeamRunLoopRecord): TeamToolResult {
   const bottleneck = teamRunLoopBottleneck(result);
   return {
-    title: `team_run_loop ${result.teamId} stop=${result.stopReason} bottleneck=${bottleneck} fanout=${result.maxConcurrentDispatches ?? "default"} verify=${result.maxConcurrentVerifications ?? "default"} dispatched=${result.dispatched.length} running=${result.stillRunning.length}`,
+    title: `team_run_loop ${result.teamId} stop=${result.stopReason} bottleneck=${bottleneck} scheduler-cap=${result.maxConcurrentDispatches ?? DEFAULT_TEAM_RUN_LOOP_CONCURRENCY} child-cap=runtime verify=${result.maxConcurrentVerifications ?? "default"} dispatched=${result.dispatched.length} running=${result.stillRunning.length}`,
     output: JSON.stringify(teamRunLoopOutput(result)),
     metadata: {
       team_id: result.teamId,
@@ -1387,6 +1423,8 @@ function teamRunLoopToolResult(result: TeamRunLoopRecord): TeamToolResult {
       cycles: result.cycles,
       max_concurrent_dispatches: result.maxConcurrentDispatches,
       maxConcurrentDispatches: result.maxConcurrentDispatches,
+      requestedMaxConcurrentDispatches: result.maxConcurrentDispatches,
+      concurrencyLimitScope: "team_scheduler_capped_by_runtime_global",
       max_concurrent_verifications: result.maxConcurrentVerifications,
       maxConcurrentVerifications: result.maxConcurrentVerifications,
       dispatched: result.dispatched.length,
@@ -1452,7 +1490,7 @@ function teamMessageListToolResult(messages: readonly TeamMessageRecord[]): Team
 async function runTeamTaskDispatchBatch(
   input: TeamTaskDispatchBatchToolInput,
   context: TeamToolContext,
-  dispatch: (task: TeamTaskDispatchBatchToolInput["tasks"][number]) => Promise<TeamTaskDispatchRecord>,
+  dispatch: (task: TeamTaskDispatchBatchToolInput["tasks"][number], batchIndex: number) => Promise<TeamTaskDispatchRecord>,
 ): Promise<TeamTaskDispatchBatchRecord> {
   const maxConcurrency = input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY;
   const dispatched = new Array<TeamTaskDispatchRecord | undefined>(input.tasks.length);
@@ -1467,7 +1505,7 @@ async function runTeamTaskDispatchBatch(
       const task = input.tasks[index];
       if (!task) continue;
       try {
-        dispatched[index] = await dispatch(task);
+        dispatched[index] = await dispatch(task, index);
       } catch (error) {
         if (isAbortError(error)) throw error;
         errors[index] = {
@@ -1481,6 +1519,10 @@ async function runTeamTaskDispatchBatch(
 
   return {
     count: input.tasks.length,
+    batchId: context.callId,
+    sourceCallId: context.callId,
+    maxConcurrency,
+    concurrencyLimitScope: "batch_lifecycle_capped_by_runtime_global",
     dispatched: dispatched.filter((item): item is TeamTaskDispatchRecord => item !== undefined),
     errors: errors.filter((item): item is TeamTaskDispatchBatchErrorRecord => item !== undefined),
   };
@@ -1562,8 +1604,6 @@ function teamMemberRecordOutput(member: TeamMemberRecord): Record<string, unknow
     status: member.status,
     child_session_id: member.childSessionId,
     childSessionId: member.childSessionId,
-    child_thread_id: member.childThreadId,
-    childThreadId: member.childThreadId,
     model: member.model,
     tool_scope: member.toolScope,
     toolScope: member.toolScope,
@@ -1596,7 +1636,7 @@ function teamTaskRecordOutput(task: TeamTaskRecord): Record<string, unknown> {
     depends_on: task.dependsOn,
     dependsOn: task.dependsOn,
     summary: task.summary,
-    error: task.error,
+    error: task.error === undefined ? undefined : normalizePersistedError(task.error).message,
     metadata: task.metadata,
     created_at: task.createdAt,
     createdAt: task.createdAt,
@@ -1643,6 +1683,8 @@ function teamRunLoopOutput(result: TeamRunLoopRecord): Record<string, unknown> {
     endedAt: result.endedAt,
     max_concurrent_dispatches: result.maxConcurrentDispatches,
     maxConcurrentDispatches: result.maxConcurrentDispatches,
+    requested_max_concurrent_dispatches: result.maxConcurrentDispatches,
+    concurrency_limit_scope: "team_scheduler_capped_by_runtime_global",
     max_concurrent_verifications: result.maxConcurrentVerifications,
     maxConcurrentVerifications: result.maxConcurrentVerifications,
     dispatched: result.dispatched.map(teamRunTaskOutput),
@@ -1669,6 +1711,12 @@ function teamRunTaskOutput(task: object): Record<string, unknown> {
   const record = task as Record<string, unknown>;
   return pruneUndefined({
     ...record,
+    error: record.error === undefined ? undefined : normalizePersistedError(record.error).message,
+    conflicts: Array.isArray(record.conflicts)
+      ? record.conflicts
+          .slice(0, 20)
+          .map((conflict) => normalizePersistedError(conflict).message)
+      : undefined,
     team_id: record.teamId,
     teamId: record.teamId,
     task_id: record.taskId,
@@ -1695,15 +1743,16 @@ function agentTaskRecordOutput(task: NonNullable<TeamTaskDispatchRecord["agentTa
     runId: task.runId,
     child_session_id: task.childSessionId,
     childSessionId: task.childSessionId,
-    child_thread_id: task.childThreadId,
-    childThreadId: task.childThreadId,
     status: task.status,
     summary: task.summary,
-    error: task.error,
+    error: task.error === undefined ? undefined : normalizePersistedError(task.error).message,
   });
 }
 
 function teamMessageRecordOutput(message: TeamMessageRecord): Record<string, unknown> {
+  const deliveryError = message.deliveryError === undefined
+    ? undefined
+    : normalizePersistedError(message.deliveryError).message;
   return pruneUndefined({
     message_id: message.messageId,
     messageId: message.messageId,
@@ -1718,8 +1767,8 @@ function teamMessageRecordOutput(message: TeamMessageRecord): Record<string, unk
     delivery: message.delivery,
     delivery_status: message.deliveryStatus,
     deliveryStatus: message.deliveryStatus,
-    delivery_error: message.deliveryError,
-    deliveryError: message.deliveryError,
+    delivery_error: deliveryError,
+    deliveryError,
     delivery_updated_at: message.deliveryUpdatedAt,
     deliveryUpdatedAt: message.deliveryUpdatedAt,
     delivered_at: message.deliveredAt,
@@ -1734,6 +1783,9 @@ function teamMessageRecordOutput(message: TeamMessageRecord): Record<string, unk
 }
 
 function teamMessageDeliveryRecordOutput(delivery: TeamSnapshotRecord["messageDeliveries"][number]): Record<string, unknown> {
+  const error = delivery.error === undefined
+    ? undefined
+    : normalizePersistedError(delivery.error).message;
   return pruneUndefined({
     mailbox_message_id: delivery.mailboxMessageId,
     mailboxMessageId: delivery.mailboxMessageId,
@@ -1747,9 +1799,7 @@ function teamMessageDeliveryRecordOutput(delivery: TeamSnapshotRecord["messageDe
     triggerTurn: delivery.triggerTurn,
     child_session_id: delivery.childSessionId,
     childSessionId: delivery.childSessionId,
-    child_thread_id: delivery.childThreadId,
-    childThreadId: delivery.childThreadId,
-    error: delivery.error,
+    error,
     queued_at: delivery.queuedAt,
     queuedAt: delivery.queuedAt,
     updated_at: delivery.updatedAt,
@@ -1795,9 +1845,8 @@ function requiredTeamMessageTarget(
   name: string,
 ): ValidationResult<string | "*"> {
   const value = pickString(record, keys);
-  if (value === undefined) return { ok: false, message: `${name} must be a non-empty agent path or *` };
-  if (value === "*") return { ok: true, value };
-  return normalizePath(value, name);
+  if (value === undefined) return { ok: false, message: `${name} must be a non-empty member path, member name, or *` };
+  return { ok: true, value };
 }
 
 function normalizePath(value: string, name: string): ValidationResult<AgentPath> {
@@ -2037,5 +2086,5 @@ function isAbortError(error: unknown): boolean {
 }
 
 function toErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return normalizePersistedError(error).message;
 }

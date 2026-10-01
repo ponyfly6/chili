@@ -1,4 +1,5 @@
-import type { ChatMessagePart, ChatToolInputSummary, ChatTranscriptItem } from "@chili/sdk";
+import type { ChatMessagePart, ChatToolExecutionContext, ChatToolInputSummary, ChatTranscriptItem } from "@chili/sdk";
+import { publicSyntheticAssistantText } from "./public-error.js";
 
 export type TranscriptLineTone = "heading" | "text" | "muted" | "error";
 
@@ -26,24 +27,28 @@ function messageLines(item: Extract<ChatTranscriptItem, { kind: "message" }>, is
   const lines: TranscriptSourceLine[] = [
     sourceLine(`message:${item.id}:header`, `message ${item.role} ${item.id}`, "heading"),
   ];
-  appendOptionalField(lines, `message:${item.id}`, "threadId", item.threadId);
   appendOptionalField(lines, `message:${item.id}`, "createdAt", String(item.createdAt));
   appendOptionalField(lines, `message:${item.id}`, "completedAt", item.completedAt === undefined ? undefined : String(item.completedAt));
 
   for (const [partIndex, part] of item.parts.entries()) {
-    lines.push(...messagePartLines(item.id, part, partIndex));
+    lines.push(...messagePartLines(item.id, item.role, part, partIndex));
   }
   if (!isLast) lines.push(sourceLine(`message:${item.id}:spacer`, "", "muted"));
   return lines;
 }
 
-function messagePartLines(messageId: string, part: ChatMessagePart, index: number): TranscriptSourceLine[] {
+function messagePartLines(
+  messageId: string,
+  role: Extract<ChatTranscriptItem, { kind: "message" }>["role"],
+  part: ChatMessagePart,
+  index: number,
+): TranscriptSourceLine[] {
   const key = `message:${messageId}:part:${part.id}:${index}`;
   if (part.type === "text") {
     return blockLines({
       key,
-      label: `  part text ${part.id}`,
-      value: part.text,
+      label: `  part text ${part.id}${role === "assistant" ? ` phase=${part.phase ?? "unclassified"}` : ""}`,
+      value: publicSyntheticAssistantText(part.text, part.synthetic),
       tone: "text",
       valueTone: "text",
     });
@@ -90,6 +95,9 @@ function messagePartLines(messageId: string, part: ChatMessagePart, index: numbe
   const lines = [
     sourceLine(`${key}:header`, `  part tool_result ${part.id} callId=${part.callId}${part.synthetic ? " synthetic" : ""}`, "heading"),
   ];
+  if (part.executionContext !== undefined) {
+    lines.push(...executionContextLines(`${key}:execution`, "    executionContext", part.executionContext));
+  }
   lines.push(...blockLines({ key: `${key}:output`, label: "    output", value: part.output, tone: "muted", valueTone: "text" }));
   if (part.error !== undefined) {
     lines.push(...blockLines({ key: `${key}:error`, label: "    error", value: part.error, tone: "error", valueTone: "error" }));
@@ -105,10 +113,12 @@ function toolLines(item: Extract<ChatTranscriptItem, { kind: "tool" }>, isLast: 
     sourceLine(`tool:${item.id}:waiting`, `  waitingForApproval: ${item.waitingForApproval ? "true" : "false"}`, "muted"),
   ];
   appendOptionalField(lines, `tool:${item.id}`, "sessionId", item.sessionId);
-  appendOptionalField(lines, `tool:${item.id}`, "threadId", item.threadId);
   appendOptionalField(lines, `tool:${item.id}`, "approvalId", item.approvalId);
   appendOptionalField(lines, `tool:${item.id}`, "approvalStatus", item.approvalStatus);
   appendOptionalField(lines, `tool:${item.id}`, "approvalDecision", item.approvalDecision);
+  if (item.executionContext !== undefined) {
+    lines.push(...executionContextLines(`tool:${item.id}:execution`, "  executionContext", item.executionContext));
+  }
   lines.push(...summaryBlockLines(`tool:${item.id}:summary`, item.inputSummary));
   lines.push(...blockLines({ key: `tool:${item.id}:input`, label: "  input", value: item.input, tone: "muted", valueTone: "text", emptyText: "(none)" }));
   if (item.output !== undefined) {
@@ -133,7 +143,6 @@ function approvalLines(item: Extract<ChatTranscriptItem, { kind: "approval" }>, 
   appendOptionalField(lines, `approval:${item.id}`, "decision", item.decision);
   appendOptionalField(lines, `approval:${item.id}`, "feedback", item.feedback);
   appendOptionalField(lines, `approval:${item.id}`, "sessionId", item.sessionId);
-  appendOptionalField(lines, `approval:${item.id}`, "threadId", item.threadId);
   lines.push(...listBlockLines(`approval:${item.id}:patterns`, "  patterns", item.patterns));
   lines.push(...summaryBlockLines(`approval:${item.id}:summary`, item.inputSummary));
   if (item.toolInput !== undefined) {
@@ -145,6 +154,22 @@ function approvalLines(item: Extract<ChatTranscriptItem, { kind: "approval" }>, 
 
 function summaryBlockLines(key: string, summary: ChatToolInputSummary): TranscriptSourceLine[] {
   return blockLines({ key, label: "  inputSummary", value: summary, tone: "muted", valueTone: "text" });
+}
+
+function executionContextLines(key: string, label: string, context: ChatToolExecutionContext): TranscriptSourceLine[] {
+  const fields: [string, string][] = [];
+  if (context.executionMode !== undefined) fields.push(["executionMode", context.executionMode]);
+  if (context.sandbox !== undefined) fields.push(["sandbox", context.sandbox]);
+  if (context.exitCode !== undefined) fields.push(["exitCode", String(context.exitCode ?? "null")]);
+  if (context.timedOut !== undefined) fields.push(["timedOut", String(context.timedOut)]);
+  if (context.aborted !== undefined) fields.push(["aborted", String(context.aborted)]);
+  if (context.signal !== undefined) fields.push(["signal", context.signal ?? "null"]);
+  if (fields.length === 0) return [];
+  const prefix = `${leadingWhitespace(label)}  `;
+  return [
+    sourceLine(`${key}:label`, `${label}:`, "muted"),
+    ...fields.map(([name, value]) => sourceLine(`${key}:${name}`, `${prefix}${name}: ${value}`, "text")),
+  ];
 }
 
 function listBlockLines(key: string, label: string, values: readonly string[]): TranscriptSourceLine[] {

@@ -156,7 +156,7 @@ Keep these boundaries unless there is a deliberate architecture change:
 
 The next natural extensions are:
 
-- path-aware `.chili/rules/*.md` frontmatter
+- [path-aware `.chili/rules/*.md` frontmatter](path-aware-rules-rfc.md) — **not implemented / 尚未实现**; the RFC defines the activation contract
 - a model-driven skill activation tool path
 - retrieval memory and memory write/delete policy
 - MCP/deferred tool discovery once tool counts become large

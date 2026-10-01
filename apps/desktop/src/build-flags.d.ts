@@ -1,0 +1,1 @@
+declare const __CHILI_DESKTOP_LOCAL_AD_HOC_BUILD__: boolean;

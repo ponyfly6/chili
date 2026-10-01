@@ -11,12 +11,6 @@ export interface McpServerInstructionsInput {
   metadata?: Record<string, unknown>;
 }
 
-export interface McpServerStatusInput {
-  serverName: string;
-  status: string;
-  detail?: string;
-}
-
 export interface McpStdioTrustInput {
   scope: "project" | "user" | "extension" | "builtin" | string;
   transport: "stdio" | "http" | "sse" | "websocket" | string;
@@ -63,40 +57,6 @@ export function mcpServerInstructionsPromptFragment(input: McpServerInstructions
     },
   };
   if (input.maxChars !== undefined) fragment.maxChars = input.maxChars;
-  return fragment;
-}
-
-export function mcpServerStatusPromptFragment(
-  statuses: readonly McpServerStatusInput[],
-  options: { priority?: number; lifecycle?: PromptFragmentLifecycle; maxChars?: number } = {},
-): PromptFragment | undefined {
-  const lines = statuses
-    .map((status) => {
-      const serverName = status.serverName.trim();
-      const state = status.status.trim();
-      const detail = status.detail?.trim();
-      if (!serverName || !state) return undefined;
-      return detail ? `- ${serverName}: ${state} (${detail})` : `- ${serverName}: ${state}`;
-    })
-    .filter(isString);
-
-  if (lines.length === 0) return undefined;
-
-  const fragment: PromptFragment = {
-    id: "mcp.server.status",
-    layer: "contextual_user",
-    source: "mcp",
-    priority: options.priority ?? 60,
-    lifecycle: options.lifecycle ?? "turn",
-    trust: "tool",
-    content: ["MCP server status:", ...lines].join("\n"),
-    marker: {
-      open: "<mcp_server_status>",
-      close: "</mcp_server_status>",
-    },
-    metadata: { serverCount: lines.length },
-  };
-  if (options.maxChars !== undefined) fragment.maxChars = options.maxChars;
   return fragment;
 }
 

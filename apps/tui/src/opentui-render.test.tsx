@@ -39,19 +39,42 @@ test("chat prompt exposes a native renderer cursor", async () => {
   }
 });
 
-test("renders fielded chat footer with cwd status model and usage fallback", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), { width: 120, height: 24 });
+test("renders a restrained one-line chat footer", async () => {
+  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), { width: 120, height: 24 });
+  const footerLine = frame.split("\n").find((line) => line.includes("test-model")) ?? "";
 
-  expect(frame).toContain("/repo/chili");
-  expect(frame).toContain("idle");
-  expect(frame).toContain("ctx --");
-  expect(frame).toContain("test-provider/test-model Build");
-  expect(frame).toContain("Details off");
-  expect(frame).toContain("Ctrl+T Transcript");
+  expect(footerLine).toContain("chili");
+  expect(footerLine).toContain("Build");
+  expect(frame).not.toContain("test-provider/");
+  expect(frame).not.toContain("idle");
+  expect(frame).not.toContain("ctx --");
+  expect(frame).not.toContain("Details off");
+  expect(frame).not.toContain("Ctrl+T Transcript");
 });
 
-test("renders token usage and known context when model metadata is available", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), {
+test("chat footer follows the persisted session workspace", async () => {
+  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
+    width: 120,
+    height: 24,
+    runtime: fakeChatRuntime({
+      chatView: {
+        cwd: "/server/persisted-workspace",
+        status: "idle",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "now",
+      },
+    }),
+  });
+
+  const footerLine = frame.split("\n").find((line) => line.includes("test-model")) ?? "";
+  expect(footerLine).toContain("persisted-workspace");
+  expect(footerLine).not.toContain("chili");
+});
+
+test("renders remaining context without cumulative token usage", async () => {
+  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -73,13 +96,14 @@ test("renders token usage and known context when model metadata is available", a
     }),
   });
 
-  expect(frame).toContain("ctx 20.0k/205k 10%");
-  expect(frame).toContain("used 75.0k");
-  expect(frame).toContain("minimax/MiniMax-M2.7 Build");
+  expect(frame).toContain("90% ctx left");
+  expect(frame).toContain("MiniMax-M2.7");
+  expect(frame).not.toContain("used 75.0k");
+  expect(frame).not.toContain("minimax/");
 });
 
-test("renders latest context tokens without a percentage when the model limit is unavailable", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), {
+test("renders compact context tokens when the model limit is unavailable", async () => {
+  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -100,13 +124,13 @@ test("renders latest context tokens without a percentage when the model limit is
     }),
   });
 
-  expect(frame).toContain("ctx 20.0k  used 75.0k");
-  expect(frame).not.toContain("ctx 20.0k/");
-  expect(frame).not.toContain("10%");
+  expect(frame).toContain("20.0k ctx");
+  expect(frame).not.toContain("used 75.0k");
+  expect(frame).not.toContain("custom/");
 });
 
 test("keeps the input visible in a short narrow chat frame", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), {
+  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
     width: 64,
     height: 12,
     runtime: fakeChatRuntime({
@@ -121,7 +145,8 @@ test("keeps the input visible in a short narrow chat frame", async () => {
   });
 
   expect(frame).toContain("Ask anything");
-  expect(frame).toContain("ctx --");
+  expect(frame).toContain("test-model");
+  expect(frame).not.toContain("ctx --");
   expect(lineCount(frame)).toBe(12);
 });
 
@@ -154,8 +179,104 @@ test("renders chat shell action feedback", async () => {
   expect(error).toContain("merge failed");
 });
 
+test("accepted feedback is bound to the next per-session status event", async () => {
+  const staleFailure = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 40,
+    runtime: fakeChatRuntime({
+      chatFeedback: {
+        status: "accepted",
+        message: "prompt queued",
+        acceptedAgainstStatusEventId: "event_old_failed",
+      },
+      chatView: {
+        status: "failed",
+        statusEventId: "event_old_failed",
+        statusReason: "old failure must not replace the new acknowledgement",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "now",
+      },
+    }),
+  });
+  const running = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 40,
+    runtime: fakeChatRuntime({
+      chatFeedback: {
+        status: "accepted",
+        message: "prompt queued",
+        acceptedAgainstStatusEventId: "event_old_failed",
+      },
+      chatView: {
+        status: "running",
+        statusEventId: "event_new_running",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "now",
+      },
+    }),
+  });
+  const newFailure = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 40,
+    runtime: fakeChatRuntime({
+      chatFeedback: {
+        status: "accepted",
+        message: "prompt queued",
+        acceptedAgainstStatusEventId: "event_old_failed",
+      },
+      chatView: {
+        status: "failed",
+        statusEventId: "event_new_failed",
+        statusReason: "Model request failed with HTTP 502 Bad Gateway",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "now",
+      },
+    }),
+  });
+
+  expect(staleFailure).toContain("accepted: prompt queued");
+  expect(staleFailure).not.toContain("old failure must not replace");
+  expect(running).toContain("pending: session running");
+  expect(running).not.toContain("prompt queued");
+  expect(newFailure).toContain("Model request failed with HTTP 502 Bad Gateway");
+  expect(newFailure).not.toContain("prompt queued");
+});
+
+test("retry feedback exposes timing without rendering the unsafe provider reason", async () => {
+  const frame = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 40,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "running",
+        statusEventId: "event_retry_running",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "now",
+        retry: {
+          turnId: "turn_retry" as TurnId,
+          attempt: 2,
+          delayMs: 1_500,
+          reason: "<!DOCTYPE html><html>private provider page</html>",
+          scheduledAt: 1,
+        },
+      },
+    }),
+  });
+
+  expect(frame).toContain("retrying request · attempt 2 · 2s");
+  expect(frame).not.toContain("private provider page");
+});
+
 test("renders chat transcript as a scrollable window", async () => {
-  const app = await renderShell(teamLiveFixture(), {
+  const app = await renderShell(emptyTeamLiveFixture("streaming"), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -174,8 +295,7 @@ test("renders chat transcript as a scrollable window", async () => {
     expect(app.captureCharFrame()).not.toContain("message 01");
 
     act(() => {
-      app.mockInput.pressKey("y", { ctrl: true });
-      app.mockInput.pressKey("y", { ctrl: true });
+      for (let index = 0; index < 4; index += 1) app.mockInput.pressKey("y", { ctrl: true });
     });
     await Bun.sleep(60);
     await app.renderOnce();
@@ -273,7 +393,8 @@ test("renders tool rows as compact activity without raw output blocks", async ()
   });
 
   expect(frame).toContain("Waiting approval for bun test");
-  expect(frame).toContain("Exploring 1 file, searched 1 pattern");
+  expect(frame).toContain("Searching TODO in apps/tui");
+  expect(frame).toContain("Read README.md");
   expect(frame).not.toContain("result tool_done: ok");
   expect(frame).toContain("Rejected a.ts");
 });
@@ -301,7 +422,7 @@ test("ctrl+o toggles tool details and footer status", async () => {
   });
 
   try {
-    expect(app.captureCharFrame()).toContain("Details off");
+    expect(app.captureCharFrame()).not.toContain("Details on");
     expect(app.captureCharFrame()).toContain("output hidden (12 lines, details available)");
     expect(app.captureCharFrame()).not.toContain("line_01");
 
@@ -315,7 +436,8 @@ test("ctrl+o toggles tool details and footer status", async () => {
     expect(app.captureCharFrame()).not.toContain("output hidden");
     expect(app.captureCharFrame()).toContain("output (truncated):");
     expect(app.captureCharFrame()).toContain("line_01");
-    expect(app.captureCharFrame()).toContain("line_05");
+    expect(app.captureCharFrame()).toContain("… +8 lines");
+    expect(app.captureCharFrame()).toContain("line_12");
     expect(app.captureCharFrame()).not.toContain("line_06");
   } finally {
     app.renderer.destroy();
@@ -324,7 +446,7 @@ test("ctrl+o toggles tool details and footer status", async () => {
 
 test("ctrl+t opens transcript view with raw tool and approval details, and escape returns to chat", async () => {
   const items = rawTranscriptItems();
-  const app = await renderShell(teamLiveFixture(), {
+  const app = await renderShell(emptyTeamLiveFixture("streaming"), {
     width: 120,
     height: 54,
     runtime: fakeChatRuntime({
@@ -350,7 +472,7 @@ test("ctrl+t opens transcript view with raw tool and approval details, and escap
     await app.renderOnce();
 
     expect(app.captureCharFrame()).toContain("Transcript");
-    expect(app.captureCharFrame()).toContain("Ctrl+T Transcript on");
+    expect(app.captureCharFrame()).toContain("Transcript on");
     expect(app.captureCharFrame()).toContain("tool bash failed tool_raw");
     expect(app.captureCharFrame()).toContain("\"command\": \"bun test\"");
     expect(app.captureCharFrame()).toContain("RAW_TOOL_OUTPUT_LINE_1");
@@ -532,6 +654,48 @@ test("renders approval permission patterns and risk metadata", async () => {
   expect(frame).toContain("a once | s session | A always | x deny");
 });
 
+test("renders unsandboxed approvals as one-time only", async () => {
+  const command = "echo visible first\necho visible second\nremindctl status --include-completed";
+  const frame = await renderShellFrame(teamLiveFixture(), {
+    width: 110,
+    height: 34,
+    runtime: fakeChatRuntime({
+      canSubmit: false,
+      chatView: {
+        status: "waiting_for_approval",
+        items: chatMessages(1),
+        pendingApprovals: [
+          {
+            id: "approval_unsandboxed" as ApprovalId,
+            kind: "approval",
+            permission: "bash.unsandboxed",
+            patterns: [command],
+            maxApprovalScope: "once",
+            status: "pending",
+            createdAt: 1,
+            toolName: "bash",
+            toolDisplayStatus: "waiting_permission",
+            inputSummary: { title: "bash", command, detail: command, scope: "tools/reminders" },
+            metadata: { justification: "inspect Reminders authorization through desktop IPC" },
+          },
+        ] as never,
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  expect(frame).toContain("outside Chili's host sandbox");
+  expect(frame).toContain("approval is one-time");
+  expect(frame).toContain("remindctl status --include-completed");
+  expect(frame).not.toContain("...");
+  expect(frame).toContain("cwd: tools/reminders");
+  expect(frame).toContain("purpose: inspect Reminders authorization through desktop IPC");
+  expect(frame).toContain("a once | x deny");
+  expect(frame).not.toContain("s session");
+  expect(frame).not.toContain("A always");
+});
+
 test("folds long approval details without hiding the prompt", async () => {
   const longCommand = Array.from({ length: 80 }, (_, index) => `echo segment_${index}`).join(" && ");
   const frame = await renderShellFrame(teamLiveFixture(), {
@@ -564,7 +728,8 @@ test("folds long approval details without hiding the prompt", async () => {
   expect(frame).toContain("Approval required");
   expect(frame).toContain("...");
   expect(frame).toContain("Resolve approval to continue");
-  expect(frame).toContain("commands");
+  expect(frame).toContain("test-model · chili");
+  expect(frame).toContain("Build · approval");
 });
 
 test("mouse wheel scrolls the chat transcript", async () => {
@@ -588,7 +753,7 @@ test("mouse wheel scrolls the chat transcript", async () => {
     expect(app.captureCharFrame()).not.toContain("message 01");
 
     await act(async () => {
-      for (let index = 0; index < 16; index += 1) {
+      for (let index = 0; index < 48; index += 1) {
         await app.mockMouse.scroll(10, 3, "up");
       }
     });
@@ -599,7 +764,7 @@ test("mouse wheel scrolls the chat transcript", async () => {
     expect(app.captureCharFrame()).not.toContain("message 30");
 
     await act(async () => {
-      for (let index = 0; index < 16; index += 1) {
+      for (let index = 0; index < 48; index += 1) {
         await app.mockMouse.scroll(10, 3, "down");
       }
     });
@@ -803,6 +968,7 @@ function fakeChatRuntime(input: Partial<ChatRuntimeState> = {}): ChatRuntimeStat
     reconnect: () => undefined,
     executeAction: (_action: TeamLiveAction) => undefined,
     clearActionFeedback: () => undefined,
+    hydrateEvents: () => undefined,
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
@@ -812,6 +978,9 @@ function fakeChatRuntime(input: Partial<ChatRuntimeState> = {}): ChatRuntimeStat
     resumeGoal: async () => undefined,
     clearGoal: async () => false,
     startNewSession: async () => undefined,
+    listSessions: async () => [],
+    resumeSession: async () => true,
+    renameSession: async () => undefined,
     interruptActiveSession: async () => undefined,
     approveApproval: async () => undefined,
     rejectApproval: async () => undefined,

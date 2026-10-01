@@ -1,0 +1,21 @@
+{
+  "name": "@chili/remote-control",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./browser": {
+      "types": "./dist/browser.d.ts",
+      "default": "./dist/browser.js"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "demo": "bun run src/demo.ts",
+    "test": "bun test src",
+    "typecheck": "tsc -b"
+  }
+}

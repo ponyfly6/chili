@@ -99,9 +99,9 @@ async function smokeSingleAgentToolLoop(workspace: string): Promise<void> {
     },
   });
 
-  const sessionId = await harness.runtime.createSession({ threadId: "thread_1" as never, cwd: workspace });
-  await harness.runtime.appendUserMessage({ sessionId, threadId: "thread_1" as never, text: "change file" });
-  const result = await harness.runtime.runTurn({ sessionId, threadId: "thread_1" as never, cwd: workspace });
+  const sessionId = await harness.runtime.createSession({ cwd: workspace });
+  await harness.runtime.appendUserMessage({ sessionId, text: "change file" });
+  const result = await harness.runtime.runTurn({ sessionId, cwd: workspace });
 
   assert.equal(result.status, "completed");
   assert.equal(await readFile(join(workspace, "a.txt"), "utf8"), "new\n");
@@ -119,14 +119,13 @@ async function smokeInterruptSyntheticResult(workspace: string): Promise<void> {
       yield { type: "finish", reason: "stop" } as const;
     },
   });
-  const sessionId = await harness.runtime.createSession({ threadId: "thread_2" as never, cwd: workspace });
-  await harness.runtime.appendUserMessage({ sessionId, threadId: "thread_2" as never, text: "run sleep" });
+  const sessionId = await harness.runtime.createSession({ cwd: workspace });
+  await harness.runtime.appendUserMessage({ sessionId, text: "run sleep" });
   const controller = new AbortController();
   setTimeout(() => controller.abort(), 50);
 
   const result = await harness.runtime.runTurn({
     sessionId,
-    threadId: "thread_2" as never,
     cwd: workspace,
     signal: controller.signal,
   });
@@ -159,9 +158,9 @@ async function smokeRetry(workspace: string): Promise<void> {
     },
     { retryPolicy: { maxAttempts: 2, initialDelayMs: 1 } },
   );
-  const sessionId = await harness.runtime.createSession({ threadId: "thread_3" as never, cwd: workspace });
-  await harness.runtime.appendUserMessage({ sessionId, threadId: "thread_3" as never, text: "retry" });
-  const result = await harness.runtime.runTurn({ sessionId, threadId: "thread_3" as never, cwd: workspace });
+  const sessionId = await harness.runtime.createSession({ cwd: workspace });
+  await harness.runtime.appendUserMessage({ sessionId, text: "retry" });
+  const result = await harness.runtime.runTurn({ sessionId, cwd: workspace });
 
   assert.equal(result.status, "completed");
   assert.equal(attempts, 2);
@@ -181,9 +180,9 @@ async function smokeDoomLoopGuard(workspace: string): Promise<void> {
     },
     { doomLoopGuard: { maxRepeatedToolCalls: 1 } },
   );
-  const sessionId = await harness.runtime.createSession({ threadId: "thread_4" as never, cwd: workspace });
-  await harness.runtime.appendUserMessage({ sessionId, threadId: "thread_4" as never, text: "loop" });
-  const result = await harness.runtime.runTurn({ sessionId, threadId: "thread_4" as never, cwd: workspace });
+  const sessionId = await harness.runtime.createSession({ cwd: workspace });
+  await harness.runtime.appendUserMessage({ sessionId, text: "loop" });
+  const result = await harness.runtime.runTurn({ sessionId, cwd: workspace });
 
   assert.equal(result.status, "failed");
   const events = await harness.store.events({ sessionId, limit: 100 });
@@ -209,9 +208,9 @@ async function smokeSnapshotRevert(workspace: string): Promise<void> {
       yield { type: "finish", reason: "stop" } as const;
     },
   });
-  const sessionId = await harness.runtime.createSession({ threadId: "thread_5" as never, cwd: workspace });
-  await harness.runtime.appendUserMessage({ sessionId, threadId: "thread_5" as never, text: "snapshot" });
-  await harness.runtime.runTurn({ sessionId, threadId: "thread_5" as never, cwd: workspace });
+  const sessionId = await harness.runtime.createSession({ cwd: workspace });
+  await harness.runtime.appendUserMessage({ sessionId, text: "snapshot" });
+  await harness.runtime.runTurn({ sessionId, cwd: workspace });
 
   assert.equal(await readFile(join(workspace, "snap.txt"), "utf8"), "after");
   const snapshotEvent = (await harness.store.events({ sessionId, type: "snapshot.created", limit: 10 }))[0];
@@ -222,7 +221,7 @@ async function smokeSnapshotRevert(workspace: string): Promise<void> {
     createId: idFactory(),
     now: () => 1 as never,
   });
-  await recovery.revert({ sessionId, threadId: "thread_5" as never, snapshotId: snapshotEvent.payload.snapshotId });
+  await recovery.revert({ sessionId, snapshotId: snapshotEvent.payload.snapshotId });
   assert.equal(await readFile(join(workspace, "snap.txt"), "utf8"), "before");
   assert.equal((await harness.store.events({ sessionId, type: "snapshot.reverted", limit: 10 })).length, 1);
   harness.store.close();
@@ -230,7 +229,7 @@ async function smokeSnapshotRevert(workspace: string): Promise<void> {
 
 async function smokeContextAndOutputTruncation(workspace: string): Promise<void> {
   const builder = new ContextWindowBuilder({
-    maxInputChars: 120,
+    maxInputChars: 260,
     maxToolResultChars: 20,
     preserveRecentMessages: 1,
   });
@@ -247,13 +246,33 @@ async function smokeContextAndOutputTruncation(workspace: string): Promise<void>
       sessionId: "session_1" as never,
       role: "assistant",
       createdAt: 2 as never,
-      parts: [{ id: "part_2" as never, messageId: "msg_2" as never, sessionId: "session_1" as never, type: "tool_result", callId: "toolcall_1" as never, output: "y".repeat(100) }],
+      parts: [
+        {
+          id: "part_2_call" as never,
+          messageId: "msg_2" as never,
+          sessionId: "session_1" as never,
+          type: "tool_call",
+          callId: "toolcall_1" as never,
+          toolName: "large_output",
+          input: {},
+          status: "completed",
+        },
+        {
+          id: "part_2" as never,
+          messageId: "msg_2" as never,
+          sessionId: "session_1" as never,
+          type: "tool_result",
+          callId: "toolcall_1" as never,
+          output: "y".repeat(100),
+        },
+      ],
     },
   ]);
   assert.ok(built.compactionBoundary);
   assert.equal(built.usage.truncatedToolResults, 1);
-  assert.ok(built.messages.at(-1)?.parts[0]?.type === "tool_result");
-  assert.ok(built.messages.at(-1)?.parts[0]?.type === "tool_result" && built.messages.at(-1)?.parts[0]?.output.includes("tool result omitted"));
+  const contextToolResult = built.messages.flatMap((message) => message.parts).find((part) => part.type === "tool_result");
+  assert.ok(contextToolResult?.type === "tool_result");
+  assert.ok(contextToolResult?.type === "tool_result" && contextToolResult.output.includes("tool result omitted"));
 
   const createId = idFactory();
   const store = new SqliteEventStore(join(workspace, `${globalThis.crypto.randomUUID()}.sqlite`));
@@ -285,18 +304,17 @@ async function smokeContextAndOutputTruncation(workspace: string): Promise<void>
     toolExecutor: executor,
     createId,
     now: () => 1 as never,
-    contextBudget: { maxInputChars: 80, preserveRecentMessages: 1 },
+    contextBudget: { maxInputChars: 120, preserveRecentMessages: 1 },
   });
 
-  const sessionId = await runtime.createSession({ threadId: "thread_6" as never, cwd: workspace });
-  await runtime.appendUserMessage({ sessionId, threadId: "thread_6" as never, text: "a".repeat(200) });
-  const result = await runtime.runTurn({ sessionId, threadId: "thread_6" as never, cwd: workspace });
+  const sessionId = await runtime.createSession({ cwd: workspace });
+  await runtime.appendUserMessage({ sessionId, text: "a".repeat(200) });
+  const result = await runtime.runTurn({ sessionId, cwd: workspace });
   assert.equal(result.status, "completed");
   assert.ok((await store.events({ sessionId, type: "turn.compaction_requested", limit: 10 })).length >= 1);
 
   const toolResult = await executor.execute({
     sessionId,
-    threadId: "thread_6" as never,
     turnId: "turn_tool" as never,
     toolName: "large_output",
     input: {},

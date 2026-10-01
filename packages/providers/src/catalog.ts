@@ -1,11 +1,20 @@
 import type { AuthStatus, FileAuthStorage } from "./auth.js";
-import { findConfiguredEnvironmentNames, readProviderEnvironment, type EnvironmentSource } from "./env.js";
 import {
+  findConfiguredEnvironmentNames,
+  isAbsoluteHttpUrl,
+  readProviderEnvironment,
+  type EnvironmentSource,
+} from "./env.js";
+import {
+  CODEX_API_PROVIDER_ID,
   DEEPSEEK_PROVIDER_ID,
   KIMI_PROVIDER_ID,
   listKnownModels,
+  OPENAI_CODEX_BASE_URL,
   MINIMAX_PROVIDER_ID,
   OPENAI_CODEX_PROVIDER_ID,
+  XAI_PROVIDER_ID,
+  ZAI_PROVIDER_ID,
 } from "./models.js";
 import type { ModelDescriptor } from "./types.js";
 
@@ -22,11 +31,14 @@ export interface ProviderCatalogStatus {
   accountId?: string;
   expires?: number;
   expired?: boolean;
+  endpoint?: string;
 }
 
 export type ModelCatalogEntry = ModelDescriptor & {
   providerDisplayName: string;
   available: boolean;
+  authSource: ProviderAuthSource;
+  endpoint?: string;
   authStatus: ProviderCatalogStatus;
 };
 
@@ -34,13 +46,17 @@ export interface ProviderCatalogOptions {
   env?: EnvironmentSource;
   authStatus?: AuthStatus;
   displayName?: string;
+  endpoint?: string;
 }
 
 export const BUILTIN_PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  [CODEX_API_PROVIDER_ID]: "Api",
   [DEEPSEEK_PROVIDER_ID]: "DeepSeek",
   [KIMI_PROVIDER_ID]: "Kimi",
   [MINIMAX_PROVIDER_ID]: "MiniMax",
-  [OPENAI_CODEX_PROVIDER_ID]: "ChatGPT Codex",
+  [OPENAI_CODEX_PROVIDER_ID]: "ChatGPT",
+  [XAI_PROVIDER_ID]: "xAI",
+  [ZAI_PROVIDER_ID]: "Z.ai",
 };
 
 export function getProviderDisplayName(provider: string, overrides: Record<string, string> = {}): string {
@@ -54,21 +70,34 @@ export function getProviderCatalogStatus(
   const env = options.env;
   const environment = readProviderEnvironment(provider, env);
   const configuredEnvironmentNames = findConfiguredEnvironmentNames(provider, env);
-  const environmentConfigured = environment.apiKey !== undefined;
+  const environmentConfigured = provider === CODEX_API_PROVIDER_ID
+    ? Boolean(environment.apiKey?.trim()) && isAbsoluteHttpUrl(environment.baseUrl)
+    : environment.apiKey !== undefined;
   const authStatus = options.authStatus;
-  const configured = environmentConfigured || authStatus?.configured === true;
+  const storedAuthConfigured = provider === OPENAI_CODEX_PROVIDER_ID
+    ? authStatus?.configured === true && authStatus.type === "oauth"
+    : provider === CODEX_API_PROVIDER_ID
+      ? false
+      : authStatus?.configured === true;
+  const configured = environmentConfigured || storedAuthConfigured;
   const status: ProviderCatalogStatus = {
     provider,
     displayName: options.displayName ?? getProviderDisplayName(provider),
     configured,
     available: configured,
-    authSource: environmentConfigured ? "environment" : authStatus?.type ?? "none",
+    authSource: environmentConfigured ? "environment" : storedAuthConfigured ? authStatus?.type ?? "none" : "none",
     configuredEnvironmentNames,
   };
   if (authStatus?.authPath) status.authPath = authStatus.authPath;
   if (authStatus?.accountId) status.accountId = authStatus.accountId;
   if (authStatus?.expires !== undefined) status.expires = authStatus.expires;
   if (authStatus?.expired !== undefined) status.expired = authStatus.expired;
+  const endpoint = safeEndpointOrigin(
+    environment.baseUrl
+    ?? options.endpoint
+    ?? (provider === OPENAI_CODEX_PROVIDER_ID ? OPENAI_CODEX_BASE_URL : undefined),
+  );
+  if (endpoint) status.endpoint = endpoint;
   return status;
 }
 
@@ -91,12 +120,15 @@ export function listModelCatalog(provider?: string, options: ProviderCatalogOpti
       getProviderCatalogStatus(model.provider, {
         ...options,
         displayName: options.displayName ?? getProviderDisplayName(model.provider),
+        ...(model.baseUrl ? { endpoint: model.baseUrl } : {}),
       });
     statusByProvider.set(model.provider, authStatus);
     return {
       ...model,
       providerDisplayName: authStatus.displayName,
       available: authStatus.available,
+      authSource: authStatus.authSource,
+      ...(authStatus.endpoint ? { endpoint: authStatus.endpoint } : {}),
       authStatus,
     };
   });
@@ -111,7 +143,10 @@ export async function listModelCatalogFromStorage(
   const models = listKnownModels(provider);
   for (const model of models) {
     if (!statuses.has(model.provider)) {
-      statuses.set(model.provider, await getProviderCatalogStatusFromStorage(model.provider, storage, options));
+      statuses.set(model.provider, await getProviderCatalogStatusFromStorage(model.provider, storage, {
+        ...options,
+        ...(model.baseUrl ? { endpoint: model.baseUrl } : {}),
+      }));
     }
   }
   return models.map((model) => {
@@ -120,7 +155,20 @@ export async function listModelCatalogFromStorage(
       ...model,
       providerDisplayName: authStatus.displayName,
       available: authStatus.available,
+      authSource: authStatus.authSource,
+      ...(authStatus.endpoint ? { endpoint: authStatus.endpoint } : {}),
       authStatus,
     };
   });
+}
+
+function safeEndpointOrigin(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
+    return url.origin;
+  } catch {
+    return undefined;
+  }
 }

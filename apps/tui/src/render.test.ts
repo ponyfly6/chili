@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readdir, readFile } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
-import type { SessionId, ThreadId } from "@chili/protocol";
+import type { SessionId } from "@chili/protocol";
 import { formatResumeCommand, formatTerminalTitle, parseArgs, terminalTitleSequence, teamLiveStreamInput } from "./index.js";
 import { detectSystemTheme, generateSystemTheme, initialTuiThemeId, resolveTuiTheme } from "./theme/index.js";
 
@@ -23,42 +23,36 @@ test("parses runtime flags and keeps Team Live stream unscoped for child-session
     themeId: "chili-light",
     maxCycles: 2,
   });
-  expect(parseArgs(["--resume", "session_resume", "--thread", "thread_resume"])).toMatchObject({
+  expect(parseArgs(["--resume", "session_resume"])).toMatchObject({
     sessionId: "session_resume",
-    threadId: "thread_resume",
   });
+  expect(() => parseArgs(["--thread", "thread_resume"])).toThrow("Unknown argument: --thread");
 
   const streamInput = teamLiveStreamInput(
-    { sessionId: "session_live" as SessionId, threadId: "thread_live" as ThreadId },
+    { sessionId: "session_live" as SessionId },
     controller.signal,
     "event_live",
   );
   expect(streamInput.signal).toBe(controller.signal);
   expect(streamInput.afterEventId).toBe("event_live");
   expect(streamInput.sessionId).toBeUndefined();
-  expect(streamInput.threadId).toBeUndefined();
 
   const scopedStreamInput = teamLiveStreamInput(
-    { sessionId: "session_resume" as SessionId, threadId: "thread_resume" as ThreadId, streamScope: "session" },
+    { sessionId: "session_resume" as SessionId, streamScope: "session" },
     controller.signal,
   );
   expect(scopedStreamInput.sessionId).toBe("session_resume" as SessionId);
-  expect(scopedStreamInput.threadId).toBe("thread_resume" as ThreadId);
 });
 
-test("formats a resume command when a chat session and thread are available", () => {
+test("formats a resume command when a chat session is available", () => {
   expect(formatResumeCommand({
     sessionId: "session_resume" as SessionId,
-    threadId: "thread_resume" as ThreadId,
     cwd: "/repo/chili",
-  })).toBe("chili --cwd /repo/chili --resume session_resume --thread thread_resume");
+  })).toBe("chili --cwd /repo/chili --resume session_resume");
   expect(formatResumeCommand({
     sessionId: "session_resume" as SessionId,
-    threadId: "thread_resume" as ThreadId,
-  })).toBe("chili --resume session_resume --thread thread_resume");
-  expect(formatResumeCommand({
-    sessionId: "session_resume" as SessionId,
-  })).toBeUndefined();
+  })).toBe("chili --resume session_resume");
+  expect(formatResumeCommand(undefined)).toBeUndefined();
 });
 
 test("formats terminal title from the active cwd", () => {
@@ -189,6 +183,7 @@ test("generates a system TUI theme from a terminal palette", () => {
     name: "System",
     colors: {
       background: "#101820",
+      message: { userBackground: "#2c3339" },
       text: { primary: "#f8f8f2" },
       accent: { primary: "#7ee7c8" },
       status: {
@@ -221,6 +216,7 @@ test("detects system TUI theme with a fresh renderer palette", async () => {
     id: "system",
     colors: {
       background: "#fdfdfd",
+      message: { userBackground: "#f4f4f4" },
       text: { primary: "#101010" },
       accent: { primary: "#228f8f" },
     },

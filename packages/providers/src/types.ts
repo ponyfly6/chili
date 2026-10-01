@@ -1,11 +1,11 @@
-import type { Message, ServiceTier } from "@chili/protocol";
+import type { AssistantMessagePhase, Message, PersistedModelOutput, ServiceTier } from "@chili/protocol";
 import type { ModelCompatibilityOverrides } from "./compat.js";
 
 export type ModelApiFamily = "anthropic-messages" | "openai-completions" | "openai-responses" | (string & {});
 
 export type ModelInputCapability = "text" | "image";
 
-export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 export const THINKING_LEVELS = REASONING_LEVELS;
 export type ThinkingLevel = ReasoningLevel;
@@ -37,6 +37,8 @@ export interface ModelDescriptor {
   inputCapabilities?: readonly ModelInputCapability[];
   contextWindowTokens?: number;
   maxOutputTokens?: number;
+  reasoningLevels?: readonly ReasoningLevel[];
+  serviceTiers?: readonly ServiceTier[];
   cost?: ModelCost;
   default?: boolean;
 }
@@ -72,6 +74,7 @@ export interface ModelStreamInput {
   provider?: string;
   model?: string;
   selection?: Partial<ModelSelection>;
+  reasoningLevel?: ReasoningLevel;
   reasoning?: ReasoningLevel;
   thinking?: ThinkingLevel;
   serviceTier?: ServiceTier;
@@ -86,6 +89,7 @@ export interface ModelStreamInput {
 }
 
 export interface ModelUsage {
+  /** Non-cached input tokens. Cached reads and writes are reported separately. */
   inputTokens?: number;
   outputTokens?: number;
   cacheReadInputTokens?: number;
@@ -98,6 +102,7 @@ export type ModelStreamEvent =
   | ModelMetadataEvent
   | ModelTextDeltaEvent
   | ModelReasoningDeltaEvent
+  | ModelReasoningItemEvent
   | ModelToolCallStartEvent
   | ModelToolCallDeltaEvent
   | ModelToolCallEndEvent
@@ -118,6 +123,7 @@ export interface ModelTextDeltaEvent {
   type: "text_delta";
   text: string;
   index?: number;
+  phase?: AssistantMessagePhase;
 }
 
 export interface ModelReasoningDeltaEvent {
@@ -125,6 +131,11 @@ export interface ModelReasoningDeltaEvent {
   text: string;
   index?: number;
   redacted?: boolean;
+}
+
+export interface ModelReasoningItemEvent {
+  type: "reasoning_item";
+  output: PersistedModelOutput;
 }
 
 export interface ModelToolCallStartEvent {
@@ -148,6 +159,7 @@ export interface ModelToolCallEndEvent {
   toolCallId: string;
   name: string;
   input: unknown;
+  inputParseError?: string;
   index?: number;
 }
 

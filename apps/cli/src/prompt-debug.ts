@@ -1,9 +1,8 @@
 import type { PromptDebugManifest, RenderedPromptFragment } from "@chili/core";
-import type { SessionId, ThreadId } from "@chili/protocol";
+import type { SessionId } from "@chili/protocol";
 
 export interface CliPromptDebugOutput {
   sessionId: SessionId;
-  threadId: ThreadId;
   cwd: string;
   created: boolean;
   debug: PromptDebugManifest;
@@ -26,7 +25,6 @@ export function formatPromptDebugText(output: CliPromptDebugOutput): string {
   const lines = [
     `[prompt-debug] totalChars=${output.debug.totalChars}`,
     `sessionId=${output.sessionId}`,
-    `threadId=${output.threadId}`,
     `cwd=${output.cwd}`,
     `created=${output.created}`,
     "[fragments]",

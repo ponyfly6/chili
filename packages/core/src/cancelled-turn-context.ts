@@ -23,9 +23,9 @@ export async function filterCancelledPromptMessagesForContext(
     if (turnId && status) completedStatusByTurn.set(turnId, status);
   }
 
-  const cancelledTurnIds = new Set<string>();
+  const removableStatusTurnIds = new Set<string>();
   for (const [turnId, status] of completedStatusByTurn) {
-    if (status === "cancelled") cancelledTurnIds.add(turnId);
+    if (status === "cancelled" || status === "failed") removableStatusTurnIds.add(turnId);
   }
 
   const statusEvents = await readEvents(store, { sessionId, type: "session.status_changed" });
@@ -33,12 +33,16 @@ export async function filterCancelledPromptMessagesForContext(
     const payload = recordPayload(event);
     const turnId = stringValue(payload.turnId);
     const status = stringValue(payload.status);
-    if (turnId && status === "cancelled" && !completedStatusByTurn.has(turnId)) {
-      cancelledTurnIds.add(turnId);
+    if (
+      turnId &&
+      (status === "cancelled" || status === "failed") &&
+      !completedStatusByTurn.has(turnId)
+    ) {
+      removableStatusTurnIds.add(turnId);
     }
   }
 
-  if (cancelledTurnIds.size === 0) return [...messages];
+  if (removableStatusTurnIds.size === 0) return [...messages];
 
   const meaningfulOutputTurnIds = new Set<string>();
   for (const message of messages) {
@@ -49,7 +53,7 @@ export async function filterCancelledPromptMessagesForContext(
   }
 
   const removableTurnIds = new Set(
-    [...cancelledTurnIds].filter((turnId) => !meaningfulOutputTurnIds.has(turnId)),
+    [...removableStatusTurnIds].filter((turnId) => !meaningfulOutputTurnIds.has(turnId)),
   );
   if (removableTurnIds.size === 0) return [...messages];
 
@@ -77,7 +81,7 @@ async function readEvents(
 
 function isMeaningfulAssistantOutput(part: MessagePart): boolean {
   if (part.type === "reasoning") return false;
-  if (part.type === "text") return part.text.trim().length > 0;
+  if (part.type === "text") return part.synthetic !== true && part.text.trim().length > 0;
   if (part.type === "tool_result") {
     return (
       part.output.trim().length > 0 ||

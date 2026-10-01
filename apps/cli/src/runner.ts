@@ -1,10 +1,9 @@
-import type { ModelSelection, ReasoningLevel, ServiceTier, SessionId, ThreadId } from "@chili/protocol";
+import type { ModelSelection, ReasoningLevel, ServiceTier, SessionId } from "@chili/protocol";
 import type { CliHarness } from "./harness.js";
 
 export interface RunPromptOptions {
   harness: CliHarness;
   sessionId: SessionId;
-  threadId: ThreadId;
   prompt: string;
   maxTurns: number;
   modelSelection?: ModelSelection;
@@ -13,10 +12,23 @@ export interface RunPromptOptions {
   signal?: AbortSignal;
 }
 
+export type RunSessionPromptOptions = Omit<
+  RunPromptOptions,
+  "modelSelection" | "reasoningLevel" | "serviceTier"
+>;
+
+/**
+ * Submit through the Runtime's persisted model state. Harness defaults seed that
+ * state at construction time; repeating them here would turn defaults into
+ * per-turn overrides and bypass capability normalization for the selected model.
+ */
+export function runSessionPrompt(options: RunSessionPromptOptions): Promise<void> {
+  return runPrompt(options);
+}
+
 export async function runPrompt(options: RunPromptOptions): Promise<void> {
   const input = {
     sessionId: options.sessionId,
-    threadId: options.threadId,
     text: options.prompt,
     maxTurns: options.maxTurns,
   };
@@ -38,7 +50,13 @@ export async function runPrompt(options: RunPromptOptions): Promise<void> {
     return;
   }
 
-  if (result.finishReason === "max_tokens") {
-    console.error("[warning] model stopped at max_tokens");
+  if (isOutputLimitFinishReason(result.finishReason)) {
+    console.error(`[warning] model stopped at ${result.finishReason}; response may be truncated`);
   }
+}
+
+function isOutputLimitFinishReason(reason: string | undefined): boolean {
+  if (!reason) return false;
+  const normalized = reason.toLowerCase();
+  return normalized === "length" || normalized === "max_tokens" || normalized === "max_output_tokens";
 }

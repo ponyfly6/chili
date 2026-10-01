@@ -1,15 +1,70 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, AgentRunId, SessionId, TaskId, TeamId, TimestampMs, ThreadId } from "@chili/protocol";
-import { SqliteEventStore } from "@chili/store";
+import type {
+  AgentPath,
+  AgentRunId,
+  ChiliEvent,
+  SessionId,
+  TaskId,
+  TeamId,
+  TimestampMs,
+} from "@chili/protocol";
+import {
+  SessionRunClaimConflictError,
+  SqliteEventStore,
+  type EventAppendOptions,
+  type SessionRunClaimFence,
+} from "@chili/store";
 import { LocalSubagentManager, type LocalSubagentRunInput, type LocalSubagentRunResult, type LocalSubagentRunner } from "./subagent.js";
-import { TeamTaskDispatchService, type TeamTaskDispatchResult } from "./team-dispatcher.js";
-import { TeamExecutionRunner, type TeamTaskMerger, type TeamTaskVerifier } from "./team-execution-runner.js";
+import {
+  TeamTaskDispatchService as CoreTeamTaskDispatchService,
+  type TeamTaskDispatchResult,
+  type TeamTaskDispatchServiceOptions,
+} from "./team-dispatcher.js";
+import {
+  TeamExecutionRunner as CoreTeamExecutionRunner,
+  type TeamExecutionRunnerOptions,
+  type TeamTaskMerger,
+  type TeamTaskVerifier,
+} from "./team-execution-runner.js";
 import type { TeamMergeResultStatus, TeamMergeSweepResult } from "./team-merge.js";
+import { TeamSessionAuthorityError } from "./team-session-authority.js";
 import { TeamControlService } from "./team.js";
 import { taskMergeMetadata } from "./team-worktree.js";
+import {
+  RuntimeBusyError,
+  type RuntimeSessionOperation,
+  type SessionOperationCoordinator,
+} from "./runtime-service.js";
+
+const passthroughSessionOperations: SessionOperationCoordinator = {
+  async withSessionOperation(_sessionId, fn) {
+    const operation = {
+      signal: new AbortController().signal,
+      assertCurrent() {},
+    };
+    return fn(operation);
+  },
+};
+
+class TeamExecutionRunner extends CoreTeamExecutionRunner {
+  constructor(options: Omit<TeamExecutionRunnerOptions, "sessionOperations"> & {
+    sessionOperations?: SessionOperationCoordinator;
+  }) {
+    super({ sessionOperations: passthroughSessionOperations, ...options });
+  }
+}
+
+class TeamTaskDispatchService extends CoreTeamTaskDispatchService {
+  constructor(options: Omit<TeamTaskDispatchServiceOptions, "sessionOperations"> & {
+    sessionOperations?: SessionOperationCoordinator;
+  }) {
+    super({ sessionOperations: passthroughSessionOperations, ...options });
+  }
+}
 
 test("runs team tasks through dependencies until the board is drained", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-drained-"));
@@ -20,19 +75,27 @@ test("runs team tasks through dependencies until the board is drained", async ()
   const setupPath = "/root/setup" as AgentPath;
   const featurePath = "/root/feature" as AgentPath;
   const sessionId = "session_team_runner" as SessionId;
-  const threadId = "thread_team_runner" as ThreadId;
   const runner = new DeferredLocalSubagentRunner();
   let subagents: LocalSubagentManager | undefined;
 
   try {
+    await persistRootSession(store, sessionId, dir);
     const teams = new TeamControlService({ store, createId: ids, now });
     subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+    const dispatcher = new TeamTaskDispatchService({
+      teams,
+      subagents,
+      store,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+    });
     const execution = new TeamExecutionRunner({
       teams,
       dispatcher,
       cwd: dir,
       now,
+      resolveSession: persistedRootSessionResolver(store),
       sleep: async () => {
         runner.completeNext();
         if (!subagents) throw new Error("subagents not initialized");
@@ -40,24 +103,22 @@ test("runs team tasks through dependencies until the board is drained", async ()
       },
     });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "runner", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: setupPath, name: "setup", role: "implementer" });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: featurePath, name: "feature", role: "implementer" });
-    const setup = await teams.createTask({ sessionId, threadId, teamId: team.id, title: "Prepare", ownerPath: setupPath });
+    const team = await teams.createTeam({ sessionId, name: "runner", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: setupPath, name: "setup", role: "implementer" });
+    await teams.addMember({ sessionId, teamId: team.id, path: featurePath, name: "feature", role: "implementer" });
+    const setup = await teams.createTask({ sessionId, teamId: team.id, title: "Prepare", ownerPath: setupPath });
     const feature = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Build feature",
       ownerPath: featurePath,
       dependsOn: [setup.id],
     });
-    const unowned = await teams.createTask({ sessionId, threadId, teamId: team.id, title: "Needs owner" });
+    const unowned = await teams.createTask({ sessionId, teamId: team.id, title: "Needs owner" });
 
     const summary = await execution.run({
       teamId: team.id,
       sessionId,
-      threadId,
       maxCycles: 5,
       timeoutMs: 10_000,
       pollIntervalMs: 1,
@@ -94,6 +155,45 @@ test("runs team tasks through dependencies until the board is drained", async ()
   }
 });
 
+test("normalizes hostile reconcile failures before returning a successful run summary", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-hostile-error-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_team_runner_hostile_error" as SessionId;
+
+  try {
+    await persistRootSession(store, sessionId, dir);
+    const teams = new TeamControlService({ store });
+    const team = await teams.createTeam({
+      sessionId,
+      name: "hostile-error",
+      leadPath: "/root" as AgentPath,
+    });
+    const dispatcher = {
+      async reconcileTasks() {
+        throw hostileSuccessfulOutputError("runner reconcile failed");
+      },
+      async dispatchTask() {
+        throw new Error("unexpected dispatch");
+      },
+    } as unknown as TeamTaskDispatchService;
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      cwd: dir,
+      resolveSession: persistedRootSessionResolver(store),
+    });
+
+    const summary = await execution.run({ teamId: team.id, sessionId, once: true });
+
+    expect(summary.errors).toHaveLength(1);
+    expectBoundedSanitizedDiagnostic(summary.errors[0]?.error);
+    expect(utf8Bytes(JSON.stringify(summary))).toBeLessThan(64 * 1024);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("runs one cycle and reports still-running background tasks", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-once-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -106,10 +206,24 @@ test("runs one cycle and reports still-running background tasks", async () => {
   let subagents: LocalSubagentManager | undefined;
 
   try {
+    await persistRootSession(store, sessionId, dir);
     const teams = new TeamControlService({ store, createId: ids, now });
     subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
-    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now });
+    const dispatcher = new TeamTaskDispatchService({
+      teams,
+      subagents,
+      store,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+    });
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+    });
 
     const team = await teams.createTeam({ sessionId, name: "runner-once", leadPath });
     await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
@@ -138,77 +252,170 @@ test("runs one cycle and reports still-running background tasks", async () => {
   }
 });
 
-test("dispatches independent team tasks concurrently with a bounded fan-out", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-concurrent-dispatch-"));
+test("uses one persisted canonical workspace for dispatch, verification, and merge and rejects A/B overrides", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-authority-"));
+  const workspaceA = join(dir, "workspace-a");
+  const workspaceAlias = join(dir, "workspace-a-alias");
+  const workspaceB = join(dir, "workspace-b");
+  await Promise.all([mkdir(workspaceA), mkdir(workspaceB)]);
+  await symlink(workspaceA, workspaceAlias);
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const ids = createSequentialId();
-  const now = () => 620 as TimestampMs;
-  const leadPath = "/root" as AgentPath;
-  const sessionId = "session_team_runner_concurrent" as SessionId;
-  let running = 0;
-  let maxRunning = 0;
+  const now = () => 610 as TimestampMs;
+  const sessionA = "session_team_runner_authority_a" as SessionId;
+  const sessionB = "session_team_runner_authority_b" as SessionId;
+  const dispatchInputs: Array<Parameters<TeamTaskDispatchService["dispatchTask"]>[0]> = [];
+  const verifyInputs: Array<Parameters<TeamTaskVerifier["verifyCompletedTasks"]>[0]> = [];
+  const mergeInputs: Array<Parameters<TeamTaskMerger["mergeTeamTasks"]>[0]> = [];
 
   try {
+    await persistRootSession(store, sessionA, workspaceA);
     const teams = new TeamControlService({ store, createId: ids, now });
-    const team = await teams.createTeam({ sessionId, name: "runner-concurrent", leadPath });
-    const workerA = "/root/a" as AgentPath;
-    const workerB = "/root/b" as AgentPath;
-    const workerC = "/root/c" as AgentPath;
-    await teams.addMember({ sessionId, teamId: team.id, path: workerA, name: "a", role: "implementer" });
-    await teams.addMember({ sessionId, teamId: team.id, path: workerB, name: "b", role: "implementer" });
-    await teams.addMember({ sessionId, teamId: team.id, path: workerC, name: "c", role: "implementer" });
-    const first = await teams.createTask({ sessionId, teamId: team.id, title: "First", ownerPath: workerA });
-    const second = await teams.createTask({ sessionId, teamId: team.id, title: "Second", ownerPath: workerB });
-    const third = await teams.createTask({ sessionId, teamId: team.id, title: "Third", ownerPath: workerC });
-    const tasksById = new Map([first, second, third].map((task) => [task.id, task]));
-
+    const team = await teams.createTeam({ sessionId: sessionA, name: "authority", leadPath: "/root" as AgentPath });
+    const workerPath = "/root/worker" as AgentPath;
+    await teams.addMember({ sessionId: sessionA, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const task = await teams.createTask({ sessionId: sessionA, teamId: team.id, title: "Authority", ownerPath: workerPath });
     const dispatcher = {
       async reconcileTasks() {
         return emptyReconcileResult();
       },
       async dispatchTask(input: Parameters<TeamTaskDispatchService["dispatchTask"]>[0]): Promise<TeamTaskDispatchResult> {
-        const task = tasksById.get(input.taskId);
-        if (!task) throw new Error(`missing task ${input.taskId}`);
-        running += 1;
-        maxRunning = Math.max(maxRunning, running);
-        await delay(task.id === first.id ? 20 : 1);
-        running -= 1;
-        return {
-          status: "running",
-          teamTask: { ...task, status: "in_progress" },
-        };
+        dispatchInputs.push(input);
+        return { status: "running", teamTask: { ...task, status: "in_progress" } };
+      },
+    } as unknown as TeamTaskDispatchService;
+    const verifier: TeamTaskVerifier = {
+      async verifyCompletedTasks(input) {
+        verifyInputs.push(input);
+        return { scanned: 0, maxConcurrentVerifications: 2, verified: [], skipped: [], errors: [] };
+      },
+    };
+    const merger: TeamTaskMerger = {
+      async mergeTeamTasks(input) {
+        mergeInputs.push(input);
+        return { scanned: 0, applied: [], failed: [], conflicted: [], skipped: [], errors: [] };
       },
     };
     const execution = new TeamExecutionRunner({
       teams,
-      dispatcher: dispatcher as unknown as TeamTaskDispatchService,
-      cwd: dir,
+      dispatcher,
+      verifier,
+      merger,
+      cwd: workspaceB,
       now,
+      resolveSession: persistedRootSessionResolver(store),
     });
 
-    const summary = await execution.run({
-      teamId: team.id,
-      sessionId,
-      once: true,
-      maxConcurrentDispatches: 2,
-    });
+    await execution.run({ teamId: team.id, sessionId: sessionA, cwd: workspaceAlias, once: true });
 
-    expect(maxRunning).toBe(2);
-    expect(summary).toMatchObject({
-      stopReason: "once",
-      maxConcurrentDispatches: 2,
-      errors: [],
-    });
-    expect(summary.dispatched).toEqual(expect.arrayContaining([
-      expect.objectContaining({ taskId: first.id, status: "running", ownerPath: workerA }),
-      expect.objectContaining({ taskId: second.id, status: "running", ownerPath: workerB }),
-      expect.objectContaining({ taskId: third.id, status: "running", ownerPath: workerC }),
-    ]));
+    const canonicalA = await realpath(workspaceA);
+    expect(dispatchInputs).toMatchObject([{ sessionId: sessionA, cwd: canonicalA }]);
+    expect(verifyInputs).toMatchObject([{ sessionId: sessionA, cwd: canonicalA }]);
+    expect(mergeInputs).toMatchObject([{ sessionId: sessionA, cwd: canonicalA }]);
+
+    dispatchInputs.length = 0;
+    verifyInputs.length = 0;
+    mergeInputs.length = 0;
+    await expect(execution.run({ teamId: team.id, sessionId: sessionB, cwd: workspaceA, once: true }))
+      .rejects.toBeInstanceOf(TeamSessionAuthorityError);
+    await expect(execution.run({ teamId: team.id, sessionId: sessionA, cwd: workspaceB, once: true }))
+      .rejects.toBeInstanceOf(TeamSessionAuthorityError);
+    expect(dispatchInputs).toEqual([]);
+    expect(verifyInputs).toEqual([]);
+    expect(mergeInputs).toEqual([]);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+for (const maxConcurrentDispatches of [1, 2]) {
+  test(`limits five live child tasks to ${maxConcurrentDispatches} and replenishes terminal slots`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), `chili-team-runner-live-cap-${maxConcurrentDispatches}-`));
+    const store = new SqliteEventStore(join(dir, "events.sqlite"));
+    const ids = createSequentialId();
+    const now = () => 620 as TimestampMs;
+    const leadPath = "/root" as AgentPath;
+    const sessionId = `session_team_runner_live_cap_${maxConcurrentDispatches}` as SessionId;
+    const runner = new DeferredLocalSubagentRunner();
+    const activeRunsAtWait: number[] = [];
+    let subagents: LocalSubagentManager | undefined;
+
+    try {
+      await persistRootSession(store, sessionId, dir);
+      const teams = new TeamControlService({ store, createId: ids, now });
+      subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+      const dispatcher = new TeamTaskDispatchService({
+        teams,
+        subagents,
+        store,
+        cwd: dir,
+        now,
+        resolveSession: persistedRootSessionResolver(store),
+      });
+      const execution = new TeamExecutionRunner({
+        teams,
+        dispatcher,
+        cwd: dir,
+        now,
+        resolveSession: persistedRootSessionResolver(store),
+        sleep: async () => {
+          activeRunsAtWait.push(runner.activeRunCount);
+          const completedTaskId = runner.completeNext();
+          if (!completedTaskId) throw new Error("expected an active subagent run");
+          await waitForAgentTaskTerminal(store, completedTaskId);
+        },
+      });
+
+      const team = await teams.createTeam({ sessionId, name: `runner-live-cap-${maxConcurrentDispatches}`, leadPath });
+      const tasks = [];
+      for (let index = 0; index < 5; index++) {
+        const workerPath = `/root/worker-${index + 1}` as AgentPath;
+        await teams.addMember({
+          sessionId,
+          teamId: team.id,
+          path: workerPath,
+          name: `worker-${index + 1}`,
+          role: "implementer",
+        });
+        tasks.push(await teams.createTask({
+          sessionId,
+          teamId: team.id,
+          title: `Task ${index + 1}`,
+          ownerPath: workerPath,
+        }));
+      }
+
+      const summary = await execution.run({
+        teamId: team.id,
+        sessionId,
+        maxCycles: 10,
+        timeoutMs: 10_000,
+        pollIntervalMs: 1,
+        maxConcurrentDispatches,
+      });
+
+      expect(runner.maxActiveRuns).toBe(maxConcurrentDispatches);
+      expect(runner.runs).toHaveLength(5);
+      expect(activeRunsAtWait).toEqual(maxConcurrentDispatches === 1 ? [1, 1, 1, 1, 1] : [2, 2, 2, 2, 1]);
+      expect(summary).toMatchObject({
+        stopReason: "drained",
+        maxConcurrentDispatches,
+        stillRunning: [],
+        errors: [],
+      });
+      expect(summary.dispatched).toHaveLength(5);
+      expect(summary.dispatched.map((task) => task.taskId)).toEqual(expect.arrayContaining(tasks.map((task) => task.id)));
+      expect(summary.completed).toHaveLength(5);
+      expect(summary.completed.map((task) => task.taskId)).toEqual(expect.arrayContaining(tasks.map((task) => task.id)));
+    } finally {
+      runner.completeAll();
+      await subagents?.waitForBackgroundTasks();
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("orders runnable dispatches by task priority before creation order", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-priority-dispatch-"));
@@ -260,11 +467,12 @@ test("orders runnable dispatches by task priority before creation order", async 
       dispatcher: dispatcher as unknown as TeamTaskDispatchService,
       cwd: dir,
       now,
+      resolveSession: () => ({ cwd: dir }),
     });
 
     await execution.run({ teamId: team.id, sessionId, once: true, maxConcurrentDispatches: 1 });
 
-    expect(dispatchOrder).toEqual([high.id, low.id]);
+    expect(dispatchOrder).toEqual([high.id]);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -331,6 +539,7 @@ test("prioritizes critical-path narrow writes over broad write reservations", as
       dispatcher: dispatcher as unknown as TeamTaskDispatchService,
       cwd: dir,
       now,
+      resolveSession: () => ({ cwd: dir }),
     });
 
     const summary = await execution.run({ teamId: team.id, sessionId, once: true, maxConcurrentDispatches: 4 });
@@ -355,21 +564,36 @@ test("emits team run lifecycle events", async () => {
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_runner_lifecycle" as SessionId;
-  const threadId = "thread_team_runner_lifecycle" as ThreadId;
   const runner = new ImmediateLocalSubagentRunner();
   let subagents: LocalSubagentManager | undefined;
 
   try {
+    await persistRootSession(store, sessionId, dir);
     const teams = new TeamControlService({ store, createId: ids, now });
     subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
-    const execution = new TeamExecutionRunner({ teams, dispatcher, events: store, cwd: dir, now, createId: ids });
+    const dispatcher = new TeamTaskDispatchService({
+      teams,
+      subagents,
+      store,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+    });
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      events: store,
+      cwd: dir,
+      now,
+      createId: ids,
+      resolveSession: persistedRootSessionResolver(store),
+    });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "runner-lifecycle", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
-    const task = await teams.createTask({ sessionId, threadId, teamId: team.id, title: "Emit events", ownerPath: workerPath });
+    const team = await teams.createTeam({ sessionId, name: "runner-lifecycle", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const task = await teams.createTask({ sessionId, teamId: team.id, title: "Emit events", ownerPath: workerPath });
 
-    const summary = await execution.run({ teamId: team.id, sessionId, threadId, mode: "one_shot", maxCycles: 3 });
+    const summary = await execution.run({ teamId: team.id, sessionId, mode: "one_shot", maxCycles: 3 });
 
     expect(summary).toMatchObject({
       stopReason: "drained",
@@ -391,13 +615,12 @@ test("emits team run lifecycle events", async () => {
     expect(lifecycleEvents[0]).toMatchObject({
       type: "team.run_started",
       sessionId,
-      threadId,
       payload: {
         teamId: team.id,
         mode: "one_shot",
         once: false,
         maxCycles: 3,
-        maxConcurrentDispatches: 4,
+        maxConcurrentDispatches: 3,
         maxConcurrentVerifications: 2,
       },
     });
@@ -412,7 +635,6 @@ test("emits team run lifecycle events", async () => {
     expect(lifecycleEvents.at(-1)).toMatchObject({
       type: "team.run_completed",
       sessionId,
-      threadId,
       payload: {
         teamId: team.id,
         cycles: 1,
@@ -426,6 +648,77 @@ test("emits team run lifecycle events", async () => {
     });
   } finally {
     await subagents?.waitForBackgroundTasks();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("fences the ordered team run lifecycle with the owner run claim", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-lifecycle-fence-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_team_runner_lifecycle_fence" as SessionId;
+  const runClaim: SessionRunClaimFence = {
+    sessionId,
+    claimId: "run_claim_team_runner_lifecycle_fence",
+  };
+  const operations = new ControlledSessionOperationCoordinator();
+
+  try {
+    await persistRootSession(store, sessionId, dir);
+    const teams = new TeamControlService({ store, sessionOperations: operations });
+    const team = await teams.createTeam({
+      sessionId,
+      name: "lifecycle-fence",
+      leadPath: "/root" as AgentPath,
+    });
+    expect(store.claimSessionRun({
+      sessionId,
+      claimId: runClaim.claimId,
+      allowSubagentSessions: false,
+      time: Date.now(),
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+    operations.setRunClaim(runClaim);
+    const events = new RecordingTeamRunEventStore(store);
+    const dispatcher = {
+      async reconcileTasks() {
+        return emptyReconcileResult();
+      },
+      async dispatchTask() {
+        throw new Error("not expected");
+      },
+    } as unknown as TeamTaskDispatchService;
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      sessionOperations: operations,
+      events,
+      cwd: dir,
+      resolveSession: persistedRootSessionResolver(store),
+    });
+
+    const summary = await execution.run({ teamId: team.id, sessionId, maxCycles: 2 });
+
+    expect(summary).toMatchObject({ stopReason: "drained", cycles: 1, errors: [] });
+    expect(events.appends.map(({ event }) => event.type)).toEqual([
+      "team.run_started",
+      "team.run_progress",
+      "team.run_progress",
+      "team.run_progress",
+      "team.run_progress",
+      "team.run_progress",
+      "team.run_progress",
+      "team.run_completed",
+    ]);
+    expect(
+      events.appends
+        .filter(({ event }) => event.type === "team.run_progress")
+        .map(({ event }) => event.type === "team.run_progress" ? event.payload.phase : undefined),
+    ).toEqual(["reconcile", "load", "verify", "merge", "dispatch", "drain"]);
+    expect(events.appends.every(({ options }) => options?.runClaim === runClaim)).toBe(true);
+  } finally {
+    operations.setRunClaim(undefined);
+    store.releaseSessionRun({ sessionId, claimId: runClaim.claimId });
     store.close();
     await rm(dir, { recursive: true, force: true });
   }
@@ -480,6 +773,7 @@ test("auto-assigns scoped unowned tasks to compatible idle members", async () =>
       dispatcher: dispatcher as unknown as TeamTaskDispatchService,
       cwd: dir,
       now,
+      resolveSession: () => ({ cwd: dir }),
     });
 
     const summary = await execution.run({ teamId: team.id, sessionId, once: true, maxConcurrentDispatches: 4 });
@@ -510,10 +804,24 @@ test("records dispatcher policy blocks in the runner summary", async () => {
   let subagents: LocalSubagentManager | undefined;
 
   try {
+    await persistRootSession(store, sessionId, dir);
     const teams = new TeamControlService({ store, createId: ids, now });
     subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
-    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now });
+    const dispatcher = new TeamTaskDispatchService({
+      teams,
+      subagents,
+      store,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+    });
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+    });
 
     const team = await teams.createTeam({ sessionId, name: "runner-policy", leadPath });
     await teams.addMember({
@@ -558,7 +866,6 @@ test("creates a parent session when runnable team tasks do not have one", async 
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const createdSessionId = "session_created_for_runner" as SessionId;
-  const createdThreadId = "thread_created_for_runner" as ThreadId;
   const runner = new ImmediateLocalSubagentRunner();
   let subagents: LocalSubagentManager | undefined;
   const createdSessions: Array<{ teamId: string; cwd: string }> = [];
@@ -566,15 +873,24 @@ test("creates a parent session when runnable team tasks do not have one", async 
   try {
     const teams = new TeamControlService({ store, createId: ids, now });
     subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+    const dispatcher = new TeamTaskDispatchService({
+      teams,
+      subagents,
+      store,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+    });
     const execution = new TeamExecutionRunner({
       teams,
       dispatcher,
       cwd: dir,
       now,
+      resolveSession: persistedRootSessionResolver(store),
       createSession: async (input) => {
         createdSessions.push(input);
-        return { sessionId: createdSessionId, threadId: createdThreadId };
+        await persistRootSession(store, createdSessionId, input.cwd);
+        return { sessionId: createdSessionId, discard: async () => {} };
       },
     });
 
@@ -582,7 +898,11 @@ test("creates a parent session when runnable team tasks do not have one", async 
     await teams.addMember({ teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
     const task = await teams.createTask({ teamId: team.id, title: "Needs session", ownerPath: workerPath });
 
-    const summary = await execution.run({ teamId: team.id, mode: "one_shot" });
+    const summary = await execution.run({
+      teamId: team.id,
+      sessionId: "session_untrusted_caller" as SessionId,
+      mode: "one_shot",
+    });
 
     expect(summary).toMatchObject({
       stopReason: "drained",
@@ -591,14 +911,130 @@ test("creates a parent session when runnable team tasks do not have one", async 
       skipped: [],
       errors: [],
     });
-    expect(createdSessions).toEqual([{ teamId: team.id, cwd: dir }]);
+    expect(createdSessions).toEqual([{ teamId: team.id, cwd: await realpath(dir) }]);
+    expect((await teams.listTeams()).find((candidate) => candidate.id === team.id)?.sessionId).toBe(createdSessionId);
     expect(runner.runs[0]).toMatchObject({
       parentSessionId: createdSessionId,
-      parentThreadId: createdThreadId,
       taskName: "Needs session",
     });
   } finally {
     await subagents?.waitForBackgroundTasks();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("archives only the unused session that loses a concurrent owner-binding race", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-session-race-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const now = () => 825 as TimestampMs;
+  const sessionIds = [
+    "session_runner_race_a" as SessionId,
+    "session_runner_race_b" as SessionId,
+  ];
+  let candidateIndex = 0;
+  let createdCount = 0;
+  let releaseCreated!: () => void;
+  const bothCreated = new Promise<void>((resolve) => {
+    releaseCreated = resolve;
+  });
+  let bindingOperationIndex = 0;
+  let releaseFirstBinding!: () => void;
+  const firstBindingFinished = new Promise<void>((resolve) => {
+    releaseFirstBinding = resolve;
+  });
+  const bindingOperations: SessionOperationCoordinator = {
+    async withSessionOperation(_sessionId, fn) {
+      const index = bindingOperationIndex++;
+      if (index > 0) await firstBindingFinished;
+      const operation: RuntimeSessionOperation = {
+        signal: new AbortController().signal,
+        assertCurrent() {},
+      };
+      try {
+        return await fn(operation);
+      } finally {
+        if (index === 0) releaseFirstBinding();
+      }
+    },
+  };
+  let reconciliations = 0;
+
+  try {
+    const teams = new TeamControlService({ store, now, sessionOperations: bindingOperations });
+    const team = await teams.createTeam({ name: "session-race", leadPath: "/root" as AgentPath });
+    const dispatcher = {
+      async reconcileTasks() {
+        reconciliations++;
+        return emptyReconcileResult();
+      },
+      async dispatchTask() {
+        throw new Error("an owner-binding loser must not dispatch");
+      },
+    } as unknown as TeamTaskDispatchService;
+    const createSession = async (input: { cwd: string }) => {
+      const sessionId = sessionIds[candidateIndex++];
+      if (!sessionId) throw new Error("unexpected third session candidate");
+      await persistRootSession(store, sessionId, input.cwd);
+      createdCount++;
+      if (createdCount === sessionIds.length) releaseCreated();
+      await bothCreated;
+      return {
+        sessionId,
+        discard: async () => {
+          await store.append({
+            id: `event_archive_${sessionId}`,
+            type: "session.archived",
+            time: 826 as TimestampMs,
+            sessionId,
+            payload: { sessionId },
+          });
+        },
+      };
+    };
+    const first = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+      createSession,
+    });
+    const second = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+      createSession,
+    });
+
+    const results = await Promise.allSettled([
+      first.run({ teamId: team.id, once: true }),
+      second.run({ teamId: team.id, once: true }),
+    ]);
+
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.reason).toBeInstanceOf(TeamSessionAuthorityError);
+    expect(reconciliations).toBe(1);
+
+    const ownerSessionId = (await teams.listTeams()).find((candidate) => candidate.id === team.id)?.sessionId;
+    if (!ownerSessionId) throw new Error("concurrent owner binding did not produce a winner");
+    expect(sessionIds).toContain(ownerSessionId);
+    const loserSessionId = sessionIds.find((sessionId) => sessionId !== ownerSessionId);
+    expect(loserSessionId).toBeDefined();
+    if (!loserSessionId) throw new Error("concurrent owner binding did not produce a loser");
+    expect(await store.sessions()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: ownerSessionId, status: "active" }),
+      expect.objectContaining({ id: loserSessionId, status: "archived" }),
+    ]));
+    expect(await store.events({ type: "session.archived", limit: 10 })).toMatchObject([
+      { sessionId: loserSessionId, payload: { sessionId: loserSessionId } },
+    ]);
+  } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
   }
@@ -612,20 +1048,30 @@ test("uses the auto-created parent session when reconciling background tasks", a
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const createdSessionId = "session_created_for_reconcile" as SessionId;
-  const createdThreadId = "thread_created_for_reconcile" as ThreadId;
   const runner = new DeferredLocalSubagentRunner();
   let subagents: LocalSubagentManager | undefined;
 
   try {
     const teams = new TeamControlService({ store, createId: ids, now });
     subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+    const dispatcher = new TeamTaskDispatchService({
+      teams,
+      subagents,
+      store,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+    });
     const execution = new TeamExecutionRunner({
       teams,
       dispatcher,
       cwd: dir,
       now,
-      createSession: async () => ({ sessionId: createdSessionId, threadId: createdThreadId }),
+      resolveSession: persistedRootSessionResolver(store),
+      createSession: async (input) => {
+        await persistRootSession(store, createdSessionId, input.cwd);
+        return { sessionId: createdSessionId, discard: async () => {} };
+      },
       sleep: async () => {
         runner.completeNext();
         if (!subagents) throw new Error("subagents not initialized");
@@ -648,7 +1094,6 @@ test("uses the auto-created parent session when reconciling background tasks", a
     const completion = updates.find((event) => isRecord(event.payload) && event.payload.taskId === task.id && event.payload.status === "completed");
     expect(completion).toMatchObject({
       sessionId: createdSessionId,
-      threadId: createdThreadId,
     });
   } finally {
     runner.completeAll();
@@ -666,7 +1111,6 @@ test("does not dispatch after slow session creation exceeds the deadline", async
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const createdSessionId = "session_created_after_deadline" as SessionId;
-  const createdThreadId = "thread_created_after_deadline" as ThreadId;
   const dispatches: Array<Parameters<TeamTaskDispatchService["dispatchTask"]>[0]> = [];
 
   try {
@@ -691,9 +1135,10 @@ test("does not dispatch after slow session creation exceeds the deadline", async
       dispatcher,
       cwd: dir,
       now,
+      resolveSession: () => ({ cwd: dir }),
       createSession: async () => {
         await delay(30);
-        return { sessionId: createdSessionId, threadId: createdThreadId };
+        return { sessionId: createdSessionId, discard: async () => {} };
       },
     });
 
@@ -701,7 +1146,7 @@ test("does not dispatch after slow session creation exceeds the deadline", async
 
     expect(summary).toMatchObject({
       stopReason: "timeout",
-      cycles: 1,
+      cycles: 0,
       dispatched: [],
       errors: [],
     });
@@ -720,7 +1165,6 @@ test("passes abort signals into session creation and stops before dispatch when 
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const createdSessionId = "session_created_after_abort" as SessionId;
-  const createdThreadId = "thread_created_after_abort" as ThreadId;
   const controller = new AbortController();
   const createSessionSignals: Array<AbortSignal | undefined> = [];
   const dispatches: Array<Parameters<TeamTaskDispatchService["dispatchTask"]>[0]> = [];
@@ -747,10 +1191,11 @@ test("passes abort signals into session creation and stops before dispatch when 
       dispatcher,
       cwd: dir,
       now,
+      resolveSession: () => ({ cwd: dir }),
       createSession: async (input) => {
         createSessionSignals.push(input.signal);
         controller.abort();
-        return { sessionId: createdSessionId, threadId: createdThreadId };
+        return { sessionId: createdSessionId, discard: async () => {} };
       },
     });
 
@@ -758,7 +1203,7 @@ test("passes abort signals into session creation and stops before dispatch when 
 
     expect(summary).toMatchObject({
       stopReason: "aborted",
-      cycles: 1,
+      cycles: 0,
       dispatched: [],
       errors: [],
     });
@@ -802,6 +1247,7 @@ test("treats abort-aware session creation rejection as an aborted run", async ()
       dispatcher,
       cwd: dir,
       now,
+      resolveSession: () => ({ cwd: dir }),
       createSession: async () => {
         controller.abort();
         const error = new Error("session creation aborted");
@@ -814,7 +1260,7 @@ test("treats abort-aware session creation rejection as an aborted run", async ()
 
     expect(summary).toMatchObject({
       stopReason: "aborted",
-      cycles: 1,
+      cycles: 0,
       dispatched: [],
       errors: [],
     });
@@ -856,7 +1302,7 @@ test("reports timeout when dispatch finishes after the run deadline", async () =
         throw new Error("not expected");
       },
     } as unknown as TeamTaskDispatchService;
-    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now });
+    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now, resolveSession: () => ({ cwd: dir }) });
 
     const summary = await execution.run({ teamId: team.id, sessionId, once: true, timeoutMs: 10 });
 
@@ -897,7 +1343,7 @@ test("reports timeout when reconcile finishes after the run deadline", async () 
         throw new Error("not expected");
       },
     } as unknown as TeamTaskDispatchService;
-    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now });
+    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now, resolveSession: () => ({ cwd: dir }) });
 
     const summary = await execution.run({ teamId: team.id, sessionId, timeoutMs: 10 });
 
@@ -945,7 +1391,7 @@ test("reports abort when the signal is aborted during task dispatch", async () =
         throw new Error("not expected");
       },
     } as unknown as TeamTaskDispatchService;
-    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now });
+    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now, resolveSession: () => ({ cwd: dir }) });
 
     const summary = await execution.run({ teamId: team.id, sessionId, once: true, signal: controller.signal });
 
@@ -972,12 +1418,28 @@ test("merges verifier-passed tasks and drains after merge is applied", async () 
   let subagents: LocalSubagentManager | undefined;
 
   try {
+    await persistRootSession(store, sessionId, dir);
     const teams = new TeamControlService({ store, createId: ids, now });
     subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+    const dispatcher = new TeamTaskDispatchService({
+      teams,
+      subagents,
+      store,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+    });
     const verifier = new PendingMergeVerifier(teams, now);
     const merger = new MetadataMergeService(teams, "applied", now);
-    const execution = new TeamExecutionRunner({ teams, dispatcher, verifier, merger, cwd: dir, now });
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      verifier,
+      merger,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+    });
     const team = await teams.createTeam({ sessionId, name: "runner-merge", leadPath });
     await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
     const task = await teams.createTask({ sessionId, teamId: team.id, title: "Complete and merge", ownerPath: workerPath });
@@ -1036,7 +1498,14 @@ test("reports merge conflicts from verifier-passed tasks", async () => {
       },
     } as unknown as TeamTaskDispatchService;
     const merger = new MetadataMergeService(teams, "conflicted", now);
-    const execution = new TeamExecutionRunner({ teams, dispatcher, merger, cwd: dir, now });
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      merger,
+      cwd: dir,
+      now,
+      resolveSession: () => ({ cwd: dir }),
+    });
 
     const summary = await execution.run({ teamId: team.id, sessionId, maxCycles: 2 });
 
@@ -1086,7 +1555,7 @@ test("does not report drained while a pending merge has not been processed", asy
         throw new Error("not expected");
       },
     } as unknown as TeamTaskDispatchService;
-    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now });
+    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now, resolveSession: () => ({ cwd: dir }) });
 
     const summary = await execution.run({ teamId: team.id, sessionId, maxCycles: 1 });
 
@@ -1104,20 +1573,269 @@ test("does not report drained while a pending merge has not been processed", asy
   }
 });
 
+test("holds one owner-session operation for a direct team run and rejects a peer run", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-operation-peer-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_team_runner_operation_peer" as SessionId;
+  const operations = new ControlledSessionOperationCoordinator();
+  let releaseReconcile: (() => void) | undefined;
+  let markReconcileEntered: (() => void) | undefined;
+  const reconcileEntered = new Promise<void>((resolve) => {
+    markReconcileEntered = resolve;
+  });
+  const reconcileGate = new Promise<void>((resolve) => {
+    releaseReconcile = resolve;
+  });
+
+  try {
+    await persistRootSession(store, sessionId, dir);
+    const teams = new TeamControlService({ store, sessionOperations: operations });
+    const team = await teams.createTeam({ sessionId, name: "operation-peer", leadPath: "/root" as AgentPath });
+    operations.resetObservations();
+    const dispatcher = {
+      async reconcileTasks() {
+        markReconcileEntered?.();
+        await reconcileGate;
+        return emptyReconcileResult();
+      },
+      async dispatchTask() {
+        throw new Error("not expected");
+      },
+    } as unknown as TeamTaskDispatchService;
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      sessionOperations: operations,
+      events: store,
+      cwd: dir,
+      resolveSession: persistedRootSessionResolver(store),
+    });
+
+    const first = execution.run({ teamId: team.id, sessionId, once: true });
+    await reconcileEntered;
+    await expect(execution.run({ teamId: team.id, sessionId, once: true }))
+      .rejects.toBeInstanceOf(RuntimeBusyError);
+    releaseReconcile?.();
+    await expect(first).resolves.toMatchObject({ stopReason: "once" });
+    expect(operations.topLevelEntries).toEqual([sessionId]);
+  } finally {
+    releaseReconcile?.();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuses an inherited owner-session operation for a nested team run", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-operation-nested-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_team_runner_operation_nested" as SessionId;
+  const runClaim: SessionRunClaimFence = {
+    sessionId,
+    claimId: "run_claim_team_runner_operation_nested",
+  };
+  const operations = new ControlledSessionOperationCoordinator();
+
+  try {
+    await persistRootSession(store, sessionId, dir);
+    const teams = new TeamControlService({ store, sessionOperations: operations });
+    const team = await teams.createTeam({ sessionId, name: "operation-nested", leadPath: "/root" as AgentPath });
+    expect(store.claimSessionRun({
+      sessionId,
+      claimId: runClaim.claimId,
+      allowSubagentSessions: false,
+      time: Date.now(),
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+    operations.setRunClaim(runClaim);
+    const events = new RecordingTeamRunEventStore(store);
+    const dispatcher = {
+      async reconcileTasks() {
+        return emptyReconcileResult();
+      },
+      async dispatchTask() {
+        throw new Error("not expected");
+      },
+    } as unknown as TeamTaskDispatchService;
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      sessionOperations: operations,
+      events,
+      cwd: dir,
+      resolveSession: persistedRootSessionResolver(store),
+    });
+    operations.resetObservations();
+
+    const summary = await operations.withSessionOperation(
+      sessionId,
+      () => execution.run({ teamId: team.id, sessionId, once: true }),
+    );
+
+    expect(summary.stopReason).toBe("once");
+    expect(operations.topLevelEntries).toEqual([sessionId]);
+    expect(operations.nestedEntries).toBe(1);
+    expect(events.appends.length).toBeGreaterThan(0);
+    expect(events.appends.every(({ options }) => options?.runClaim === runClaim)).toBe(true);
+  } finally {
+    operations.setRunClaim(undefined);
+    store.releaseSessionRun({ sessionId, claimId: runClaim.claimId });
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects a stale runner finalize after the owner lease is taken over", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-finalize-fence-"));
+  const dbPath = join(dir, "events.sqlite");
+  const store = new SqliteEventStore(dbPath);
+  const contender = new SqliteEventStore(dbPath);
+  const sessionId = "session_team_runner_finalize_fence" as SessionId;
+  const runClaim: SessionRunClaimFence = {
+    sessionId,
+    claimId: "run_claim_team_runner_finalize_stale",
+  };
+  const contenderClaimId = "run_claim_team_runner_finalize_current";
+  const claimedAt = Date.now();
+  const operations = new ControlledSessionOperationCoordinator();
+  let takeoverStatus: ReturnType<SqliteEventStore["claimSessionRun"]>["status"] | undefined;
+  let tookOver = false;
+
+  try {
+    await persistRootSession(store, sessionId, dir);
+    const teams = new TeamControlService({ store, sessionOperations: operations });
+    const team = await teams.createTeam({
+      sessionId,
+      name: "finalize-fence",
+      leadPath: "/root" as AgentPath,
+    });
+    expect(store.claimSessionRun({
+      sessionId,
+      claimId: runClaim.claimId,
+      allowSubagentSessions: false,
+      time: claimedAt,
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+    operations.setRunClaim(runClaim);
+    const events = new RecordingTeamRunEventStore(store, (event) => {
+      if (event.type !== "team.run_completed" || tookOver) return;
+      tookOver = true;
+      takeoverStatus = contender.claimSessionRun({
+        sessionId,
+        claimId: contenderClaimId,
+        allowSubagentSessions: false,
+        time: claimedAt + 60_000,
+        leaseDurationMs: 60_000,
+      }).status;
+      // Model the old runner's cleanup racing its stale async finalize. Once
+      // the connection-local owner marker is gone, only the explicit fence on
+      // the lifecycle append can reject this commit.
+      store.releaseSessionRun({ sessionId, claimId: runClaim.claimId });
+    });
+    const dispatcher = {
+      async reconcileTasks() {
+        return emptyReconcileResult();
+      },
+      async dispatchTask() {
+        throw new Error("not expected");
+      },
+    } as unknown as TeamTaskDispatchService;
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      sessionOperations: operations,
+      events,
+      cwd: dir,
+      resolveSession: persistedRootSessionResolver(store),
+    });
+
+    await expect(execution.run({ teamId: team.id, sessionId, maxCycles: 2 }))
+      .rejects.toBeInstanceOf(SessionRunClaimConflictError);
+
+    expect(takeoverStatus).toBe("claimed");
+    expect(events.appends.at(-1)).toMatchObject({
+      event: { type: "team.run_completed" },
+      options: { runClaim },
+    });
+    const lifecycleTypes = (await store.events({ sessionId, limit: 100 }))
+      .map((event) => event.type)
+      .filter((type) => type.startsWith("team.run_"));
+    expect(lifecycleTypes).toContain("team.run_started");
+    expect(lifecycleTypes).not.toContain("team.run_completed");
+  } finally {
+    operations.setRunClaim(undefined);
+    contender.releaseSessionRun({ sessionId, claimId: contenderClaimId });
+    store.releaseSessionRun({ sessionId, claimId: runClaim.claimId });
+    contender.close();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("lease loss rejects the run without writing progress or completed lifecycle events", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-operation-lost-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_team_runner_operation_lost" as SessionId;
+  const operations = new ControlledSessionOperationCoordinator();
+
+  try {
+    await persistRootSession(store, sessionId, dir);
+    const teams = new TeamControlService({ store, sessionOperations: operations });
+    const team = await teams.createTeam({ sessionId, name: "operation-lost", leadPath: "/root" as AgentPath });
+    const dispatcher = {
+      async reconcileTasks() {
+        operations.invalidate(sessionId);
+        throw new DOMException("operation lease aborted", "AbortError");
+      },
+      async dispatchTask() {
+        throw new Error("not expected");
+      },
+    } as unknown as TeamTaskDispatchService;
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      sessionOperations: operations,
+      events: store,
+      cwd: dir,
+      resolveSession: persistedRootSessionResolver(store),
+    });
+
+    await expect(execution.run({ teamId: team.id, sessionId, once: true }))
+      .rejects.toBeInstanceOf(RuntimeBusyError);
+    const lifecycleTypes = (await store.events({ sessionId, limit: 100 }))
+      .map((event) => event.type)
+      .filter((type) => type.startsWith("team.run_"));
+    expect(lifecycleTypes).toEqual(["team.run_started"]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 class DeferredLocalSubagentRunner implements LocalSubagentRunner {
   readonly runs: LocalSubagentRunInput[] = [];
-  private readonly completions: Array<() => void> = [];
+  maxActiveRuns = 0;
+  private readonly completions: Array<{ taskId: TaskId; resolve: () => void }> = [];
+  private activeRuns = 0;
+
+  get activeRunCount(): number {
+    return this.activeRuns;
+  }
 
   async run(input: LocalSubagentRunInput): Promise<LocalSubagentRunResult> {
     this.runs.push(input);
+    this.activeRuns++;
+    this.maxActiveRuns = Math.max(this.maxActiveRuns, this.activeRuns);
     await new Promise<void>((resolve) => {
-      this.completions.push(resolve);
+      this.completions.push({ taskId: input.taskId, resolve });
     });
+    this.activeRuns--;
     return { status: "completed", summary: `Done ${input.taskName}` };
   }
 
-  completeNext(): void {
-    this.completions.shift()?.();
+  completeNext(): TaskId | undefined {
+    const completion = this.completions.shift();
+    completion?.resolve();
+    return completion?.taskId;
   }
 
   completeAll(): void {
@@ -1132,6 +1850,138 @@ class ImmediateLocalSubagentRunner implements LocalSubagentRunner {
     this.runs.push(input);
     return { status: "completed", summary: `Done ${input.taskName}` };
   }
+}
+
+interface ControlledSessionOperationContext {
+  sessionId: SessionId;
+  controller: AbortController;
+  current: boolean;
+  operation: RuntimeSessionOperation;
+}
+
+class ControlledSessionOperationCoordinator implements SessionOperationCoordinator {
+  topLevelEntries: SessionId[] = [];
+  nestedEntries = 0;
+  private readonly storage = new AsyncLocalStorage<ControlledSessionOperationContext>();
+  private readonly active = new Map<SessionId, ControlledSessionOperationContext>();
+  private runClaim: SessionRunClaimFence | undefined;
+
+  async withSessionOperation<T>(
+    sessionId: SessionId,
+    fn: (operation: RuntimeSessionOperation) => Promise<T> | T,
+  ): Promise<T> {
+    const inherited = this.storage.getStore();
+    if (inherited?.sessionId === sessionId && inherited.current) {
+      this.nestedEntries++;
+      inherited.operation.assertCurrent();
+      try {
+        const result = await fn(inherited.operation);
+        inherited.operation.assertCurrent();
+        return result;
+      } catch (error) {
+        inherited.operation.assertCurrent();
+        throw error;
+      }
+    }
+    if (this.active.has(sessionId)) throw new RuntimeBusyError(sessionId);
+
+    const controller = new AbortController();
+    let context: ControlledSessionOperationContext;
+    context = {
+      sessionId,
+      controller,
+      current: true,
+      operation: {
+        signal: controller.signal,
+        ...(this.runClaim?.sessionId === sessionId ? { runClaim: this.runClaim } : {}),
+        assertCurrent: () => {
+          if (!context.current || this.active.get(sessionId) !== context) {
+            throw new RuntimeBusyError(sessionId);
+          }
+        },
+      },
+    };
+    this.topLevelEntries.push(sessionId);
+    this.active.set(sessionId, context);
+    try {
+      const result = await this.storage.run(context, () => fn(context.operation));
+      context.operation.assertCurrent();
+      return result;
+    } catch (error) {
+      context.operation.assertCurrent();
+      throw error;
+    } finally {
+      context.current = false;
+      if (this.active.get(sessionId) === context) this.active.delete(sessionId);
+    }
+  }
+
+  invalidate(sessionId: SessionId): void {
+    const context = this.active.get(sessionId);
+    if (!context) return;
+    context.current = false;
+    context.controller.abort(new RuntimeBusyError(sessionId));
+  }
+
+  setRunClaim(runClaim: SessionRunClaimFence | undefined): void {
+    this.runClaim = runClaim;
+  }
+
+  resetObservations(): void {
+    this.topLevelEntries = [];
+    this.nestedEntries = 0;
+  }
+}
+
+class RecordingTeamRunEventStore {
+  readonly appends: Array<{ event: ChiliEvent; options?: EventAppendOptions }> = [];
+
+  constructor(
+    private readonly store: SqliteEventStore,
+    private readonly beforeAppend?: (
+      event: ChiliEvent,
+      options: EventAppendOptions | undefined,
+    ) => void,
+  ) {}
+
+  async append(event: ChiliEvent, options?: EventAppendOptions): Promise<void> {
+    this.beforeAppend?.(event, options);
+    this.appends.push({ event, ...(options ? { options } : {}) });
+    await this.store.append(event, options);
+  }
+}
+
+for (const mergeStatus of ["failed", "conflicted"] as const) {
+  test(`does not dispatch dependents of a ${mergeStatus} verified artifact`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-undelivered-"));
+    const store = new SqliteEventStore(join(dir, "events.sqlite"));
+    const sessionId = "session_team_undelivered" as SessionId;
+    const now = () => 900 as TimestampMs;
+    try {
+      const teams = new TeamControlService({ store, createId: createSequentialId(), now });
+      const team = await teams.createTeam({ sessionId, name: "undelivered", leadPath: "/root" as AgentPath });
+      const workerPath = "/root/worker" as AgentPath;
+      await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+      const artifact = { version: 1, baseCommit: "a".repeat(40), commit: "b".repeat(40), tree: "c".repeat(40), patchFingerprint: "d".repeat(64) };
+      const prerequisite = await teams.createTask({ sessionId, teamId: team.id, title: "Undelivered prerequisite", ownerPath: workerPath,
+        status: "completed", metadata: {
+          verification: { status: "passed", artifact },
+          merge: { status: mergeStatus, createdAt: 900, artifactCommit: artifact.commit },
+        },
+      });
+      const dependent = await teams.createTask({ sessionId, teamId: team.id, title: "Dependent", ownerPath: workerPath, dependsOn: [prerequisite.id] });
+      const dispatcher = {
+        async reconcileTasks() { return emptyReconcileResult(); },
+        async dispatchTask() { throw new Error("must not dispatch undelivered dependency"); },
+      } as unknown as TeamTaskDispatchService;
+      const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now, resolveSession: () => ({ cwd: dir }) });
+      const result = await execution.run({ teamId: team.id, sessionId, maxCycles: 2 });
+      expect(result.dispatched).toEqual([]);
+      expect(result.errors).toEqual([]);
+      expect(result.blocked).toContainEqual(expect.objectContaining({ taskId: dependent.id, reason: "dependency_incomplete", blockedBy: [prerequisite.id] }));
+      expect((await teams.tasks(team.id)).find((task) => task.id === dependent.id)?.status).toBe("pending");
+    } finally { store.close(); await rm(dir, { recursive: true, force: true }); }
+  });
 }
 
 class PendingMergeVerifier implements TeamTaskVerifier {
@@ -1157,7 +2007,6 @@ class PendingMergeVerifier implements TeamTaskVerifier {
         taskId: task.id,
         metadata: pendingMergeMetadata(Number(this.now())),
         ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-        ...(input.threadId ? { threadId: input.threadId } : {}),
       });
       result.verified.push({
         status: "passed",
@@ -1168,7 +2017,6 @@ class PendingMergeVerifier implements TeamTaskVerifier {
           path: "/root/worker/verifier" as AgentPath,
           parentPath: "/root/worker" as AgentPath,
           childSessionId: "session_verifier" as SessionId,
-          childThreadId: "thread_verifier" as ThreadId,
           status: "completed",
           summary: "VERDICT: passed",
         },
@@ -1216,7 +2064,6 @@ class MetadataMergeService implements TeamTaskMerger {
         taskId: task.id,
         metadata,
         ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-        ...(input.threadId ? { threadId: input.threadId } : {}),
       });
       const item = {
         status: this.status,
@@ -1246,6 +2093,26 @@ function pendingMergeMetadata(createdAt = 900): Record<string, unknown> {
   };
 }
 
+async function persistRootSession(store: SqliteEventStore, sessionId: SessionId, cwd: string): Promise<void> {
+  await store.append({
+    id: `event_root_${sessionId}`,
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd },
+  });
+}
+
+function persistedRootSessionResolver(store: SqliteEventStore) {
+  return async (sessionId: SessionId): Promise<{ cwd: string }> => {
+    const session = (await store.sessions()).find((candidate) => candidate.id === sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.status !== "active") throw new Error(`Session is not active: ${sessionId}`);
+    if (session.source !== "interactive") throw new Error(`Session is not a root session: ${sessionId}`);
+    return { cwd: session.cwd };
+  };
+}
+
 function createSequentialId(): (prefix: string) => string {
   let next = 0;
   return (prefix: string) => `${prefix}_${++next}`;
@@ -1264,6 +2131,40 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitForAgentTaskTerminal(store: SqliteEventStore, taskId: TaskId): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const task = await store.agentTask(taskId);
+    if (task && task.status !== "running") return;
+    await delay(1);
+  }
+  throw new Error(`agent task did not reach terminal state: ${taskId}`);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const HOSTILE_SUCCESS_OUTPUT_SECRET = "sk-team-success-output-secret-123456789";
+
+function hostileSuccessfulOutputError(label: string): Error {
+  return new Error([
+    `${label}: password=${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    `Authorization: Bearer ${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    `http://127.0.0.1:4567/callback?token=${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    "\u0000".repeat(5 * 1024 * 1024),
+  ].join("\n"));
+}
+
+function expectBoundedSanitizedDiagnostic(value: string | undefined): void {
+  expect(value).toBeDefined();
+  if (value === undefined) return;
+  expect(value).toContain("[REDACTED]");
+  expect(value).not.toContain(HOSTILE_SUCCESS_OUTPUT_SECRET);
+  expect(value).not.toContain("127.0.0.1");
+  expect(value).not.toContain("\u0000");
+  expect(utf8Bytes(value)).toBeLessThanOrEqual(16 * 1024);
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }

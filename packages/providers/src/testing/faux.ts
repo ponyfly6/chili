@@ -141,6 +141,8 @@ function copyDescriptor(descriptor: ModelDescriptor): ModelDescriptor {
   const copy: ModelDescriptor = { ...descriptor };
   if (descriptor.capabilities) copy.capabilities = { ...descriptor.capabilities };
   if (descriptor.inputCapabilities) copy.inputCapabilities = [...descriptor.inputCapabilities];
+  if (descriptor.reasoningLevels) copy.reasoningLevels = [...descriptor.reasoningLevels];
+  if (descriptor.serviceTiers) copy.serviceTiers = [...descriptor.serviceTiers];
   return copy;
 }
 

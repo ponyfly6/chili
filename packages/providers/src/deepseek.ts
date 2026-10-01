@@ -1,4 +1,4 @@
-import type { ChiliModelProvider, ModelDescriptor } from "./types.js";
+import type { ChiliModelProvider, ModelDescriptor, ReasoningLevel } from "./types.js";
 import { type EnvironmentSource, readDeepSeekEnvironment } from "./env.js";
 import {
   DEEPSEEK_OPENAI_BASE_URL,
@@ -27,10 +27,12 @@ export interface DeepSeekModelOptions {
   fetch?: typeof fetch;
   headers?: Record<string, string>;
   reasoning?: boolean;
+  reasoningEffort?: ReasoningLevel;
   env?: EnvironmentSource;
 }
 
 const DEFAULT_DEEPSEEK_MAX_TOKENS = 128 * 1024;
+const DEFAULT_DEEPSEEK_REASONING_EFFORT: ReasoningLevel = "high";
 
 export class DeepSeekOpenAIProvider implements ChiliModelProvider {
   readonly id = DEEPSEEK_PROVIDER_ID;
@@ -114,6 +116,9 @@ export function createDeepSeekV4Model(options: DeepSeekModelOptions = {}): OpenA
   };
   if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
   if (descriptor?.compatibility?.chatCompletions) modelOptions.compatibility = descriptor.compatibility.chatCompletions;
+  if (modelOptions.reasoning) {
+    modelOptions.reasoningEffort = options.reasoningEffort ?? DEFAULT_DEEPSEEK_REASONING_EFFORT;
+  }
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
   if (options.fetch !== undefined) modelOptions.fetch = options.fetch;
   if (options.headers !== undefined) modelOptions.headers = options.headers;

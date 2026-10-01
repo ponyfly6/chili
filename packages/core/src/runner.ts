@@ -1,26 +1,29 @@
-import type { MessageId, MessageImageContent, ModelSelection, ModelUsage, ReasoningLevel, ServiceTier, SessionId, ThreadId, TurnId } from "@chili/protocol";
+import type { MessageId, MessageImageContent, ModelSelection, ModelUsage, ReasoningLevel, ServiceTier, SessionId, TurnId } from "@chili/protocol";
 import type { ToolAccessPolicy } from "@chili/tools";
 import type { ContextUsage } from "./context/index.js";
 import type { PromptDebugManifest } from "./prompt/index.js";
 
 export interface CreateSessionInput {
   sessionId?: SessionId;
-  threadId: ThreadId;
   cwd: string;
 }
 
 export interface AppendUserMessageInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   turnId?: TurnId;
   text: string;
   displayText?: string;
   images?: readonly MessageImageContent[];
 }
 
+/** Reuse this object only across the model turns of one prompt execution. */
+export interface PromptExecutionScope {
+  readonly sessionId: SessionId;
+}
+
 export interface RunTurnInput {
   sessionId: SessionId;
-  threadId: ThreadId;
+  promptExecution?: PromptExecutionScope;
   turnId?: TurnId;
   cwd: string;
   system?: string[];

@@ -93,6 +93,7 @@ export function wrapTerminalText(text: string, options: {
   const paragraphs = text.split("\n");
   const width = Math.max(8, options.width);
   const tone = options.tone ?? "text";
+  const hangingIndentWidth = displayWidth(options.hangingIndent ?? "");
 
   for (const [paragraphIndex, paragraph] of paragraphs.entries()) {
     const prefix = paragraphIndex === 0 ? options.prefix ?? "" : "";
@@ -114,7 +115,8 @@ export function wrapTerminalText(text: string, options: {
 
     for (const char of source) {
       const nextWidth = charDisplayWidth(char);
-      if (current && currentWidth + nextWidth > width) push();
+      const contentWidth = Math.max(1, width - (lineIndex === 0 ? 0 : hangingIndentWidth));
+      if (current && currentWidth + nextWidth > contentWidth) push();
       current += char;
       currentWidth += nextWidth;
     }

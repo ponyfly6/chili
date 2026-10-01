@@ -1,0 +1,40 @@
+{
+  "name": "@chili/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first desktop control surface for the Chili coding agent runtime",
+  "author": "Chili contributors",
+  "type": "module",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build:sidecar": "bun run scripts/build-sidecar.ts",
+    "build": "tsc -b ../../tsconfig.json && bun run --cwd ../control-web build && bun run build:sidecar && electron-vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck:e2e": "tsc --noEmit -p e2e/tsconfig.json",
+    "test:e2e": "bun run typecheck:e2e && bun run e2e/electron.e2e.ts",
+    "package:dir": "bun run build && electron-builder --dir --mac --config electron-builder.config.ts",
+    "package:mac": "bun run build && electron-builder --mac dmg zip --config electron-builder.config.ts"
+  },
+  "devDependencies": {
+    "@electron/asar": "3.4.1",
+    "@electron/fuses": "2.1.3",
+    "@chili/protocol": "workspace:*",
+    "@chili/sdk": "workspace:*",
+    "@chili/server": "workspace:*",
+    "@chili/tools": "workspace:*",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "4.7.0",
+    "electron": "42.10.1",
+    "electron-builder": "26.15.2",
+    "electron-vite": "5.0.0",
+    "playwright-core": "1.62.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "typescript": "^5.8.3",
+    "vite": "7.3.6",
+    "@chili/remote-control": "workspace:*"
+  }
+}

@@ -1,4 +1,6 @@
 export * from "./types.js";
+export * from "./provider-error.js";
+export * from "./provider-backpressure.js";
 export * from "./models.js";
 export * from "./model-selection.js";
 export * from "./catalog.js";
@@ -11,4 +13,6 @@ export * from "./openai-codex.js";
 export * from "./oauth/openai-codex.js";
 export * from "./deepseek.js";
 export * from "./kimi.js";
+export * from "./zai.js";
 export * from "./minimax.js";
+export * from "./xai.js";

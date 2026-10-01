@@ -1,6 +1,8 @@
 import type {
   ChiliToolDefinition,
+  ContextualToolProvider,
   MutableToolRegistry,
+  ToolRegistryContext,
   ToolRegistryEntry,
   ToolRegistryListOptions,
   ToolRegistryRegisterOptions,
@@ -15,6 +17,7 @@ interface RegisteredTool {
 export class InMemoryToolRegistry implements MutableToolRegistry {
   private readonly canonical = new Map<string, RegisteredTool>();
   private readonly lookup = new Map<string, RegisteredTool>();
+  private readonly contextualSources = new Map<string, ContextualToolProvider>();
 
   register(tool: ChiliToolDefinition, options: ToolRegistryRegisterOptions = {}): void {
     const existing = this.lookup.get(tool.name);
@@ -41,6 +44,28 @@ export class InMemoryToolRegistry implements MutableToolRegistry {
 
   list(_options: ToolRegistryListOptions = {}): ChiliToolDefinition[] {
     return this.sortedEntries().map((entry) => entry.tool);
+  }
+
+  async getForContext(name: string, context: ToolRegistryContext): Promise<ChiliToolDefinition | undefined> {
+    return contextualLookup(await this.listForContext(context)).get(name);
+  }
+
+  async listForContext(
+    context: ToolRegistryContext,
+    _options: ToolRegistryListOptions = {},
+  ): Promise<ChiliToolDefinition[]> {
+    const tools = this.list();
+    const lookup = contextualLookup(tools);
+    for (const [source, provider] of [...this.contextualSources.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))) {
+      for (const tool of await provider(context)) {
+        assertContextualToolAvailable(tool, lookup, source);
+        tools.push(tool);
+        lookup.set(tool.name, tool);
+        for (const alias of tool.aliases ?? []) lookup.set(alias, tool);
+      }
+    }
+    return tools.sort((left, right) => left.name.localeCompare(right.name));
   }
 
   entries(_options: ToolRegistryListOptions = {}): ToolRegistryEntry[] {
@@ -99,6 +124,14 @@ export class InMemoryToolRegistry implements MutableToolRegistry {
     return this.replaceMatching({ source }, tools, { source });
   }
 
+  replaceContextualSource(source: string, provider: ContextualToolProvider): void {
+    this.contextualSources.set(source, provider);
+  }
+
+  unregisterContextualSource(source: string): boolean {
+    return this.contextualSources.delete(source);
+  }
+
   private sortedEntries(): RegisteredTool[] {
     return [...this.canonical.values()].sort((left, right) => left.tool.name.localeCompare(right.tool.name));
   }
@@ -144,6 +177,32 @@ export class InMemoryToolRegistry implements MutableToolRegistry {
         }
         futureLookup.set(alias, tool.name);
       }
+    }
+  }
+}
+
+function contextualLookup(tools: readonly ChiliToolDefinition[]): Map<string, ChiliToolDefinition> {
+  const lookup = new Map<string, ChiliToolDefinition>();
+  for (const tool of tools) {
+    lookup.set(tool.name, tool);
+    for (const alias of tool.aliases ?? []) lookup.set(alias, tool);
+  }
+  return lookup;
+}
+
+function assertContextualToolAvailable(
+  tool: ChiliToolDefinition,
+  lookup: ReadonlyMap<string, ChiliToolDefinition>,
+  source: string,
+): void {
+  const existing = lookup.get(tool.name);
+  if (existing) {
+    throw new Error(`Contextual tool already registered: ${tool.name} (${source}; owned by ${existing.name})`);
+  }
+  for (const alias of tool.aliases ?? []) {
+    const aliasOwner = lookup.get(alias);
+    if (aliasOwner || alias === tool.name) {
+      throw new Error(`Contextual tool alias already registered: ${alias} (${source})`);
     }
   }
 }

@@ -1,8 +1,16 @@
 import { RGBA, SyntaxStyle } from "@opentui/core";
 import type { TuiTheme } from "../theme/index.js";
-import { detailPreviewLines, TranscriptLines, type TranscriptLineModel, wrapLine } from "./lines.js";
+import {
+  clipTranscriptRows,
+  detailPreviewLines,
+  formatTranscriptOmissionLine,
+  isTranscriptOmissionLine,
+  TranscriptLines,
+  type TranscriptLineModel,
+  wrapLine,
+} from "./lines.js";
 import type { ChatDisplayItem, ToolActivityDisplay } from "./presentation.js";
-import type { ToolActivityDetail } from "./tool-renderers.js";
+import { isExplorationTool, type ToolActivityDetail } from "./tool-renderers.js";
 
 type ToolGroupDisplay = Extract<ChatDisplayItem, { kind: "tool_group" }>;
 type ToolCellBaseProps = { width: number; theme: TuiTheme; keyPrefix?: string | undefined };
@@ -60,16 +68,17 @@ export function toolCellLines(activity: ToolActivityDisplay, width: number, them
 }
 
 export function toolGroupCellLines(group: ToolGroupDisplay, width: number, theme: TuiTheme, keyPrefix = `display:${group.kind}`): TranscriptLineModel[] {
-  const lines = wrapLine(group.label, {
-    key: `${keyPrefix}:${group.id}`,
-    fg: toolFg(group.tone, theme),
-    width,
-    hangingIndent: "  ",
-  });
+  const lines = toolHeaderLines(`${keyPrefix}:${group.id}`, group.label, toolGroupDisplayStatus(group), width, theme);
+  for (const [index, failure] of (group.metadata.compactFailureLines ?? []).entries()) {
+    const prefix = index === 0 ? "  └ " : "    ";
+    lines.push(...wrapLine(`${prefix}${failure}`, {
+      key: `${keyPrefix}:${group.id}:failure:${index}`,
+      fg: theme.colors.text.muted,
+      width,
+      hangingIndent: "    ",
+    }));
+  }
   for (const activity of group.activities) {
-    if (activity.compactErrorLines?.length) {
-      lines.push(...detailPreviewLines(`${keyPrefix}:${group.id}:${activity.id}:error`, "error", activity.compactErrorLines, false, width, theme.colors.status.error));
-    }
     if (activity.details.length > 0 || activity.bodyLines.length > 0) {
       lines.push(...wrapLine(`  ${activity.label}`, {
         key: `${keyPrefix}:${group.id}:${activity.id}:label`,
@@ -101,12 +110,7 @@ function toolBlockCellLines(activity: ToolActivityDisplay, width: number, theme:
 }
 
 function toolLabelLines(activity: ToolActivityDisplay, width: number, theme: TuiTheme, keyPrefix: string): TranscriptLineModel[] {
-  return wrapLine(activity.label, {
-    key: `${keyPrefix}:${activity.id}`,
-    fg: toolFg(activity.tone, theme),
-    width,
-    hangingIndent: "  ",
-  });
+  return toolHeaderLines(`${keyPrefix}:${activity.id}`, activity.label, activity.displayStatus, width, theme);
 }
 
 function toolCompactSupplementLines(key: string, activity: ToolActivityDisplay, width: number, theme: TuiTheme): TranscriptLineModel[] {
@@ -120,9 +124,50 @@ function toolCompactSupplementLines(key: string, activity: ToolActivityDisplay, 
     }));
   }
   if (activity.compactErrorLines?.length) {
-    lines.push(...detailPreviewLines(`${key}:compact-error`, "error", activity.compactErrorLines, false, width, theme.colors.status.error));
+    if (isExplorationTool(activity.toolName)) {
+      const [first] = activity.compactErrorLines;
+      if (first) {
+        const hint = first.includes("Ctrl+O") ? first : `${first} (Ctrl+O for details)`;
+        lines.push(...wrapLine(`  └ ${hint}`, {
+          key: `${key}:compact-error`,
+          fg: theme.colors.text.muted,
+          width,
+          hangingIndent: "    ",
+        }));
+      }
+    } else {
+      lines.push(...compactTreePreviewLines(`${key}:compact-error`, activity.compactErrorLines, width, theme));
+    }
   }
   return lines;
+}
+
+function compactTreePreviewLines(
+  key: string,
+  sourceLines: readonly string[],
+  width: number,
+  theme: TuiTheme,
+): TranscriptLineModel[] {
+  const rows = sourceLines.flatMap((line, index) => {
+    const text = `    ${line || " "}`;
+    if (isTranscriptOmissionLine(line)) {
+      return [{ key: `${key}:line:${index}`, text: formatTranscriptOmissionLine(line, width), fg: theme.colors.text.muted }];
+    }
+    return wrapLine(text, {
+      key: `${key}:line:${index}`,
+      fg: theme.colors.text.muted,
+      width,
+      hangingIndent: "    ",
+    });
+  });
+  const clipped = clipTranscriptRows(rows, 5, `${key}:rows`, theme.colors.text.muted, width).lines;
+  const first = clipped[0];
+  if (!first) return [];
+  const firstText = first.text.startsWith("    ") ? first.text.slice(4) : first.text.trimStart();
+  return [
+    { ...first, text: `  └ ${firstText}` },
+    ...clipped.slice(1),
+  ];
 }
 
 function toolSupplementLines(key: string, activity: ToolActivityDisplay, width: number, theme: TuiTheme): TranscriptLineModel[] {
@@ -148,10 +193,10 @@ function toolBodyLines(
   if (activity.bodyKind === "diff") return diffBodyLines(key, activity, width, theme);
   if (activity.bodyKind === "code") return codeBodyLines(key, activity, width, theme);
   if (activity.bodyKind === "error") {
-    return detailPreviewLinesWithTones(key, "error", activity.bodyLines, activity.bodyTruncated, detail?.lineTones, width, theme);
+    return detailPreviewLines(key, "error", activity.bodyLines, activity.bodyTruncated, width, theme.colors.text.muted, detail?.maxVisibleRows);
   }
   if (activity.bodyKind === "text") {
-    return detailPreviewLinesWithTones(key, detail?.label ?? "output", activity.bodyLines, activity.bodyTruncated, detail?.lineTones, width, theme);
+    return detailPreviewLines(key, detail?.label ?? "output", activity.bodyLines, activity.bodyTruncated, width, theme.colors.text.muted, detail?.maxVisibleRows);
   }
   return [];
 }
@@ -171,8 +216,10 @@ function ToolBodyBlock(props: {
 
   const kind = activity.bodyKind;
   const labelLines = richBodyLabelLines(`${cellKey}:body:${kind}`, kind, activity.bodyTruncated, width, theme);
-  const content = activity.bodyLines.join("\n") || " ";
   const richWidth = Math.max(1, width - 4);
+  const content = activity.bodyLines
+    .map((line) => isTranscriptOmissionLine(line) ? formatTranscriptOmissionLine(line, richWidth, "") : line)
+    .join("\n") || " ";
   const richHeight = Math.max(1, activity.bodyLines.length);
   const syntaxStyle = toolSyntaxStyle(theme);
   const useNativeDiff = kind === "diff" && canRenderNativeDiff(content);
@@ -234,12 +281,12 @@ function richBodyLabelLines(key: string, label: "code" | "diff", truncated: bool
 
 function diffBodyLines(key: string, activity: ToolActivityDisplay, width: number, theme: TuiTheme): TranscriptLineModel[] {
   // Text fallback for transcript/copy paths and partial scroll slices.
-  return detailPreviewLines(key, "diff", activity.bodyLines, activity.bodyTruncated, width, theme.colors.text.muted);
+  return detailPreviewLines(key, "diff", activity.bodyLines, activity.bodyTruncated, width, theme.colors.text.muted, Number.POSITIVE_INFINITY);
 }
 
 function codeBodyLines(key: string, activity: ToolActivityDisplay, width: number, theme: TuiTheme): TranscriptLineModel[] {
   // Text fallback for transcript/copy paths and partial scroll slices.
-  return detailPreviewLines(key, "code", activity.bodyLines, activity.bodyTruncated, width, theme.colors.text.muted);
+  return detailPreviewLines(key, "code", activity.bodyLines, activity.bodyTruncated, width, theme.colors.text.muted, Number.POSITIVE_INFINITY);
 }
 
 function canRenderNativeDiff(content: string): boolean {
@@ -307,49 +354,46 @@ function bodyDetailForActivity(activity: ToolActivityDisplay): ToolActivityDetai
 }
 
 function toolDetailLines(key: string, detail: ToolActivityDetail, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  return detailPreviewLinesWithTones(key, detail.label, detail.lines, detail.truncated, detail.lineTones, width, theme, detail.tone);
-}
-
-function detailPreviewLinesWithTones(
-  key: string,
-  label: string,
-  lines: readonly string[],
-  truncated: boolean,
-  lineTones: readonly ("muted" | "error")[] | undefined,
-  width: number,
-  theme: TuiTheme,
-  fallbackTone: "muted" | "error" = "muted",
-): TranscriptLineModel[] {
-  if (!lineTones?.length) {
-    const fg = fallbackTone === "error" ? theme.colors.status.error : theme.colors.text.muted;
-    return detailPreviewLines(key, label, lines, truncated, width, fg);
-  }
-  const output: TranscriptLineModel[] = [];
-  const labelFg = fallbackTone === "error" ? theme.colors.status.error : theme.colors.text.muted;
-  const suffix = truncated ? " (truncated)" : "";
-  output.push(...wrapLine(`  ${label}${suffix}:`, {
-    key: `${key}:label`,
-    fg: labelFg,
-    width,
-    hangingIndent: "    ",
-  }));
-  for (const [index, line] of lines.entries()) {
-    output.push(...wrapLine(`    ${line || " "}`, {
-      key: `${key}:line:${index}`,
-      fg: lineTones[index] === "error" ? theme.colors.status.error : theme.colors.text.muted,
-      width,
-      hangingIndent: "    ",
-    }));
-  }
-  return output;
+  return detailPreviewLines(key, detail.label, detail.lines, detail.truncated, width, theme.colors.text.muted, detail.maxVisibleRows);
 }
 
 function sameLines(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((line, index) => line === right[index]);
 }
 
-function toolFg(tone: "muted" | "pending" | "error", theme: TuiTheme): string {
-  if (tone === "error") return theme.colors.status.error;
-  if (tone === "pending") return theme.colors.status.pending;
-  return theme.colors.text.muted;
+function toolHeaderLines(
+  key: string,
+  label: string,
+  displayStatus: ToolActivityDisplay["displayStatus"],
+  width: number,
+  theme: TuiTheme,
+): TranscriptLineModel[] {
+  return wrapLine(`• ${label}`, {
+    key,
+    fg: theme.colors.text.muted,
+    width,
+    hangingIndent: "  ",
+    leadingAccent: { length: 1, fg: toolStatusMarkerFg(displayStatus, theme) },
+  });
+}
+
+function toolGroupDisplayStatus(group: ToolGroupDisplay): ToolActivityDisplay["displayStatus"] {
+  const priorities: readonly ToolActivityDisplay["displayStatus"][] = [
+    "failed",
+    "rejected",
+    "waiting_permission",
+    "running",
+    "checking",
+    "queued",
+    "cancelled",
+    "succeeded",
+  ];
+  return priorities.find((status) => group.activities.some((activity) => activity.displayStatus === status)) ?? "succeeded";
+}
+
+function toolStatusMarkerFg(displayStatus: ToolActivityDisplay["displayStatus"], theme: TuiTheme): string {
+  if (displayStatus === "failed") return theme.colors.status.error;
+  if (displayStatus === "rejected" || displayStatus === "waiting_permission") return theme.colors.status.warning;
+  if (displayStatus === "queued" || displayStatus === "checking" || displayStatus === "running") return theme.colors.status.pending;
+  return theme.colors.text.disabled;
 }

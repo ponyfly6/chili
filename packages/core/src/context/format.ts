@@ -1,4 +1,4 @@
-import type { Message } from "@chili/protocol";
+import { formatToolResultForModel, type Message } from "@chili/protocol";
 
 interface ContextMessageFormatOptions {
   includeToolCallStatus?: boolean;
@@ -43,7 +43,7 @@ function formatContextPart(part: Message["parts"][number], options: ContextMessa
     case "image":
       return `[image ${part.mimeType}${part.filename ? ` ${part.filename}` : ""}${part.sourcePath ? ` ${part.sourcePath}` : ""}]`;
     case "reasoning":
-      return `[reasoning]\n${part.text}`;
+      return part.text ? `[reasoning]\n${part.text}` : "";
     case "tool_call": {
       const status = options.includeToolCallStatus ? ` ${part.status}` : "";
       return `[tool_call ${part.toolName} ${part.callId}${status}]\n${safeJson(part.input)}`;
@@ -68,9 +68,17 @@ function formatToolResultPart(
   options: ContextMessageFormatOptions,
 ): string {
   const prefix = `[tool_result ${part.callId}${part.error ? " error" : ""}]`;
-  if (!part.error) return `${prefix}\n${part.output}`;
-  if (options.errorToolResultMode === "error_and_output") return `${prefix}\nError: ${part.error}\n${part.output}`;
-  return `${prefix}\n${part.error}`;
+  const body = !part.error
+    ? part.output
+    : options.errorToolResultMode === "error_and_output"
+      ? `Error: ${part.error}\n${part.output}`
+      : part.error;
+  const formatted = `${prefix}\n${body}`;
+  const executionContext = part.executionContext
+    ? formatToolResultForModel({ output: "", executionContext: part.executionContext })
+    : "";
+  if (!executionContext) return formatted;
+  return body ? `${formatted}\n\n${executionContext}` : `${prefix}\n${executionContext}`;
 }
 
 function safeJson(value: unknown): string {

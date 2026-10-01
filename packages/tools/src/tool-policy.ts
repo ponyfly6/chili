@@ -1,10 +1,11 @@
 import { relative, resolve } from "node:path";
+import { TEAM_TASK_RUNTIME_METADATA_KEYS } from "@chili/protocol";
 import { ToolDeniedError } from "./errors.js";
 import type {
   ChiliToolDefinition,
   ExecuteToolInput,
   ToolAccessPolicy,
-  ToolApprovalSpec,
+  ToolApprovalSpecWithDefaults,
   ToolPolicyContext,
 } from "./types.js";
 
@@ -17,6 +18,8 @@ const SCOPED_TEAM_TOOL_NAMES = new Set([
   "team_message_send",
   "team_message_list",
 ]);
+const SCOPED_AGENT_MESSAGE_TOOL_NAMES = new Set(["agent_message_send", "agent_message_list"]);
+const TEAM_TASK_RUNTIME_METADATA_KEY_SET = new Set<string>(TEAM_TASK_RUNTIME_METADATA_KEYS);
 
 export function filterToolsByPolicy(
   tools: readonly ChiliToolDefinition[],
@@ -28,7 +31,12 @@ export function filterToolsByPolicy(
 
 export function isToolVisible(tool: ChiliToolDefinition, policy: ToolAccessPolicy | undefined): boolean {
   if (!policy) return true;
+  if (policy.deniedTools && toolNameDenied(tool, policy.deniedTools)) return false;
   if (policy.allowedTools && !toolNameAllowed(tool, policy.allowedTools)) return false;
+  // A deny-only policy is an overlay, not a scoped-worker capability policy.
+  // This lets callers disable a narrow set of tools without accidentally
+  // removing root filesystem, execution, or team-inspection capabilities.
+  if (!hasScopedWorkerConstraints(policy)) return true;
   if (isScopedTeamTool(tool) && !policy.teamId) return false;
   if (isFilesystemWriteTool(tool) && normalizedList(policy.writeScope).length === 0) return false;
   return true;
@@ -38,7 +46,7 @@ export async function authorizeToolByPolicy<Input>(input: {
   tool: ChiliToolDefinition<Input>;
   executeInput: ExecuteToolInput;
   validatedInput: Input;
-  approvalSpec: Required<ToolApprovalSpec>;
+  approvalSpec: ToolApprovalSpecWithDefaults;
   policy: ToolAccessPolicy | undefined;
   isReadOnly: (tool: ChiliToolDefinition<Input>, input: Input) => Promise<boolean | undefined>;
 }): Promise<void> {
@@ -49,7 +57,17 @@ export async function authorizeToolByPolicy<Input>(input: {
     throw new ToolDeniedError(input.tool.name, "Tool is not allowed by the current worker policy.");
   }
 
+  if (!hasScopedWorkerConstraints(policy)) return;
+
   authorizeTeamToolByPolicy(input.tool, input.validatedInput, policy);
+  authorizeAgentMessageToolByPolicy(input.tool, input.validatedInput, policy);
+
+  if (normalizeToolName(input.approvalSpec.permission) === "bash.unsandboxed") {
+    throw new ToolDeniedError(
+      input.tool.name,
+      "Scoped workers cannot request execution outside the host sandbox.",
+    );
+  }
 
   if (isFilesystemWriteRequest(input.tool, input.approvalSpec)) {
     const writeScope = normalizedList(policy.writeScope);
@@ -91,7 +109,6 @@ export function toolPolicyContext(input: ExecuteToolInput): ToolPolicyContext {
     turnId: input.turnId,
     cwd: input.cwd,
   };
-  if (input.threadId) context.threadId = input.threadId;
   return context;
 }
 
@@ -100,11 +117,25 @@ function toolNameAllowed(tool: ChiliToolDefinition, allowedTools: readonly strin
   return names.has("*") || toolNameMatches(tool, names);
 }
 
+function toolNameDenied(tool: ChiliToolDefinition, deniedTools: readonly string[]): boolean {
+  const names = new Set(deniedTools.map((name) => normalizeToolName(name)));
+  return names.has("*") || toolNameMatches(tool, names);
+}
+
+function hasScopedWorkerConstraints(policy: ToolAccessPolicy): boolean {
+  return policy.allowedTools !== undefined ||
+    policy.writeScope !== undefined ||
+    policy.executeScope !== undefined ||
+    policy.teamId !== undefined ||
+    policy.taskId !== undefined ||
+    policy.memberPath !== undefined;
+}
+
 function isFilesystemWriteTool(tool: ChiliToolDefinition): boolean {
   return toolNameMatches(tool, FILE_WRITE_TOOL_NAMES);
 }
 
-function isFilesystemWriteRequest(tool: ChiliToolDefinition, approvalSpec: Required<ToolApprovalSpec>): boolean {
+function isFilesystemWriteRequest(tool: ChiliToolDefinition, approvalSpec: ToolApprovalSpecWithDefaults): boolean {
   if (isFilesystemWriteTool(tool)) return true;
   return FILE_WRITE_PERMISSIONS.has(normalizeToolName(approvalSpec.permission)) && !isScopedTeamTool(tool);
 }
@@ -159,9 +190,43 @@ function authorizeTeamTaskTool(
     throw new ToolDeniedError(tool.name, "Team task tool is outside this worker's team task scope.");
   }
 
+  authorizeTeamTaskProgressUpdate(tool, input);
+
   const ownerPath = stringField(input, "ownerPath");
   if (ownerPath && policy.memberPath && ownerPath !== policy.memberPath) {
     throw new ToolDeniedError(tool.name, "Team task ownerPath must match this worker's member path.");
+  }
+}
+
+function authorizeTeamTaskProgressUpdate(
+  tool: ChiliToolDefinition,
+  input: Record<string, unknown>,
+): void {
+  const status = stringField(input, "status");
+  if (status && status !== "in_progress") {
+    throw new ToolDeniedError(
+      tool.name,
+      "Scoped workers may only report in-progress task updates; complete the local task with complete_task.",
+    );
+  }
+
+  const structuralFields = ["ownerPath", "title", "description", "dependsOn", "error"] as const;
+  const structuralField = structuralFields.find((field) => input[field] !== undefined);
+  if (structuralField) {
+    throw new ToolDeniedError(
+      tool.name,
+      `Scoped workers cannot change team task field: ${structuralField}.`,
+    );
+  }
+
+  const metadata = recordField(input, "metadata");
+  if (!metadata) return;
+  const protectedKey = Object.keys(metadata).find((key) => TEAM_TASK_RUNTIME_METADATA_KEY_SET.has(key));
+  if (protectedKey) {
+    throw new ToolDeniedError(
+      tool.name,
+      `Scoped workers cannot change runtime-owned team task metadata: ${protectedKey}.`,
+    );
   }
 }
 
@@ -192,6 +257,32 @@ function authorizeOptionalTeamTask(
   }
 }
 
+function authorizeAgentMessageToolByPolicy<Input>(
+  tool: ChiliToolDefinition<Input>,
+  validatedInput: Input,
+  policy: ToolAccessPolicy,
+): void {
+  if (!toolNameMatches(tool, SCOPED_AGENT_MESSAGE_TOOL_NAMES)) return;
+  const input = recordInput(validatedInput);
+  const from = stringField(input, "from");
+  if (from && policy.memberPath && from !== policy.memberPath) {
+    throw new ToolDeniedError(tool.name, "Agent message sender must match this worker's agent path.");
+  }
+  if (normalizeToolName(tool.name) !== "agent_message_send" || !policy.memberPath) return;
+
+  const to = stringField(input, "to");
+  if (!to || to === "parent" || !to.startsWith("/")) return;
+  const segments = policy.memberPath.split("/").filter(Boolean);
+  const parentPath = segments.length > 1 ? `/${segments.slice(0, -1).join("/")}` : undefined;
+  const isSelfOrDescendant = to === policy.memberPath || to.startsWith(`${policy.memberPath}/`);
+  if (to !== parentPath && !isSelfOrDescendant) {
+    throw new ToolDeniedError(
+      tool.name,
+      "Scoped agents may message only their parent or descendants directly; use team_message_send for teammates.",
+    );
+  }
+}
+
 function recordInput(input: unknown): Record<string, unknown> {
   return typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
 }
@@ -199,6 +290,13 @@ function recordInput(input: unknown): Record<string, unknown> {
 function stringField(input: Record<string, unknown>, key: string): string | undefined {
   const value = input[key];
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function recordField(input: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const value = input[key];
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function pathPatternWithinScopes(cwd: string, pattern: string, scopes: readonly string[]): boolean {

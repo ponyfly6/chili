@@ -1,8 +1,8 @@
 import { createReadStream } from "node:fs";
 import { open, stat } from "node:fs/promises";
-import { resolve, relative } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
+import { assertExistingPathInsideWorkspace, resolveWorkspacePath } from "../workspace-path.js";
 
 export interface ReadFileInput {
   filePath: string;
@@ -11,7 +11,25 @@ export interface ReadFileInput {
   maxBytes?: number;
 }
 
-export function createReadFileTool(): ChiliToolDefinition<ReadFileInput> {
+export interface ReadFileToolOptions {
+  defaultMaxBytes?: number;
+  maxBytesLimit?: number;
+}
+
+const DEFAULT_MAX_READ_BYTES = 256_000;
+
+export function createReadFileTool(options: ReadFileToolOptions = {}): ChiliToolDefinition<ReadFileInput> {
+  const defaultMaxBytes = options.defaultMaxBytes ?? DEFAULT_MAX_READ_BYTES;
+  const maxBytesLimit = options.maxBytesLimit ?? Math.max(defaultMaxBytes, DEFAULT_MAX_READ_BYTES);
+  if (!isPositiveInteger(defaultMaxBytes)) {
+    throw new Error("defaultMaxBytes must be a positive integer");
+  }
+  if (!isPositiveInteger(maxBytesLimit)) {
+    throw new Error("maxBytesLimit must be a positive integer");
+  }
+  if (defaultMaxBytes > maxBytesLimit) {
+    throw new Error("defaultMaxBytes must be <= maxBytesLimit");
+  }
   return {
     name: "read",
     aliases: ["read_file"],
@@ -28,7 +46,7 @@ export function createReadFileTool(): ChiliToolDefinition<ReadFileInput> {
         filePath: { type: "string" },
         offset: { type: "number" },
         limit: { type: "number" },
-        maxBytes: { type: "number" },
+        maxBytes: { type: "number", maximum: maxBytesLimit },
       },
     },
     validate(input): ValidationResult<ReadFileInput> {
@@ -49,6 +67,9 @@ export function createReadFileTool(): ChiliToolDefinition<ReadFileInput> {
       }
       if (maxBytes !== undefined && !isPositiveInteger(maxBytes)) {
         return { ok: false, message: "maxBytes must be a positive integer" };
+      }
+      if (maxBytes !== undefined && maxBytes > maxBytesLimit) {
+        return { ok: false, message: `maxBytes must be <= ${maxBytesLimit}` };
       }
       const value: ReadFileInput = {
         filePath,
@@ -71,37 +92,36 @@ export function createReadFileTool(): ChiliToolDefinition<ReadFileInput> {
       };
     },
     async execute(input, context) {
-      const workspace = resolve(context.cwd);
-      const target = resolve(workspace, input.filePath);
-      const rel = relative(workspace, target);
+      const workspace = context.cwd;
+      const target = resolveWorkspacePath(workspace, input.filePath);
+      await assertExistingPathInsideWorkspace(workspace, target, input.filePath);
 
-      if (rel.startsWith("..") || rel === "") {
-        throw new Error(`read only supports files inside the workspace: ${input.filePath}`);
+      const maxBytes = input.maxBytes ?? defaultMaxBytes;
+      if (maxBytes > maxBytesLimit) {
+        throw new Error(`maxBytes must be <= ${maxBytesLimit}`);
       }
-
-      const maxBytes = input.maxBytes ?? 256_000;
       const rangeOptions: { offset?: number; limit?: number; maxBytes: number } = { maxBytes };
       if (input.offset !== undefined) rangeOptions.offset = input.offset;
       if (input.limit !== undefined) rangeOptions.limit = input.limit;
       const selection = input.offset === undefined && input.limit === undefined
-        ? await readPrefix(target, maxBytes)
-        : await readLineRange(target, rangeOptions);
+        ? await readPrefix(target.absolutePath, maxBytes)
+        : await readLineRange(target.absolutePath, rangeOptions);
       const { content, truncated, bytes } = selection;
       const fullRead = !truncated && input.offset === undefined && input.limit === undefined;
       if (fullRead) {
-        await context.fileReads?.recordTextRead(workspace, target, content);
+        await context.fileReads?.recordTextRead(workspace, target.absolutePath, content);
       } else {
-        await context.fileReads?.recordTextRangeRead(workspace, target, content, {
+        await context.fileReads?.recordTextRangeRead(workspace, target.absolutePath, content, {
           ...(input.offset !== undefined ? { offset: input.offset } : {}),
           ...(input.limit !== undefined ? { limit: input.limit } : {}),
         });
       }
 
       return {
-        title: rel,
+        title: target.relativePath,
         output: truncated ? `${content}\n[truncated after ${maxBytes} bytes]` : content,
         metadata: {
-          path: rel,
+          path: target.relativePath,
           bytes,
           truncated,
         },

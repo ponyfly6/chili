@@ -1,3 +1,7 @@
+export const AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX = `create unique index if not exists agent_tasks_child_session_idx
+  on agent_tasks(child_session_id)
+  where child_session_id is not null`;
+
 export const SQLITE_SCHEMA = [
   `create table if not exists events (
     seq integer primary key autoincrement,
@@ -5,16 +9,14 @@ export const SQLITE_SCHEMA = [
     type text not null,
     time integer not null,
     session_id text,
-    thread_id text,
     payload_json text not null
   )`,
   `create unique index if not exists events_id_idx on events(id)`,
   `create index if not exists events_seq_idx on events(seq)`,
   `create index if not exists events_session_seq_idx on events(session_id, seq)`,
-  `create index if not exists events_thread_seq_idx on events(thread_id, seq)`,
+  `create index if not exists events_session_type_seq_idx on events(session_id, type, seq)`,
   `create index if not exists events_type_seq_idx on events(type, seq)`,
   `create index if not exists events_session_time_idx on events(session_id, time, id)`,
-  `create index if not exists events_thread_time_idx on events(thread_id, time, id)`,
   `create index if not exists events_type_time_idx on events(type, time, id)`,
 
   `create table if not exists sessions (
@@ -27,9 +29,8 @@ export const SQLITE_SCHEMA = [
   )`,
   `create index if not exists sessions_updated_idx on sessions(updated_at)`,
 
-  `create table if not exists thread_goals (
-    thread_id text primary key,
-    session_id text,
+  `create table if not exists session_goals (
+    session_id text not null primary key,
     objective text not null,
     status text not null,
     token_budget integer,
@@ -40,17 +41,16 @@ export const SQLITE_SCHEMA = [
     completed_at integer,
     last_reason text
   )`,
-  `create index if not exists thread_goals_session_idx on thread_goals(session_id)`,
-  `create index if not exists thread_goals_status_idx on thread_goals(status, updated_at)`,
+  `create index if not exists session_goals_status_idx on session_goals(status, updated_at)`,
 
   `create table if not exists messages (
     id text primary key,
     session_id text not null,
-    thread_id text,
     turn_id text,
     role text not null,
     parent_id text,
-    created_at integer not null
+    created_at integer not null,
+    created_event_seq integer
   )`,
   `create index if not exists messages_session_time_idx on messages(session_id, created_at, id)`,
 
@@ -61,6 +61,7 @@ export const SQLITE_SCHEMA = [
     type text not null,
     ordinal integer not null,
     data_json text not null,
+    delta_event_seq integer not null default 0,
     created_at integer not null
   )`,
   `create index if not exists message_parts_message_ordinal_idx on message_parts(message_id, ordinal)`,
@@ -69,7 +70,6 @@ export const SQLITE_SCHEMA = [
   `create table if not exists tool_calls (
     id text primary key,
     session_id text,
-    thread_id text,
     turn_id text,
     tool_name text not null,
     status text not null,
@@ -86,10 +86,10 @@ export const SQLITE_SCHEMA = [
   `create table if not exists approvals (
     id text primary key,
     session_id text,
-    thread_id text,
     call_id text,
     permission text not null,
     patterns_json text not null,
+    max_approval_scope text,
     metadata_json text,
     status text not null,
     decision text,
@@ -103,14 +103,11 @@ export const SQLITE_SCHEMA = [
   `create table if not exists agent_runs (
     id text primary key,
     session_id text,
-    thread_id text,
     task_id text,
     path text not null,
     parent_path text,
     parent_session_id text,
-    parent_thread_id text,
     child_session_id text,
-    child_thread_id text,
     task_name text not null,
     cwd text,
     mode text,
@@ -124,16 +121,23 @@ export const SQLITE_SCHEMA = [
 
   `create table if not exists agent_tasks (
     id text primary key,
+    dispatch_id text,
+    reserved_run_id text,
+    worker_policy_json text,
     path text not null,
     parent_path text,
     parent_session_id text,
-    parent_thread_id text,
     child_session_id text,
-    child_thread_id text,
     task_name text not null,
     cwd text,
     prompt text,
     mode text,
+    source_call_id text,
+    batch_id text,
+    batch_index integer,
+    expected_batch_size integer,
+    completion_policy text,
+    max_concurrency integer,
     status text not null,
     generation integer not null default 0,
     current_run_id text,
@@ -149,15 +153,14 @@ export const SQLITE_SCHEMA = [
   )`,
   `create index if not exists agent_tasks_path_idx on agent_tasks(path)`,
   `create index if not exists agent_tasks_parent_session_status_idx on agent_tasks(parent_session_id, status)`,
-  `create index if not exists agent_tasks_child_session_idx on agent_tasks(child_session_id)`,
+  AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX,
 
   `create table if not exists agent_mailbox (
     id text primary key,
     task_id text,
     path text not null,
     from_path text not null,
-    child_session_id text,
-    child_thread_id text,
+    recipient_session_id text,
     trigger_turn integer not null,
     status text not null,
     message_json text,
@@ -166,7 +169,7 @@ export const SQLITE_SCHEMA = [
   )`,
   `create index if not exists agent_mailbox_task_idx on agent_mailbox(task_id, created_at)`,
   `create index if not exists agent_mailbox_path_idx on agent_mailbox(path, created_at)`,
-  `create index if not exists agent_mailbox_child_session_idx on agent_mailbox(child_session_id, created_at)`,
+  `create index if not exists agent_mailbox_recipient_session_idx on agent_mailbox(recipient_session_id, created_at)`,
   `create index if not exists agent_mailbox_status_idx on agent_mailbox(status, created_at)`,
 
   `create table if not exists teams (
@@ -188,7 +191,6 @@ export const SQLITE_SCHEMA = [
     role text not null,
     status text not null,
     child_session_id text,
-    child_thread_id text,
     model text,
     tool_scope_json text,
     write_scope_json text,
@@ -200,6 +202,7 @@ export const SQLITE_SCHEMA = [
   )`,
   `create index if not exists team_members_team_status_idx on team_members(team_id, status)`,
   `create index if not exists team_members_path_idx on team_members(path)`,
+  `create index if not exists team_members_child_session_idx on team_members(child_session_id)`,
 
   `create table if not exists team_tasks (
     id text primary key,
@@ -244,7 +247,6 @@ export const SQLITE_SCHEMA = [
     team_message_id text not null,
     path text not null,
     child_session_id text,
-    child_thread_id text,
     trigger_turn integer not null,
     status text not null,
     error text,

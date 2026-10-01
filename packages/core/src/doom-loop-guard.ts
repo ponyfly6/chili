@@ -1,6 +1,8 @@
 export interface DoomLoopGuardOptions {
   maxRepeatedToolCalls?: number;
   maxToolCallsPerTurn?: number;
+  /** Count repeated inputs only within this many recent calls in the prompt. */
+  repetitionWindowSize?: number;
 }
 
 export interface DoomLoopCheckInput {
@@ -14,13 +16,23 @@ export type DoomLoopCheckResult =
 
 export class DoomLoopGuard {
   private readonly seen = new Map<string, number>();
+  private readonly recent: string[] = [];
   private total = 0;
   private readonly maxRepeatedToolCalls: number;
   private readonly maxToolCallsPerTurn: number;
+  private readonly repetitionWindowSize: number;
 
   constructor(options: DoomLoopGuardOptions = {}) {
     this.maxRepeatedToolCalls = options.maxRepeatedToolCalls ?? 20;
     this.maxToolCallsPerTurn = options.maxToolCallsPerTurn ?? 200;
+    this.repetitionWindowSize = Math.max(
+      this.maxRepeatedToolCalls + 1,
+      options.repetitionWindowSize ?? 100,
+    );
+  }
+
+  beginTurn(): void {
+    this.total = 0;
   }
 
   check(input: DoomLoopCheckInput): DoomLoopCheckResult {
@@ -30,6 +42,15 @@ export class DoomLoopGuard {
     }
 
     const signature = stableStringify([input.toolName, input.input]);
+    this.recent.push(signature);
+    if (this.recent.length > this.repetitionWindowSize) {
+      const expired = this.recent.shift();
+      if (expired !== undefined) {
+        const remaining = (this.seen.get(expired) ?? 0) - 1;
+        if (remaining <= 0) this.seen.delete(expired);
+        else this.seen.set(expired, remaining);
+      }
+    }
     const count = (this.seen.get(signature) ?? 0) + 1;
     this.seen.set(signature, count);
     if (count > this.maxRepeatedToolCalls) {

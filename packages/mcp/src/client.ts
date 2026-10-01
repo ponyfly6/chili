@@ -1,6 +1,8 @@
 import type { McpServerConfig } from "./config.js";
 
-export const MCP_PROTOCOL_VERSION = "2024-11-05";
+/** Current handshake revision for the legacy JSON-RPC adapter. */
+export const MCP_PROTOCOL_VERSION = "2025-11-25";
+export const MCP_CURRENT_PROTOCOL_VERSION = "2026-07-28";
 
 export interface McpClientInfo {
   name: string;
@@ -19,6 +21,7 @@ export interface McpServerCapabilities {
   resources?: { subscribe?: boolean; listChanged?: boolean };
   logging?: Record<string, never>;
   experimental?: Record<string, unknown>;
+  extensions?: Record<string, unknown>;
 }
 
 export interface McpInitializeResult {
@@ -159,6 +162,9 @@ export class JsonRpcMcpClient implements McpClient {
   ) {}
 
   async initialize(options: McpInitializeOptions = {}): Promise<McpInitializeResult> {
+    if ((options.protocolVersion ?? MCP_PROTOCOL_VERSION) >= MCP_CURRENT_PROTOCOL_VERSION) {
+      throw new Error("JsonRpcMcpClient supports handshake revisions only; use SdkMcpClient for MCP 2026-07-28 or later.");
+    }
     await this.transport.start?.();
     const result = await this.transport.request<McpInitializeResult>("initialize", {
       protocolVersion: options.protocolVersion ?? MCP_PROTOCOL_VERSION,

@@ -1,15 +1,16 @@
 import type {
   AgentRunId,
+  AssistantMessagePhase,
   ChiliEvent,
   EventEnvelope,
   Message,
   ModelSelection,
   ModelUsage as ProtocolModelUsage,
+  PersistedModelOutput,
   ReasoningLevel,
   RuntimeModelDescriptor,
   ServiceTier,
   SessionId,
-  ThreadId,
   ToolDefinition,
   TurnId,
 } from "@chili/protocol";
@@ -46,11 +47,24 @@ export interface ToolRegistry {
 export interface ModelRouter {
   stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent>;
   listModels?(): Promise<readonly RuntimeModelDescriptor[]> | readonly RuntimeModelDescriptor[];
+  resolveRequestLimits?(
+    input: ModelRequestLimitsInput,
+  ): Promise<ModelRequestLimits | undefined> | ModelRequestLimits | undefined;
+}
+
+export interface ModelRequestLimitsInput {
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
+}
+
+export interface ModelRequestLimits {
+  contextWindowTokens?: number;
+  requestMaxOutputTokens?: number;
 }
 
 export interface ModelStreamInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   turnId: TurnId;
   messages: Message[];
   tools: ToolDefinition[];
@@ -61,6 +75,7 @@ export interface ModelStreamInput {
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
   serviceTier?: ServiceTier;
+  maxTokens?: number;
   signal?: AbortSignal;
 }
 
@@ -70,6 +85,7 @@ export type ModelStreamEvent =
   | ModelMetadataEvent
   | ModelTextDeltaEvent
   | ModelReasoningDeltaEvent
+  | ModelReasoningItemEvent
   | ModelToolCallStartEvent
   | ModelToolCallDeltaEvent
   | ModelToolCallEndEvent
@@ -91,6 +107,7 @@ export interface ModelTextDeltaEvent {
   type: "text_delta";
   text: string;
   index?: number;
+  phase?: AssistantMessagePhase;
 }
 
 export interface ModelReasoningDeltaEvent {
@@ -98,6 +115,11 @@ export interface ModelReasoningDeltaEvent {
   text: string;
   index?: number;
   redacted?: boolean;
+}
+
+export interface ModelReasoningItemEvent {
+  type: "reasoning_item";
+  output: PersistedModelOutput;
 }
 
 export interface ModelToolCallStartEvent {
@@ -121,6 +143,7 @@ export interface ModelToolCallEndEvent {
   toolCallId: string;
   name: string;
   input: unknown;
+  inputParseError?: string;
   index?: number;
 }
 
@@ -128,6 +151,7 @@ export interface ModelLegacyToolCallEvent {
   type: "tool_call";
   name: string;
   input: unknown;
+  inputParseError?: string;
 }
 
 export interface ModelFinishEvent {

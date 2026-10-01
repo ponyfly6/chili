@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+import { stat } from "node:fs/promises";
+import { join, resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { addChiliMemoryEntry, loadChiliMemoryContext } from "@chili/core";
 import type { AgentTreeNode, TeamExecutionRunSummary, TeamMergeSweepResult, TeamSnapshot } from "@chili/core";
@@ -13,20 +15,25 @@ import type {
   RuntimeMcpServerDescriptor,
   RuntimeMcpStatusResponse,
   SessionId,
+  SnapshotId,
   TaskId,
   TeamId,
-  ThreadId,
 } from "@chili/protocol";
 import { ROOT_AGENT_PATH } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
 import { loadSkillSettings, loadSkills, updateSkillDisabledSetting, type Skill } from "@chili/skills";
+import { inspectSqliteEventStore } from "@chili/store";
 import { DeferredApprovalQueue } from "@chili/tools";
 import { parseArgs, usage } from "./args.js";
-import { cliEnvironmentDefaults } from "./environment-defaults.js";
+import { applyCliEnvironmentDefaults, cliEnvironmentDefaults } from "./environment-defaults.js";
 import { createCliHarness } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
-import { runPrompt } from "./runner.js";
+import { createCliReplCommandRegistry, dispatchCliReplCommand, type CliReplCommandContext } from "./repl-commands.js";
+import { runSessionPrompt } from "./runner.js";
 import { resolveSession } from "./session.js";
+import { revertSessionSnapshot } from "./session-recovery.js";
+import { formatStoreDoctorText } from "./store-doctor.js";
+import { bindNewTeamOwnerSession } from "./team-owner-session.js";
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
@@ -37,6 +44,11 @@ async function main(): Promise<void> {
 
   if (args.command === "skills-list" || args.command === "skills-enable" || args.command === "skills-disable") {
     await handleSkillsCommand(args);
+    return;
+  }
+
+  if (args.command === "store-doctor") {
+    await handleStoreDoctorCommand(args);
     return;
   }
 
@@ -54,18 +66,43 @@ async function main(): Promise<void> {
     ...(approvalQueue ? { approvalQueue } : {}),
   };
   const envDefaults = cliEnvironmentDefaults(process.env);
-  if (args.provider !== undefined) harnessInput.provider = args.provider;
-  else if (envDefaults.provider !== undefined) harnessInput.provider = envDefaults.provider;
-  if (args.model !== undefined) harnessInput.model = args.model;
-  else if (envDefaults.model !== undefined) harnessInput.model = envDefaults.model;
-  if (args.reasoningLevel !== undefined) harnessInput.reasoningLevel = args.reasoningLevel;
-  else if (envDefaults.reasoningLevel !== undefined) harnessInput.reasoningLevel = envDefaults.reasoningLevel;
-  if (envDefaults.serviceTier !== undefined) harnessInput.serviceTier = envDefaults.serviceTier;
-  const harness = await createCliHarness(harnessInput);
+  const modelDefaults = applyCliEnvironmentDefaults({
+    ...(args.provider !== undefined ? { provider: args.provider } : {}),
+    ...(args.model !== undefined ? { model: args.model } : {}),
+    ...(args.reasoningLevel !== undefined ? { reasoningLevel: args.reasoningLevel } : {}),
+  }, envDefaults);
+  if (modelDefaults.provider !== undefined) harnessInput.provider = modelDefaults.provider;
+  if (modelDefaults.model !== undefined) harnessInput.model = modelDefaults.model;
+  if (modelDefaults.reasoningLevel !== undefined) harnessInput.reasoningLevel = modelDefaults.reasoningLevel;
+  if (modelDefaults.serviceTier !== undefined) harnessInput.serviceTier = modelDefaults.serviceTier;
+  const signalLifecycle = createCliShutdownLifecycle({
+    signalSource: process,
+    forceExit: ({ exitCode }) => process.exit(exitCode),
+    onFirstSignal: ({ signal, exitCode }) => {
+      const currentExitCode = typeof process.exitCode === "number" ? process.exitCode : 0;
+      process.exitCode = Math.max(currentExitCode, exitCode);
+      console.log(`\n[interrupt] ${signal} received; shutting down...`);
+    },
+  });
+  let harness: Awaited<ReturnType<typeof createCliHarness>>;
+  try {
+    harness = await createCliHarness(harnessInput);
+    signalLifecycle.attachHarness(harness);
+  } catch (error) {
+    signalLifecycle.dispose();
+    throw error;
+  }
+  let lifecycleOwnsHarness = true;
 
   try {
+    if (signalLifecycle.signal.aborted) {
+      await signalLifecycle.close();
+      return;
+    }
     if (args.command === "serve") {
       if (!approvalQueue) throw new Error("approval queue was not initialized");
+      lifecycleOwnsHarness = false;
+      signalLifecycle.dispose();
       await serve({ harness, approvalQueue, host: args.host, port: args.port });
       return;
     }
@@ -132,24 +169,34 @@ async function main(): Promise<void> {
 
     if (args.command === "team-dispatch") {
       if (!args.teamId || !args.taskId) throw new Error("team-dispatch requires a team id and task id");
-      await dispatchTeamTask(harness, args.teamId as TeamId, args.taskId as TaskId, "background");
+      await dispatchTeamTask(
+        harness,
+        args.teamId as TeamId,
+        args.taskId as TaskId,
+        "background",
+        signalLifecycle.signal,
+      );
       return;
     }
 
     if (args.command === "team-run") {
       if (!args.teamId || !args.taskId) throw new Error("team-run requires a team id and task id");
-      await dispatchTeamTask(harness, args.teamId as TeamId, args.taskId as TaskId, "one_shot");
+      await dispatchTeamTask(
+        harness,
+        args.teamId as TeamId,
+        args.taskId as TaskId,
+        "one_shot",
+        signalLifecycle.signal,
+      );
       return;
     }
 
     if (args.command === "team-run-loop") {
       if (!args.teamId) throw new Error("team-run-loop requires a team id");
-      const controller = installInterruptHandler();
       const input: Parameters<typeof harness.teamRunner.run>[0] = {
         teamId: args.teamId as TeamId,
-        cwd: harness.cwd,
         once: args.once,
-        signal: controller.signal,
+        signal: signalLifecycle.signal,
       };
       if (args.maxCycles !== undefined) input.maxCycles = args.maxCycles;
       if (args.timeoutMs !== undefined) input.timeoutMs = args.timeoutMs;
@@ -165,7 +212,7 @@ async function main(): Promise<void> {
       if (!args.teamId) throw new Error("team-merge requires a team id");
       const input: Parameters<typeof harness.teamMerger.mergeTeamTasks>[0] = {
         teamId: args.teamId as TeamId,
-        cwd: harness.cwd,
+        signal: signalLifecycle.signal,
       };
       if (args.taskId) input.taskId = args.taskId as TaskId;
       const result = await harness.teamMerger.mergeTeamTasks(input);
@@ -234,12 +281,11 @@ async function main(): Promise<void> {
     if (args.command === "task-followup") {
       if (!args.taskId) throw new Error("followup requires a task id");
       if (!args.prompt) throw new Error("followup requires prompt text");
-      const controller = installInterruptHandler();
       const result = await harness.tasks.followupTask({
         taskId: args.taskId as TaskId,
         text: args.prompt,
         maxTurns: args.maxTurns,
-        signal: controller.signal,
+        signal: signalLifecycle.signal,
       });
       console.log(`[task] ${result.task.id}\t${result.task.status}\t${result.task.summary ?? ""}`);
       return;
@@ -247,7 +293,10 @@ async function main(): Promise<void> {
 
     if (args.command === "task-wait") {
       if (!args.taskId) throw new Error("wait requires a task id");
-      const input: { taskId: TaskId; timeoutMs?: number } = { taskId: args.taskId as TaskId };
+      const input: { taskId: TaskId; timeoutMs?: number; signal: AbortSignal } = {
+        taskId: args.taskId as TaskId,
+        signal: signalLifecycle.signal,
+      };
       if (args.timeoutMs !== undefined) input.timeoutMs = args.timeoutMs;
       const task = await harness.tasks.waitForTask(input);
       console.log(`[task] ${task.id}\t${task.status}\t${task.summary ?? ""}`);
@@ -256,7 +305,7 @@ async function main(): Promise<void> {
 
     if (args.command === "task-close") {
       if (!args.taskId) throw new Error("close requires a task id");
-      const input: { taskId: TaskId; status?: "completed" | "failed" | "cancelled"; summary?: string } = {
+      const input: { taskId: TaskId; status?: "completed" | "incomplete" | "failed" | "cancelled"; summary?: string } = {
         taskId: args.taskId as TaskId,
       };
       if (args.taskStatus) input.status = args.taskStatus;
@@ -269,8 +318,14 @@ async function main(): Promise<void> {
     if (args.command === "revert") {
       if (!args.resume) throw new Error("revert requires --resume <session-id>");
       if (!args.snapshotId) throw new Error("revert requires a snapshot id");
-      const sessionId = args.resume as SessionId;
-      await harness.recovery.revert({ sessionId, snapshotId: args.snapshotId as never });
+      await revertSessionSnapshot({
+        service: harness.service,
+        store: harness.store,
+        recovery: harness.recovery,
+        cwd: harness.cwd,
+        resume: args.resume,
+        snapshotId: args.snapshotId as SnapshotId,
+      });
       console.log(`Reverted snapshot ${args.snapshotId}`);
       return;
     }
@@ -284,29 +339,36 @@ async function main(): Promise<void> {
 
     console.log(`[session] ${session.sessionId}${session.isNew ? " (new)" : " (resumed)"}`);
     if (args.prompt) {
-      const controller = installInterruptHandler();
-      await runPrompt({
+      await runSessionPrompt({
         harness,
         sessionId: session.sessionId,
-        threadId: session.threadId,
         prompt: args.prompt,
         maxTurns: args.maxTurns,
-        ...(harness.defaultModelSelection ? { modelSelection: harness.defaultModelSelection } : {}),
-        ...(harness.defaultReasoningLevel !== undefined ? { reasoningLevel: harness.defaultReasoningLevel } : {}),
-        ...(harness.defaultServiceTier !== undefined ? { serviceTier: harness.defaultServiceTier } : {}),
-        signal: controller.signal,
+        signal: signalLifecycle.signal,
       });
+      // A one-shot CLI process owns any background agents it started. Let
+      // successful work reach its durable terminal state before the finally
+      // block invokes the cancellation-oriented host shutdown path.
+      if (!signalLifecycle.signal.aborted) await harness.waitForBackgroundTasks();
       return;
     }
 
+    // Readline owns interactive SIGINT semantics. Keep SIGTERM under the host
+    // lifecycle so service-manager shutdown still drains detached tool groups.
+    signalLifecycle.releaseSigint();
     await repl({
       harness,
       sessionId: session.sessionId,
-      threadId: session.threadId,
       maxTurns: args.maxTurns,
+      shutdownSignal: signalLifecycle.signal,
     });
   } finally {
-    await harness.close();
+    try {
+      if (lifecycleOwnsHarness) await signalLifecycle.close();
+      else await harness.close();
+    } finally {
+      signalLifecycle.dispose();
+    }
   }
 }
 
@@ -320,21 +382,22 @@ async function printPromptDebug(
     cwd: harness.cwd,
   };
   if (args.resume) sessionInput.resume = args.resume;
-  if (args.threadId) sessionInput.threadId = args.threadId;
   const session = await resolveSession(sessionInput);
+  const persistedSession = (await harness.store.sessions()).find((candidate) => (
+    candidate.id === session.sessionId
+  ));
+  if (!persistedSession) throw new Error(`Session not found: ${session.sessionId}`);
+  const cwd = persistedSession.cwd;
 
   if (args.content) {
     const inspected = await harness.service.inspectPrompt({
       sessionId: session.sessionId,
-      threadId: session.threadId,
-      cwd: harness.cwd,
       ...(args.prompt !== undefined ? { text: args.prompt } : {}),
       includeContent: true,
     });
     const output: CliPromptDebugOutput = {
       sessionId: session.sessionId,
-      threadId: session.threadId,
-      cwd: harness.cwd,
+      cwd,
       created: session.isNew,
       debug: inspected.debug,
       fragments: inspected.fragments,
@@ -345,14 +408,11 @@ async function printPromptDebug(
 
   const debug = await harness.service.inspectPrompt({
     sessionId: session.sessionId,
-    threadId: session.threadId,
-    cwd: harness.cwd,
     ...(args.prompt !== undefined ? { text: args.prompt } : {}),
   });
   const output: CliPromptDebugOutput = {
     sessionId: session.sessionId,
-    threadId: session.threadId,
-    cwd: harness.cwd,
+    cwd,
     created: session.isNew,
     debug,
   };
@@ -385,23 +445,316 @@ async function serve(input: {
   console.log(`[server] ${server.url}`);
   console.log("Press Ctrl+C to stop.");
 
-  await new Promise<void>((resolve) => {
-    const stop = () => {
-      process.removeListener("SIGINT", stop);
-      process.removeListener("SIGTERM", stop);
-      input.approvalQueue.denyAll("Runtime server stopped.");
-      server.close();
-      resolve();
-    };
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
+  await waitForServeShutdown({
+    signalSource: process,
+    denyPending: () => input.approvalQueue.denyAll("Runtime server stopped."),
+    closeServer: () => server.close(),
+    closeHarness: () => input.harness.close(),
+    forceExit: ({ exitCode }) => process.exit(exitCode),
   });
 }
 
+export type ServeShutdownSignal = "SIGINT" | "SIGTERM";
+export type ServeShutdownForceReason = "deadline" | "repeated_signal";
+
+export interface ServeShutdownForceExit {
+  signal: ServeShutdownSignal;
+  reason: ServeShutdownForceReason;
+  exitCode: number;
+}
+
+export interface ServeShutdownDeadline {
+  cancel(): void;
+}
+
+export interface ServeShutdownSignalSource {
+  on(signal: ServeShutdownSignal, listener: () => void): unknown;
+  removeListener(signal: ServeShutdownSignal, listener: () => void): unknown;
+}
+
+const SERVE_SHUTDOWN_DEADLINE_MS = 12_000;
+const CLI_SHUTDOWN_DEADLINE_MS = 12_000;
+
+export interface CliShutdownLifecycle {
+  readonly signal: AbortSignal;
+  attachHarness(harness: { close(): Promise<void> }): void;
+  close(): Promise<void>;
+  releaseSigint(): void;
+  dispose(): void;
+}
+
+export function createCliShutdownLifecycle(input: {
+  signalSource: ServeShutdownSignalSource;
+  forceExit(input: ServeShutdownForceExit): void;
+  shutdownDeadlineMs?: number;
+  armDeadline?(callback: () => void, delayMs: number): ServeShutdownDeadline;
+  onFirstSignal?(input: { signal: ServeShutdownSignal; exitCode: number }): void;
+}): CliShutdownLifecycle {
+  const shutdownDeadlineMs = input.shutdownDeadlineMs ?? CLI_SHUTDOWN_DEADLINE_MS;
+  if (!Number.isSafeInteger(shutdownDeadlineMs) || shutdownDeadlineMs <= 0) {
+    throw new RangeError("CLI shutdown deadline must be a positive safe integer");
+  }
+
+  const controller = new AbortController();
+  let harness: { close(): Promise<void> } | undefined;
+  let closeStarted = false;
+  let closePromise: Promise<void> | undefined;
+  let resolveClose: (() => void) | undefined;
+  let rejectClose: ((error: unknown) => void) | undefined;
+  let deadline: ServeShutdownDeadline | undefined;
+  let firstSignal: ServeShutdownSignal | undefined;
+  let settled = false;
+  let disposed = false;
+  let sigintReleased = false;
+
+  const removeSignalListeners = (): void => {
+    input.signalSource.removeListener("SIGINT", onSigint);
+    input.signalSource.removeListener("SIGTERM", onSigterm);
+  };
+  const cancelDeadline = (): void => {
+    deadline?.cancel();
+    deadline = undefined;
+  };
+  const publishClosePromise = (): Promise<void> => {
+    if (!closePromise) {
+      closePromise = new Promise<void>((resolvePromise, rejectPromise) => {
+        resolveClose = resolvePromise;
+        rejectClose = rejectPromise;
+      });
+      // A signal can force shutdown while harness construction is still
+      // pending and before main has a chance to await this promise.
+      void closePromise.catch(() => undefined);
+    }
+    return closePromise;
+  };
+  const finish = (error?: unknown): void => {
+    if (settled) return;
+    settled = true;
+    disposed = true;
+    cancelDeadline();
+    removeSignalListeners();
+    if (error === undefined) resolveClose?.();
+    else rejectClose?.(error);
+  };
+  const startHarnessClose = (): void => {
+    if (closeStarted || !harness) return;
+    closeStarted = true;
+    const cleanup = invokeServeShutdownOperation(() => harness?.close() ?? Promise.resolve());
+    void cleanup.then(
+      () => finish(),
+      (error: unknown) => finish(error),
+    );
+  };
+  const forceShutdown = (signal: ServeShutdownSignal, reason: ServeShutdownForceReason): void => {
+    if (settled) return;
+    settled = true;
+    disposed = true;
+    cancelDeadline();
+    removeSignalListeners();
+    const exitCode = signal === "SIGINT" ? 130 : 143;
+    const error = new Error(
+      reason === "deadline"
+        ? `CLI shutdown exceeded ${shutdownDeadlineMs}ms`
+        : `CLI shutdown was forced by repeated ${signal}`,
+    );
+    try {
+      input.forceExit({ signal, reason, exitCode });
+    } catch (forceError) {
+      rejectClose?.(forceError);
+      return;
+    }
+    rejectClose?.(error);
+  };
+  const armDeadline = (signal: ServeShutdownSignal): void => {
+    const arm = input.armDeadline ?? armServeShutdownDeadline;
+    try {
+      const armedDeadline = arm(
+        () => forceShutdown(signal, "deadline"),
+        shutdownDeadlineMs,
+      );
+      if (settled) armedDeadline.cancel();
+      else deadline = armedDeadline;
+    } catch {
+      forceShutdown(signal, "deadline");
+    }
+  };
+  const stop = (signal: ServeShutdownSignal): void => {
+    if (firstSignal) {
+      forceShutdown(signal, "repeated_signal");
+      return;
+    }
+    firstSignal = signal;
+    if (signal === "SIGTERM" && sigintReleased) {
+      // Readline owns Ctrl+C while the REPL is healthy. Once host shutdown
+      // starts, restore SIGINT as an immediate forced-escape path.
+      input.signalSource.on("SIGINT", onSigint);
+      sigintReleased = false;
+    }
+    const exitCode = signal === "SIGINT" ? 130 : 143;
+    publishClosePromise();
+    try {
+      input.onFirstSignal?.({ signal, exitCode });
+    } catch {
+      // An observer must not prevent abort or cleanup admission from closing.
+    }
+    controller.abort(new Error(`CLI received ${signal}`));
+    startHarnessClose();
+    if (!settled) armDeadline(signal);
+  };
+  const onSigint = (): void => stop("SIGINT");
+  const onSigterm = (): void => stop("SIGTERM");
+
+  input.signalSource.on("SIGINT", onSigint);
+  input.signalSource.on("SIGTERM", onSigterm);
+
+  return {
+    signal: controller.signal,
+    attachHarness(attachedHarness) {
+      if (harness && harness !== attachedHarness) throw new Error("CLI shutdown harness is already attached");
+      harness = attachedHarness;
+      if (closePromise) startHarnessClose();
+    },
+    close() {
+      const promise = publishClosePromise();
+      startHarnessClose();
+      return promise;
+    },
+    releaseSigint() {
+      if (sigintReleased || disposed) return;
+      sigintReleased = true;
+      input.signalSource.removeListener("SIGINT", onSigint);
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      cancelDeadline();
+      removeSignalListeners();
+      if (closePromise && !settled && !closeStarted) {
+        settled = true;
+        resolveClose?.();
+      }
+    },
+  };
+}
+
+export function waitForServeShutdown(input: {
+  signalSource: ServeShutdownSignalSource;
+  denyPending(): void;
+  closeServer(): Promise<void>;
+  closeHarness(): Promise<void>;
+  forceExit(input: ServeShutdownForceExit): void;
+  shutdownDeadlineMs?: number;
+  armDeadline?(callback: () => void, delayMs: number): ServeShutdownDeadline;
+}): Promise<void> {
+  const shutdownDeadlineMs = input.shutdownDeadlineMs ?? SERVE_SHUTDOWN_DEADLINE_MS;
+  if (!Number.isSafeInteger(shutdownDeadlineMs) || shutdownDeadlineMs <= 0) {
+    throw new RangeError("Serve shutdown deadline must be a positive safe integer");
+  }
+
+  return new Promise<void>((resolvePromise, rejectPromise) => {
+    let stopping = false;
+    let settled = false;
+    let deadline: ServeShutdownDeadline | undefined;
+    const removeSignalListeners = (): void => {
+      input.signalSource.removeListener("SIGINT", onSigint);
+      input.signalSource.removeListener("SIGTERM", onSigterm);
+    };
+    const forceShutdown = (signal: ServeShutdownSignal, reason: ServeShutdownForceReason): void => {
+      if (settled) return;
+      settled = true;
+      deadline?.cancel();
+      deadline = undefined;
+      removeSignalListeners();
+      const exitCode = signal === "SIGINT" ? 130 : 143;
+      const error = new Error(
+        reason === "deadline"
+          ? `Runtime server shutdown exceeded ${shutdownDeadlineMs}ms`
+          : `Runtime server shutdown was forced by repeated ${signal}`,
+      );
+      try {
+        input.forceExit({ signal, reason, exitCode });
+      } catch (forceError) {
+        rejectPromise(forceError);
+        return;
+      }
+      // The production hook does not return. Settling here keeps injected unit
+      // test hooks deterministic without pretending the shutdown was graceful.
+      rejectPromise(error);
+    };
+    const stop = (signal: ServeShutdownSignal): void => {
+      if (stopping) {
+        forceShutdown(signal, "repeated_signal");
+        return;
+      }
+      stopping = true;
+
+      const errors: unknown[] = [];
+      try {
+        input.denyPending();
+      } catch (error) {
+        errors.push(error);
+      }
+
+      // Calling closeServer synchronously closes HTTP admission. Calling
+      // closeHarness immediately afterwards closes runtime admission and aborts
+      // in-flight prompts, allowing Bun's force-stop drain to finish.
+      const serverClose = invokeServeShutdownOperation(input.closeServer);
+      const harnessClose = invokeServeShutdownOperation(input.closeHarness);
+      void Promise.allSettled([serverClose, harnessClose]).then((results) => {
+        for (const result of results) {
+          if (result.status === "rejected") errors.push(result.reason);
+        }
+        if (settled) return;
+        settled = true;
+        deadline?.cancel();
+        deadline = undefined;
+        removeSignalListeners();
+        if (errors.length === 1) rejectPromise(errors[0]);
+        else if (errors.length > 1) {
+          rejectPromise(new AggregateError(errors, "Runtime server shutdown encountered multiple errors"));
+        } else {
+          resolvePromise();
+        }
+      });
+
+      const armDeadline = input.armDeadline ?? armServeShutdownDeadline;
+      try {
+        const armedDeadline = armDeadline(
+          () => forceShutdown(signal, "deadline"),
+          shutdownDeadlineMs,
+        );
+        if (settled) armedDeadline.cancel();
+        else deadline = armedDeadline;
+      } catch {
+        // Failure to install the only bound must itself fail closed.
+        forceShutdown(signal, "deadline");
+      }
+    };
+    const onSigint = (): void => stop("SIGINT");
+    const onSigterm = (): void => stop("SIGTERM");
+
+    input.signalSource.on("SIGINT", onSigint);
+    input.signalSource.on("SIGTERM", onSigterm);
+  });
+}
+
+function armServeShutdownDeadline(callback: () => void, delayMs: number): ServeShutdownDeadline {
+  const timer = setTimeout(callback, delayMs);
+  return { cancel: () => clearTimeout(timer) };
+}
+
+function invokeServeShutdownOperation(operation: () => Promise<void>): Promise<void> {
+  try {
+    return Promise.resolve(operation());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
 interface CliMcpControl {
-  list(): Promise<RuntimeMcpListResponse>;
-  status?(): Promise<RuntimeMcpStatusResponse>;
-  reload?(): Promise<RuntimeMcpReloadResponse>;
+  list(input?: { cwd?: string }): Promise<RuntimeMcpListResponse>;
+  status?(input?: { cwd?: string }): Promise<RuntimeMcpStatusResponse>;
+  reload?(input?: { cwd?: string }): Promise<RuntimeMcpReloadResponse>;
   add?(input: RuntimeMcpAddServerRequest): Promise<RuntimeMcpServerDescriptor>;
   remove?(server: string): Promise<RuntimeMcpRemoveServerResponse>;
   auth?(server: string, input?: RuntimeMcpAuthRequest): Promise<RuntimeMcpAuthResponse>;
@@ -420,12 +773,13 @@ async function handleMcpCommand(
   }
 
   if (action === "list") {
-    const result = await control.list();
+    const result = await control.list({ cwd: harness.cwd });
     printMcpList(result, args.json);
     return;
   }
   if (action === "status") {
-    const result = control.status ? await control.status() : statusFromMcpList(await control.list());
+    const scope = { cwd: harness.cwd };
+    const result = control.status ? await control.status(scope) : statusFromMcpList(await control.list(scope));
     if (args.mcpServer) {
       const server = result.servers.find((item) => item.name === args.mcpServer);
       if (!server) throw new Error(`MCP server not found: ${args.mcpServer}`);
@@ -437,7 +791,7 @@ async function handleMcpCommand(
   }
   if (action === "reload") {
     if (!control.reload) throw new Error("MCP reload is not supported by the configured manager");
-    const result = await control.reload();
+    const result = await control.reload({ cwd: harness.cwd });
     printMcpReload(result, args.json);
     return;
   }
@@ -590,8 +944,23 @@ async function printSessions(store: Awaited<ReturnType<typeof createCliHarness>>
   }
 }
 
-async function printTasks(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
-  const tasks = await harness.tasks.listTasks();
+async function handleStoreDoctorCommand(args: ReturnType<typeof parseArgs>): Promise<void> {
+  const dbPath = join(resolvePath(args.cwd), ".chili", "chili.sqlite");
+  if (!(await fileExists(dbPath))) {
+    const missing = { path: dbPath, exists: false };
+    console.log(args.json ? jsonStringify(missing) : `No store database found at ${dbPath}`);
+    return;
+  }
+
+  const report = await inspectSqliteEventStore(dbPath);
+  console.log(args.json ? jsonStringify(report) : formatStoreDoctorText(report));
+}
+
+async function printTasks(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  sessionId?: SessionId,
+): Promise<void> {
+  const tasks = await harness.tasks.listTasks(sessionId ? { parentSessionId: sessionId } : {});
   if (tasks.length === 0) {
     console.log("No tasks yet.");
     return;
@@ -610,13 +979,25 @@ async function printTasks(harness: Awaited<ReturnType<typeof createCliHarness>>)
   }
 }
 
-async function printTask(harness: Awaited<ReturnType<typeof createCliHarness>>, taskId: TaskId): Promise<void> {
+async function printTask(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  taskId: TaskId,
+  sessionId?: SessionId,
+): Promise<void> {
   const task = await harness.tasks.getTask(taskId);
+  if (sessionId && task.parentSessionId !== sessionId) {
+    throw new Error(`Task ${taskId} does not belong to session ${sessionId}`);
+  }
   console.log(JSON.stringify(task, null, 2));
 }
 
-async function printAgentTree(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
-  const snapshot = await harness.agents.snapshot({ rootPath: ROOT_AGENT_PATH });
+async function printAgentTree(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  sessionId?: SessionId,
+): Promise<void> {
+  const snapshot = await harness.agents.snapshot(
+    sessionId ? { rootPath: ROOT_AGENT_PATH, sessionId } : { rootPath: ROOT_AGENT_PATH },
+  );
   if (snapshot.nodes.length === 0) {
     console.log("No agents yet.");
     return;
@@ -777,27 +1158,30 @@ async function dispatchTeamTask(
   teamId: TeamId,
   taskId: TaskId,
   mode: "background" | "one_shot",
+  signal: AbortSignal,
 ): Promise<void> {
   const team = (await harness.teams.listTeams()).find((item) => item.id === teamId);
   if (!team) throw new Error(`Team not found: ${teamId}`);
   const task = (await harness.teams.tasks(teamId)).find((item) => item.id === taskId);
   if (!task) throw new Error(`Team task not found: ${taskId}`);
 
-  let sessionId = task.sessionId ?? team.sessionId;
-  let threadId: import("@chili/protocol").ThreadId | undefined;
+  let sessionId = team.sessionId;
   if (!sessionId) {
     const session = await harness.service.createSession({ cwd: harness.cwd });
-    sessionId = session.sessionId;
-    threadId = session.threadId;
+    sessionId = await bindNewTeamOwnerSession({
+      teams: harness.teams,
+      teamId,
+      candidateSessionId: session.sessionId,
+      discardCandidate: () => harness.service.archiveSession(session.sessionId),
+    });
   }
 
   const result = await harness.teamDispatcher.dispatchTask({
     teamId,
     taskId,
     mode,
-    cwd: harness.cwd,
     sessionId,
-    ...(threadId ? { threadId } : {}),
+    signal,
   });
   console.log(jsonStringify(result));
 }
@@ -909,8 +1293,13 @@ function mergeFilesChanged(summary: unknown): string {
   return `files=${typeof filesChanged === "number" ? filesChanged : 0}`;
 }
 
-async function printMailbox(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
-  const messages = await harness.agents.mailbox({ status: "queued" });
+async function printMailbox(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  sessionId?: SessionId,
+): Promise<void> {
+  const messages = sessionId
+    ? (await harness.agents.snapshot({ rootPath: ROOT_AGENT_PATH, sessionId })).mailbox.filter((message) => message.status === "queued")
+    : await harness.agents.mailbox({ status: "queued" });
   if (messages.length === 0) {
     console.log("No mailbox messages.");
     return;
@@ -923,8 +1312,12 @@ async function printMailbox(harness: Awaited<ReturnType<typeof createCliHarness>
 
 type MemoryScopeArg = "user" | "project" | "all" | undefined;
 
-async function printMemory(harness: Awaited<ReturnType<typeof createCliHarness>>, scope: MemoryScopeArg): Promise<void> {
-  const snapshot = await loadChiliMemoryContext({ cwd: harness.cwd });
+async function printMemory(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  scope: MemoryScopeArg,
+  cwd = harness.cwd,
+): Promise<void> {
+  const snapshot = await loadChiliMemoryContext({ cwd });
   const documents = filterMemoryDocuments(snapshot.documents, scope);
   if (documents.length === 0) {
     console.log("No Chili memory or project instructions loaded.");
@@ -943,9 +1336,10 @@ async function addMemory(
   harness: Awaited<ReturnType<typeof createCliHarness>>,
   text: string,
   scope: MemoryScopeArg,
+  cwd = harness.cwd,
 ): Promise<void> {
   const result = await addChiliMemoryEntry({
-    cwd: harness.cwd,
+    cwd,
     text,
     scope: memoryWriteScope(scope),
   });
@@ -953,8 +1347,12 @@ async function addMemory(
   console.log(`- ${result.text}`);
 }
 
-async function reloadMemory(harness: Awaited<ReturnType<typeof createCliHarness>>, scope: MemoryScopeArg): Promise<void> {
-  const snapshot = await loadChiliMemoryContext({ cwd: harness.cwd });
+async function reloadMemory(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  scope: MemoryScopeArg,
+  cwd = harness.cwd,
+): Promise<void> {
+  const snapshot = await loadChiliMemoryContext({ cwd });
   const documents = filterMemoryDocuments(snapshot.documents, scope);
   console.log(`[memory] reloaded ${documents.length} source(s)`);
   if (documents.length > 0) {
@@ -1054,6 +1452,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+async function fileExists(path: string): Promise<boolean> {
+  return stat(path).then(() => true, () => false);
+}
+
 function jsonStringify(value: unknown): string {
   return JSON.stringify(
     value,
@@ -1068,106 +1470,131 @@ function jsonStringify(value: unknown): string {
 async function repl(input: {
   harness: Awaited<ReturnType<typeof createCliHarness>>;
   sessionId: SessionId;
-  threadId: import("@chili/protocol").ThreadId;
   maxTurns: number;
+  shutdownSignal: AbortSignal;
 }): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  console.log("Type /help for commands, /exit to quit.");
+  const persistedSession = (await input.harness.store.sessions()).find((session) => session.id === input.sessionId);
+  if (!persistedSession) throw new Error(`Session not found: ${input.sessionId}`);
+  const sessionCwd = persistedSession.cwd;
+  const commandRegistry = createCliReplCommandRegistry(await input.harness.commands.list({ cwd: sessionCwd }));
+  const commandContext: CliReplCommandContext = {
+    sessionId: input.sessionId,
+    cwd: sessionCwd,
+    listSessions: async () => printSessions(input.harness.store),
+    setModel: async (sessionId, selection) => {
+      const config = await input.harness.service.setModel({ sessionId, modelSelection: selection });
+      console.log(`[model] ${config.modelSelection?.provider ?? selection.provider}/${config.modelSelection?.model ?? selection.model}`);
+    },
+    setReasoning: async (sessionId, reasoningLevel) => {
+      const config = await input.harness.service.setReasoning({ sessionId, reasoningLevel });
+      console.log(`[thinking] ${config.reasoningLevel ?? reasoningLevel}`);
+    },
+    setServiceTier: async (sessionId, serviceTier) => {
+      const config = await input.harness.service.setServiceTier({ sessionId, serviceTier });
+      console.log(`[service] ${config.serviceTier ?? serviceTier}`);
+    },
+    compactSession: async (sessionId, focus) => {
+      const interrupt = installReplInterruptHandler(input.shutdownSignal);
+      const compactInput: {
+        sessionId: SessionId;
+        instructions?: string;
+        signal: AbortSignal;
+      } = {
+        sessionId,
+        signal: interrupt.signal,
+      };
+      if (focus) compactInput.instructions = focus;
+      try {
+        const result = await input.harness.service.compactSession(compactInput);
+        if (result.status === "skipped") console.log(`[context] compact skipped: ${result.reason}`);
+        else if (result.status === "failed" || result.status === "cancelled") console.error(`[context] compact ${result.status}: ${result.error.message}`);
+      } finally {
+        interrupt.dispose();
+      }
+    },
+    revertSession: async (sessionId, snapshotId) => {
+      await input.harness.recovery.revert({ sessionId, snapshotId: snapshotId as never });
+      console.log(`Reverted snapshot ${snapshotId}`);
+    },
+    showDelegation: async (sessionId, policy) => {
+      const config = policy
+        ? await input.harness.service.setDelegationPolicy({ sessionId, policy })
+        : await input.harness.service.getDelegationConfig(sessionId);
+      console.log(`[delegation] ${config.policy} (${config.source})`);
+    },
+    showAgents: async (sessionId) => printAgentTree(input.harness, sessionId),
+    showMailbox: async (sessionId) => printMailbox(input.harness, sessionId),
+    listTasks: async (sessionId) => printTasks(input.harness, sessionId),
+    showTask: async (sessionId, taskId) => printTask(input.harness, taskId as TaskId, sessionId),
+    recoverTasks: async (sessionId) => {
+      const result = await input.harness.tasks.reconcileStaleTasks({ parentSessionId: sessionId });
+      console.log(`[tasks] scanned=${result.scanned} closed=${result.closed.length}`);
+      for (const task of result.closed) {
+        console.log(`[task] ${task.id}\t${task.status}\t${task.summary ?? ""}`);
+      }
+    },
+    showMemory: async (cwd, scope) => handleMemoryReplCommand(input.harness, `show ${scope}`.trim(), cwd),
+    addMemory: async (cwd, value) => handleMemoryReplCommand(input.harness, `add ${value}`.trim(), cwd),
+    reloadMemory: async (cwd, scope) => handleMemoryReplCommand(input.harness, `reload ${scope}`.trim(), cwd),
+    runPromptCommand: async (sessionId, commandId, args) => {
+      const command = await input.harness.commands.run({
+        commandId,
+        ...(args ? { args } : {}),
+        cwd: sessionCwd,
+      });
+      const interrupt = installReplInterruptHandler(input.shutdownSignal);
+      try {
+        await runSessionPrompt({
+          harness: input.harness,
+          sessionId,
+          prompt: command.prompt,
+          maxTurns: input.maxTurns,
+          signal: interrupt.signal,
+        });
+      } finally {
+        interrupt.dispose();
+      }
+    },
+  };
+  console.log("Type /help for commands, /app exit to quit.");
   try {
     while (true) {
-      const line = (await rl.question("chili> ")).trim();
+      if (input.shutdownSignal.aborted) return;
+      let answer: string;
+      try {
+        answer = await rl.question("chili> ", { signal: input.shutdownSignal });
+      } catch (error) {
+        if (input.shutdownSignal.aborted) return;
+        throw error;
+      }
+      if (input.shutdownSignal.aborted) return;
+      const line = answer.trim();
       if (!line) continue;
-      if (line === "/exit" || line === "/quit") return;
-      if (line === "/help") {
-        console.log(
-          [
-            "/help                 Show commands",
-            "/sessions             List sessions",
-            "/agents               Show agent tree",
-            "/mailbox              List queued mailbox messages",
-            "/memory show          Show loaded memory and project instructions",
-            "/memory add <text>    Save a project memory entry",
-            "/memory reload        Refresh and show loaded memory sources",
-            "/tasks                List subagent tasks",
-            "/recover-tasks        Mark stale background tasks cancelled",
-            "/task <taskId>        Show a subagent task",
-            "/compact [focus]      Compress conversation context",
-            "/revert <snapshotId>  Revert a snapshot in this session",
-            "/exit                 Quit",
-          ].join("\n"),
-        );
+      const command = await dispatchCliReplCommand(commandRegistry, commandContext, line);
+      if (input.shutdownSignal.aborted) return;
+      if (command.status === "exit") return;
+      if (command.status === "handled") {
+        if (command.output) console.log(command.output);
         continue;
       }
-      if (line === "/sessions") {
-        await printSessions(input.harness.store);
-        continue;
-      }
-      if (line === "/agents") {
-        await printAgentTree(input.harness);
-        continue;
-      }
-      if (line === "/mailbox") {
-        await printMailbox(input.harness);
-        continue;
-      }
-      if (line === "/memory" || line.startsWith("/memory ")) {
-        await handleMemoryReplCommand(input.harness, line.slice("/memory".length).trim());
-        continue;
-      }
-      if (line === "/tasks") {
-        await printTasks(input.harness);
-        continue;
-      }
-      if (line === "/recover-tasks") {
-        const result = await input.harness.tasks.reconcileStaleTasks();
-        console.log(`[tasks] scanned=${result.scanned} closed=${result.closed.length}`);
-        continue;
-      }
-      if (line.startsWith("/task ")) {
-        await printTask(input.harness, line.slice("/task ".length).trim() as TaskId);
-        continue;
-      }
-      if (line === "/compact" || line.startsWith("/compact ")) {
-        const instructions = line.slice("/compact".length).trim();
-        const controller = installInterruptHandler();
-        const compactInput: {
-          sessionId: SessionId;
-          threadId: import("@chili/protocol").ThreadId;
-          instructions?: string;
-          signal: AbortSignal;
-        } = {
-          sessionId: input.sessionId,
-          threadId: input.threadId,
-          signal: controller.signal,
-        };
-        if (instructions) compactInput.instructions = instructions;
-        const result = await input.harness.service.compactSession(compactInput);
-        if (result.status === "skipped") {
-          console.log(`[context] compact skipped: ${result.reason}`);
-        } else if (result.status === "failed" || result.status === "cancelled") {
-          console.error(`[context] compact ${result.status}: ${result.error.message}`);
-        }
-        continue;
-      }
-      if (line.startsWith("/revert ")) {
-        const snapshotId = line.slice("/revert ".length).trim();
-        await input.harness.recovery.revert({ sessionId: input.sessionId, threadId: input.threadId, snapshotId: snapshotId as never });
-        console.log(`Reverted snapshot ${snapshotId}`);
+      if (command.status === "error") {
+        console.error(command.output ?? "Command failed.");
         continue;
       }
 
-      const controller = installInterruptHandler();
-      await runPrompt({
-        harness: input.harness,
-        sessionId: input.sessionId,
-        threadId: input.threadId,
-        prompt: line,
-        maxTurns: input.maxTurns,
-        ...(input.harness.defaultModelSelection ? { modelSelection: input.harness.defaultModelSelection } : {}),
-        ...(input.harness.defaultReasoningLevel !== undefined ? { reasoningLevel: input.harness.defaultReasoningLevel } : {}),
-        ...(input.harness.defaultServiceTier !== undefined ? { serviceTier: input.harness.defaultServiceTier } : {}),
-        signal: controller.signal,
-      });
+      const interrupt = installReplInterruptHandler(input.shutdownSignal);
+      try {
+        await runSessionPrompt({
+          harness: input.harness,
+          sessionId: input.sessionId,
+          prompt: line,
+          maxTurns: input.maxTurns,
+          signal: interrupt.signal,
+        });
+      } finally {
+        interrupt.dispose();
+      }
     }
   } finally {
     rl.close();
@@ -1177,21 +1604,22 @@ async function repl(input: {
 async function handleMemoryReplCommand(
   harness: Awaited<ReturnType<typeof createCliHarness>>,
   command: string,
+  cwd = harness.cwd,
 ): Promise<void> {
   const action = command.split(/\s+/, 1)[0] || "show";
   const rest = command.slice(action.length).trim();
   if (action === "show" || action === "list") {
-    await printMemory(harness, parseReplMemoryScope(rest));
+    await printMemory(harness, parseReplMemoryScope(rest), cwd);
     return;
   }
   if (action === "reload" || action === "refresh") {
-    await reloadMemory(harness, parseReplMemoryScope(rest));
+    await reloadMemory(harness, parseReplMemoryScope(rest), cwd);
     return;
   }
   if (action === "add") {
     const parsed = parseReplMemoryAdd(rest);
     if (!parsed.text) throw new Error("/memory add requires text");
-    await addMemory(harness, parsed.text, parsed.scope);
+    await addMemory(harness, parsed.text, parsed.scope, cwd);
     return;
   }
   throw new Error(`Unknown /memory command: ${action}`);
@@ -1244,26 +1672,34 @@ function preview(value: string, max = 96): string {
   return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}...`;
 }
 
-function installInterruptHandler(): AbortController {
+function installReplInterruptHandler(shutdownSignal: AbortSignal): { signal: AbortSignal; dispose(): void } {
   const controller = new AbortController();
-  const onSigint = () => {
-    if (controller.signal.aborted) process.exit(130);
+  let disposed = false;
+  const onSigint = (): void => {
     console.log("\n[interrupt] cancelling current turn...");
-    controller.abort();
+    controller.abort(new Error("CLI received SIGINT"));
+  };
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    process.removeListener("SIGINT", onSigint);
+    shutdownSignal.removeEventListener("abort", onShutdown);
+  };
+  const onShutdown = (): void => {
+    controller.abort(shutdownSignal.reason ?? new Error("CLI is shutting down"));
   };
   process.once("SIGINT", onSigint);
-  controller.signal.addEventListener(
-    "abort",
-    () => {
-      process.removeListener("SIGINT", onSigint);
-    },
-    { once: true },
-  );
-  return controller;
+  if (shutdownSignal.aborted) onShutdown();
+  else shutdownSignal.addEventListener("abort", onShutdown, { once: true });
+  controller.signal.addEventListener("abort", dispose, { once: true });
+  return { signal: controller.signal, dispose };
 }
 
-main().catch((error: unknown) => {
-  const err = error instanceof Error ? error : new Error(String(error));
-  console.error(`chili: ${err.message}`);
-  process.exitCode = 1;
-});
+if (import.meta.main) {
+  void main().catch((error: unknown) => {
+    const err = error instanceof Error ? error : new Error(String(error));
+    console.error(`chili: ${err.message}`);
+    const currentExitCode = typeof process.exitCode === "number" ? process.exitCode : 0;
+    process.exitCode = Math.max(currentExitCode, 1);
+  });
+}

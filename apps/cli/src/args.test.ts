@@ -17,6 +17,28 @@ test("parses Kimi as a CLI model", () => {
   });
 });
 
+test("parses Z.ai as a CLI model", () => {
+  expect(parseArgs(["--model", "zai", "hello"])).toMatchObject({
+    command: "run",
+    model: "zai",
+    prompt: "hello",
+  });
+});
+
+test("parses xAI and Grok as CLI models", () => {
+  expect(parseArgs(["--model", "grok", "hello"])).toMatchObject({
+    command: "run",
+    model: "grok",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--provider", "xai", "--model", "grok-4.6", "hello"])).toMatchObject({
+    command: "run",
+    provider: "xai",
+    model: "grok-4.6",
+    prompt: "hello",
+  });
+});
+
 test("parses ChatGPT Codex as a CLI model", () => {
   expect(parseArgs(["--model", "codex", "hello"])).toMatchObject({
     command: "run",
@@ -30,8 +52,22 @@ test("parses ChatGPT Codex as a CLI model", () => {
   });
 });
 
-test("keeps legacy model aliases parseable", () => {
-  for (const alias of ["fake", "minimax", "deepseek", "kimi", "moonshot", "codex", "openai-codex", "legacy-minimax"]) {
+test("parses the separate Codex API provider", () => {
+  expect(parseArgs(["--model", "codex-api", "hello"])).toMatchObject({
+    command: "run",
+    model: "codex-api",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--provider", "codex-api", "--model", "gpt-5.6-sol", "hello"])).toMatchObject({
+    command: "run",
+    provider: "codex-api",
+    model: "gpt-5.6-sol",
+    prompt: "hello",
+  });
+});
+
+test("keeps current model aliases parseable", () => {
+  for (const alias of ["fake", "minimax", "deepseek", "kimi", "moonshot", "zai", "glm", "xai", "x.ai", "grok", "codex", "openai-codex", "codex-api"]) {
     expect(parseArgs(["--model", alias, "hello"])).toMatchObject({
       command: "run",
       model: alias,
@@ -41,34 +77,50 @@ test("keeps legacy model aliases parseable", () => {
 });
 
 test("parses provider and concrete model references", () => {
-  expect(parseArgs(["--provider", "openai-codex", "--model", "gpt-5.5", "hello"])).toMatchObject({
+  expect(parseArgs(["--provider", "openai-codex", "--model", "gpt-5.6", "hello"])).toMatchObject({
     command: "run",
     provider: "openai-codex",
-    model: "gpt-5.5",
+    model: "gpt-5.6",
     prompt: "hello",
   });
-  expect(parseArgs(["--model", "openai-codex/gpt-5.3-codex", "hello"])).toMatchObject({
+  expect(parseArgs(["--model", "openai-codex/gpt-5.6-terra", "hello"])).toMatchObject({
     command: "run",
-    model: "openai-codex/gpt-5.3-codex",
+    model: "openai-codex/gpt-5.6-terra",
     prompt: "hello",
   });
-  expect(parseArgs(["--model", "gpt-5.5", "hello"])).toMatchObject({
+  expect(parseArgs(["--model", "codex-api/gpt-5.6-terra", "hello"])).toMatchObject({
     command: "run",
-    model: "gpt-5.5",
+    model: "codex-api/gpt-5.6-terra",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--model", "gpt-5.6", "hello"])).toMatchObject({
+    command: "run",
+    model: "gpt-5.6",
     prompt: "hello",
   });
 });
 
 test("parses thinking and reasoning levels", () => {
-  expect(parseArgs(["--model", "gpt-5.3-codex:high", "hello"])).toMatchObject({
+  expect(parseArgs(["--model", "gpt-5.6-luna:high", "hello"])).toMatchObject({
     command: "run",
-    model: "gpt-5.3-codex",
+    model: "gpt-5.6-luna",
     reasoningLevel: "high",
     prompt: "hello",
   });
   expect(parseArgs(["--thinking", "xhigh", "hello"])).toMatchObject({
     command: "run",
     reasoningLevel: "xhigh",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--model", "gpt-5.6-sol:max", "hello"])).toMatchObject({
+    command: "run",
+    model: "gpt-5.6-sol",
+    reasoningLevel: "max",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--thinking", "ultra", "hello"])).toMatchObject({
+    command: "run",
+    reasoningLevel: "ultra",
     prompt: "hello",
   });
   expect(parseArgs(["--reasoning", "off", "hello"])).toMatchObject({
@@ -88,6 +140,23 @@ test("parses MCP startup flags for CLI runs", () => {
     command: "run",
     mcpMode: "off",
     prompt: "hello",
+  });
+});
+
+test("parses the read-only store doctor command", () => {
+  expect(parseArgs(["store", "doctor"])).toMatchObject({ command: "store-doctor" });
+  expect(parseArgs(["store", "doctor", "--json"])).toMatchObject({
+    command: "store-doctor",
+    json: true,
+  });
+  expect(() => parseArgs(["store", "recover"])).toThrow("Unknown store command: recover");
+});
+
+test("parses incomplete as a terminal task close status", () => {
+  expect(parseArgs(["--status", "incomplete", "close", "task_1"])).toMatchObject({
+    command: "task-close",
+    taskId: "task_1",
+    taskStatus: "incomplete",
   });
 });
 
@@ -162,6 +231,10 @@ test("usage documents team run loop fan-out flag", () => {
   expect(usage()).toContain("--until-drained");
   expect(usage()).toContain("--max-concurrent-dispatches <n>");
   expect(usage()).toContain("--max-concurrent-verifications <n>");
+  expect(usage()).toContain("openai-codex | codex-api");
+  expect(usage()).toContain("codex-api/gpt-5.6-sol");
+  expect(usage()).toContain("xai | grok");
+  expect(usage()).toContain("xai/grok-4.6");
 });
 
 test("parses team merge command", () => {
@@ -188,14 +261,14 @@ test("parses memory commands", () => {
   });
 });
 
-test("parses prompt-debug command and flags", () => {
-  expect(parseArgs(["prompt-debug", "--resume", "session_1", "--thread", "thread_1", "--content", "--json"])).toMatchObject({
+test("parses prompt-debug command and session-only flags", () => {
+  expect(parseArgs(["prompt-debug", "--resume", "session_1", "--content", "--json"])).toMatchObject({
     command: "prompt-debug",
     resume: "session_1",
-    threadId: "thread_1",
     content: true,
     json: true,
   });
+  expect(() => parseArgs(["prompt-debug", "--thread", "thread_1"])).toThrow("Unknown option: --thread");
   expect(parseArgs(["prompt-debug", "--text", "use $reviewer"])).toMatchObject({
     command: "prompt-debug",
     prompt: "use $reviewer",

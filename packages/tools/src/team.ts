@@ -1,4 +1,4 @@
-import type { AgentPath, TaskId, TeamId, ThreadId, SessionId, ToolExecutionContext } from "@chili/protocol";
+import type { AgentPath, TaskId, TeamId, SessionId, ToolCallId, ToolExecutionContext } from "@chili/protocol";
 
 export type TeamMemberStatus = "idle" | "running" | "waiting" | "blocked" | "closed";
 export type TeamTaskStatus = "pending" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
@@ -24,7 +24,6 @@ export interface TeamMemberRecord {
   role: string;
   status: TeamMemberStatus;
   childSessionId?: SessionId | string;
-  childThreadId?: ThreadId | string;
   model?: string;
   toolScope?: string[];
   writeScope?: string[];
@@ -78,7 +77,6 @@ export interface TeamMessageDeliveryRecord {
   status: TeamMessageDeliveryStatus;
   triggerTurn: boolean;
   childSessionId?: SessionId | string;
-  childThreadId?: ThreadId | string;
   error?: string;
   queuedAt?: number;
   updatedAt?: number;
@@ -160,7 +158,6 @@ export interface TeamMemberAddToolInput {
   role: string;
   status?: TeamMemberStatus;
   childSessionId?: string;
-  childThreadId?: string;
   model?: string;
   toolScope?: string[];
   writeScope?: string[];
@@ -247,7 +244,7 @@ export interface TeamTaskUpdateToolInput {
 }
 
 export type TeamTaskDispatchMode = "one_shot" | "resumable" | "background";
-export type TeamTaskDispatchStatus = "running" | "completed" | "failed" | "cancelled" | "skipped";
+export type TeamTaskDispatchStatus = "running" | "completed" | "incomplete" | "failed" | "cancelled" | "skipped";
 
 export interface TeamTaskDispatchToolInput {
   teamId: string;
@@ -255,6 +252,11 @@ export interface TeamTaskDispatchToolInput {
   ownerPath?: string;
   mode?: TeamTaskDispatchMode;
   prompt?: string;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+  maxConcurrency?: number;
 }
 
 export interface TeamTaskDispatchBatchItemInput {
@@ -285,7 +287,6 @@ export interface TeamDispatchAgentTaskRecord {
   path?: AgentPath | string;
   runId?: string;
   childSessionId?: SessionId | string;
-  childThreadId?: ThreadId | string;
   status: string;
   summary?: string;
   error?: string;
@@ -311,6 +312,10 @@ export interface TeamTaskDispatchBatchErrorRecord {
 
 export interface TeamTaskDispatchBatchRecord {
   count: number;
+  batchId: string;
+  sourceCallId: ToolCallId;
+  maxConcurrency: number;
+  concurrencyLimitScope: "batch_lifecycle_capped_by_runtime_global";
   dispatched: TeamTaskDispatchRecord[];
   errors: TeamTaskDispatchBatchErrorRecord[];
 }

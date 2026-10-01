@@ -1,16 +1,16 @@
-import type { ChiliModelProvider, ModelDescriptor } from "./types.js";
+import type { ChiliModelProvider, ModelDescriptor, ReasoningLevel } from "./types.js";
 import { type EnvironmentSource, readKimiEnvironment } from "./env.js";
 import {
   findDefaultKnownModel,
   findKnownModel,
-  KIMI_K26_MODEL,
+  KIMI_K3_MODEL,
   KIMI_OPENAI_BASE_URL,
   KIMI_PROVIDER_ID,
   listKnownModels,
 } from "./models.js";
 import { OpenAICompletionsModel, type OpenAICompletionsModelOptions } from "./openai-completions.js";
 
-export { KIMI_K26_MODEL, KIMI_OPENAI_BASE_URL, KIMI_PROVIDER_ID } from "./models.js";
+export { KIMI_K3_MODEL, KIMI_OPENAI_BASE_URL, KIMI_PROVIDER_ID } from "./models.js";
 
 export interface KimiModelOptions {
   apiKey?: string;
@@ -21,10 +21,11 @@ export interface KimiModelOptions {
   fetch?: typeof fetch;
   headers?: Record<string, string>;
   reasoning?: boolean;
+  reasoningEffort?: ReasoningLevel;
   env?: EnvironmentSource;
 }
 
-const DEFAULT_KIMI_MAX_TOKENS = 32 * 1024;
+const DEFAULT_KIMI_MAX_TOKENS = 128 * 1024;
 
 export class KimiOpenAIProvider implements ChiliModelProvider {
   readonly id = KIMI_PROVIDER_ID;
@@ -70,7 +71,7 @@ export class KimiOpenAIProvider implements ChiliModelProvider {
 
   private defaultModel(): string {
     const env = readKimiEnvironment(this.options.env);
-    return this.options.model ?? env.model ?? KIMI_K26_MODEL;
+    return this.options.model ?? env.model ?? KIMI_K3_MODEL;
   }
 
   private defaultBaseUrl(): string {
@@ -104,7 +105,7 @@ export function createMoonshotRouter(options: KimiModelOptions = {}): OpenAIComp
 
 export function createKimiModel(options: KimiModelOptions = {}): OpenAICompletionsModel {
   const env = readKimiEnvironment(options.env);
-  const model = options.model ?? env.model ?? KIMI_K26_MODEL;
+  const model = options.model ?? env.model ?? KIMI_K3_MODEL;
   const apiKey = options.apiKey ?? env.apiKey ?? "";
   if (!apiKey) {
     throw new Error("Kimi provider requires MOONSHOT_API_KEY or KIMI_API_KEY");
@@ -120,6 +121,7 @@ export function createKimiModel(options: KimiModelOptions = {}): OpenAICompletio
   if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
   if (descriptor?.compatibility?.chatCompletions) modelOptions.compatibility = descriptor.compatibility.chatCompletions;
   if (options.reasoning !== undefined) modelOptions.reasoning = options.reasoning;
+  if (options.reasoningEffort !== undefined) modelOptions.reasoningEffort = options.reasoningEffort;
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
   if (options.fetch !== undefined) modelOptions.fetch = options.fetch;
   if (options.headers !== undefined) modelOptions.headers = options.headers;

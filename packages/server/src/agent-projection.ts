@@ -1,7 +1,7 @@
-import type { AgentPath, AgentRunId, EventEnvelope, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { AgentPath, AgentRunId, EventEnvelope, SessionId, TaskId, TeamId } from "@chili/protocol";
 
-export type RuntimeAgentStatus = "running" | "completed" | "failed" | "cancelled";
-export type RuntimeTaskStatus = "pending" | "running" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
+export type RuntimeAgentStatus = "running" | "completed" | "incomplete" | "failed" | "cancelled";
+export type RuntimeTaskStatus = "pending" | "running" | "in_progress" | "blocked" | "completed" | "incomplete" | "failed" | "cancelled";
 
 export interface RuntimeAgentView {
   id: AgentRunId;
@@ -16,7 +16,6 @@ export interface RuntimeAgentView {
   updatedAt: number;
   parentPath?: AgentPath;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   completedAt?: number;
 }
 
@@ -25,10 +24,10 @@ export interface RuntimeAgentMailboxMessageView {
   path: AgentPath;
   from: AgentPath;
   triggerTurn: boolean;
-  status: "queued" | "delivering" | "consumed";
+  status: "queued" | "delivering" | "consumed" | "discarded";
   queuedAt: number;
   sessionId?: SessionId;
-  threadId?: ThreadId;
+  recipientSessionId?: SessionId;
   claimedAt?: number;
   consumedAt?: number;
 }
@@ -44,7 +43,6 @@ export interface RuntimeTaskView {
   ownerPath?: AgentPath;
   path?: AgentPath;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   completedAt?: number;
 }
 
@@ -129,7 +127,6 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
     agent.updatedAt = event.time;
     assignOptional(agent, "parentPath", stringValue(payload.parentPath) as AgentPath | undefined);
     assignOptional(agent, "sessionId", event.sessionId);
-    assignOptional(agent, "threadId", event.threadId);
     if (taskId) {
       if (!agent.taskIds.includes(taskId)) agent.taskIds.push(taskId);
       const task = upsertTask(view, taskId, event.time);
@@ -141,7 +138,6 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
       task.ownerPath = path;
       assignOptional(task, "sessionId", (stringValue(payload.parentSessionId) as SessionId | undefined) ?? event.sessionId);
       assignOptional(task, "childSessionId", stringValue(payload.childSessionId) as SessionId | undefined);
-      assignOptional(task, "childThreadId", stringValue(payload.childThreadId) as ThreadId | undefined);
       linkTaskToOwnerAgent(view, task, event.time);
     }
     view.agentRunIdsByPath[path] = runId;
@@ -166,7 +162,6 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
     agent.completedAt = event.time;
     agent.updatedAt = event.time;
     assignOptional(agent, "sessionId", event.sessionId);
-    assignOptional(agent, "threadId", event.threadId);
     const taskId = stringValue(payload.taskId) as TaskId | undefined;
     if (taskId && !agent.taskIds.includes(taskId)) agent.taskIds.push(taskId);
     view.agentRunIdsByPath[path] = runId;
@@ -187,7 +182,11 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
       queuedAt: event.time,
     };
     assignOptional(message, "sessionId", event.sessionId);
-    assignOptional(message, "threadId", event.threadId);
+    assignOptional(
+      message,
+      "recipientSessionId",
+      stringValue(payload.recipientSessionId ?? payload.childSessionId) as SessionId | undefined,
+    );
     view.mailboxMessages[message.id] = message;
     if (!view.mailboxMessageIds.includes(message.id)) view.mailboxMessageIds.push(message.id);
 
@@ -236,6 +235,11 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
     const path = stringValue(payload.path) as AgentPath | undefined;
     if (!taskId || !path) return;
 
+    // Task creation is an immutable, first-write-wins boundary. Replayed or
+    // late duplicate creation events must not rewind a running/terminal task
+    // or replace the identity established by the first projected event.
+    if (view.tasks[taskId]) return;
+
     const task = upsertTask(view, taskId, event.time);
     task.status = "pending";
     task.generation = 0;
@@ -244,7 +248,6 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
     task.ownerPath = path;
     assignOptional(task, "sessionId", stringValue(payload.parentSessionId) as SessionId | undefined);
     assignOptional(task, "childSessionId", stringValue(payload.childSessionId) as SessionId | undefined);
-    assignOptional(task, "childThreadId", stringValue(payload.childThreadId) as ThreadId | undefined);
     linkTaskToOwnerAgent(view, task, event.time);
     return;
   }
@@ -305,7 +308,7 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
     task.status = status;
     if (generation !== undefined) task.generation = Math.max(task.generation, generation);
     task.updatedAt = event.time;
-    if (status === "completed" || status === "failed" || status === "cancelled") task.completedAt = event.time;
+    if (status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled") task.completedAt = event.time;
     assignOptional(task, "sessionId", event.sessionId);
     assignOptional(task, "ownerPath", stringValue(payload.ownerPath) as AgentPath | undefined);
     assignOptional(task, "path", stringValue(payload.path) as AgentPath | undefined);
@@ -401,11 +404,13 @@ function generationValue(value: unknown): number | undefined {
 }
 
 function agentStatusValue(value: unknown): RuntimeAgentStatus | undefined {
-  return value === "running" || value === "completed" || value === "failed" || value === "cancelled" ? value : undefined;
+  return value === "running" || value === "completed" || value === "incomplete" || value === "failed" || value === "cancelled"
+    ? value
+    : undefined;
 }
 
 function taskStatusValue(value: unknown): RuntimeTaskStatus | undefined {
-  return value === "pending" || value === "running" || value === "in_progress" || value === "blocked" || value === "completed" || value === "failed" || value === "cancelled"
+  return value === "pending" || value === "running" || value === "in_progress" || value === "blocked" || value === "completed" || value === "incomplete" || value === "failed" || value === "cancelled"
     ? value
     : undefined;
 }
@@ -416,5 +421,5 @@ function isStaleTaskSpawn(task: RuntimeTaskView, generation: number | undefined)
 }
 
 function isFinalTaskStatus(status: RuntimeTaskStatus): boolean {
-  return status === "completed" || status === "failed" || status === "cancelled";
+  return status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled";
 }

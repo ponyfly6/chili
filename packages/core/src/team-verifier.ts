@@ -1,16 +1,29 @@
 import { randomUUID } from "node:crypto";
-import type { AgentPath, AgentRunId, SessionId, TaskId, TeamId, ThreadId, TimestampMs } from "@chili/protocol";
-import { timestampNow } from "@chili/protocol";
+import type { AgentPath, AgentRunId, SessionId, TaskId, TeamId, TimestampMs } from "@chili/protocol";
+import { normalizePersistedError, timestampNow } from "@chili/protocol";
 import type { TeamMemberRow, TeamRow, TeamTaskRow } from "@chili/store";
 import { runProcess } from "@chili/tools";
+import {
+  RuntimeBusyError,
+  type RuntimeSessionOperation,
+  type SessionOperationCoordinator,
+} from "./runtime-service.js";
 import type { LocalSubagentTaskResult } from "./subagent.js";
+import { captureTeamTaskArtifact, teamTaskArtifact, type TeamTaskArtifact } from "./team-artifact.js";
 import type { TeamTaskSubagentRunner } from "./team-dispatcher.js";
 import { TeamTaskNotFoundError, type TeamControlService } from "./team.js";
-import { mergeMergeMetadata, worktreeMetadata } from "./team-worktree.js";
+import {
+  resolveTeamSessionAuthority,
+  TeamSessionAuthorityError,
+  type TeamSessionResolver,
+} from "./team-session-authority.js";
+import { mergeMergeMetadata, preflightTeamTaskWorktree } from "./team-worktree.js";
 import type { WorkerToolPolicyTemplate } from "./worker-policy.js";
 
 const VERIFICATION_METADATA_KEY = "verification";
 const DEFAULT_GIT_DIFF_MAX_BYTES = 200_000;
+const DEFAULT_GIT_DIFF_MAX_UNTRACKED_FILES = 128;
+const DEFAULT_GIT_DIFF_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_CONCURRENT_VERIFICATIONS = 2;
 const MAX_CONCURRENT_VERIFICATIONS = 4;
 const VERIFICATION_PENDING_TTL_MS = 15 * 60_000;
@@ -22,6 +35,7 @@ export type TeamTaskVerifierSkipReason =
   | "missing_session"
   | "not_completed"
   | "already_passed"
+  | "merge_pending"
   | "verification_pending";
 
 export interface TeamTaskVerificationMetadata {
@@ -35,12 +49,15 @@ export interface TeamTaskVerificationMetadata {
   feedback?: string;
   workerSummary?: string;
   gitDiff?: string;
+  artifact?: TeamTaskArtifact;
 }
 
 export interface TeamTaskVerifierOptions {
   teams: TeamControlService;
   subagents: TeamTaskSubagentRunner;
   cwd: string;
+  resolveSession: TeamSessionResolver;
+  sessionOperations: SessionOperationCoordinator;
   now?: () => TimestampMs;
   gitDiff?: (input: TeamTaskVerifierGitDiffInput) => Promise<string>;
 }
@@ -50,13 +67,14 @@ export interface TeamTaskVerifierGitDiffInput {
   task: TeamTaskRow;
   member?: TeamMemberRow;
   cwd: string;
+  baseRef?: string;
+  baseCwd?: string;
   signal?: AbortSignal;
 }
 
 export interface TeamTaskVerifierSweepInput {
   teamId: TeamId;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd?: string;
   maxConcurrentVerifications?: number;
   signal?: AbortSignal;
@@ -98,15 +116,48 @@ export interface TeamTaskVerifierError {
   error: string;
 }
 
+interface VerifierGitDiffSnapshot {
+  text: string;
+  incompleteReason?: string;
+  artifact?: TeamTaskArtifact;
+}
+
+type AuthorizedTeamTaskVerifierInput = TeamTaskVerifierSweepInput & {
+  sessionId: SessionId;
+  cwd: string;
+};
+
+interface AuthorizedTeamTaskVerifierState {
+  input: AuthorizedTeamTaskVerifierInput;
+  team: TeamRow;
+  tasks: TeamTaskRow[];
+  members: TeamMemberRow[];
+}
+
 export class TeamTaskVerificationService {
   constructor(private readonly options: TeamTaskVerifierOptions) {}
 
   async verifyCompletedTasks(input: TeamTaskVerifierSweepInput): Promise<TeamTaskVerifierSweepResult> {
-    const [team, tasks, members] = await Promise.all([
-      this.requireTeam(input.teamId),
-      this.options.teams.tasks(input.teamId),
-      this.options.teams.members(input.teamId),
-    ]);
+    const initial = await this.authorizedState(input);
+    return this.options.sessionOperations.withSessionOperation(initial.input.sessionId, async (operation) => {
+      operation.assertCurrent();
+      const current = await this.authorizedState({
+        ...input,
+        sessionId: initial.input.sessionId,
+        cwd: initial.input.cwd,
+        signal: combinedAbortSignal(input.signal, operation.signal),
+      });
+      operation.assertCurrent();
+      throwIfAborted(current.input.signal);
+      return this.verifyCompletedTasksWithOperation(current, operation);
+    });
+  }
+
+  private async verifyCompletedTasksWithOperation(
+    state: AuthorizedTeamTaskVerifierState,
+    operation: RuntimeSessionOperation,
+  ): Promise<TeamTaskVerifierSweepResult> {
+    const { input, team, tasks, members } = state;
     const maxConcurrentVerifications = normalizeMaxConcurrentVerifications(input.maxConcurrentVerifications);
     const result: TeamTaskVerifierSweepResult = {
       scanned: 0,
@@ -121,9 +172,20 @@ export class TeamTaskVerificationService {
     for (const batch of chunk(candidates, maxConcurrentVerifications)) {
       const verifiedBatch = await Promise.all(batch.map(async (task) => {
         try {
-          return { task, result: await this.verifyTaskWithState({ ...input, taskId: task.id }, team, task, members) };
+          operation.assertCurrent();
+          throwIfAborted(input.signal);
+          return {
+            task,
+            result: await this.verifyTaskWithState(
+              input,
+              team,
+              task,
+              members,
+              operation,
+            ),
+          };
         } catch (error) {
-          if (isSignalAbort(error, input.signal)) throw error;
+          this.assertRecoverableVerificationError(error, input.signal, operation);
           return { task, error };
         }
       }));
@@ -145,24 +207,37 @@ export class TeamTaskVerificationService {
   }
 
   async verifyTask(input: TeamTaskVerifierTaskInput): Promise<TeamTaskVerifierResult> {
-    const [team, tasks, members] = await Promise.all([
-      this.requireTeam(input.teamId),
-      this.options.teams.tasks(input.teamId),
-      this.options.teams.members(input.teamId),
-    ]);
-    const task = tasks.find((item) => item.id === input.taskId);
-    if (!task) throw new TeamTaskNotFoundError(input.teamId, input.taskId);
-    return this.verifyTaskWithState(input, team, task, members);
+    const initial = await this.authorizedState(input);
+    return this.options.sessionOperations.withSessionOperation(initial.input.sessionId, async (operation) => {
+      operation.assertCurrent();
+      const current = await this.authorizedState({
+        ...input,
+        sessionId: initial.input.sessionId,
+        cwd: initial.input.cwd,
+        signal: combinedAbortSignal(input.signal, operation.signal),
+      });
+      operation.assertCurrent();
+      throwIfAborted(current.input.signal);
+      const task = current.tasks.find((item) => item.id === input.taskId);
+      if (!task) throw new TeamTaskNotFoundError(input.teamId, input.taskId);
+      return this.verifyTaskWithState(current.input, current.team, task, current.members, operation);
+    });
   }
 
   private async verifyTaskWithState(
-    input: TeamTaskVerifierTaskInput,
+    input: AuthorizedTeamTaskVerifierInput,
     team: TeamRow,
     task: TeamTaskRow,
     members: readonly TeamMemberRow[],
+    operation: RuntimeSessionOperation,
   ): Promise<TeamTaskVerifierResult> {
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
     if (task.status !== "completed") {
       return { status: "skipped", reason: "not_completed", teamTask: task };
+    }
+    if (hasFrozenPendingMerge(task)) {
+      return { status: "skipped", reason: "merge_pending", teamTask: task };
     }
     if (isAcceptedTeamTask(task)) {
       return { status: "skipped", reason: "already_passed", teamTask: task };
@@ -174,15 +249,51 @@ export class TeamTaskVerificationService {
       return { status: "skipped", reason: "missing_owner", teamTask: task };
     }
 
-    const parentSessionId = input.sessionId ?? task.sessionId ?? team.sessionId;
-    if (!parentSessionId) {
-      return { status: "skipped", reason: "missing_session", teamTask: task };
-    }
-
-    const worktree = worktreeMetadata(task.metadata);
-    const cwd = worktree?.path ?? input.cwd ?? this.options.cwd;
-    const member = members.find((item) => item.path === task.ownerPath);
+    const parentSessionId = input.sessionId;
+    const workspaceCwd = input.cwd;
+    let worktree = await preflightTeamTaskWorktree({
+      cwd: workspaceCwd,
+      teamId: task.teamId,
+      taskId: task.id,
+      metadata: task.metadata,
+      requireExisting: true,
+    });
+    operation.assertCurrent();
     throwIfAborted(input.signal);
+    let cwd = worktree?.path ?? workspaceCwd;
+    if (requiresArtifactReverification(task)) {
+      const state = await this.revalidateAuthority(input, operation);
+      const current = state.tasks.find((candidate) => candidate.id === task.id);
+      if (!current) throw new TeamTaskNotFoundError(input.teamId, task.id);
+      if (hasFrozenPendingMerge(current)) {
+        return { status: "skipped", reason: "merge_pending", teamTask: current };
+      }
+      if (requiresArtifactReverification(current)) {
+        operation.assertCurrent();
+        throwIfAborted(input.signal);
+        task = await this.options.teams.updateTask({
+          teamId: current.teamId,
+          taskId: current.id,
+          sessionId: parentSessionId,
+          metadata: mergeVerificationMetadata(current.metadata, verificationFields({
+            status: "failed",
+            feedback: "Legacy verification has no immutable artifact and must be repeated before delivery.",
+            workerSummary: current.summary,
+          })),
+        });
+        operation.assertCurrent();
+        throwIfAborted(input.signal);
+      } else {
+        task = current;
+      }
+      if (isAcceptedTeamTask(task)) return { status: "skipped", reason: "already_passed", teamTask: task };
+      if (task.status !== "completed") return { status: "skipped", reason: "not_completed", teamTask: task };
+      if (!task.ownerPath) return { status: "skipped", reason: "missing_owner", teamTask: task };
+    }
+    const previousMerge = task.metadata?.merge;
+    const legacyReverification = worktree !== undefined && teamTaskArtifact(task.metadata) === undefined
+      && isRecord(previousMerge) && previousMerge.status === "applied";
+    const member = members.find((item) => item.path === task.ownerPath);
     const startedAt = Number(this.now());
     const claimId = randomUUID();
     const pendingMetadata = mergeVerificationMetadata(task.metadata, verificationFields({
@@ -191,141 +302,284 @@ export class TeamTaskVerificationService {
       startedAt,
       workerSummary: task.summary,
     }));
+    await this.revalidateAuthority(input, operation);
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
     const pendingClaim = await this.options.teams.claimTaskVerification({
       teamId: task.teamId,
       taskId: task.id,
       metadata: pendingMetadata,
       sessionId: parentSessionId,
       stalePendingBefore: startedAt - VERIFICATION_PENDING_TTL_MS,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
     });
-    if (!pendingClaim.applied) {
-      return {
-        status: "skipped",
-        reason: verifierClaimSkipReason(pendingClaim.reason),
-        teamTask: pendingClaim.task ?? task,
-      };
-    }
-    const pendingTask = pendingClaim.task ?? task;
-    throwIfAborted(input.signal);
-    const gitDiffInput: TeamTaskVerifierGitDiffInput = { team, task, cwd };
-    if (member) gitDiffInput.member = member;
-    if (input.signal) gitDiffInput.signal = input.signal;
-    let gitDiff: string;
     try {
-      gitDiff = await this.gitDiff(gitDiffInput);
+      operation.assertCurrent();
       throwIfAborted(input.signal);
+      if (!pendingClaim.applied) {
+        return {
+          status: "skipped",
+          reason: verifierClaimSkipReason(pendingClaim.reason),
+          teamTask: pendingClaim.task ?? task,
+        };
+      }
+      const pendingTask = pendingClaim.task ?? task;
+      await this.revalidateAuthority(input, operation);
+      worktree = await preflightTeamTaskWorktree({
+        cwd: workspaceCwd,
+        teamId: pendingTask.teamId,
+        taskId: pendingTask.id,
+        metadata: pendingTask.metadata,
+        requireExisting: true,
+      });
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
+      cwd = worktree?.path ?? workspaceCwd;
+      const gitDiffInput: TeamTaskVerifierGitDiffInput = { team, task: pendingTask, cwd };
+      if (member) gitDiffInput.member = member;
+      if (worktree) {
+        gitDiffInput.baseRef = worktree.baseRef;
+        gitDiffInput.baseCwd = workspaceCwd;
+      }
+      if (input.signal) gitDiffInput.signal = input.signal;
+      await this.revalidateAuthority(input, operation);
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
+      const gitDiffSnapshot = await this.gitDiff(gitDiffInput);
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
+      const gitDiff = gitDiffSnapshot.text;
+      const testCommands = verifierTestCommands(task.metadata);
+      await this.revalidateAuthority(input, operation);
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
+      const verificationPendingTask = await this.options.teams.updateTask({
+        teamId: task.teamId,
+        taskId: task.id,
+        metadata: mergeVerificationMetadata(pendingTask.metadata, verificationFields({
+          status: "pending",
+          claimId,
+          startedAt,
+          workerSummary: task.summary,
+          gitDiff,
+          ...(gitDiffSnapshot.artifact ? { artifact: gitDiffSnapshot.artifact } : {}),
+        })),
+        sessionId: parentSessionId,
+      });
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
+      worktree = await preflightTeamTaskWorktree({
+        cwd: workspaceCwd,
+        teamId: verificationPendingTask.teamId,
+        taskId: verificationPendingTask.id,
+        metadata: verificationPendingTask.metadata,
+        requireExisting: true,
+      });
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
+      cwd = worktree?.path ?? workspaceCwd;
+
+      const verifierInput = {
+        parentSessionId,
+        parentPath: task.ownerPath,
+        cwd,
+        taskName: `Verify ${task.title}`,
+        prompt: verifierPrompt(verifierPromptInput({ team, task: pendingTask, member, gitDiff, testCommands, worktreePath: worktree?.path })),
+        mode: "one_shot" as const,
+        workerPolicy: verifierWorkerPolicy({
+          teamId: task.teamId,
+          taskId: task.id,
+          memberPath: task.ownerPath,
+          parentSessionId,
+          testCommands,
+        }),
+        ...(input.signal ? { signal: input.signal } : {}),
+      };
+      await this.revalidateAuthority(input, operation);
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
+      const verifierTask = await this.options.subagents.spawnTask(verifierInput);
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
+      const reportedVerdict = verifierVerdict(verifierTask);
+      let verdict = gitDiffSnapshot.incompleteReason !== undefined
+        ? {
+            status: "failed" as const,
+            feedback: `Verification cannot pass because git diff collection was incomplete: ${gitDiffSnapshot.incompleteReason}.\n\n${reportedVerdict.feedback}`,
+          }
+        : reportedVerdict;
+      if (verdict.status === "passed" && gitDiffSnapshot.artifact) {
+        try {
+          const currentArtifact = await captureTeamTaskArtifact({
+            cwd,
+            baseRef: gitDiffSnapshot.artifact.baseCommit,
+            ...(input.signal ? { signal: input.signal } : {}),
+          });
+          operation.assertCurrent();
+          throwIfAborted(input.signal);
+          if (!sameArtifactContent(gitDiffSnapshot.artifact, currentArtifact)) {
+            verdict = {
+              status: "failed",
+              feedback: `Verification cannot pass because the worktree changed during verification. Run verification again on the final changes.\n\n${reportedVerdict.feedback}`,
+            };
+          }
+        } catch (error) {
+          if (error instanceof RuntimeBusyError || error instanceof TeamSessionAuthorityError) throw error;
+          operation.assertCurrent();
+          if (isSignalAbort(error, input.signal)) throw error;
+          verdict = {
+            status: "failed",
+            feedback: `Verification cannot pass because the checked worktree snapshot could not be confirmed: ${toError(error).message}.\n\n${reportedVerdict.feedback}`,
+          };
+        }
+      }
+      const checkedAt = Number(this.now());
+      const feedback = verdict.feedback;
+
+      if (verdict.status === "passed") {
+        const verificationMetadata = mergeVerificationMetadata(pendingTask.metadata, verificationFields({
+          status: "passed",
+          verifierTaskId: verifierTask.taskId,
+          verifierRunId: verifierTask.runId,
+          verifierPath: verifierTask.path,
+          checkedAt,
+          feedback,
+          workerSummary: task.summary,
+          gitDiff,
+          ...(gitDiffSnapshot.artifact ? { artifact: gitDiffSnapshot.artifact } : {}),
+        }));
+        const metadata = worktree
+          ? mergeMergeMetadata(verificationMetadata, {
+              status: "pending",
+              createdAt: checkedAt,
+              worktreePath: worktree.path,
+              baseRef: worktree.baseRef,
+              diff: gitDiff,
+              ...(legacyReverification ? { reason: "legacy_reverification" } : {}),
+            })
+          : verificationMetadata;
+        await this.revalidateAuthority(input, operation);
+        operation.assertCurrent();
+        throwIfAborted(input.signal);
+        const acceptedTask = await this.options.teams.updateTask({
+          teamId: task.teamId,
+          taskId: task.id,
+          metadata,
+          sessionId: parentSessionId,
+        });
+        operation.assertCurrent();
+        throwIfAborted(input.signal);
+        return { status: "passed", teamTask: acceptedTask, verifierTask, feedback };
+      }
+
+      await this.revalidateAuthority(input, operation);
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
+      const reopenedTask = await this.options.teams.updateTask({
+        teamId: task.teamId,
+        taskId: task.id,
+        status: "pending",
+        error: "verification_failed",
+        metadata: mergeVerificationMetadata(pendingTask.metadata, verificationFields({
+          status: "failed",
+          verifierTaskId: verifierTask.taskId,
+          verifierRunId: verifierTask.runId,
+          verifierPath: verifierTask.path,
+          checkedAt,
+          feedback,
+          workerSummary: task.summary,
+          gitDiff,
+          ...(gitDiffSnapshot.artifact ? { artifact: gitDiffSnapshot.artifact } : {}),
+        })),
+        sessionId: parentSessionId,
+      });
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
+      return { status: "failed", teamTask: reopenedTask, verifierTask, feedback };
     } catch (error) {
+      if (!pendingClaim.applied || error instanceof RuntimeBusyError || error instanceof TeamSessionAuthorityError) throw error;
+      // A caller cancellation may release its claim while the session lease is
+      // still ours. A lost lease must leave recovery to the current owner.
+      operation.assertCurrent();
       if (isSignalAbort(error, input.signal)) {
-        await this.clearPendingVerificationClaim(task, claimId, parentSessionId, input.threadId);
+        await this.clearPendingVerificationClaim(task, claimId, input, operation);
       }
       throw error;
     }
-    const testCommands = verifierTestCommands(task.metadata);
-    await this.options.teams.updateTask({
-      teamId: task.teamId,
-      taskId: task.id,
-      metadata: mergeVerificationMetadata(pendingTask.metadata, verificationFields({
-        status: "pending",
-        claimId,
-        startedAt,
-        workerSummary: task.summary,
-        gitDiff,
-      })),
-      sessionId: parentSessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
-    });
-    throwIfAborted(input.signal);
-
-    const verifierInput = {
-      parentSessionId,
-      ...(input.threadId ? { parentThreadId: input.threadId } : {}),
-      parentPath: task.ownerPath,
-      cwd,
-      taskName: `Verify ${task.title}`,
-      prompt: verifierPrompt(verifierPromptInput({ team, task: pendingTask, member, gitDiff, testCommands, worktreePath: worktree?.path })),
-      mode: "one_shot" as const,
-      workerPolicy: verifierWorkerPolicy({
-        teamId: task.teamId,
-        taskId: task.id,
-        memberPath: task.ownerPath,
-        parentSessionId,
-        testCommands,
-      }),
-      ...(input.signal ? { signal: input.signal } : {}),
-    };
-    const verifierTask = await this.options.subagents.spawnTask(verifierInput);
-    const verdict = verifierVerdict(verifierTask);
-    const checkedAt = Number(this.now());
-    const feedback = verdict.feedback;
-
-    if (verdict.status === "passed") {
-      const verificationMetadata = mergeVerificationMetadata(pendingTask.metadata, verificationFields({
-        status: "passed",
-        verifierTaskId: verifierTask.taskId,
-        verifierRunId: verifierTask.runId,
-        verifierPath: verifierTask.path,
-        checkedAt,
-        feedback,
-        workerSummary: task.summary,
-        gitDiff,
-      }));
-      const metadata = worktree
-        ? mergeMergeMetadata(verificationMetadata, {
-            status: "pending",
-            createdAt: checkedAt,
-            worktreePath: worktree.path,
-            baseRef: worktree.baseRef,
-            diff: gitDiff,
-          })
-        : verificationMetadata;
-      const acceptedTask = await this.options.teams.updateTask({
-        teamId: task.teamId,
-        taskId: task.id,
-        metadata,
-        sessionId: parentSessionId,
-        ...(input.threadId ? { threadId: input.threadId } : {}),
-      });
-      return { status: "passed", teamTask: acceptedTask, verifierTask, feedback };
-    }
-
-    const reopenedTask = await this.options.teams.updateTask({
-      teamId: task.teamId,
-      taskId: task.id,
-      status: "pending",
-      error: "verification_failed",
-      metadata: mergeVerificationMetadata(pendingTask.metadata, verificationFields({
-        status: "failed",
-        verifierTaskId: verifierTask.taskId,
-        verifierRunId: verifierTask.runId,
-        verifierPath: verifierTask.path,
-        checkedAt,
-        feedback,
-        workerSummary: task.summary,
-        gitDiff,
-      })),
-      sessionId: parentSessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
-    });
-    return { status: "failed", teamTask: reopenedTask, verifierTask, feedback };
   }
 
   private async clearPendingVerificationClaim(
     task: TeamTaskRow,
     claimId: string,
-    sessionId: SessionId,
-    threadId: ThreadId | undefined,
+    input: AuthorizedTeamTaskVerifierInput,
+    operation: RuntimeSessionOperation,
   ): Promise<void> {
+    const cleanupInput: AuthorizedTeamTaskVerifierInput = {
+      ...input,
+      signal: operation.signal,
+    };
+    await this.revalidateAuthority(cleanupInput, operation);
     const current = (await this.options.teams.tasks(task.teamId)).find((item) => item.id === task.id);
     if (!current || verificationMetadata(current.metadata)?.status !== "pending") return;
     if (verificationMetadata(current.metadata)?.claimId !== claimId) return;
+    operation.assertCurrent();
     await this.options.teams.updateTask({
       teamId: task.teamId,
       taskId: task.id,
       metadata: restoreVerificationMetadata(current.metadata, task.metadata),
-      sessionId,
-      ...(threadId ? { threadId } : {}),
+      sessionId: input.sessionId,
     });
+    operation.assertCurrent();
+  }
+
+  private async authorizedState(input: TeamTaskVerifierSweepInput): Promise<AuthorizedTeamTaskVerifierState> {
+    const [team, tasks, members] = await Promise.all([
+      this.requireTeam(input.teamId),
+      this.options.teams.tasks(input.teamId),
+      this.options.teams.members(input.teamId),
+    ]);
+    const authority = await resolveTeamSessionAuthority({
+      team,
+      tasks,
+      ...(input.sessionId ? { requestedSessionId: input.sessionId } : {}),
+      ...(input.cwd !== undefined ? { requestedCwd: input.cwd } : {}),
+      resolveSession: this.options.resolveSession,
+    });
+    return {
+      input: {
+        ...input,
+        sessionId: authority.sessionId,
+        cwd: authority.cwd,
+      },
+      team,
+      tasks,
+      members,
+    };
+  }
+
+  private async revalidateAuthority(
+    input: AuthorizedTeamTaskVerifierInput,
+    operation: RuntimeSessionOperation,
+  ): Promise<AuthorizedTeamTaskVerifierState> {
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
+    const state = await this.authorizedState({
+      ...input,
+      sessionId: input.sessionId,
+      cwd: input.cwd,
+    });
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
+    return state;
+  }
+
+  private assertRecoverableVerificationError(
+    error: unknown,
+    signal: AbortSignal | undefined,
+    operation: RuntimeSessionOperation,
+  ): void {
+    if (error instanceof RuntimeBusyError || error instanceof TeamSessionAuthorityError) throw error;
+    operation.assertCurrent();
+    if (isSignalAbort(error, signal)) throw error;
   }
 
   private async requireTeam(teamId: TeamId): Promise<TeamRow> {
@@ -334,43 +588,94 @@ export class TeamTaskVerificationService {
     return team;
   }
 
-  private async gitDiff(input: TeamTaskVerifierGitDiffInput): Promise<string> {
+  private async gitDiff(input: TeamTaskVerifierGitDiffInput): Promise<VerifierGitDiffSnapshot> {
+    const snapshot = new VerifierGitDiffCollector();
+    const deadline = Date.now() + DEFAULT_GIT_DIFF_TIMEOUT_MS;
     try {
-      if (this.options.gitDiff) return await this.options.gitDiff(input);
-      const processInput = {
-        cwd: input.cwd,
-        timeoutMs: 15_000,
-        maxOutputBytes: DEFAULT_GIT_DIFF_MAX_BYTES,
+      throwIfAborted(input.signal);
+      // Managed worktrees are verified against an immutable Git snapshot. The
+      // exact same artifact is subsequently consumed by the merge service.
+      if (input.baseRef) {
+        const { patch, ...artifact } = await captureTeamTaskArtifact({
+          cwd: input.cwd,
+          baseRef: input.baseRef,
+          ...(input.signal ? { signal: input.signal } : {}),
+        });
+        const diff = this.options.gitDiff ? await this.options.gitDiff(input) : patch;
+        throwIfAborted(input.signal);
+        const collected = snapshot.append(diff) ? snapshot.complete() : snapshot.incomplete("UTF-8 byte limit reached");
+        return { ...collected, artifact };
+      }
+      if (this.options.gitDiff) {
+        const diff = await this.options.gitDiff(input);
+        throwIfAborted(input.signal);
+        return snapshot.append(diff) ? snapshot.complete() : snapshot.incomplete("UTF-8 byte limit reached");
+      }
+      const runGit = async (cwd: string, args: readonly string[], maxOutputBytes = snapshot.remainingBytes + 4) => {
+        throwIfAborted(input.signal);
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) throw new Error(`collection timed out after ${DEFAULT_GIT_DIFF_TIMEOUT_MS}ms`);
+        const result = await runProcess("git", args, {
+          cwd,
+          timeoutMs: remainingMs,
+          maxOutputBytes,
+          ...(input.signal ? { signal: input.signal } : {}),
+        });
+        throwIfAborted(input.signal);
+        if (result.timedOut) throw new Error(`collection timed out after ${DEFAULT_GIT_DIFF_TIMEOUT_MS}ms`);
+        return result;
       };
-      const runGit = (args: readonly string[]) =>
-        runProcess("git", args, input.signal ? { ...processInput, signal: input.signal } : processInput);
-      const tracked = await runGit(["diff", "--no-ext-diff", "--no-color", "HEAD", "--"]);
-      if (tracked.timedOut) return "(git diff failed: timed out after 15000ms)";
-      if (tracked.exitCode !== 0) return `(git diff failed: ${tracked.stderr || `exit ${tracked.exitCode}`})`;
-
-      const parts = tracked.stdout.trim().length > 0 ? [tracked.stdout.trimEnd()] : [];
-      const untracked = await runGit(["ls-files", "--others", "--exclude-standard", "-z"]);
-      if (untracked.timedOut) {
-        parts.push("(git untracked file scan failed: timed out after 15000ms)");
-      } else if (untracked.exitCode !== 0) {
-        parts.push(`(git untracked file scan failed: ${untracked.stderr || `exit ${untracked.exitCode}`})`);
-      } else {
-        for (const path of splitNul(untracked.stdout)) {
-          const fileDiff = await runGit(["diff", "--no-ext-diff", "--no-color", "--no-index", "--", "/dev/null", path]);
-          if (fileDiff.timedOut) {
-            parts.push(`(git diff for untracked file failed: ${path}: timed out after 15000ms)`);
-          } else if (fileDiff.exitCode !== 0 && fileDiff.exitCode !== 1) {
-            parts.push(`(git diff for untracked file failed: ${path}: ${fileDiff.stderr || `exit ${fileDiff.exitCode}`})`);
-          } else if (fileDiff.stdout.trim().length > 0) {
-            parts.push(fileDiff.stdout.trimEnd());
+      const tracked = await runGit(input.cwd, [
+        "diff",
+        "--no-ext-diff",
+        "--no-color",
+        "--no-renames",
+        "--binary",
+        "HEAD",
+        "--",
+      ]);
+      if (tracked.exitCode !== 0) {
+        if (isReadOnlyVerificationTask(input.task)) {
+          const repository = await runGit(input.cwd, ["rev-parse", "--is-inside-work-tree"], 4_096);
+          const head = repository.exitCode === 0
+            ? await runGit(input.cwd, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], 4_096)
+            : undefined;
+          if (repository.exitCode !== 0 || (head?.exitCode === 1 && !head.stderr)) {
+            return {
+              text: "(Git diff unavailable: this read-only task has no Git worktree or committed HEAD baseline. Inspect the relevant files and task result directly before reporting a verdict.)",
+            };
           }
         }
+        return snapshot.incomplete(`git diff failed: ${tracked.stderr || `exit ${tracked.exitCode}`}`);
       }
+      const trackedFits = snapshot.append(tracked.stdout);
+      if (!trackedFits || tracked.stdoutTruncated) return snapshot.incomplete("tracked diff truncated at UTF-8 byte limit");
 
-      return parts.length > 0 ? truncateDiff(parts.join("\n")) : "(no diff)";
+      const untracked = await runGit(input.cwd, ["ls-files", "--others", "--exclude-standard", "-z"], DEFAULT_GIT_DIFF_MAX_BYTES + 4);
+      if (untracked.exitCode !== 0) {
+        return snapshot.incomplete(`untracked file scan failed: ${untracked.stderr || `exit ${untracked.exitCode}`}`);
+      }
+      // A truncated NUL-delimited scan can end in the middle of a filename.
+      if (untracked.stdoutTruncated) return snapshot.incomplete("untracked file list truncated at UTF-8 byte limit");
+      let filesCollected = 0;
+      for (const path of splitNul(untracked.stdout)) {
+        throwIfAborted(input.signal);
+        if (filesCollected >= DEFAULT_GIT_DIFF_MAX_UNTRACKED_FILES) {
+          return snapshot.incomplete(`untracked file limit reached (${DEFAULT_GIT_DIFF_MAX_UNTRACKED_FILES} files)`);
+        }
+        if (snapshot.remainingBytes <= 0) return snapshot.incomplete("UTF-8 byte limit reached before remaining untracked files");
+        const fileDiff = await runGit(input.cwd, ["diff", "--no-ext-diff", "--no-color", "--binary", "--no-index", "--", "/dev/null", path]);
+        filesCollected++;
+        if (fileDiff.exitCode !== 0 && fileDiff.exitCode !== 1) {
+          return snapshot.incomplete(`diff for untracked file failed: ${path}: ${fileDiff.stderr || `exit ${fileDiff.exitCode}`}`);
+        }
+        const fileFits = snapshot.append(fileDiff.stdout);
+        if (!fileFits || fileDiff.stdoutTruncated) return snapshot.incomplete("untracked diff truncated at UTF-8 byte limit");
+      }
+      return snapshot.complete();
     } catch (error) {
       if (isSignalAbort(error, input.signal)) throw error;
-      return `(git diff unavailable: ${toError(error).message})`;
+      return snapshot.incomplete(toError(error).message);
     }
   }
 
@@ -406,13 +711,14 @@ export function verificationMetadata(metadata: Record<string, unknown> | undefin
 }
 
 export function isAcceptedTeamTask(task: TeamTaskRow): boolean {
-  return task.status === "completed" && verificationMetadata(task.metadata)?.status === "passed";
+  return task.status === "completed" && verificationMetadata(task.metadata)?.status === "passed"
+    && (task.metadata?.worktree === undefined || teamTaskArtifact(task.metadata) !== undefined);
 }
 
 export function isCompletedButUnverifiedTeamTask(task: TeamTaskRow): boolean {
   if (task.status !== "completed") return false;
   const status = verificationMetadata(task.metadata)?.status;
-  return status !== "passed" && status !== "pending";
+  return status !== "pending" && !isAcceptedTeamTask(task);
 }
 
 export function isPendingVerificationTeamTask(task: TeamTaskRow): boolean {
@@ -424,7 +730,21 @@ export function isReopenedAfterFailedVerification(task: TeamTaskRow): boolean {
 }
 
 function isVerificationCandidate(task: TeamTaskRow, now: number): boolean {
-  return isCompletedButUnverifiedTeamTask(task) || isStalePendingVerification(task, now);
+  return !hasFrozenPendingMerge(task)
+    && (isCompletedButUnverifiedTeamTask(task) || isStalePendingVerification(task, now));
+}
+
+function requiresArtifactReverification(task: TeamTaskRow): boolean {
+  return task.status === "completed" && task.metadata?.worktree !== undefined
+    && verificationMetadata(task.metadata)?.status === "passed"
+    && teamTaskArtifact(task.metadata) === undefined;
+}
+
+function hasFrozenPendingMerge(task: TeamTaskRow): boolean {
+  const merge = task.metadata?.merge;
+  return isRecord(merge) && merge.status === "pending"
+    && (merge.applyStartedAt !== undefined || merge.patchFingerprint !== undefined
+      || merge.applyPaths !== undefined || merge.baseCommit !== undefined || merge.postStateFingerprint !== undefined);
 }
 
 function isFreshPendingVerification(task: TeamTaskRow, now: number): boolean {
@@ -461,6 +781,8 @@ function verifierPrompt(input: {
     "Use complete_task with a concise summary that starts with exactly one of:",
     "VERDICT: passed",
     "VERDICT: failed",
+    "Put the verdict alone on the first line. Do not include additional verdict lines, even when quoting earlier output.",
+    "If the git diff is marked incomplete, report failed and explain what prevented complete inspection.",
     "",
     "Git diff at verifier start:",
     input.gitDiff,
@@ -490,12 +812,16 @@ function verifierPromptInput(input: {
 
 function verifierVerdict(task: LocalSubagentTaskResult): { status: Exclude<TeamTaskVerifierResultStatus, "skipped">; feedback: string } {
   const feedback = task.error?.message ?? task.summary ?? "";
-  if (task.status !== "completed") {
+  if (task.status !== "completed" || task.error) {
     return { status: "failed", feedback: feedback || `Verifier task ended with status ${task.status}.` };
   }
   const text = feedback.trim();
-  if (/^\s*VERDICT:\s*passed\b/im.test(text)) return { status: "passed", feedback: text };
-  if (/^\s*VERDICT:\s*failed\b/im.test(text)) return { status: "failed", feedback: text };
+  const lines = text.split(/\r?\n/);
+  const firstVerdict = /^VERDICT:[\t ]*(passed|failed)[\t ]*$/i.exec(lines[0] ?? "");
+  const verdictCount = [...text.replace(/[`*_]/g, "").matchAll(/\bVERDICT[\t ]*:[\t ]*(?:passed|failed)\b/gi)].length;
+  if (firstVerdict && verdictCount === 1) {
+    return { status: firstVerdict[1]?.toLowerCase() === "passed" ? "passed" : "failed", feedback: text };
+  }
   return {
     status: "failed",
     feedback: text ? `Verifier did not report a passing verdict.\n\n${text}` : "Verifier did not report a passing verdict.",
@@ -519,12 +845,14 @@ function verificationFields(input: {
   feedback?: string;
   workerSummary: string | undefined;
   gitDiff?: string;
+  artifact?: TeamTaskArtifact;
 }): TeamTaskVerificationMetadata {
   const output: TeamTaskVerificationMetadata = {
     status: input.status,
   };
   if (input.claimId) output.claimId = input.claimId;
   if (input.gitDiff !== undefined) output.gitDiff = input.gitDiff;
+  if (input.artifact) output.artifact = input.artifact;
   if (input.verifierTaskId) output.verifierTaskId = input.verifierTaskId;
   if (input.verifierRunId) output.verifierRunId = input.verifierRunId;
   if (input.verifierPath) output.verifierPath = input.verifierPath;
@@ -559,10 +887,17 @@ function mergeVerificationMetadata(
   if (verification.status !== "pending" && verification.claimId === undefined) {
     delete (merged as Record<string, unknown>).claimId;
   }
+  if (verification.artifact === undefined) delete (merged as Record<string, unknown>).artifact;
   return {
     ...current,
     [VERIFICATION_METADATA_KEY]: pruneUndefined(merged),
   };
+}
+
+function sameArtifactContent(left: TeamTaskArtifact, right: TeamTaskArtifact): boolean {
+  return left.baseCommit === right.baseCommit
+    && left.tree === right.tree
+    && left.patchFingerprint === right.patchFingerprint;
 }
 
 function normalizeMaxConcurrentVerifications(value: number | undefined): number {
@@ -588,6 +923,15 @@ function metadataStringArray(metadata: Record<string, unknown> | undefined, keys
     return items.length > 0 ? items : [];
   }
   return undefined;
+}
+
+function isReadOnlyVerificationTask(task: TeamTaskRow): boolean {
+  const writeScope = metadataStringArray(task.metadata, ["writeScope", "write_scope", "writeScopes", "write_scopes"]);
+  const executeScope = metadataStringArray(task.metadata, ["executeScope", "execute_scope", "executionScope", "execution_scope"]);
+  if ((writeScope?.length ?? 0) > 0 || (executeScope?.length ?? 0) > 0) return false;
+  const tools = metadataStringArray(task.metadata, ["requiredTools", "required_tools", "toolScope", "tool_scope"]);
+  const mutatingTools = new Set(["edit", "write", "write_file", "apply_patch", "patch", "bash", "shell", "run_shell_command"]);
+  return !(tools ?? []).some((tool) => mutatingTools.has(tool.trim().toLowerCase()));
 }
 
 function verifierTestCommands(metadata: Record<string, unknown> | undefined): string[] {
@@ -646,13 +990,49 @@ function splitNul(value: string): string[] {
   return value.split("\0").filter((item) => item.length > 0);
 }
 
-function truncateDiff(value: string): string {
-  if (value.length <= DEFAULT_GIT_DIFF_MAX_BYTES) return value;
-  return `${value.slice(0, DEFAULT_GIT_DIFF_MAX_BYTES)}\n(diff truncated at ${DEFAULT_GIT_DIFF_MAX_BYTES} characters)`;
+class VerifierGitDiffCollector {
+  private text = "";
+  private bytes = 0;
+
+  get remainingBytes(): number {
+    return DEFAULT_GIT_DIFF_MAX_BYTES - this.bytes;
+  }
+
+  append(part: string): boolean {
+    if (!part) return true;
+    const separator = this.text && !this.text.endsWith("\n") && !part.startsWith("\n") ? "\n" : "";
+    const addition = separator + part;
+    const bounded = utf8Prefix(addition, this.remainingBytes);
+    this.text += bounded;
+    this.bytes += Buffer.byteLength(bounded, "utf8");
+    return bounded === addition;
+  }
+
+  complete(): VerifierGitDiffSnapshot {
+    return { text: this.text || "(no diff)" };
+  }
+
+  incomplete(reason: string): VerifierGitDiffSnapshot {
+    const incompleteReason = utf8Prefix(normalizePersistedError(reason).message || "unknown git diff collection error", 1_024);
+    // Persisted metadata may be shortened again, so keep the warning ahead of the patch.
+    const marker = `[Git diff incomplete: ${incompleteReason}. Automatic verification cannot pass with omitted changes.]\n\n`;
+    return {
+      text: marker + utf8Prefix(this.text, DEFAULT_GIT_DIFF_MAX_BYTES - Buffer.byteLength(marker, "utf8")),
+      incompleteReason,
+    };
+  }
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength <= maxBytes) return value;
+  let end = Math.max(0, maxBytes);
+  while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end).toString("utf8");
 }
 
 function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  return normalizePersistedError(error);
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -668,4 +1048,12 @@ function isSignalAbort(error: unknown, signal: AbortSignal | undefined): boolean
   if (signal?.aborted) return true;
   const err = toError(error);
   return err.name === "AbortError" && err.message.toLowerCase().includes("aborted");
+}
+
+function combinedAbortSignal(
+  requestSignal: AbortSignal | undefined,
+  operationSignal: AbortSignal,
+): AbortSignal {
+  if (!requestSignal || requestSignal === operationSignal) return operationSignal;
+  return AbortSignal.any([requestSignal, operationSignal]);
 }

@@ -8,7 +8,7 @@ import {
   DEEPSEEK_V4_PRO_MODEL,
   resolveDeepSeekCompletionsUrl,
 } from "./index.js";
-import type { ModelStreamEvent } from "./types.js";
+import type { ModelStreamEvent, ReasoningLevel } from "./types.js";
 
 test("DeepSeek model factory resolves model, baseUrl, and API key from env", async () => {
   let url = "";
@@ -74,6 +74,56 @@ test("DeepSeek provider marks a configured catalog model as default", () => {
   expect(models.filter((model) => model.default)).toHaveLength(1);
 });
 
+test("DeepSeek maps Chili reasoning efforts to the documented low, high, and max values", async () => {
+  const cases: readonly [ReasoningLevel, "low" | "high" | "max"][] = [
+    ["low", "low"],
+    ["medium", "high"],
+    ["xhigh", "high"],
+    ["max", "max"],
+  ];
+
+  for (const [reasoningEffort, expectedEffort] of cases) {
+    let body: Record<string, unknown> = {};
+    const model = createDeepSeekV4Model({
+      apiKey: "key",
+      reasoningEffort,
+      fetch: (async (_input, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonCompletion();
+      }) as typeof fetch,
+    });
+
+    await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+    expect(body).toMatchObject({
+      max_tokens: 131072,
+      thinking: { type: "enabled" },
+      reasoning_effort: expectedEffort,
+    });
+  }
+});
+
+test("DeepSeek reasoning off disables thinking and omits reasoning effort", async () => {
+  let body: Record<string, unknown> = {};
+  const model = createDeepSeekV4Model({
+    apiKey: "key",
+    reasoning: false,
+    reasoningEffort: "xhigh",
+    fetch: (async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return jsonCompletion();
+    }) as typeof fetch,
+  });
+
+  await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+  expect(body).toMatchObject({
+    max_tokens: 131072,
+    thinking: { type: "disabled" },
+  });
+  expect(body).not.toHaveProperty("reasoning_effort");
+});
+
 test("DeepSeek request URL follows the documented root chat completions endpoint", () => {
   expect(resolveDeepSeekCompletionsUrl("https://api.deepseek.com")).toBe(
     "https://api.deepseek.com/chat/completions",
@@ -88,4 +138,15 @@ async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelSt
   const events: ModelStreamEvent[] = [];
   for await (const streamEvent of stream) events.push(streamEvent);
   return events;
+}
+
+function jsonCompletion(): Response {
+  return new Response(
+    JSON.stringify({
+      id: "chatcmpl_reasoning",
+      model: DEEPSEEK_V4_PRO_MODEL,
+      choices: [{ index: 0, finish_reason: "stop", message: { content: "ok" } }],
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
 }

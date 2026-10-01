@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
-import { createMcpPromptCommand, parseMcpPromptArguments, type McpPromptController } from "./mcp-prompts.js";
+import { createMcpPromptCommands, parseMcpPromptArguments, type McpPromptController } from "./mcp-prompts.js";
+import { createCommandRegistry } from "./registry.js";
+import { resolveCommand } from "./resolve.js";
 
-test("mcp prompt adapter creates command definitions with mcp source", async () => {
+test("MCP prompts live under /prompt mcp server name and preserve render metadata", async () => {
   const calls: unknown[] = [];
   const controller: McpPromptController = {
     renderPrompt(request) {
@@ -12,24 +14,26 @@ test("mcp prompt adapter creates command definitions with mcp source", async () 
       };
     },
   };
-  const command = createMcpPromptCommand({
+  const registry = createCommandRegistry(createMcpPromptCommands([{
     serverName: "docs",
     name: "review-doc",
     description: "Review a doc",
     arguments: [{ name: "target", required: true }],
-  }, controller);
+  }], controller));
 
-  expect(command.source).toBe("mcp");
-  expect(command.category).toBe("mcp");
-  expect(command.name).toBe("docs review-doc");
-  expect(command.argumentHint).toBe("<target>");
-
-  const result = await command.run({}, {
-    raw: "README.md",
-    argv: ["README.md"],
-    invocation: "review-doc",
-    input: "README.md",
+  const command = registry.findByPath("/prompt mcp docs review-doc");
+  expect(command).toMatchObject({
+    id: "prompt.mcp.docs.review-doc",
+    source: "mcp",
+    group: "prompt",
+    argumentHint: "<target>",
   });
+  expect(resolveCommand(registry, {}, "/docs review-doc README.md").status).toBe("unknown");
+
+  const resolved = resolveCommand(registry, {}, "/prompt mcp docs review-doc README.md");
+  expect(resolved.status).toBe("matched");
+  if (resolved.status !== "matched" || !resolved.command.run) return;
+  const result = await resolved.command.run({}, resolved.args);
 
   expect(calls).toEqual([{
     serverName: "docs",
@@ -40,7 +44,8 @@ test("mcp prompt adapter creates command definitions with mcp source", async () 
     type: "prompt",
     prompt: "USER: Review README.md",
     metadata: {
-      commandName: "docs review-doc",
+      commandId: "prompt.mcp.docs.review-doc",
+      commandPath: "/prompt mcp docs review-doc",
       source: "mcp",
       model: "test-model",
       allowedTools: ["read"],
@@ -48,7 +53,7 @@ test("mcp prompt adapter creates command definitions with mcp source", async () 
   });
 });
 
-test("mcp prompt argument parser supports named and positional arguments", () => {
+test("MCP prompt argument parser supports named and positional arguments", () => {
   expect(parseMcpPromptArguments("target=src mode=fast extra=value", [
     { name: "target", required: true },
     { name: "mode" },

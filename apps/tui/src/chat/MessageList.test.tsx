@@ -4,7 +4,7 @@ import type { ScrollBoxRenderable } from "@opentui/core";
 import { act, createRef } from "react";
 import type { ChatSessionView, ChatTranscriptItem } from "@chili/sdk";
 import type { MessageId, PartId, ToolCallId } from "@chili/protocol";
-import { resolveTuiTheme } from "../theme/index.js";
+import { chiliDarkTheme, resolveTuiTheme } from "../theme/index.js";
 import { charDisplayWidth, markdownToTerminalLines, type MarkdownRenderOptions, type MarkdownTerminalLine } from "./markdown.js";
 import { MessageList } from "./MessageList.js";
 import { buildChatDisplayItems } from "./presentation.js";
@@ -12,6 +12,27 @@ import { HistoryRenderModel } from "./render-model.js";
 import { splitStreamingMarkdown } from "./streaming.js";
 import { renderToolActivity } from "./tool-renderers.js";
 import type { LocalTranscriptItem } from "./types.js";
+
+test("user messages render as compact cards with one outer row of vertical spacing", async () => {
+  const width = 36;
+  const app = await renderMessageListApp([
+    chatMessage("msg_user_card", "user", "第一行人类消息\n第二行仍然在同一张卡片里", 1),
+  ], { width, height: 12 });
+
+  try {
+    const frame = app.frame();
+    expect(frame).toContain("🥔: 第一行人类消息");
+    expect(frame).toContain("    第二行仍然在同一张卡片里");
+    const messagePosition = frameTextPosition(frame, "🥔: 第一行人类消息");
+    const secondLinePosition = frameTextPosition(frame, "    第二行仍然在同一张卡片里");
+    expect(app.backgroundMatches(messagePosition.x, messagePosition.y, chiliDarkTheme.colors.message.userBackground)).toBe(true);
+    expect(app.backgroundMatches(width - 2, messagePosition.y, chiliDarkTheme.colors.message.userBackground)).toBe(true);
+    expect(app.backgroundMatches(0, messagePosition.y - 1, chiliDarkTheme.colors.message.userBackground)).toBe(false);
+    expect(app.backgroundMatches(0, secondLinePosition.y + 1, chiliDarkTheme.colors.message.userBackground)).toBe(false);
+  } finally {
+    app.destroy();
+  }
+});
 
 test("assistant markdown renders readable terminal lines", () => {
   const markdown = [
@@ -144,7 +165,7 @@ test("streaming assistant text does not prematurely close unfinished code fences
 
   expect(frame).toContain("Intro");
   expect(frame).toContain("const ok");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(occurrences(frame, "```")).toBe(0);
 });
 
@@ -167,6 +188,43 @@ test("hidden thinking masks reasoning text", async () => {
   expect(frame).toContain("final answer");
 });
 
+test("Thinking subjects stay compact and render Markdown details without raw markers", async () => {
+  const items: ChatTranscriptItem[] = [{
+    id: "msg_reasoning_sections" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      {
+        type: "reasoning",
+        id: "part_reasoning_inspecting" as PartId,
+        text: "**Inspecting core**\n\nReading runtime state.",
+      },
+      {
+        type: "reasoning",
+        id: "part_reasoning_checking" as PartId,
+        text: "**Checking schema**\n\nComparing migrations.",
+      },
+    ],
+  }];
+
+  const compact = await renderMessageList(items, { height: 12 });
+  const details = await renderMessageList(items, { showToolDetails: true, height: 16 });
+
+  expect(occurrences(compact, "Thinking:")).toBe(2);
+  expect(compact).toContain("Thinking: Inspecting core");
+  expect(compact).toContain("Thinking: Checking schema");
+  expect(compact).not.toContain("Reading runtime state.");
+  expect(compact).not.toContain("Comparing migrations.");
+  expect(compact).not.toContain("**");
+  expect(compact).not.toContain("****");
+  expect(details).toContain("Thinking: Inspecting core");
+  expect(details).toContain("Reading runtime state.");
+  expect(details).toContain("Thinking: Checking schema");
+  expect(details).toContain("Comparing migrations.");
+  expect(details).not.toContain("**");
+});
+
 test("hidden thinking masks intermediate assistant text before tool calls", async () => {
   const callId = "toolcall_hidden_thinking_text" as ToolCallId;
   const frame = await renderMessageList([
@@ -177,7 +235,7 @@ test("hidden thinking masks intermediate assistant text before tool calls", asyn
       createdAt: 1,
       parts: [
         { type: "reasoning", id: "part_hidden_reasoning" as PartId, text: "deciding which file to inspect" },
-        { type: "text", id: "part_hidden_text" as PartId, text: "Let me inspect the prompt handling." },
+        { type: "text", id: "part_hidden_text" as PartId, text: "Let me inspect the prompt handling.", phase: "commentary" },
         {
           type: "tool_call",
           id: "part_hidden_call" as PartId,
@@ -196,7 +254,7 @@ test("hidden thinking masks intermediate assistant text before tool calls", asyn
   expect(occurrences(frame, "🫧")).toBe(1);
   expect(frame).toContain("Read ChatShellApp.tsx");
   expect(frame).not.toContain("deciding which file");
-  expect(frame).not.toContain("🌶️: Let me inspect");
+  expect(frame).not.toContain("↳ Let me inspect");
 });
 
 test("hidden thinking masks live assistant text before a tool call arrives", async () => {
@@ -207,13 +265,13 @@ test("hidden thinking masks live assistant text before a tool call arrives", asy
       role: "assistant",
       createdAt: 1,
       parts: [
-        { type: "text", id: "part_live_trace_hidden" as PartId, text: "Let me inspect the prompt handling." },
+        { type: "text", id: "part_live_trace_hidden" as PartId, text: "Let me inspect the prompt handling.", phase: "commentary" },
       ],
     },
   ], { hideThinking: true, status: "running" });
 
   expect(frame).toContain("🫧 thinking...");
-  expect(frame).not.toContain("🌶️: Let me inspect");
+  expect(frame).not.toContain("↳ Let me inspect");
 });
 
 test("hidden thinking shows completed assistant text without tool calls", async () => {
@@ -224,13 +282,35 @@ test("hidden thinking shows completed assistant text without tool calls", async 
       role: "assistant",
       createdAt: 1,
       parts: [
-        { type: "text", id: "part_final_answer_visible" as PartId, text: "Final answer is visible." },
+        { type: "text", id: "part_final_answer_visible" as PartId, text: "Final answer is visible.", phase: "final_answer" },
       ],
     },
   ], { hideThinking: true, status: "idle" });
 
   expect(frame).toContain("Final answer is visible.");
   expect(frame).not.toContain("🫧 thinking...");
+});
+
+test("assistant phases render distinct prefixes in transcript order", async () => {
+  const frame = await renderMessageList([{
+    id: "msg_phase_prefixes" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    completedAt: 2,
+    parts: [
+      { type: "text", id: "part_prefix_commentary" as PartId, text: "Checking files.", phase: "commentary" },
+      { type: "text", id: "part_prefix_unclassified" as PartId, text: "Provider text." },
+      { type: "text", id: "part_prefix_final" as PartId, text: "Done.", phase: "final_answer" },
+    ],
+  }]);
+
+  expect(frame).toContain("↳ Checking files.");
+  expect(frame).toContain("Assistant: Provider text.");
+  expect(frame).toContain("🌶️: Done.");
+  expect(occurrences(frame, "🌶️:")).toBe(1);
+  expect(frame.indexOf("↳ Checking files.")).toBeLessThan(frame.indexOf("Assistant: Provider text."));
+  expect(frame.indexOf("Assistant: Provider text.")).toBeLessThan(frame.indexOf("🌶️: Done."));
 });
 
 test("streaming markdown keeps the last growing block active", () => {
@@ -288,7 +368,7 @@ test("completed assistant markdown keeps block rendering", async () => {
   expect(frame).toContain("# Done");
   expect(frame).toContain("- ship it");
   expect(frame).toContain("const ok = true;");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(frame).not.toContain("```ts");
 });
 
@@ -317,7 +397,7 @@ test("assistant markdown table uses native table rendering in the message list",
   expect(frame).toContain("│Name");
   expect(frame).toContain("│alpha");
   expect(frame).not.toContain("│ Name");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(frame).not.toContain("| ---");
 });
 
@@ -343,7 +423,7 @@ test("streaming assistant markdown table uses native table rendering", async () 
   expect(frame).toContain("Clear");
   expect(frame).toContain("┌");
   expect(frame).toContain("┬");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(frame).not.toContain("| ---");
 });
 
@@ -376,7 +456,7 @@ test("assistant markdown tables with dotted names and package scopes stay native
   expect(frame).toContain("@pondwader/socks5-server");
   expect(frame).toContain("┌");
   expect(frame).toContain("┬");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(frame).not.toContain("| ---");
 });
 
@@ -546,7 +626,7 @@ test("assistant tool parts stay out of default chat text while tool rows render 
 
   expect(frame).toContain("Done with");
   expect(frame).toContain("tests");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(frame).toContain("Ran bun test");
   expect(occurrences(frame, "Ran bun test")).toBe(1);
   expect(frame).not.toContain("tool_call");
@@ -583,7 +663,7 @@ test("consecutive exploration tools merge into a compact group", () => {
   });
 });
 
-test("exploration group labels pending and failed runs naturally", () => {
+test("non-succeeded exploration tools remain standalone", () => {
   const running = buildChatDisplayItems([
     chatTool("read_running" as ToolCallId, "read", "running", "running", { title: "read", path: "package.json", detail: "package.json" }),
     chatTool("grep_done" as ToolCallId, "grep", "completed", "succeeded", { title: "grep", pattern: "TODO", scope: "apps/tui", detail: "TODO in apps/tui" }),
@@ -593,16 +673,33 @@ test("exploration group labels pending and failed runs naturally", () => {
     chatTool("grep_after_failed" as ToolCallId, "grep", "completed", "succeeded", { title: "grep", pattern: "TODO", scope: "apps/tui", detail: "TODO in apps/tui" }),
   ]);
 
-  expect(running[0]).toMatchObject({
-    kind: "tool_group",
-    label: "Exploring 1 file, searched 1 pattern",
-    tone: "pending",
-  });
-  expect(failed[0]).toMatchObject({
-    kind: "tool_group",
-    label: "Explored 1 file, searched 1 pattern with errors",
-    tone: "error",
-  });
+  expect(running).toHaveLength(2);
+  expect(running[0]).toMatchObject({ kind: "tool_activity", activity: { id: "read_running", displayStatus: "running" } });
+  expect(running[1]).toMatchObject({ kind: "tool_activity", activity: { id: "grep_done", displayStatus: "succeeded" } });
+  expect(failed).toHaveLength(2);
+  expect(failed[0]).toMatchObject({ kind: "tool_activity", activity: { id: "read_failed", displayStatus: "failed" } });
+  expect(failed[1]).toMatchObject({ kind: "tool_activity", activity: { id: "grep_after_failed", displayStatus: "succeeded" } });
+});
+
+test("exact no-match exploration results remain visible when compact", async () => {
+  const single = await renderMessageList([
+    chatTool("glob_no_matches" as ToolCallId, "glob", "completed", "succeeded", { title: "glob", pattern: "*.missing", path: "apps/tui/src" }, {
+      output: "(no matches)",
+    }),
+  ], { height: 8 });
+  const grouped = await renderMessageList([
+    chatTool("grep_no_matches" as ToolCallId, "grep", "completed", "succeeded", { title: "grep", pattern: "missing", scope: "apps/tui/src" }, {
+      output: "(no matches)",
+    }),
+    chatTool("glob_one_match" as ToolCallId, "glob", "completed", "succeeded", { title: "glob", pattern: "*.tsx", path: "apps/tui/src" }, {
+      output: "apps/tui/src/index.tsx",
+    }),
+  ], { height: 8 });
+
+  expect(single).toContain("Listed *.missing under apps/tui/src");
+  expect(single).toContain("No matches");
+  expect(single).not.toContain("(no matches)");
+  expect(grouped).toContain("Explored searched 1 pattern, listed 1 path · No matches");
 });
 
 test("exploration tool groups hide raw output when compact and expand in details mode", async () => {
@@ -639,6 +736,42 @@ test("exploration tool groups hide raw output when compact and expand in details
   expect(occurrences(details, "output:")).toBe(3);
 });
 
+test("exploration failures remain individually visible while details retain every raw diagnostic", async () => {
+  const failed = [
+    chatTool("read_group_failed" as ToolCallId, "read", "failed", "failed", { title: "read", path: "/repo/app/first.php" }, {
+      error: "ENOENT: no such file or directory, lstat '/repo/app/first.php'",
+      liveOutput: [
+        { stream: "stderr", delta: "RAW_LIVE_ENOENT: lstat '/repo/app/first.php'\n", time: 1 },
+      ],
+    }),
+    chatTool("grep_group_failed" as ToolCallId, "grep", "failed", "failed", { title: "grep", path: "/repo/app/second.php", scope: "/repo/app/second.php" }, {
+      error: "ENOENT: no such file or directory, lstat '/repo/app/second.php'",
+    }),
+    chatTool("glob_group_failed" as ToolCallId, "glob", "failed", "failed", { title: "glob", path: "/repo/app/third.php" }, {
+      error: "ENOENT: no such file or directory, lstat '/repo/app/third.php'",
+    }),
+  ];
+
+  const compact = await renderMessageList(failed, { cwd: "/repo", height: 24 });
+  const details = await renderMessageList(failed, { cwd: "/repo", showToolDetails: true, height: 56 });
+
+  expect(compact).not.toContain("Explored");
+  expect(compact).toContain("Failed first.php");
+  expect(compact).toContain("Failed /repo/app/second.php");
+  expect(compact).toContain("Failed /repo/app/third.php");
+  expect(compact).toContain("File not found: app/first.php");
+  expect(compact).toContain("File not found: app/second.php");
+  expect(compact).toContain("File not found: app/third.php");
+  expect(compact).not.toContain("more failures");
+  expect(compact).not.toContain("ENOENT");
+  expect(compact).not.toContain("RAW_LIVE_ENOENT");
+  expect(occurrences(compact, "error:")).toBe(0);
+  expect(details).toContain("ENOENT: no such file or directory, lstat '/repo/app/first.php'");
+  expect(details).toContain("RAW_LIVE_ENOENT: lstat '/repo/app/first.php'");
+  expect(details).toContain("ENOENT: no such file or directory, lstat '/repo/app/second.php'");
+  expect(details).toContain("ENOENT: no such file or directory, lstat '/repo/app/third.php'");
+});
+
 test("large tool output is hidden by default and truncated in details mode", async () => {
   const output = Array.from({ length: 20 }, (_, index) => `line_${String(index + 1).padStart(2, "0")}`).join("\n");
   const item = chatTool("tool_big_output" as ToolCallId, "bash", "completed", "succeeded", { title: "bash", command: "bun test", detail: "bun test" }, {
@@ -654,7 +787,7 @@ test("large tool output is hidden by default and truncated in details mode", asy
   expect(details).toContain("output (truncated):");
   expect(details).not.toContain("output hidden");
   expect(details).toContain("line_01");
-  expect(details).toContain("line_05");
+  expect(details).toContain("line_20");
   expect(details).not.toContain("line_06");
 });
 
@@ -679,8 +812,10 @@ test("running command rows show live output tail without exposing completed live
   expect(runningFrame).toContain("Running npm install");
   expect(runningFrame).toContain("live output (truncated):");
   expect(runningFrame).not.toContain("error (truncated):");
+  expect(runningFrame).toContain("… +2 lines (Ctrl+T for transcript)");
   expect(runningFrame).not.toContain("live_01");
-  expect(runningFrame).toContain("live_02");
+  expect(runningFrame).not.toContain("live_02");
+  expect(runningFrame).toContain("live_03");
   expect(runningFrame).toContain("warn_05");
   expect(runningFrame).toContain("live_06");
   expect(completedFrame).toContain("Ran npm install");
@@ -714,7 +849,7 @@ test("tool details scroll as a full component in the native scrollbox", async ()
   const app = await renderMessageListApp([item], { showToolDetails: true, height: 5, width: 120 });
 
   try {
-    expect(app.frame()).toContain("slice_line_05");
+    expect(app.frame()).toContain("slice_line_20");
     expect(app.frame()).not.toContain("Ran bun test");
 
     await app.scrollBy(-3);
@@ -751,11 +886,12 @@ test("failed tools show a compact error summary", async () => {
   const frame = await renderMessageList([item]);
   const details = await renderMessageList([item], { showToolDetails: true, height: 24 });
 
-  expect(frame).toContain("Failed bun test");
-  expect(frame).toContain("error:");
-  expect(frame).toContain("first failure");
-  expect(frame).toContain("fourth failure");
-  expect(frame).not.toContain("fifth failure");
+  expect(frame).toContain("• Failed bun test");
+  expect(frame).toContain("  └ first failure");
+  expect(frame).not.toContain("error:");
+  expect(frame).toContain("second failure");
+  expect(frame).toContain("… +2 lines (Ctrl+T for transcript)");
+  expect(frame).toContain("fifth failure");
   expect(details.match(/error:/g)).toHaveLength(1);
   expect(details).toContain("fifth failure");
 });
@@ -817,6 +953,7 @@ async function renderMessageListApp(
   options: MessageListTestOptions = {},
 ): Promise<{
   frame: () => string;
+  backgroundMatches: (x: number, y: number, color: string) => boolean;
   scrollBy: (delta: number) => Promise<void>;
   destroy: () => void;
 }> {
@@ -829,6 +966,7 @@ async function renderMessageListApp(
       scrollRef={scrollRef}
       showToolDetails={options.showToolDetails === true}
       hideThinking={options.hideThinking === true}
+      cwd={options.cwd}
       theme={resolveTuiTheme("chili-dark", {})}
     />,
     { width: options.width ?? 120, height: options.height ?? 24, exitOnCtrlC: false },
@@ -840,6 +978,7 @@ async function renderMessageListApp(
     });
     return {
       frame: () => app.captureCharFrame(),
+      backgroundMatches: (x, y, color) => renderBufferColorMatches(app.renderer.currentRenderBuffer.buffers.bg, app.renderer.currentRenderBuffer.width, x, y, color),
       scrollBy: async (delta: number) => {
         await act(async () => {
           scrollRef.current?.scrollBy(delta);
@@ -862,6 +1001,7 @@ interface MessageListTestOptions {
   status?: ChatSessionView["status"];
   activeTools?: ChatSessionView["activeTools"];
   localItems?: readonly LocalTranscriptItem[];
+  cwd?: string;
 }
 
 function chatView(items: readonly ChatTranscriptItem[], options: { status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {}): ChatSessionView {
@@ -893,6 +1033,26 @@ function occurrences(value: string, needle: string): number {
 
 function displayWidth(value: string): number {
   return [...value].reduce((sum, char) => sum + charDisplayWidth(char), 0);
+}
+
+function frameTextPosition(frame: string, text: string): { x: number; y: number } {
+  for (const [y, line] of frame.split("\n").entries()) {
+    const index = line.indexOf(text);
+    if (index >= 0) return { x: displayWidth(line.slice(0, index)), y };
+  }
+  throw new Error(`Frame did not include ${text}`);
+}
+
+function renderBufferColorMatches(buffer: Float32Array, width: number, x: number, y: number, color: string): boolean {
+  const offset = (y * width + x) * 4;
+  const value = color.replace(/^#/, "");
+  const expected = [
+    Number.parseInt(value.slice(0, 2), 16) / 255,
+    Number.parseInt(value.slice(2, 4), 16) / 255,
+    Number.parseInt(value.slice(4, 6), 16) / 255,
+    1,
+  ];
+  return expected.every((channel, index) => Math.abs((buffer[offset + index] ?? 0) - channel) < 0.001);
 }
 
 function countingMarkdownRenderer(calls: string[]): (text: string, options: MarkdownRenderOptions) => MarkdownTerminalLine[] {

@@ -11,7 +11,8 @@ Chili is a Bun + TypeScript workspace. Runtime applications live in `apps/`: `ap
 - `bun test`: run colocated unit tests with Bun.
 - `bun run chili -- "summarize this repo"`: run the CLI locally.
 - `bun run tui`: start the terminal UI.
-- `bun run smoke`: run the fake-model P0 smoke suite without API keys.
+- `bun run smoke:all`: run the complete fake-model smoke gate used by CI and before commits.
+- `bun run smoke` or another individual `smoke:*` command: run a focused suite during local development.
 - `bun run test:index`: list available smoke scripts and grouped test files.
 
 ## Coding Style & Naming Conventions
@@ -20,7 +21,7 @@ Use TypeScript ESM with explicit `.js` extensions for relative runtime imports. 
 
 ## Testing Guidelines
 
-Add focused tests next to changed code using the `*.test.ts` or `*.test.tsx` convention. Prefer behavioral tests for parsers, state transitions, render models, and tool adapters. Run `bun test` and `bun run typecheck` before submitting. For CLI/runtime changes, also run `bun run smoke` or a narrower command such as `bun run smoke:cli`.
+Add focused tests next to changed code using the `*.test.ts` or `*.test.tsx` convention. Prefer behavioral tests for parsers, state transitions, render models, and tool adapters. Run `bun test`, `bun run typecheck`, and the complete `bun run smoke:all` gate before submitting. Use individual smoke commands such as `bun run smoke:cli` for focused development feedback.
 For team parallel scheduling changes, run `bun run smoke:p3-team-model` and `bun run smoke:p3-team-parallel`.
 
 ## Commit & Pull Request Guidelines

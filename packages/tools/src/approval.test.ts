@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
 import type { ApprovalDecision, ApprovalId, SessionId, ToolCallId, TurnId } from "@chili/protocol";
 import type { PermissionRule } from "@chili/policy";
-import { PolicyApprovalBroker } from "./approval.js";
+import { PolicyApprovalBroker, PolicyApprovalState } from "./approval.js";
+import { DeferredApprovalQueue } from "./deferred-approval.js";
 import type { ApprovalBrokerRequest } from "./types.js";
 
 test("approval denies catastrophic bash commands even when a broad allow rule exists", async () => {
@@ -79,6 +80,64 @@ test("approval fails closed when ask returns an unknown decision action", async 
   expect(decision.feedback).toContain("Invalid approval decision action");
 });
 
+test("once-only approvals reject broader decisions without creating a grant", async () => {
+  const broker = new PolicyApprovalBroker({
+    ask: async (): Promise<ApprovalDecision> => ({ action: "allow_session" }),
+  });
+  const request: ApprovalBrokerRequest = {
+    ...approvalRequest("npm test"),
+    maxApprovalScope: "once",
+  };
+
+  const decision = await broker.decide(request);
+
+  expect(decision.action).toBe("deny");
+  expect(decision.feedback).toContain("exceeds the maximum approval scope once");
+  expect(await broker.preflight(preflightRequest(request))).toMatchObject({ action: "ask" });
+});
+
+test("once-only approvals require a fresh decision despite reusable grants", async () => {
+  const state = new PolicyApprovalState();
+  state.addPersistentGrant({ permission: "*", patterns: ["*"] });
+  let asked = 0;
+  const request: ApprovalBrokerRequest = {
+    ...approvalRequest("remindctl status"),
+    permission: "bash.unsandboxed",
+    maxApprovalScope: "once",
+  };
+  const broker = new PolicyApprovalBroker({
+    state,
+    ask: async () => {
+      asked += 1;
+      return { action: "allow_once" };
+    },
+  });
+
+  expect(await broker.preflight(preflightRequest(request))).toMatchObject({
+    action: "ask",
+    source: "approval_request",
+  });
+  expect(await broker.decide(request)).toEqual({ action: "allow_once" });
+  expect(asked).toBe(1);
+
+  const fullAccess = new PolicyApprovalBroker({ state, allowOneShotPolicyBypass: true });
+  expect(await fullAccess.preflight(preflightRequest(request))).toMatchObject({ action: "allow" });
+});
+
+test("deferred approvals keep a once-only request pending after a broader decision", async () => {
+  const queue = new DeferredApprovalQueue();
+  const request: ApprovalBrokerRequest = {
+    ...approvalRequest("npm test"),
+    maxApprovalScope: "once",
+  };
+  const pending = queue.ask(request);
+
+  expect(queue.resolve({ approvalId: request.approvalId, decision: "allow_session" })).toBe(false);
+  expect(queue.list()).toHaveLength(1);
+  expect(queue.resolve({ approvalId: request.approvalId, decision: "allow_once" })).toBe(true);
+  expect(await pending).toEqual({ action: "allow_once" });
+});
+
 test("approval forces explicit review for dangerous wildcard deletes", async () => {
   let asked: ApprovalBrokerRequest | undefined;
   const broker = new PolicyApprovalBroker({
@@ -103,6 +162,36 @@ test("approval forces explicit review for dangerous wildcard deletes", async () 
     action: "ask",
     source: "bash_danger_classifier",
     suggestions: [{ permission: "bash", pattern: "rm -rf *", scope: "session" }],
+  });
+});
+
+test("unsandboxed bash approvals use the dangerous shell classifier", async () => {
+  let asked: ApprovalBrokerRequest | undefined;
+  const broker = new PolicyApprovalBroker({
+    rulesets: [[{ permission: "*", pattern: "*", action: "allow" }]],
+    ask: async (request): Promise<ApprovalDecision> => {
+      asked = request;
+      return { action: "allow_once" };
+    },
+  });
+  const request: ApprovalBrokerRequest = {
+    ...approvalRequest("rm -rf *"),
+    permission: "bash.unsandboxed",
+    maxApprovalScope: "once",
+  };
+
+  expect((await broker.decide(request)).action).toBe("allow_once");
+  expect(asked?.metadata?.approvalRisks).toEqual([
+    expect.objectContaining({
+      pattern: "rm -rf *",
+      action: "ask",
+      source: "bash_danger_classifier",
+    }),
+  ]);
+  expect(asked?.metadata?.preflightDecision).toMatchObject({
+    action: "ask",
+    source: "bash_danger_classifier",
+    suggestions: [],
   });
 });
 
@@ -143,6 +232,82 @@ test("allow_session grants only the current session", async () => {
     sessionId: "session_other" as SessionId,
   }));
   expect(otherSession.action).toBe("ask");
+});
+
+test("shared approval state grants the whole parent-child session tree", async () => {
+  const state = new PolicyApprovalState();
+  const parentSessionId = "session_parent" as SessionId;
+  const childSessionId = "session_child" as SessionId;
+  const siblingSessionId = "session_sibling" as SessionId;
+  state.linkSession(parentSessionId, childSessionId);
+  state.linkSession(parentSessionId, siblingSessionId);
+
+  const parentBroker = new PolicyApprovalBroker({
+    state,
+    ask: async (): Promise<ApprovalDecision> => ({ action: "allow_session" }),
+  });
+  const childBroker = new PolicyApprovalBroker({ state });
+
+  await parentBroker.decide(approvalRequest("npm test", parentSessionId));
+
+  expect(await childBroker.preflight(preflightRequest(approvalRequest("npm test", childSessionId)))).toMatchObject({
+    action: "allow",
+    source: "session_grant",
+  });
+  expect(await childBroker.preflight(preflightRequest(approvalRequest("npm test", siblingSessionId)))).toMatchObject({
+    action: "allow",
+    source: "session_grant",
+  });
+  expect(await childBroker.preflight(preflightRequest(approvalRequest("npm test", "session_unrelated" as SessionId)))).toMatchObject({
+    action: "ask",
+  });
+});
+
+test("shared approval state exposes runtime persistent grants to every broker", async () => {
+  const state = new PolicyApprovalState();
+  const firstBroker = new PolicyApprovalBroker({ state });
+  const secondBroker = new PolicyApprovalBroker({ state });
+
+  state.addPersistentGrant({ permission: "bash", patterns: ["git status --short"] });
+
+  expect(await firstBroker.preflight(preflightRequest(approvalRequest("git status --short")))).toMatchObject({
+    action: "allow",
+    matchedRule: { source: "user config.toml permissions.allow" },
+  });
+  expect(await secondBroker.preflight(preflightRequest(approvalRequest(
+    "git status --short",
+    "session_other" as SessionId,
+  )))).toMatchObject({ action: "allow" });
+});
+
+test("a tree-scoped grant rechecks pending approvals from another broker", async () => {
+  const state = new PolicyApprovalState();
+  const queue = new DeferredApprovalQueue();
+  const parentSessionId = "session_parent" as SessionId;
+  const childSessionId = "session_child" as SessionId;
+  state.linkSession(parentSessionId, childSessionId);
+
+  let grantingBroker: PolicyApprovalBroker;
+  grantingBroker = new PolicyApprovalBroker({
+    state,
+    ask: async (): Promise<ApprovalDecision> => ({ action: "allow_session" }),
+    onSessionGrant: async () => {
+      await queue.recheckPending((pendingRequest) => grantingBroker.preflight(pendingRequest));
+    },
+  });
+  const pendingBroker = new PolicyApprovalBroker({
+    state,
+    ask: (request, signal) => queue.ask(request, signal),
+  });
+
+  const pending = pendingBroker.decide(approvalRequest("npm test", childSessionId));
+  await Promise.resolve();
+  expect(queue.list()).toHaveLength(1);
+
+  await grantingBroker.decide(approvalRequest("npm test", parentSessionId));
+
+  expect(await pending).toEqual({ action: "allow_once" });
+  expect(queue.list()).toHaveLength(0);
 });
 
 test("allow_always also seeds an immediate session grant", async () => {

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   applyRuntimeEvent,
   createRuntimeView,
+  isEventCursorResyncRequiredError,
   teamLiveView,
   type ChiliRuntimeView,
   type HttpRuntimeClient,
@@ -12,13 +13,19 @@ import {
   type TeamLiveConnectionState,
   type TeamLiveView,
 } from "@chili/sdk";
-import type { ApprovalId, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import {
+  isTransientEvent,
+  type ApprovalId,
+  type ChiliEvent,
+  type SessionId,
+  type TaskId,
+  type TeamId,
+} from "@chili/protocol";
 
 export interface TeamLiveTuiOptions {
   baseUrl: string;
   teamId?: TeamId;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd?: string;
   streamScope?: "all" | "session";
   runLoop: boolean;
@@ -30,7 +37,6 @@ export interface TeamLiveTuiOptions {
 
 export interface TeamLiveStreamScopeInput {
   sessionId?: SessionId;
-  threadId?: ThreadId;
   streamScope?: "all" | "session";
 }
 
@@ -43,7 +49,6 @@ export function teamLiveStreamInput(
   const input: StreamEventsRequest = { signal };
   if (_scope.streamScope === "session") {
     if (_scope.sessionId) input.sessionId = _scope.sessionId;
-    if (_scope.threadId) input.threadId = _scope.threadId;
   }
   if (afterEventId) input.afterEventId = afterEventId;
   return input;
@@ -68,15 +73,22 @@ export interface TeamLiveRuntimeState {
   reconnect: () => void;
   executeAction: (action: TeamLiveAction) => void;
   clearActionFeedback: () => void;
+  hydrateEvents: (events: readonly ChiliEvent[]) => void;
 }
 
 export interface UseTeamLiveRuntimeInput {
   client: HttpRuntimeClient;
   options: TeamLiveTuiOptions;
+  resolveActionAuthority?: () => TeamLiveActionAuthority;
+}
+
+export interface TeamLiveActionAuthority {
+  sessionId?: SessionId;
+  cwd?: string;
 }
 
 export function useTeamLiveRuntime(input: UseTeamLiveRuntimeInput): TeamLiveRuntimeState {
-  const { client, options } = input;
+  const { client, options, resolveActionAuthority: resolveActionAuthorityOverride } = input;
   const runtimeViewRef = useRef<ChiliRuntimeView>(createRuntimeView());
   const mountedRef = useRef(true);
   const streamAbortRef = useRef<AbortController | undefined>(undefined);
@@ -84,6 +96,7 @@ export function useTeamLiveRuntime(input: UseTeamLiveRuntimeInput): TeamLiveRunt
   const streamVersionRef = useRef(0);
   const startupRunLoopRef = useRef(false);
   const actionAbortRefs = useRef(new Map<string, AbortController>());
+  const appliedDurableEventIdsRef = useRef(new Set<string>());
 
   const [revision, setRevision] = useState(0);
   const [connection, setConnection] = useState<TeamLiveConnectionState>(() => ({ status: "connecting" }));
@@ -94,6 +107,14 @@ export function useTeamLiveRuntime(input: UseTeamLiveRuntimeInput): TeamLiveRunt
     if (!mountedRef.current) return;
     setConnection(state);
     setMessage(nextMessage);
+  }, []);
+
+  const applyEventOnce = useCallback((event: ChiliEvent): boolean => {
+    const durable = !isTransientEvent(event);
+    if (durable && appliedDurableEventIdsRef.current.has(event.id)) return false;
+    applyRuntimeEvent(runtimeViewRef.current, event);
+    if (durable) appliedDurableEventIdsRef.current.add(event.id);
+    return true;
   }, []);
 
   const startStream = useCallback((status: TeamLiveConnectionState["status"]) => {
@@ -111,15 +132,23 @@ export function useTeamLiveRuntime(input: UseTeamLiveRuntimeInput): TeamLiveRunt
         const request = teamLiveStreamInput(options, controller.signal, lastEventId);
         for await (const event of client.streamEvents(request)) {
           if (!mountedRef.current || controller.signal.aborted || version !== streamVersionRef.current) return;
-          applyRuntimeEvent(runtimeViewRef.current, event);
+          const applied = applyEventOnce(event);
           setConnection(connectionState("streaming", undefined, runtimeViewRef.current.lastEventId));
           setMessage(`last event: ${event.type}`);
-          setRevision((current) => current + 1);
+          if (applied) setRevision((current) => current + 1);
         }
         if (!mountedRef.current || controller.signal.aborted || version !== streamVersionRef.current) return;
         setSafeConnection(connectionState("offline", undefined, runtimeViewRef.current.lastEventId), "stream ended");
       } catch (error) {
         if (!mountedRef.current || controller.signal.aborted || version !== streamVersionRef.current) return;
+        if (isEventCursorResyncRequiredError(error)) {
+          runtimeViewRef.current = createRuntimeView();
+          appliedDurableEventIdsRef.current.clear();
+          setRevision((current) => current + 1);
+          setSafeConnection(connectionState("reconnecting", undefined, undefined), "resyncing event stream");
+          startStream("reconnecting");
+          return;
+        }
         const messageText = toError(error).message;
         setSafeConnection(connectionState("error", messageText, runtimeViewRef.current.lastEventId), messageText);
         reconnectTimerRef.current = setTimeout(() => {
@@ -127,27 +156,43 @@ export function useTeamLiveRuntime(input: UseTeamLiveRuntimeInput): TeamLiveRunt
         }, 1500);
       }
     })();
-  }, [client, options, setSafeConnection]);
+  }, [applyEventOnce, client, options, setSafeConnection]);
 
   const reconnect = useCallback(() => {
     setActionFeedback(undefined);
     startStream("reconnecting");
   }, [startStream]);
 
+  const hydrateEvents = useCallback((events: readonly ChiliEvent[]) => {
+    const liveCursor = runtimeViewRef.current.lastEventId;
+    let applied = false;
+    for (const event of events) applied = applyEventOnce(event) || applied;
+    if (liveCursor) runtimeViewRef.current.lastEventId = liveCursor;
+    if (applied) setRevision((current) => current + 1);
+  }, [applyEventOnce]);
+
+  const resolveActionAuthority = useCallback((): TeamLiveActionAuthority => {
+    if (resolveActionAuthorityOverride) return resolveActionAuthorityOverride();
+    return {
+      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+    };
+  }, [options.cwd, options.sessionId, resolveActionAuthorityOverride]);
+
   const runTeamLoop = useCallback((teamId: TeamId, signal?: AbortSignal) => {
+    const authority = resolveActionAuthority();
     const request: RunTeamLoopRequest = {
       teamId,
       once: options.once,
     };
-    if (options.sessionId) request.sessionId = options.sessionId;
-    if (options.threadId) request.threadId = options.threadId;
-    if (options.cwd) request.cwd = options.cwd;
+    if (authority.sessionId) request.sessionId = authority.sessionId;
+    if (authority.cwd) request.cwd = authority.cwd;
     if (options.maxCycles !== undefined) request.maxCycles = options.maxCycles;
     if (options.timeoutMs !== undefined) request.timeoutMs = options.timeoutMs;
     if (options.pollIntervalMs !== undefined) request.pollIntervalMs = options.pollIntervalMs;
     if (signal) request.signal = signal;
     return client.runTeamLoop(request);
-  }, [client, options.cwd, options.maxCycles, options.once, options.pollIntervalMs, options.sessionId, options.threadId, options.timeoutMs]);
+  }, [client, options.maxCycles, options.once, options.pollIntervalMs, options.timeoutMs, resolveActionAuthority]);
 
   const executeAction = useCallback((action: TeamLiveAction) => {
     const key = actionKey(action);
@@ -167,7 +212,7 @@ export function useTeamLiveRuntime(input: UseTeamLiveRuntimeInput): TeamLiveRunt
 
     void (async () => {
       try {
-        await callAction(client, action, options, runTeamLoop, controller?.signal);
+        await callAction(client, action, resolveActionAuthority(), runTeamLoop, controller?.signal);
         if (!mountedRef.current) return;
         setActionFeedback({ key, type: action.type, status: "success", message: successMessage(action) });
       } catch (error) {
@@ -177,7 +222,7 @@ export function useTeamLiveRuntime(input: UseTeamLiveRuntimeInput): TeamLiveRunt
         actionAbortRefs.current.delete(key);
       }
     })();
-  }, [client, options, runTeamLoop]);
+  }, [client, resolveActionAuthority, runTeamLoop]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -230,7 +275,8 @@ export function useTeamLiveRuntime(input: UseTeamLiveRuntimeInput): TeamLiveRunt
     reconnect,
     executeAction,
     clearActionFeedback: () => setActionFeedback(undefined),
-  }), [actionFeedback, connection, executeAction, message, reconnect, revision]);
+    hydrateEvents,
+  }), [actionFeedback, connection, executeAction, hydrateEvents, message, reconnect, revision]);
 }
 
 export function teamLiveModel(
@@ -272,7 +318,7 @@ function connectionState(
 async function callAction(
   client: HttpRuntimeClient,
   action: TeamLiveAction,
-  options: TeamLiveTuiOptions,
+  authority: TeamLiveActionAuthority,
   runTeamLoop: (teamId: TeamId, signal?: AbortSignal) => Promise<unknown>,
   signal: AbortSignal | undefined,
 ): Promise<unknown> {
@@ -288,9 +334,8 @@ async function callAction(
   if (action.type === "merge") {
     const request: MergeTeamTasksRequest = { teamId: requireTeamId(action.teamId, action.type) };
     if (action.taskId) request.taskId = action.taskId;
-    if (options.sessionId) request.sessionId = options.sessionId;
-    if (options.threadId) request.threadId = options.threadId;
-    if (options.cwd) request.cwd = options.cwd;
+    if (authority.sessionId) request.sessionId = authority.sessionId;
+    if (authority.cwd) request.cwd = authority.cwd;
     if (signal) request.signal = signal;
     return client.mergeTeamTasks(request);
   }

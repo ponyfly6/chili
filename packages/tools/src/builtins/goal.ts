@@ -1,10 +1,10 @@
-import type { ThreadGoal, ThreadGoalStatus, ToolResult } from "@chili/protocol";
+import type { SessionGoal, SessionGoalStatus, ToolResult } from "@chili/protocol";
 import type { ChiliToolDefinition, ChiliToolExecutionContext, ValidationResult } from "../types.js";
 
 export interface GoalToolController {
-  getGoal(context: ChiliToolExecutionContext): Promise<ThreadGoal | undefined>;
-  createGoal(input: GoalCreateToolInput, context: ChiliToolExecutionContext): Promise<ThreadGoal>;
-  updateGoal(input: GoalUpdateToolInput, context: ChiliToolExecutionContext): Promise<ThreadGoal>;
+  getGoal(context: ChiliToolExecutionContext): Promise<SessionGoal | undefined>;
+  createGoal(input: GoalCreateToolInput, context: ChiliToolExecutionContext): Promise<SessionGoal>;
+  updateGoal(input: GoalUpdateToolInput, context: ChiliToolExecutionContext): Promise<SessionGoal>;
 }
 
 export interface GoalCreateToolInput {
@@ -13,7 +13,7 @@ export interface GoalCreateToolInput {
 }
 
 export interface GoalUpdateToolInput {
-  status: Extract<ThreadGoalStatus, "complete">;
+  status: Extract<SessionGoalStatus, "complete">;
   summary?: string;
 }
 
@@ -28,7 +28,7 @@ export function createGoalTools(controller: GoalToolController): ChiliToolDefini
 export function createGetGoalTool(controller: GoalToolController): ChiliToolDefinition<Record<string, never>, ToolResult> {
   return {
     name: "get_goal",
-    description: "Read the persistent goal for this thread, including status, budget, and usage.",
+    description: "Read the persistent goal for this session, including status, budget, and usage.",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -48,7 +48,7 @@ export function createCreateGoalTool(controller: GoalToolController): ChiliToolD
   return {
     name: "create_goal",
     description:
-      "Create a persistent goal only when the user explicitly asks for one. Fails if a goal already exists for the thread.",
+      "Create a persistent goal only when the user explicitly asks for one. Fails if a goal already exists for the session.",
     risk: "write",
     inputSchema: {
       type: "object",

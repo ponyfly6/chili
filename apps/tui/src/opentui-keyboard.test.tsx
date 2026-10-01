@@ -4,10 +4,11 @@ import path from "node:path";
 import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act, useState, type Dispatch, type SetStateAction } from "react";
-import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, ChiliEvent, MessageId, PartId, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type RuntimeSessionSummary, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
+import type { ApprovalId, ChiliEvent, MessageId, PartId, RuntimeCommandCatalog, RuntimeModelDescriptor, SessionId, TaskId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import type { ClipboardAccess } from "./clipboard.js";
-import { CTRL_C_EXIT_CONFIRM_MS, ChatShellApp, ChatShellSurface, isWithinCtrlCExitWindow, type ChatShellExitInfo } from "./ChatShellApp.js";
+import { CONVERSATION_INTERRUPTED_NOTICE, CTRL_C_EXIT_CONFIRM_MS, ChatShellApp, ChatShellSurface, isWithinCtrlCExitWindow, type ChatShellExitInfo } from "./ChatShellApp.js";
+import { PROMPT_PLACEHOLDER } from "./chat/PromptComposer.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatApproveOptions, ChatRuntimeState } from "./useChatRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
@@ -33,7 +34,6 @@ test("plain prompt creates a session and submits through the runtime client", as
     expect(records.create[0]?.signal).toBeInstanceOf(AbortSignal);
     expect(records.submit[0]).toMatchObject({
       sessionId: "session_created",
-      threadId: "thread_created",
       text: "fix failing tests",
       cwd: "/repo/chili",
     });
@@ -192,12 +192,12 @@ test("bang prompt switches the composer into shell mode while typing", async () 
   }
 });
 
-test("resume session and thread submit without creating a new session", async () => {
+test("resume session submits without creating a new session", async () => {
   const records = chatClientRecords();
-  const client = fakeChatClient(records);
+  const sessionId = "session_resume" as SessionId;
+  const client = fakeChatClient(records, [], { sessions: [runtimeSessionSummary(sessionId)] });
   const app = await mountChatApp(client, {
-    sessionId: "session_resume" as SessionId,
-    threadId: "thread_resume" as ThreadId,
+    sessionId,
   });
 
   try {
@@ -209,53 +209,263 @@ test("resume session and thread submit without creating a new session", async ()
     expect(records.create).toHaveLength(0);
     expect(records.submit).toHaveLength(1);
     expect(records.submit[0]).toMatchObject({
-      sessionId: "session_resume",
-      threadId: "thread_resume",
+      sessionId,
       text: "continue",
     });
+    expect(records.sessionLifecycle.slice(0, 2)).toEqual(["list", `events:${sessionId}`]);
   } finally {
     app.renderer.destroy();
   }
 });
 
-test("resume session and thread hydrate the chat stream with scoped history", async () => {
-  const records = chatClientRecords();
-  const client = fakeChatClient(records);
-  const app = await mountChatApp(client, {
-    sessionId: "session_resume" as SessionId,
-    threadId: "thread_resume" as ThreadId,
+for (const scenario of [
+  {
+    name: "missing",
+    sessionId: "session_missing" as SessionId,
+    sessions: [] as RuntimeSessionSummary[],
+    error: "Saved chat not found: session_missing",
+  },
+  {
+    name: "archived",
+    sessionId: "session_archived" as SessionId,
+    sessions: [runtimeSessionSummary("session_archived" as SessionId, { status: "archived" as const })],
+    error: "Session session_archived is archived and cannot be resumed.",
+  },
+  {
+    name: "subagent",
+    sessionId: "session_subagent" as SessionId,
+    sessions: [runtimeSessionSummary("session_subagent" as SessionId, { source: "subagent" as const })],
+    error: "Session session_subagent belongs to a subagent and cannot be resumed directly.",
+  },
+] as const) {
+  test(`exact resume rejects a ${scenario.name} session before hydration`, async () => {
+    const records = chatClientRecords();
+    const client = fakeChatClient(records, [], { sessions: scenario.sessions });
+    const app = await mountChatApp(client, { sessionId: scenario.sessionId });
+
+    try {
+      await Bun.sleep(80);
+      await app.renderOnce();
+
+      expect(records.listSessions).toHaveLength(1);
+      expect(records.sessionEvents).toHaveLength(0);
+      expect(records.create).toHaveLength(0);
+      expect(records.submit).toHaveLength(0);
+      expect(app.captureCharFrame()).toContain(scenario.error);
+
+      await typeText(app, "start a safe replacement chat");
+      await press(app, () => app.mockInput.pressEnter());
+      await Bun.sleep(80);
+      await app.renderOnce();
+
+      expect(records.create).toHaveLength(1);
+      expect(records.submit[0]).toMatchObject({
+        sessionId: "session_created",
+        text: "start a safe replacement chat",
+      });
+    } finally {
+      app.renderer.destroy();
+    }
   });
+}
+
+test("manual resume revalidates the selected session before hydration", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_became_archived" as SessionId;
+  const active = runtimeSessionSummary(sessionId, { title: "About to archive" });
+  const archived = { ...active, status: "archived" as const };
+  const client = fakeChatClient(records, [], {
+    sessionLists: [[active], [archived]],
+  });
+  const app = await mountChatApp(client);
+
+  try {
+    await typeText(app, `/session resume ${sessionId}`);
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.listSessions).toHaveLength(2);
+    expect(records.sessionEvents).toHaveLength(0);
+    expect(records.create).toHaveLength(0);
+    expect(records.submit).toHaveLength(0);
+    expect(app.captureCharFrame()).toContain(`Session ${sessionId} is archived and cannot be resumed.`);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("resumed prompts submit the persisted session workspace instead of the local cwd", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_authoritative_workspace" as SessionId;
+  const client = fakeChatClient(records, [{
+    id: "event_authoritative_workspace",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/server/persisted-workspace" },
+  }]);
+  const app = await mountChatApp(client, { sessionId });
 
   try {
     await Bun.sleep(80);
     await app.renderOnce();
+    await typeText(app, "continue in the same workspace");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
 
-    expect(records.stream[0]).toMatchObject({
-      sessionId: "session_resume",
-      threadId: "thread_resume",
+    expect(records.create).toHaveLength(0);
+    expect(records.submit[0]).toMatchObject({
+      sessionId,
+      cwd: "/server/persisted-workspace",
     });
   } finally {
     app.renderer.destroy();
   }
 });
 
-test("resume session without a thread blocks submit without creating a new session", async () => {
+test("resumed runtime commands submit canonical commandId without a thread field", async () => {
   const records = chatClientRecords();
-  const client = fakeChatClient(records);
+  const sessionId = "session_runtime_command_http" as SessionId;
+  const commandCatalog: RuntimeCommandCatalog = {
+    roots: [{
+      id: "prompt.project",
+      name: "project",
+      path: "/project",
+      title: "Project prompts",
+      description: "Project prompt namespace",
+      group: "prompt",
+      source: "project",
+      argumentMode: "none",
+      argumentHint: "",
+      selectionMode: "drilldown",
+      concurrency: "allow",
+      hidden: false,
+      enabled: true,
+      executionTarget: "prompt",
+      children: [{
+        id: "prompt.project.review",
+        name: "review",
+        path: "/project review",
+        title: "Review",
+        description: "Review code",
+        group: "prompt",
+        source: "project",
+        argumentMode: "variadic",
+        argumentHint: "[files]",
+        selectionMode: "execute",
+        concurrency: "allow",
+        hidden: false,
+        enabled: true,
+        executionTarget: "prompt",
+        children: [],
+      }],
+    }],
+    diagnostics: [],
+  };
+  const client = fakeChatClient(records, [{
+    id: "event_runtime_command_workspace",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/server/runtime-command-workspace" },
+  }], { commandCatalog });
+  const app = await mountChatApp(client, { sessionId });
+
+  try {
+    await Bun.sleep(80);
+    await app.renderOnce();
+    await typeText(app, "/project review src/index.ts");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.create).toHaveLength(0);
+    expect(records.submit[0]).toMatchObject({
+      sessionId,
+      commandId: "prompt.project.review",
+      args: "src/index.ts",
+      cwd: "/server/runtime-command-workspace",
+    });
+    expect(records.submit[0]).not.toHaveProperty("name");
+    expect(records.submit[0]).not.toHaveProperty("threadId");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("active sessions scope command catalog discovery and reload without a client cwd", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_command_catalog" as SessionId;
+  const client = fakeChatClient(records, [{
+    id: "event_command_catalog_session",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/server/catalog-workspace" },
+  }]);
+  const app = await mountChatApp(client, { sessionId });
+
+  try {
+    await Bun.sleep(80);
+    await app.renderOnce();
+    expect(records.listCommands.length).toBeGreaterThan(0);
+    expect(records.listCommands.some((input) => input.sessionId === sessionId)).toBe(true);
+    expect(records.listCommands.at(-1)).toMatchObject({ sessionId });
+    expect(records.listCommands.every((input) => !("cwd" in input))).toBe(true);
+
+    await typeText(app, "/commands reload");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.reloadCommands).toHaveLength(1);
+    expect(records.reloadCommands[0]).toMatchObject({ sessionId });
+    expect(records.reloadCommands[0]).not.toHaveProperty("cwd");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("resumed chat keeps the stream global so /session resume can switch sessions", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_resume" as SessionId;
+  const client = fakeChatClient(records, [], { sessions: [runtimeSessionSummary(sessionId)] });
   const app = await mountChatApp(client, {
-    sessionId: "session_resume_missing_thread" as SessionId,
+    sessionId,
   });
 
   try {
     await Bun.sleep(80);
     await app.renderOnce();
-    expect(app.captureCharFrame()).toContain("Session resume needs a thread");
 
+    expect(records.stream[0]?.sessionId).toBeUndefined();
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("resume session with empty history still submits without creating a new session", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_resume_empty_history" as SessionId;
+  const client = fakeChatClient(records, [], { sessions: [runtimeSessionSummary(sessionId)] });
+  const app = await mountChatApp(client, {
+    sessionId,
+  });
+
+  try {
     await typeText(app, "continue");
     await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
 
     expect(records.create).toHaveLength(0);
-    expect(records.submit).toHaveLength(0);
+    expect(records.submit).toHaveLength(1);
+    expect(records.submit[0]).toMatchObject({
+      sessionId,
+      text: "continue",
+    });
   } finally {
     app.renderer.destroy();
   }
@@ -264,7 +474,6 @@ test("resume session without a thread blocks submit without creating a new sessi
 test("default chat ignores streamed history and starts a new session", async () => {
   const records = chatClientRecords();
   const sessionId = "session_streamed" as SessionId;
-  const threadId = "thread_streamed" as ThreadId;
   const messageId = "msg_streamed" as MessageId;
   const partId = "part_streamed" as PartId;
   const client = fakeChatClient(records, [
@@ -273,7 +482,6 @@ test("default chat ignores streamed history and starts a new session", async () 
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo/chili" },
     },
     {
@@ -281,7 +489,6 @@ test("default chat ignores streamed history and starts a new session", async () 
       type: "message.created",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId, role: "assistant" },
     },
     {
@@ -289,7 +496,6 @@ test("default chat ignores streamed history and starts a new session", async () 
       type: "message.part_added",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId,
         part: { id: partId, messageId, sessionId, type: "text", text: "old streamed answer" },
@@ -312,7 +518,6 @@ test("default chat ignores streamed history and starts a new session", async () 
     expect(records.create).toHaveLength(1);
     expect(records.submit[0]).toMatchObject({
       sessionId: "session_created",
-      threadId: "thread_created",
       text: "start fresh",
     });
   } finally {
@@ -320,7 +525,7 @@ test("default chat ignores streamed history and starts a new session", async () 
   }
 });
 
-test("/new starts a fresh runtime session for following prompts", async () => {
+test("/session new starts a fresh runtime session for following prompts", async () => {
   const records = chatClientRecords();
   const client = fakeChatClient(records);
   const app = await mountChatApp(client);
@@ -334,11 +539,12 @@ test("/new starts a fresh runtime session for following prompts", async () => {
     expect(records.create).toHaveLength(1);
     expect(records.submit[0]).toMatchObject({
       sessionId: "session_created",
-      threadId: "thread_created",
       text: "first session",
     });
 
-    await typeText(app, "/new");
+    await typeText(app, "/session new");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("right"));
     await press(app, () => app.mockInput.pressEnter());
     await Bun.sleep(80);
     await app.renderOnce();
@@ -352,9 +558,206 @@ test("/new starts a fresh runtime session for following prompts", async () => {
 
     expect(records.submit[1]).toMatchObject({
       sessionId: "session_created_2",
-      threadId: "thread_created_2",
       text: "second session",
     });
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("fresh home keeps its standalone Chili title while typing slash and ordinary drafts", async () => {
+  for (const draft of ["ordinary draft", "/mod"]) {
+    const app = await mountShell(teamLiveFixture());
+
+    try {
+      expect(hasStandaloneChiliTitle(app.captureCharFrame())).toBe(true);
+
+      await typeText(app, draft);
+
+      const frame = app.captureCharFrame();
+      expect(frame).toContain(draft);
+      expect(hasStandaloneChiliTitle(frame)).toBe(true);
+    } finally {
+      app.renderer.destroy();
+    }
+  }
+});
+
+test("an explicitly resumed empty session starts in the session layout", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      activeSessionId: "session_resumed_empty" as SessionId,
+    },
+  });
+
+  try {
+    expect(hasStandaloneChiliTitle(app.captureCharFrame())).toBe(false);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("expired /model notice keeps an empty session draft and caret in the session composer", async () => {
+  const noticeTtlMs = 500;
+  let finishModelSelection: ((persisted: boolean) => void) | undefined;
+  const modelPersisted = new Promise<boolean>((resolve) => {
+    finishModelSelection = resolve;
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    localMessageTtlMs: noticeTtlMs,
+    runtime: {
+      modelCandidates: [{ provider: "test-provider", model: "test-model" }],
+      setRuntimeModel: () => modelPersisted,
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressEscape());
+
+    let frame = app.captureCharFrame();
+    expect(frame).not.toContain("Model: test-provider/test-model");
+    expect(hasStandaloneChiliTitle(frame)).toBe(false);
+
+    await typeText(app, "caret");
+    await press(app, () => app.mockInput.pressArrow("left"));
+    const promptY = frameTextPosition(app.captureCharFrame(), "caret").y;
+
+    await act(async () => {
+      finishModelSelection?.(true);
+      await Promise.resolve();
+    });
+    await app.renderOnce();
+
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Model: test-provider/test-model");
+    expect(frame).toContain("caret");
+    expect(hasStandaloneChiliTitle(frame)).toBe(false);
+    expect(frameTextPosition(frame, "caret").y).toBe(promptY);
+
+    await act(async () => {
+      await Bun.sleep(noticeTtlMs + 150);
+    });
+    await app.renderOnce();
+
+    frame = app.captureCharFrame();
+    expect(frame).not.toContain("Model: test-provider/test-model");
+    expect(frame).toContain("caret");
+    expect(hasStandaloneChiliTitle(frame)).toBe(false);
+    expect(frameTextPosition(frame, "caret").y).toBe(promptY);
+
+    await typeText(app, "X");
+    expect(app.captureCharFrame()).toContain("careXt");
+
+    await press(app, () => app.mockInput.pressArrow("right"));
+    await backspace(app, "careXt".length);
+    frame = app.captureCharFrame();
+    expect(frame).not.toContain("careXt");
+    expect(frame).toContain("Ask anything");
+    expect(hasStandaloneChiliTitle(frame)).toBe(false);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/thinking effort enters the session layout and /session new stably restores Home while it starts", async () => {
+  const noticeTtlMs = 500;
+  let finishNewSession: (() => void) | undefined;
+  const newSessionStarted = new Promise<void>((resolve) => {
+    finishNewSession = resolve;
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    localMessageTtlMs: noticeTtlMs,
+    runtime: {
+      setRuntimeReasoning: async () => true,
+      startNewSession: () => newSessionStarted,
+    },
+  });
+
+  try {
+    await typeText(app, "/thinking effort low");
+    await press(app, () => app.mockInput.pressEnter());
+
+    let frame = app.captureCharFrame();
+    expect(frame).toContain("Thinking: low");
+    expect(hasStandaloneChiliTitle(frame)).toBe(false);
+
+    await act(async () => {
+      await Bun.sleep(noticeTtlMs + 150);
+    });
+    await app.renderOnce();
+
+    frame = app.captureCharFrame();
+    expect(frame).not.toContain("Thinking: low");
+    expect(hasStandaloneChiliTitle(frame)).toBe(false);
+
+    await typeText(app, "/session new");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("right"));
+    await press(app, () => app.mockInput.pressEnter());
+
+    frame = app.captureCharFrame();
+    expect(hasStandaloneChiliTitle(frame)).toBe(true);
+
+    await typeText(app, "new session draft");
+    const promptY = frameTextPosition(app.captureCharFrame(), "new session draft").y;
+    await act(async () => {
+      finishNewSession?.();
+      await Promise.resolve();
+    });
+    await app.renderOnce();
+
+    frame = app.captureCharFrame();
+    expect(frame).toContain("new session draft");
+    expect(hasStandaloneChiliTitle(frame)).toBe(true);
+    expect(frameTextPosition(frame, "new session draft").y).toBe(promptY);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("a stale /model completion cannot move a new-session draft out of Home", async () => {
+  let finishModelSelection: ((persisted: boolean) => void) | undefined;
+  const modelPersisted = new Promise<boolean>((resolve) => {
+    finishModelSelection = resolve;
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: [{ provider: "test-provider", model: "test-model" }],
+      setRuntimeModel: () => modelPersisted,
+      startNewSession: async () => {},
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressEscape());
+    expect(app.captureCharFrame()).toContain("Ask anything");
+    expect(hasStandaloneChiliTitle(app.captureCharFrame())).toBe(false);
+
+    await typeText(app, "/session new");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("right"));
+    await press(app, () => app.mockInput.pressEnter());
+    expect(hasStandaloneChiliTitle(app.captureCharFrame())).toBe(true);
+
+    await typeText(app, "new session draft");
+    const promptY = frameTextPosition(app.captureCharFrame(), "new session draft").y;
+    await act(async () => {
+      finishModelSelection?.(true);
+      await Promise.resolve();
+    });
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(frame).not.toContain("Model: test-provider/test-model");
+    expect(frame).toContain("new session draft");
+    expect(hasStandaloneChiliTitle(frame)).toBe(true);
+    expect(frameTextPosition(frame, "new session draft").y).toBe(promptY);
   } finally {
     app.renderer.destroy();
   }
@@ -384,13 +787,147 @@ test("running session blocks a second prompt submit", async () => {
     await press(app, () => app.mockInput.pressEnter());
 
     expect(submitted).toHaveLength(0);
-    expect(app.captureCharFrame()).toContain("Session running - ctrl+x interrupt");
+    expect(app.captureCharFrame()).toContain("Ctrl+X to interrupt");
   } finally {
     app.renderer.destroy();
   }
 });
 
-test("/clear clears local TUI notices and resets prompt history", async () => {
+test("Escape restores an output-free interrupted prompt for editing", async () => {
+  const submitted: string[] = [];
+  let resolveFirstSubmit: ((accepted: boolean) => void) | undefined;
+  let interrupted = 0;
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        if (submitted.length === 1) {
+          return new Promise<boolean>((resolve) => {
+            resolveFirstSubmit = resolve;
+          });
+        }
+        return true;
+      },
+      interruptActiveSession: async () => {
+        interrupted += 1;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "hi");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(submitted).toEqual(["hi"]);
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        canSubmit: false,
+        chatView: {
+          ...current.chatView,
+          status: "running",
+          items: [chatTextMessage("msg_interrupt_user", "user", "hi", 1)],
+        },
+      }));
+    });
+    await app.renderOnce();
+
+    await press(app, () => app.mockInput.pressEscape());
+    expect(interrupted).toBe(1);
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        canSubmit: true,
+        chatView: {
+          ...current.chatView,
+          status: "cancelled",
+          items: [],
+        },
+      }));
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    const restoredFrame = app.captureCharFrame();
+    expect(restoredFrame).toContain("hi");
+    expect(restoredFrame).not.toContain(CONVERSATION_INTERRUPTED_NOTICE);
+
+    resolveFirstSubmit?.(true);
+    await Bun.sleep(60);
+    await app.renderOnce();
+    expect(app.captureCharFrame()).toContain("hi");
+
+    await typeText(app, " there");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(submitted).toEqual(["hi", "hi there"]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Escape keeps visible output and adds a persistent red interruption notice", async () => {
+  let interrupted = 0;
+  const interruptedItems = [
+    chatTextMessage("msg_interrupt_visible_user", "user", "explain", 1),
+    chatTextMessage("msg_interrupt_visible_assistant", "assistant", "partial answer", 2),
+  ];
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+      interruptActiveSession: async () => {
+        interrupted += 1;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "explain");
+    await press(app, () => app.mockInput.pressEnter());
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        canSubmit: false,
+        chatView: {
+          ...current.chatView,
+          status: "running",
+          items: interruptedItems,
+        },
+      }));
+    });
+    await app.renderOnce();
+
+    await press(app, () => app.mockInput.pressEscape());
+    expect(interrupted).toBe(1);
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        canSubmit: true,
+        chatView: {
+          ...current.chatView,
+          status: "cancelled",
+          items: interruptedItems,
+        },
+      }));
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("partial answer");
+    expect(frame).toContain(CONVERSATION_INTERRUPTED_NOTICE);
+    expect(frame).not.toContain(`error: ${CONVERSATION_INTERRUPTED_NOTICE}`);
+    expect(frame.match(/explain/g)).toHaveLength(1);
+    const noticePosition = frameTextPosition(frame, CONVERSATION_INTERRUPTED_NOTICE);
+    expect(foregroundMatches(app, noticePosition.x, noticePosition.y, chiliDarkTheme.colors.status.error)).toBe(true);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/session new clears local TUI notices and resets prompt history", async () => {
   const submitted: string[] = [];
   let started = 0;
   const clipboard = fakeClipboard({
@@ -417,7 +954,9 @@ test("/clear clears local TUI notices and resets prompt history", async () => {
     await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
     expect(app.captureCharFrame()).toContain("Clipboard is empty.");
 
-    await typeText(app, "/clear");
+    await typeText(app, "/session new");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("right"));
     await press(app, () => app.mockInput.pressEnter());
 
     expect(started).toBe(1);
@@ -494,16 +1033,37 @@ test("slash completion selection uses Up and Down without switching prompt histo
   try {
     await typeText(app, "history prompt");
     await press(app, () => app.mockInput.pressEnter());
-    await typeText(app, "/");
+    await typeText(app, "/team ");
 
-    expect(app.captureCharFrame()).toContain("> /team - Open the team cockpit");
+    expect(app.captureCharFrame()).toContain("> /team agents — Show the agent tree");
 
     await press(app, () => app.mockInput.pressArrow("down"));
-    expect(app.captureCharFrame()).toContain("> /team run - Start the selected team loop");
+    expect(app.captureCharFrame()).toContain("> /team run — Start the selected team loop");
     expect(app.captureCharFrame()).not.toContain("history prompt");
 
     await press(app, () => app.mockInput.pressArrow("up"));
-    expect(app.captureCharFrame()).toContain("> /team - Open the team cockpit");
+    expect(app.captureCharFrame()).toContain("> /team agents — Show the agent tree");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("slash completion visits thinking after model", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "/");
+    for (let index = 0; index < 4; index += 1) {
+      await press(app, () => app.mockInput.pressArrow("down"));
+    }
+    expect(app.captureCharFrame()).toContain("> /model — Configure the active model");
+
+    await press(app, () => app.mockInput.pressArrow("down"));
+    expect(app.captureCharFrame()).toContain("> /thinking — Configure reasoning and traces");
   } finally {
     app.renderer.destroy();
   }
@@ -517,10 +1077,10 @@ test("slash completion Up wraps from the first item to the last item", async () 
   });
 
   try {
-    await typeText(app, "/");
+    await typeText(app, "/team ");
 
     await press(app, () => app.mockInput.pressArrow("up"));
-    expect(app.captureCharFrame()).toContain("> /skills disable [--user|--project] <name> - Disable a skill");
+    expect(app.captureCharFrame()).toContain("> /team merge — Merge pending team work");
   } finally {
     app.renderer.destroy();
   }
@@ -531,12 +1091,30 @@ test("Enter executes the selected slash completion without Tab", async () => {
   const app = await mountShell(withRunLoopReady(teamLiveFixture()), { executed });
 
   try {
-    await typeText(app, "/");
+    await typeText(app, "/team ");
     await press(app, () => app.mockInput.pressArrow("down"));
     await press(app, () => app.mockInput.pressEnter());
 
     expect(executed).toEqual([expect.objectContaining({ type: "run_loop" })]);
     expect(app.captureCharFrame()).not.toContain("Unknown command");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Enter completes a required-argument leaf and waits for its argument", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await typeText(app, "/model ");
+    expect(app.captureCharFrame()).toContain("> /model select <provider/model>");
+
+    await press(app, () => app.mockInput.pressEnter());
+    const frame = app.captureCharFrame();
+
+    expect(frame).toContain("/model select ");
+    expect(frame).not.toContain("Incomplete command");
+    expect(frame).not.toContain("Choose a model");
   } finally {
     app.renderer.destroy();
   }
@@ -552,18 +1130,18 @@ test("slash completion keeps the input visible in a short frame", async () => {
   });
 
   try {
-    await typeText(app, "/");
+    await typeText(app, "/te");
     const frame = app.captureCharFrame();
 
     expect(frame).toContain("Commands");
     expect(frame).toContain("/team");
-    expect(frame).toContain("> /");
+    expect(frame).toContain("> /te");
   } finally {
     app.renderer.destroy();
   }
 });
 
-test("Tab accepts slash completion without leaving the completion list open", async () => {
+test("Tab drills into a command namespace without executing it", async () => {
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
       submitPrompt: async () => true,
@@ -571,15 +1149,15 @@ test("Tab accepts slash completion without leaving the completion list open", as
   });
 
   try {
-    await typeText(app, "/");
-    expect(app.captureCharFrame()).toContain("Open the team cockpit");
+    await typeText(app, "/tea");
+    expect(app.captureCharFrame()).toContain("Inspect and control agent teamwork");
 
     await press(app, () => app.mockInput.pressTab());
     const frame = app.captureCharFrame();
 
     expect(frame).toContain("/team ");
-    expect(frame).not.toContain("Open the team cockpit");
-    expect(frame).not.toContain("Start the selected team loop");
+    expect(frame).toContain("/team agents");
+    expect(frame).toContain("/team run");
   } finally {
     app.renderer.destroy();
   }
@@ -594,13 +1172,31 @@ test("Tab accepts the strongest slash completion for a typed prefix", async () =
 
   try {
     await typeText(app, "/mo");
-    expect(app.captureCharFrame()).toContain("> /model [provider/model] - Select model");
+    expect(app.captureCharFrame()).toContain("> /model — Configure the active model");
 
     await press(app, () => app.mockInput.pressTab());
     const frame = app.captureCharFrame();
 
     expect(frame).toContain("/model ");
-    expect(frame).not.toContain("/commands reload ");
+    expect(frame).toContain("/model select <provider/model>");
+    expect(frame).toContain("/model service <standard|fast>");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Right drills into a command namespace without executing it", async () => {
+  const executed: TeamLiveAction[] = [];
+  const app = await mountShell(withRunLoopReady(teamLiveFixture()), { executed });
+
+  try {
+    await typeText(app, "/tea");
+    await press(app, () => app.mockInput.pressArrow("right"));
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("/team ");
+    expect(frame).toContain("/team run");
+    expect(executed).toEqual([]);
   } finally {
     app.renderer.destroy();
   }
@@ -828,7 +1424,7 @@ test("/mcp reload refreshes MCP config and prompt commands", async () => {
       },
       reloadCommands: async () => {
         calls.push("commands");
-        return { commands: [], diagnostics: [], directories: [], skippedConflicts: [] };
+        return { roots: [], diagnostics: [] };
       },
     },
   });
@@ -844,6 +1440,64 @@ test("/mcp reload refreshes MCP config and prompt commands", async () => {
     expect(frame).toContain("MCP reloaded: yes servers=0 errors=1");
     expect(frame).toContain("error bad: config failed");
     expect(frame).toContain("Prompt commands refreshed.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("nested runtime commands submit their canonical commandId in the current session", async () => {
+  const submissions: Array<{ commandId: string; args: string }> = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      activeSessionId: "session_runtime_command" as SessionId,
+      commandList: {
+        roots: [{
+          id: "prompt.project",
+          name: "project",
+          path: "/project",
+          title: "Project prompts",
+          description: "Project prompt namespace",
+          group: "prompt",
+          source: "project",
+          argumentMode: "none",
+          argumentHint: "",
+          selectionMode: "drilldown",
+          concurrency: "allow",
+          hidden: false,
+          enabled: true,
+          executionTarget: "prompt",
+          children: [{
+            id: "prompt.project.review",
+            name: "review",
+            path: "/project review",
+            title: "Review",
+            description: "Review code",
+            group: "prompt",
+            source: "project",
+            argumentMode: "variadic",
+            argumentHint: "[files]",
+            selectionMode: "execute",
+            concurrency: "allow",
+            hidden: false,
+            enabled: true,
+            executionTarget: "prompt",
+            children: [],
+          }],
+        }],
+        diagnostics: [],
+      },
+      submitCommand: async (commandId, args) => {
+        submissions.push({ commandId, args });
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/project review src/index.ts");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(submissions).toEqual([{ commandId: "prompt.project.review", args: "src/index.ts" }]);
   } finally {
     app.renderer.destroy();
   }
@@ -898,8 +1552,8 @@ test("$ skill picker distinguishes duplicate names with source and path hints", 
   try {
     await typeText(app, "$same");
     const frame = app.captureCharFrame();
-    expect(frame).toContain("> $same - user /home/.chili/skills/same");
-    expect(frame).toContain("  $same - project /repo/.chili/skills/same");
+    expect(frame).toContain("> $same — user /home/.chili/skills/same");
+    expect(frame).toContain("  $same — project /repo/.chili/skills/same");
   } finally {
     app.renderer.destroy();
   }
@@ -982,7 +1636,7 @@ test("manual ambiguous skill mention warns locally without picker binding", asyn
     await press(app, () => app.mockInput.pressEnter());
 
     expect(submissions).toEqual(["$same please"]);
-    expect(app.captureCharFrame()).toContain("Skill $same is ambiguous; select it from /skills so Chili can bind the exact SKILL.md.");
+    expect(app.captureCharFrame()).toContain("Skill $same is ambiguous; select it from /skills browse so Chili can bind the exact SKILL.md.");
   } finally {
     app.renderer.destroy();
   }
@@ -1035,7 +1689,28 @@ test("/skills inserts $ and opens the skill picker", async () => {
   }
 });
 
-test("/thinking hide and show toggle reasoning visibility", async () => {
+test("/skills browse inserts $ and opens the skill picker", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    skills: [skillSummary("reviewer")],
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "/skills browse");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("> $");
+    expect(frame).toContain("Skills");
+    expect(frame).toContain("$reviewer");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/thinking traces hide and show toggle reasoning visibility", async () => {
   const callId = "call_reasoning_toggle" as ToolCallId;
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
@@ -1049,7 +1724,12 @@ test("/thinking hide and show toggle reasoning visibility", async () => {
             createdAt: 1,
             parts: [
               { type: "reasoning", id: "part_reasoning_toggle" as PartId, text: "checking private chain" },
-              { type: "text", id: "part_intermediate_toggle" as PartId, text: "Let me inspect private chain." },
+              {
+                type: "text",
+                id: "part_intermediate_toggle" as PartId,
+                text: "Let me inspect private chain.",
+                phase: "commentary",
+              },
               {
                 type: "tool_call",
                 id: "part_call_toggle" as PartId,
@@ -1067,7 +1747,7 @@ test("/thinking hide and show toggle reasoning visibility", async () => {
             role: "assistant",
             createdAt: 2,
             parts: [
-              { type: "text", id: "part_answer_toggle" as PartId, text: "done" },
+              { type: "text", id: "part_answer_toggle" as PartId, text: "done", phase: "final_answer" },
             ],
           },
         ],
@@ -1083,7 +1763,7 @@ test("/thinking hide and show toggle reasoning visibility", async () => {
     expect(app.captureCharFrame()).toContain("Let me inspect private chain.");
     expect(app.captureCharFrame()).toContain("done");
 
-    await typeText(app, "/thinking hide");
+    await typeText(app, "/thinking traces hide");
     await press(app, () => app.mockInput.pressEnter());
     expect(app.captureCharFrame()).toContain("Thinking traces hidden.");
     expect(app.captureCharFrame()).toContain("🫧");
@@ -1091,7 +1771,7 @@ test("/thinking hide and show toggle reasoning visibility", async () => {
     expect(app.captureCharFrame()).not.toContain("Let me inspect private chain.");
     expect(app.captureCharFrame()).toContain("done");
 
-    await typeText(app, "/thinking show");
+    await typeText(app, "/thinking traces show");
     await press(app, () => app.mockInput.pressEnter());
     expect(app.captureCharFrame()).toContain("Thinking traces shown.");
     expect(app.captureCharFrame()).toContain("Thinking: checking private chain");
@@ -1101,7 +1781,7 @@ test("/thinking hide and show toggle reasoning visibility", async () => {
   }
 });
 
-test("/hide-thinking and /show-thinking toggle reasoning visibility", async () => {
+test("legacy /hide-thinking and /show-thinking aliases are rejected", async () => {
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
       chatView: {
@@ -1128,13 +1808,13 @@ test("/hide-thinking and /show-thinking toggle reasoning visibility", async () =
   try {
     await typeText(app, "/hide-thinking");
     await press(app, () => app.mockInput.pressEnter());
-    expect(app.captureCharFrame()).toContain("Thinking traces hidden.");
-    expect(app.captureCharFrame()).toContain("🫧");
-    expect(app.captureCharFrame()).not.toContain("Thinking: checking command visibility");
+    expect(app.captureCharFrame()).toContain("Unknown command token: hide-thinking");
+    expect(app.captureCharFrame()).toContain("Thinking: checking command visibility");
 
+    await backspace(app, "/hide-thinking".length);
     await typeText(app, "/show-thinking");
     await press(app, () => app.mockInput.pressEnter());
-    expect(app.captureCharFrame()).toContain("Thinking traces shown.");
+    expect(app.captureCharFrame()).toContain("Unknown command token: show-thinking");
     expect(app.captureCharFrame()).toContain("Thinking: checking command visibility");
   } finally {
     app.renderer.destroy();
@@ -1164,6 +1844,28 @@ test("leading slash absolute paths submit as normal prompts", async () => {
   }
 });
 
+test("probable command typos show suggestions and never submit as prompts", async () => {
+  const submitted: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/sesion list");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(submitted).toEqual([]);
+    expect(app.captureCharFrame()).toContain("Did you mean /session?");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("command palette selection uses Up and Down without switching prompt history", async () => {
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
@@ -1177,11 +1879,73 @@ test("command palette selection uses Up and Down without switching prompt histor
     await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
 
     expect(app.captureCharFrame()).toContain("Command Palette");
-    expect(app.captureCharFrame()).toContain("> /team - Open the team cockpit");
+    expect(app.captureCharFrame()).toContain("> /help — Browse commands and keyboard shortcuts");
 
     await press(app, () => app.mockInput.pressArrow("down"));
-    expect(app.captureCharFrame()).toContain("> /team run - Start the selected team loop");
+    expect(app.captureCharFrame()).toContain("> /status — Show session and team status");
     expect(app.captureCharFrame()).not.toContain("palette history");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("command palette keeps a fixed frame while selection crosses every command group", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    height: 18,
+    runtime: {
+      submitPrompt: async () => true,
+      chatView: {
+        status: "idle",
+        items: [{
+          id: "msg_palette_fixed_frame" as MessageId,
+          kind: "message",
+          role: "assistant",
+          createdAt: 1,
+          parts: [{ type: "text", id: "part_palette_fixed_frame" as PartId, text: "Existing conversation" }],
+        }],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+    const initialFrame = app.captureCharFrame();
+    const initialPaletteRow = frameRowContaining(initialFrame, "Command Palette");
+    const initialPromptRow = frameRowContaining(initialFrame, PROMPT_PLACEHOLDER);
+
+    expect(initialPaletteRow).toBeGreaterThanOrEqual(0);
+    expect(initialPromptRow).toBeGreaterThanOrEqual(0);
+    expect(initialFrame).toContain("> /help — Browse commands and keyboard shortcuts");
+
+    let wrappedToFirstCommand = false;
+    const visitedCommands = new Set<string>();
+    for (let index = 0; index < 64; index += 1) {
+      await press(app, () => app.mockInput.pressArrow("down"));
+      const frame = app.captureCharFrame();
+      expect(frameRowContaining(frame, "Command Palette")).toBe(initialPaletteRow);
+      expect(frameRowContaining(frame, PROMPT_PLACEHOLDER)).toBe(initialPromptRow);
+      const selectedCommand = /(?:^|\n)[^\n]*> (\/\S+)/.exec(frame)?.[1];
+      expect(selectedCommand).toBeDefined();
+      if (selectedCommand) visitedCommands.add(selectedCommand);
+      if (frame.includes("> /help — Browse commands and keyboard shortcuts")) {
+        wrappedToFirstCommand = true;
+        break;
+      }
+    }
+
+    expect(wrappedToFirstCommand).toBe(true);
+    expect([...visitedCommands]).toEqual(expect.arrayContaining([
+      "/goal",
+      "/team",
+      "/auth",
+      "/skills",
+      "/mcp",
+      "/commands",
+      "/app",
+    ]));
   } finally {
     app.renderer.destroy();
   }
@@ -1204,7 +1968,91 @@ test("command palette keeps the draft visible without entering prompt history", 
     await press(app, () => app.mockInput.pressArrow("down"));
     const frame = app.captureCharFrame();
     expect(frame).toContain("draft before palette");
-    expect(frame).toContain("> /team run - Start the selected team loop");
+    expect(frame).toContain("> /status — Show session and team status");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/help opens the same searchable command browser", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await typeText(app, "/help");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(app.captureCharFrame()).toContain("Command Palette · type to search");
+    expect(app.captureCharFrame()).toContain("/model select <provider/model>");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("command palette edits its query and preserves the composer draft", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await typeText(app, "draft stays here");
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+    await typeText(app, "diagnostics");
+
+    let frame = app.captureCharFrame();
+    expect(frame).toContain("Command Palette · diagnostics");
+    expect(frame).toContain("> /commands diagnostics — Show command loading errors and conflicts");
+    expect(frame).toContain("draft stays here");
+
+    await press(app, () => app.mockInput.pressBackspace());
+    expect(app.captureCharFrame()).toContain("Command Palette · diagnostic");
+    await press(app, () => app.mockInput.pressKey("u", { ctrl: true }));
+    expect(app.captureCharFrame()).toContain("Command Palette · type to search");
+
+    await press(app, () => app.mockInput.pressEscape());
+    expect(app.captureCharFrame()).toContain("draft stays here");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("command palette Tab drills down while Enter executes the selected command", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+    await typeText(app, "team");
+    expect(app.captureCharFrame()).toContain("> /team — Inspect and control agent teamwork");
+
+    await press(app, () => app.mockInput.pressTab());
+    let frame = app.captureCharFrame();
+    expect(frame).toContain("Command Palette · team");
+    expect(frame).toContain("> /team agents — Show the agent tree");
+    expect(frame).toContain("/team run — Start the selected team loop");
+
+    await press(app, () => app.mockInput.pressEscape());
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+    await typeText(app, "team");
+    await press(app, () => app.mockInput.pressEnter());
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Chili Team Live");
+    expect(frame).not.toContain("Command Palette");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("command palette Enter completes required arguments without executing", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+    await typeText(app, "model select");
+    expect(app.captureCharFrame()).toContain("> /model select <provider/model>");
+
+    await press(app, () => app.mockInput.pressEnter());
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("/model select ");
+    expect(frame).not.toContain("Command Palette");
+    expect(frame).not.toContain("Incomplete command");
+    expect(frame).not.toContain("Choose a model");
   } finally {
     app.renderer.destroy();
   }
@@ -1455,8 +2303,9 @@ test("Ctrl+V pastes without scrolling the transcript down", async () => {
   });
 
   try {
-    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
-    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    for (let index = 0; index < 4; index += 1) {
+      await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    }
     expect(app.captureCharFrame()).toContain("message 01");
 
     await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
@@ -1603,7 +2452,6 @@ test("local notices clear when the active session changes", async () => {
       app.setRuntime((current) => ({
         ...current,
         activeSessionId: "session_next" as SessionId,
-        activeThreadId: "thread_next" as ThreadId,
       }));
     });
     await app.renderOnce();
@@ -1817,7 +2665,12 @@ test("left double click selects a wrapped assistant markdown word", async () => 
             role: "assistant",
             createdAt: 1,
             parts: [
-              { type: "text", id: "part_assistant_wrapped_double_click" as PartId, text: `Token ${word} done` },
+              {
+                type: "text",
+                id: "part_assistant_wrapped_double_click" as PartId,
+                text: `Token ${word} done`,
+                phase: "final_answer",
+              },
             ],
           },
         ],
@@ -1867,7 +2720,12 @@ test("left double click selects only a final assistant markdown word", async () 
             role: "assistant",
             createdAt: 1,
             parts: [
-              { type: "text", id: "part_assistant_final_word_double_click" as PartId, text: `英文：\n${sentence}` },
+              {
+                type: "text",
+                id: "part_assistant_final_word_double_click" as PartId,
+                text: `英文：\n${sentence}`,
+                phase: "final_answer",
+              },
             ],
           },
         ],
@@ -1972,13 +2830,15 @@ test("Shift+Up and Shift+Down scroll the transcript instead of prompt history", 
     expect(app.captureCharFrame()).toContain("message 30");
     expect(app.captureCharFrame()).not.toContain("message 01");
 
-    await press(app, () => app.mockInput.pressArrow("up", { shift: true }));
-    await press(app, () => app.mockInput.pressArrow("up", { shift: true }));
+    for (let index = 0; index < 4; index += 1) {
+      await press(app, () => app.mockInput.pressArrow("up", { shift: true }));
+    }
     expect(app.captureCharFrame()).toContain("message 01");
     expect(app.captureCharFrame()).not.toContain("scroll history");
 
-    await press(app, () => app.mockInput.pressArrow("down", { shift: true }));
-    await press(app, () => app.mockInput.pressArrow("down", { shift: true }));
+    for (let index = 0; index < 4; index += 1) {
+      await press(app, () => app.mockInput.pressArrow("down", { shift: true }));
+    }
     expect(app.captureCharFrame()).toContain("message 30");
     expect(app.captureCharFrame()).not.toContain("scroll history");
   } finally {
@@ -2003,8 +2863,9 @@ test("chat scroll stays on history when new messages arrive above the bottom", a
   });
 
   try {
-    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
-    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    for (let index = 0; index < 4; index += 1) {
+      await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    }
     expect(app.captureCharFrame()).toContain("message 01");
     expect(app.captureCharFrame()).not.toContain("message 30");
 
@@ -2138,7 +2999,7 @@ test("running disabled composer does not switch to prompt history", async () => 
 
     await press(app, () => app.mockInput.pressArrow("up"));
     const frame = app.captureCharFrame();
-    expect(frame).toContain("Session running - ctrl+x interrupt");
+    expect(frame).toContain("Ctrl+X to interrupt");
     expect(frame).not.toContain("saved prompt");
   } finally {
     app.renderer.destroy();
@@ -2211,6 +3072,97 @@ test("pending approval renders the approval dock and shortcuts resolve it", asyn
   }
 });
 
+test("one-time approval shortcuts cannot grant a wider scope", async () => {
+  const approved: Array<{ id: ApprovalId; scope: ChatApproveOptions["scope"] }> = [];
+  const approvalId = "approval_once_only" as ApprovalId;
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      canSubmit: false,
+      chatView: {
+        status: "waiting_for_approval",
+        items: [],
+        pendingApprovals: [
+          {
+            id: approvalId,
+            kind: "approval",
+            permission: "bash.unsandboxed",
+            patterns: ["remindctl status"],
+            maxApprovalScope: "once",
+            status: "pending",
+            createdAt: 1,
+            toolName: "bash",
+            toolDisplayStatus: "waiting_permission",
+            inputSummary: { title: "bash", command: "remindctl status", detail: "remindctl status" },
+          },
+        ] as never,
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      approveApproval: async (id, options) => {
+        approved.push({ id, scope: options?.scope });
+      },
+    },
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("a once | x deny");
+
+    await press(app, () => app.mockInput.pressKey("s"));
+    await press(app, () => app.mockInput.pressKey("a", { shift: true }));
+    expect(approved).toEqual([]);
+
+    await press(app, () => app.mockInput.pressKey("a"));
+    expect(approved).toEqual([{ id: approvalId, scope: "once" }]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("unsandboxed approval cannot be accepted until the full command fits", async () => {
+  const approved: ApprovalId[] = [];
+  const approvalId = "approval_resize_review" as ApprovalId;
+  const command = `remindctl status ${"--include-completed ".repeat(60)}`;
+  const app = await mountShell(teamLiveFixture(), {
+    width: 60,
+    height: 18,
+    runtime: {
+      canSubmit: false,
+      chatView: {
+        status: "waiting_for_approval",
+        items: [],
+        pendingApprovals: [
+          {
+            id: approvalId,
+            kind: "approval",
+            permission: "bash.unsandboxed",
+            patterns: [command],
+            maxApprovalScope: "once",
+            status: "pending",
+            createdAt: 1,
+            toolName: "bash",
+            toolDisplayStatus: "waiting_permission",
+            inputSummary: { title: "bash", command, detail: command, scope: "/repo" },
+            metadata: { justification: "inspect Reminders access" },
+          },
+        ] as never,
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      approveApproval: async (id) => {
+        approved.push(id);
+      },
+    },
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("Resize the terminal to review the full command");
+    await press(app, () => app.mockInput.pressKey("a"));
+    expect(approved).toEqual([]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("pending approval shortcuts work when the prompt still has a draft", async () => {
   const approved: Array<{ id: ApprovalId; scope: ChatApproveOptions["scope"] }> = [];
   const approvalId = "approval_with_draft" as ApprovalId;
@@ -2271,12 +3223,11 @@ test("pending approval shortcuts work when the prompt still has a draft", async 
 test("stale approval resolve failures are shown instead of success", async () => {
   const records = chatClientRecords();
   const sessionId = "session_stale_approval" as SessionId;
-  const threadId = "thread_stale_approval" as ThreadId;
   const approvalId = "approval_stale" as ApprovalId;
-  const client = fakeChatClient(records, approvalEvents(sessionId, threadId, approvalId), {
+  const client = fakeChatClient(records, approvalEvents(sessionId, approvalId), {
     approveResolved: false,
   });
-  const app = await mountChatApp(client, { sessionId, threadId });
+  const app = await mountChatApp(client, { sessionId });
 
   try {
     await Bun.sleep(80);
@@ -2295,10 +3246,9 @@ test("stale approval resolve failures are shown instead of success", async () =>
 test("session approval shortcut sends session-scoped approval", async () => {
   const records = chatClientRecords();
   const sessionId = "session_scoped_approval" as SessionId;
-  const threadId = "thread_scoped_approval" as ThreadId;
   const approvalId = "approval_scoped" as ApprovalId;
-  const client = fakeChatClient(records, approvalEvents(sessionId, threadId, approvalId));
-  const app = await mountChatApp(client, { sessionId, threadId });
+  const client = fakeChatClient(records, approvalEvents(sessionId, approvalId));
+  const app = await mountChatApp(client, { sessionId });
 
   try {
     await Bun.sleep(80);
@@ -2316,10 +3266,9 @@ test("session approval shortcut sends session-scoped approval", async () => {
 test("persistent approval shortcut sends persistent-scoped approval", async () => {
   const records = chatClientRecords();
   const sessionId = "session_persistent_approval" as SessionId;
-  const threadId = "thread_persistent_approval" as ThreadId;
   const approvalId = "approval_persistent" as ApprovalId;
-  const client = fakeChatClient(records, approvalEvents(sessionId, threadId, approvalId));
-  const app = await mountChatApp(client, { sessionId, threadId });
+  const client = fakeChatClient(records, approvalEvents(sessionId, approvalId));
+  const app = await mountChatApp(client, { sessionId });
 
   try {
     await Bun.sleep(80);
@@ -2395,11 +3344,12 @@ test("Ctrl+P opens the command palette", async () => {
   try {
     await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
     expect(app.captureCharFrame()).toContain("Command Palette");
-    expect(app.captureCharFrame()).toContain("/team");
-    expect(app.captureCharFrame()).toContain("/model [provider/model] - Select model");
-    expect(app.captureCharFrame()).toContain("/thinking <off|minimal|low");
-    expect(app.captureCharFrame()).toContain("/fast <on|off|status> - Set Codex Fast mode");
-    expect(app.captureCharFrame()).toContain("/theme - Switch theme");
+    expect(app.captureCharFrame()).toContain("/model select <provider/model>");
+    expect(app.captureCharFrame()).toContain("/model service <standard|fast>");
+    expect(app.captureCharFrame()).toContain("/theme — Switch the terminal theme");
+
+    await typeText(app, "team run");
+    expect(app.captureCharFrame()).toContain("> /team run — Start the selected team loop");
   } finally {
     app.renderer.destroy();
   }
@@ -2409,10 +3359,10 @@ test("slash completion includes team command", async () => {
   const app = await mountShell(teamLiveFixture());
 
   try {
-    await typeText(app, "/");
+    await typeText(app, "/te");
     expect(app.captureCharFrame()).toContain("Commands");
     expect(app.captureCharFrame()).toContain("/team");
-    expect(app.captureCharFrame()).toContain("/hide-thinking");
+    expect(app.captureCharFrame()).not.toContain("/hide-thinking");
   } finally {
     app.renderer.destroy();
   }
@@ -2432,6 +3382,134 @@ test("/theme opens the theme picker", async () => {
     expect(frame).toContain("> System (fallback)");
     expect(frame).toContain("  Chili Light");
     expect(frame).toContain("  Warm Light");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/session resume opens a searchable project-scoped picker and switches sessions", async () => {
+  const resumed: string[] = [];
+  const sessions = [
+    {
+      id: "session_current" as SessionId,
+      cwd: "/repo/chili",
+      title: "Current chat",
+      status: "active" as const,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: "session_saved" as SessionId,
+      cwd: "/repo/chili",
+      title: "Fix resume flow",
+      preview: "Wire the saved conversation picker",
+      source: "interactive" as const,
+      status: "active" as const,
+      createdAt: 2,
+      updatedAt: 3,
+    },
+    {
+      id: "session_other" as SessionId,
+      cwd: "/repo/other",
+      title: "Other project",
+      source: "interactive" as const,
+      status: "active" as const,
+      createdAt: 2,
+      updatedAt: 4,
+    },
+    {
+      id: "session_worker" as SessionId,
+      cwd: "/repo/chili",
+      title: "Internal worker",
+      source: "subagent" as const,
+      status: "active" as const,
+      createdAt: 2,
+      updatedAt: 5,
+    },
+  ];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      activeSessionId: "session_current" as SessionId,
+      chatView: {
+        sessionId: "session_current" as SessionId,
+        status: "idle",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      listSessions: async () => sessions,
+      resumeSession: async (session) => {
+        resumed.push(session.id);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/session resume session_worker");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(20);
+    await app.renderOnce();
+
+    expect(resumed).toEqual([]);
+    expect(app.captureCharFrame()).toContain("Saved chat not found: session_worker");
+
+    await backspace(app, "/session resume session_worker".length);
+    await typeText(app, "/session resume");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(40);
+    await app.renderOnce();
+
+    let frame = app.captureCharFrame();
+    expect(frame).toContain("Resume saved chat");
+    expect(frame).toContain("Fix resume flow");
+    expect(frame).not.toContain("Other project");
+    expect(frame).not.toContain("Internal worker");
+
+    await press(app, () => app.mockInput.pressKey("a", { ctrl: true }));
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Other project");
+    expect(frame).not.toContain("Internal worker");
+
+    await typeText(app, "Fix resume");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(resumed).toEqual(["session_saved"]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/rename edits and saves the current chat title", async () => {
+  const renamed: string[] = [];
+  const sessionId = "session_rename" as SessionId;
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      renameSession: async (title) => {
+        renamed.push(title);
+        return { id: sessionId, cwd: "/repo/chili", title, status: "active", createdAt: 1, updatedAt: 2 };
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/rename");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(40);
+    await app.renderOnce();
+    expect(app.captureCharFrame()).toContain("Rename chat");
+    expect(app.captureCharFrame()).toContain("> Type a name");
+
+    await typeText(app, "  Investigation   notes  ");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(renamed).toEqual(["Investigation notes"]);
   } finally {
     app.renderer.destroy();
   }
@@ -2546,10 +3624,449 @@ test("/model uses runtime catalog and persists the selected model", async () => 
     expect(records.create).toHaveLength(1);
     expect(records.setModel[0]).toMatchObject({
       sessionId: "session_created",
-      threadId: "thread_created",
       modelSelection: { provider: "minimax", model: "MiniMax-M2.7-highspeed" },
     });
-    expect(app.captureCharFrame()).toContain("minimax/MiniMax-M2.7-highspeed Build");
+    const footerLine = app.captureCharFrame().split("\n").find((line) => line.includes("MiniMax-M2.7-highspeed") && line.includes("Build")) ?? "";
+    expect(footerLine).toContain("MiniMax-M2.7-highspeed");
+    expect(footerLine).not.toContain("minimax/");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model uses a focused search surface and skips empty sources", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: [
+        { provider: "test-provider", providerDisplayName: "Test Provider", model: "test-model" },
+        { provider: "anthropic", providerDisplayName: "Anthropic", model: "claude-opus-4.1" },
+        { provider: "openai", providerDisplayName: "OpenAI", model: "gpt-5.5" },
+      ],
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+
+    let frame = app.captureCharFrame();
+    expect(frame).toContain("Select model");
+    expect(frame).toContain("Search  > ▏  type a model or source");
+    expect(frame).toContain("Source  All · 3 models  tab switch");
+    expectFramedModelSearch(frame);
+
+    await typeText(app, " ");
+    frame = app.captureCharFrame();
+    expect(frame).toContain("type a model or source");
+    expect(frame).toContain("Source  All · 3 models  tab switch");
+    expectFramedModelSearch(frame);
+    await press(app, () => app.mockInput.pressBackspace());
+
+    await press(app, () => app.mockInput.pressTab());
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Source  Anthropic · 1 model  tab switch");
+    expect(frame).toContain("claude-opus-4.1 [Anthropic]");
+    expect(frame).not.toContain("test-model [Test Provider]");
+
+    await typeText(app, "opus");
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Source  Anthropic · 1 match  tab switch");
+    expect(frame).toContain("Search  > opus▏");
+    expect(frame).toContain("claude-opus-4.1 [Anthropic]");
+    expect(frame).not.toContain("gpt-5.5");
+
+    await press(app, () => app.mockInput.pressArrow("left"));
+    await typeText(app, "x");
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Search  > opux▏s");
+    await press(app, () => app.mockInput.pressBackspace());
+    await press(app, () => app.mockInput.pressArrow("right"));
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Search  > opus▏");
+
+    await press(app, () => app.mockInput.pressArrow("left"));
+    await press(app, () => app.mockInput.pressArrow("left"));
+    await press(app, () => app.mockInput.pressKey("DELETE"));
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Search  > op▏s");
+    expectFramedModelSearch(frame);
+    await typeText(app, "u");
+    await press(app, () => app.mockInput.pressArrow("right"));
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Search  > opus▏");
+
+    await press(app, () => app.mockInput.pressTab());
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Source  All · 1 match  tab switch");
+    await press(app, () => app.mockInput.pressTab());
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Source  Anthropic · 1 match  tab switch");
+    await press(app, () => app.mockInput.pressTab({ shift: true }));
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Source  All · 1 match  tab switch");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model keeps its chrome and prompt separate in a 48x13 home terminal", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    width: 48,
+    height: 13,
+    runtime: {
+      modelCandidates: Array.from({ length: 10 }, (_, index) => ({
+        provider: "compact",
+        providerDisplayName: "Compact",
+        model: `model-${String(index + 1).padStart(2, "0")}`,
+      })),
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expectFramedModelSearch(frame);
+    expect(frame).toContain("Source  All · 10 models");
+    expect(frame).not.toContain("> model-01 [Compact]");
+    expect(frame).toContain("↑/↓ navigate");
+    expect(frame).toContain("> Choose a model");
+
+    const lines = frame.split("\n");
+    const helpLine = lines.findIndex((line) => line.includes("↑/↓ navigate"));
+    const promptLine = lines.findIndex((line) => line.includes("> Choose a model"));
+    expect(helpLine).toBeGreaterThan(-1);
+    expect(promptLine).toBeGreaterThan(helpLine);
+    expect(lines[helpLine]).not.toContain("Choose a model");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model keeps its chrome and prompt separate in a 48x15 active chat", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    width: 48,
+    height: 15,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: chatMessages(1),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      modelCandidates: Array.from({ length: 10 }, (_, index) => ({
+        provider: "compact",
+        providerDisplayName: "Compact",
+        model: `model-${String(index + 1).padStart(2, "0")}`,
+      })),
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expectFramedModelSearch(frame);
+    expect(frame).toContain("Source  All · 10 models");
+    expect(frame).not.toContain("> model-01 [Compact]");
+    expect(frame).toContain("↑/↓ navigate");
+    expect(frame).toContain("> Choose a model");
+
+    const lines = frame.split("\n");
+    const helpLine = lines.findIndex((line) => line.includes("↑/↓ navigate"));
+    const promptLine = lines.findIndex((line) => line.includes("> Choose a model"));
+    expect(helpLine).toBeGreaterThan(-1);
+    expect(promptLine).toBeGreaterThan(helpLine);
+    expect(lines[helpLine]).not.toContain("Choose a model");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model removes result rows when a 48x20 approval dock appears", async () => {
+  const approvalId = "approval_model_picker_compact" as ApprovalId;
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    width: 48,
+    height: 20,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: chatMessages(1),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      modelCandidates: Array.from({ length: 10 }, (_, index) => ({
+        provider: "compact",
+        providerDisplayName: "Compact",
+        model: `model-${String(index + 1).padStart(2, "0")}`,
+      })),
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("> model-01 [Compact]");
+
+    await act(async () => {
+      app.setRuntime((runtime) => ({
+        ...runtime,
+        revision: runtime.revision + 1,
+        chatView: {
+          ...runtime.chatView,
+          status: "waiting_for_approval",
+          pendingApprovals: [{
+            id: approvalId,
+            kind: "approval",
+            permission: "tool.bash",
+            patterns: ["bun test"],
+            status: "pending",
+            createdAt: 1,
+            toolName: "bash",
+            toolDisplayStatus: "waiting_permission",
+            inputSummary: { title: "bash", command: "bun test", detail: "bun test" },
+          }] as never,
+        },
+      }));
+    });
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("Approval required: bash");
+    expect(frame).toContain("> bun test");
+    expect(frame).toContain("a once | s session | A always | x deny");
+    expectFramedModelSearch(frame);
+    expect(frame).toContain("Source  All · 10 models");
+    expect(frame).not.toContain("> model-01 [Compact]");
+    expect(frame).toContain("> Choose a model");
+
+    const lines = frame.split("\n");
+    const approvalHintLine = lines.findIndex((line) => line.includes("a once | s session"));
+    const searchLine = lines.findIndex((line) => line.includes("Search  >"));
+    const pickerHelpLine = lines.findIndex((line) => line.includes("↑/↓ navigate"));
+    const promptLine = lines.findIndex((line) => line.includes("> Choose a model"));
+    expect(approvalHintLine).toBeGreaterThan(-1);
+    expect(searchLine).toBeGreaterThan(approvalHintLine);
+    expect(pickerHelpLine).toBeGreaterThan(searchLine);
+    expect(promptLine).toBeGreaterThan(pickerHelpLine);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model labels identical Codex models as ChatGPT or Api and selects the right provider", async () => {
+  const selected: ModelSelection[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: [
+        {
+          provider: "codex-api",
+          providerDisplayName: "Api",
+          model: "gpt-5.6-sol",
+          connectionLabel: "Third-party API",
+        },
+        {
+          provider: "openai-codex",
+          providerDisplayName: "ChatGPT",
+          model: "gpt-5.6-sol",
+          connectionLabel: "ChatGPT OAuth",
+        },
+      ],
+      setRuntimeModel: async (selection) => {
+        selected.push(selection);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+
+    let frame = app.captureCharFrame();
+    const chatGptIndex = frame.indexOf("gpt-5.6-sol [ChatGPT]");
+    const apiIndex = frame.indexOf("gpt-5.6-sol [Api]");
+    expect(chatGptIndex).toBeGreaterThanOrEqual(0);
+    expect(apiIndex).toBeGreaterThan(chatGptIndex);
+    expect(frame).not.toContain("[ChatGPT Codex]");
+    expect(frame).not.toContain("[Codex API]");
+
+    await typeText(app, "chatgpt");
+    frame = app.captureCharFrame();
+    expect(frame).toContain("gpt-5.6-sol [ChatGPT]");
+    expect(frame).not.toContain("gpt-5.6-sol [Api]");
+
+    await backspace(app, "chatgpt".length);
+    await typeText(app, "api");
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Source  All · 1 match  tab switch");
+    expect(frame).toContain("gpt-5.6-sol [Api]");
+    expect(frame).not.toContain("gpt-5.6-sol [ChatGPT]");
+
+    await press(app, () => app.mockInput.pressEnter());
+    expect(selected).toEqual([{ provider: "codex-api", model: "gpt-5.6-sol" }]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model search highlights the best match instead of keeping a weaker current model", async () => {
+  const current = { provider: "openai-codex", model: "gpt-5.6-sol" };
+  const candidates: RuntimeModelDescriptor[] = [
+    { ...current, providerDisplayName: "ChatGPT", default: true },
+    { provider: "codex-api", providerDisplayName: "Api", model: "gpt-5.6-sol", default: true },
+    { provider: "openai-codex", providerDisplayName: "ChatGPT", model: "gpt-5.6-luna" },
+    { provider: "codex-api", providerDisplayName: "Api", model: "gpt-5.6-luna" },
+  ];
+  const selected: ModelSelection[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: candidates,
+      modelConfig: {
+        sessionId: "session_model_search" as SessionId,
+        models: candidates,
+        availableReasoningLevels: [],
+        modelSelection: current,
+      },
+      setRuntimeModel: async (selection) => {
+        selected.push(selection);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+    await typeText(app, "gpt-5.6-l");
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("> gpt-5.6-luna [ChatGPT]");
+    expect(frame.indexOf("gpt-5.6-luna [Api]")).toBeGreaterThan(frame.indexOf("gpt-5.6-luna [ChatGPT]"));
+
+    await press(app, () => app.mockInput.pressEnter());
+    expect(selected).toEqual([{ provider: "openai-codex", model: "gpt-5.6-luna" }]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model keeps the highlighted model stable when a refreshed catalog reorders rows", async () => {
+  const selected: ModelSelection[] = [];
+  const initialModels: RuntimeModelDescriptor[] = [
+    { provider: "stable", providerDisplayName: "Stable", model: "alpha" },
+    { provider: "stable", providerDisplayName: "Stable", model: "gamma" },
+  ];
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: initialModels,
+      setRuntimeModel: async (selection) => {
+        selected.push(selection);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("down"));
+    expect(app.captureCharFrame()).toContain("> gamma [Stable]");
+
+    await act(async () => {
+      app.setRuntime((runtime) => ({
+        ...runtime,
+        revision: runtime.revision + 1,
+        modelCandidates: [
+          initialModels[0]!,
+          { provider: "stable", providerDisplayName: "Stable", model: "beta" },
+          initialModels[1]!,
+        ],
+      }));
+    });
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("> gamma [Stable]");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(selected).toEqual([{ provider: "stable", model: "gamma" }]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model falls back to All when a refreshed catalog removes the active source", async () => {
+  const selected: ModelSelection[] = [];
+  const remaining: RuntimeModelDescriptor = {
+    provider: "stay",
+    providerDisplayName: "Stay",
+    model: "stay-model",
+  };
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: [
+        { provider: "gone", providerDisplayName: "Gone", model: "gone-model" },
+        remaining,
+      ],
+      setRuntimeModel: async (selection) => {
+        selected.push(selection);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressTab());
+    expect(app.captureCharFrame()).toContain("Source  Gone · 1 model  tab switch");
+
+    await act(async () => {
+      app.setRuntime((runtime) => ({
+        ...runtime,
+        revision: runtime.revision + 1,
+        modelCandidates: [remaining],
+      }));
+    });
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("Source  All · 1 model  tab switch");
+    expect(frame).toContain("> stay-model [Stay]");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(selected).toEqual([{ provider: "stay", model: "stay-model" }]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model detail shows safe connection metadata", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: [{
+        provider: "codex-api",
+        model: "gpt-5.5",
+        connectionLabel: "Third-party API",
+        authSource: "environment",
+        endpoint: "https://gateway-user:secret@gateway.example:8443/v1?api_key=hidden#fragment",
+      }],
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("connection Third-party API");
+    expect(frame).toContain("auth API key");
+    expect(frame).toContain("endpoint gateway.example:8443");
+    expect(frame).not.toContain("gateway-user");
+    expect(frame).not.toContain("secret");
+    expect(frame).not.toContain("api_key");
   } finally {
     app.renderer.destroy();
   }
@@ -2566,15 +4083,415 @@ test("/model keeps the old UI state when persistence fails", async () => {
   });
 
   try {
-    await typeText(app, "/model openai-codex/gpt-5.5");
+    await typeText(app, "/model select openai-codex/gpt-5.5");
     await press(app, () => app.mockInput.pressEnter());
     await Bun.sleep(120);
     await app.renderOnce();
 
     const frame = app.captureCharFrame();
     expect(frame).toContain("Model unchanged: failed to persist openai-codex/gpt-5.5");
-    expect(frame).toContain("test-provider/test-model Build");
+    expect(frame.split("\n").some((line) => line.includes("test-model") && line.includes("Build"))).toBe(true);
     expect(frame).not.toContain("openai-codex/gpt-5.5 Build");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/status separates the live event stream from execution and reports unsupported MiniMax controls", async () => {
+  let serviceTierChanges = 0;
+  const selection = { provider: "minimax", model: "MiniMax-M3[1m]" };
+  const models: ModelCandidate[] = [{
+    ...selection,
+    capabilities: { reasoning: true, toolCalls: true },
+    reasoningLevels: [],
+  }];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: models,
+      modelConfig: {
+        sessionId: "session_minimax_status" as SessionId,
+        models: [{
+          ...selection,
+          capabilities: { reasoning: true, toolCalls: true },
+          reasoningLevels: [],
+        }],
+        availableReasoningLevels: [],
+        modelSelection: selection,
+        reasoningLevel: "high",
+        serviceTier: "fast",
+      },
+      setRuntimeServiceTier: async () => {
+        serviceTierChanges += 1;
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+
+    let frame = app.captureCharFrame();
+    expect(frame).toContain("event stream: connected");
+    expect(frame).toContain("execution: idle");
+    expect(frame).toContain("agent capability: available");
+    expect(frame).toContain("delegation: not configured");
+    expect(frame).toContain("ad-hoc agents: 0 active");
+    expect(frame).toContain("persistent teams: none");
+    expect(frame).toContain("thinking: unsupported");
+    expect(frame).toContain("service tier: unsupported");
+    expect(frame).not.toContain("connection: streaming");
+
+    await press(app, () => app.mockInput.pressEscape());
+    await typeText(app, "/thinking");
+    await press(app, () => app.mockInput.pressEnter());
+    frame = app.captureCharFrame();
+    expect(frame).toContain("does not support configurable thinking");
+    expect(frame).not.toContain("Very brief reasoning");
+
+    await typeText(app, "/model service fast");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("Service tiers are not available for the selected model.");
+    expect(serviceTierChanges).toBe(0);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/session delegation updates and reads the session delegation policy through runtime APIs", async () => {
+  const sessionId = "session_agents_policy" as SessionId;
+  const policies: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      activeSessionId: sessionId,
+      delegationConfig: { sessionId, policy: "explicit", source: "default" },
+      setRuntimeDelegationPolicy: async (policy) => {
+        policies.push(policy);
+        return { sessionId, policy, source: "session" };
+      },
+      refreshDelegationConfig: async () => ({ sessionId, policy: "proactive", source: "session" }),
+    },
+  });
+
+  try {
+    await typeText(app, "/session delegation proactive");
+    await press(app, () => app.mockInput.pressEnter());
+    await app.renderOnce();
+    expect(policies).toEqual(["proactive"]);
+    expect(app.captureCharFrame()).toContain("Agent delegation: proactive (source: session)");
+
+    await typeText(app, "/session delegation status");
+    await press(app, () => app.mockInput.pressEnter());
+    await app.renderOnce();
+    expect(app.captureCharFrame()).toContain("Chili may delegate useful independent work proactively.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/status preserves effective reasoning and fast tier for OpenAI Codex", async () => {
+  const selection = { provider: "openai-codex", model: "gpt-5.6-sol" };
+  const models: ModelCandidate[] = [{
+    ...selection,
+    connectionLabel: "ChatGPT OAuth",
+    authSource: "oauth",
+    endpoint: "https://chatgpt.com/backend-api",
+    capabilities: { reasoning: true },
+    reasoningLevels: ["off", "low", "medium", "high"],
+    serviceTiers: ["standard", "fast"],
+  }];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: models,
+      modelConfig: {
+        sessionId: "session_codex_status" as SessionId,
+        models: [{
+          ...selection,
+          connectionLabel: "ChatGPT OAuth",
+          authSource: "oauth",
+          endpoint: "https://chatgpt.com/backend-api",
+          capabilities: { reasoning: true },
+          reasoningLevels: ["off", "low", "medium", "high"],
+          serviceTiers: ["standard", "fast"],
+        }],
+        availableReasoningLevels: ["off", "low", "medium", "high"],
+        modelSelection: selection,
+        reasoningLevel: "high",
+        serviceTier: "fast",
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("model: openai-codex/gpt-5.6-sol");
+    expect(frame).toContain("connection: ChatGPT OAuth");
+    expect(frame).toContain("auth: ChatGPT OAuth");
+    expect(frame).toContain("endpoint: chatgpt.com");
+    expect(frame).toContain("thinking: high");
+    expect(frame).toContain("service tier: fast");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/status distinguishes a third-party API key connection from ChatGPT OAuth", async () => {
+  const selection = { provider: "codex-api", model: "gpt-5.5" };
+  const models: RuntimeModelDescriptor[] = [
+    {
+      provider: "openai-codex",
+      model: "gpt-5.5",
+      connectionLabel: "ChatGPT OAuth",
+      authSource: "oauth",
+      endpoint: "https://chatgpt.com/backend-api",
+    },
+    {
+      ...selection,
+      connectionLabel: "Third-party API",
+      authSource: "environment",
+      endpoint: "https://gateway-user:secret@gateway.example:8443/v1?api_key=hidden#fragment",
+    },
+  ];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: models,
+      modelConfig: {
+        sessionId: "session_api_status" as SessionId,
+        models,
+        availableReasoningLevels: [],
+        modelSelection: selection,
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("model: codex-api/gpt-5.5");
+    expect(frame).toContain("connection: Third-party API");
+    expect(frame).toContain("auth: API key");
+    expect(frame).toContain("endpoint: gateway.example:8443");
+    expect(frame).not.toContain("ChatGPT OAuth");
+    expect(frame).not.toContain("chatgpt.com");
+    expect(frame).not.toContain("gateway-user");
+    expect(frame).not.toContain("secret");
+    expect(frame).not.toContain("api_key");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/status shows status reasons for failed and cancelled executions", async () => {
+  for (const status of ["failed", "cancelled"] as const) {
+    const reason = `${status} because the provider closed the response stream`;
+    const app = await mountShell(teamLiveFixture(), {
+      runtime: {
+        chatView: {
+          status,
+          statusReason: reason,
+          items: [],
+          pendingApprovals: [],
+          activeTools: [],
+          generatedAt: "1970-01-01T00:00:00.000Z",
+        },
+      },
+    });
+
+    try {
+      await typeText(app, "/status");
+      await press(app, () => app.mockInput.pressEnter());
+
+      const frame = app.captureCharFrame();
+      expect(frame).toContain(`execution: ${status}`);
+      expect(frame).toContain(`reason: ${reason}`);
+    } finally {
+      app.renderer.destroy();
+    }
+  }
+});
+
+test("/status shortcut copies the complete status page on a narrow screen and shows feedback", async () => {
+  const copied: string[] = [];
+  const sessionId = "session_status_copy_with_a_value_longer_than_the_visible_status_row" as SessionId;
+  const reason = "Provider request failed after every response retry was exhausted";
+  const cwd = "/repo/chili/a/very/long/path/that/is/not/fully/visible/in/the/status/view";
+  const app = await mountShell(teamLiveFixture(), {
+    width: 44,
+    height: 40,
+    cwd,
+    kittyKeyboard: true,
+    clipboard: fakeClipboard({
+      writeText: async (text) => {
+        copied.push(text);
+        return true;
+      },
+    }),
+    runtime: {
+      activeSessionId: sessionId,
+      chatView: {
+        status: "failed",
+        statusReason: reason,
+        items: [{
+          id: "msg_status_copy_previous" as MessageId,
+          kind: "message",
+          role: "assistant",
+          createdAt: 1,
+          parts: [{ type: "text", id: "part_status_copy_previous" as PartId, text: "PREVIOUS ASSISTANT REPLY" }],
+        }],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).not.toContain(sessionId);
+
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true, shift: true }));
+
+    expect(copied).toHaveLength(1);
+    expect(copied[0]).toContain(`execution: failed\nreason: ${reason}`);
+    expect(copied[0]).toContain(`session: ${sessionId}`);
+    expect(copied[0]).toContain(`workspace: ${cwd}`);
+    expect(copied[0]).not.toContain("PREVIOUS ASSISTANT REPLY");
+    expect(app.captureCharFrame()).toContain("Copied status.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/status does not show clipboard feedback left by the chat view", async () => {
+  const copied: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    localMessageTtlMs: 0,
+    kittyKeyboard: true,
+    clipboard: fakeClipboard({
+      writeText: async (text) => {
+        copied.push(text);
+        return true;
+      },
+    }),
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: [{
+          id: "msg_status_stale_feedback" as MessageId,
+          kind: "message",
+          role: "assistant",
+          createdAt: 1,
+          parts: [{ type: "text", id: "part_status_stale_feedback" as PartId, text: "ASSISTANT COPY SOURCE" }],
+        }],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true, shift: true }));
+    expect(copied).toEqual(["ASSISTANT COPY SOURCE"]);
+    expect(app.captureCharFrame()).toContain("Copied latest assistant reply.");
+
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("Status");
+    expect(frame).not.toContain("Copied latest assistant reply.");
+    expect(frame).not.toContain("Copied status.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/status discards a pending copy result when the active session changes", async () => {
+  let resolveWrite: ((copied: boolean) => void) | undefined;
+  const writeResult = new Promise<boolean>((resolve) => {
+    resolveWrite = resolve;
+  });
+  const oldSessionId = "session_status_copy_old" as SessionId;
+  const newSessionId = "session_status_copy_new" as SessionId;
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    clipboard: fakeClipboard({ writeText: async () => writeResult }),
+    runtime: {
+      activeSessionId: oldSessionId,
+    },
+  });
+
+  try {
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true, shift: true }));
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        activeSessionId: newSessionId,
+      }));
+      await app.renderOnce();
+    });
+    resolveWrite?.(true);
+    await act(async () => {
+      await Bun.sleep(0);
+      await app.renderOnce();
+    });
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain(`session: ${newSessionId}`);
+    expect(frame).not.toContain("Copied status.");
+  } finally {
+    resolveWrite?.(false);
+    app.renderer.destroy();
+  }
+});
+
+test("/status supports themed multi-click selection and keeps selection copy priority", async () => {
+  const copied: string[] = [];
+  const sessionId = "session_status_selectable" as SessionId;
+  const app = await mountShell(teamLiveFixture(), {
+    width: 100,
+    height: 36,
+    useMouse: true,
+    kittyKeyboard: true,
+    clipboard: fakeClipboard({
+      writeText: async (text) => {
+        copied.push(text);
+        return true;
+      },
+    }),
+    runtime: {
+      activeSessionId: sessionId,
+    },
+  });
+
+  try {
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    const sessionTarget = frameTextPosition(frame, sessionId);
+    await act(async () => {
+      await app.mockMouse.doubleClick(sessionTarget.x + 4, sessionTarget.y);
+      await Bun.sleep(80);
+      await app.renderOnce();
+    });
+
+    expect(app.renderer.getSelection()?.getSelectedText()).toBe(sessionId);
+    expect(copied.at(-1)).toBe(sessionId);
+    expect(selectionBgAt(app, sessionTarget.x, sessionTarget.y)).toBe(true);
+
+    copied.length = 0;
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true, shift: true }));
+    expect(copied).toEqual([sessionId]);
   } finally {
     app.renderer.destroy();
   }
@@ -2599,6 +4516,8 @@ test("team merge slash command executes SDK merge action", async () => {
 
   try {
     await typeText(app, "/team merge");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("right"));
     await press(app, () => app.mockInput.pressEnter());
     expect(executed[0]).toMatchObject({ type: "merge", enabled: true, taskId: "task_live" });
   } finally {
@@ -2823,6 +4742,7 @@ async function mountShell(
       options.executed?.push(action);
     },
     clearActionFeedback: () => undefined,
+    hydrateEvents: () => undefined,
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
@@ -2832,6 +4752,9 @@ async function mountShell(
     resumeGoal: async () => undefined,
     clearGoal: async () => false,
     startNewSession: async () => undefined,
+    listSessions: async () => [],
+    resumeSession: async () => true,
+    renameSession: async () => undefined,
     interruptActiveSession: async () => undefined,
     approveApproval: async () => undefined,
     rejectApproval: async () => undefined,
@@ -2933,6 +4856,7 @@ function chatRuntime(
       options.executed?.push(action);
     },
     clearActionFeedback: () => undefined,
+    hydrateEvents: () => undefined,
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
@@ -2942,6 +4866,9 @@ function chatRuntime(
     resumeGoal: async () => undefined,
     clearGoal: async () => false,
     startNewSession: async () => undefined,
+    listSessions: async () => [],
+    resumeSession: async () => true,
+    renameSession: async () => undefined,
     interruptActiveSession: async () => undefined,
     approveApproval: async () => undefined,
     rejectApproval: async () => undefined,
@@ -2976,6 +4903,15 @@ function emitSelection(renderer: { emit: (event: string, ...args: unknown[]) => 
   renderer.emit("selection", { getSelectedText: () => text });
 }
 
+function expectFramedModelSearch(frame: string): void {
+  const lines = frame.split("\n");
+  const searchLine = lines.findIndex((line) => line.includes("Search  >"));
+  expect(searchLine).toBeGreaterThan(0);
+  expect(lines[searchLine - 1] ?? "").toContain("┌");
+  expect(lines[searchLine] ?? "").toContain("│");
+  expect(lines[searchLine + 1] ?? "").toContain("└");
+}
+
 function frameTextPosition(frame: string, text: string): { x: number; y: number } {
   const lines = frame.split("\n");
   for (const [y, line] of lines.entries()) {
@@ -2983,6 +4919,10 @@ function frameTextPosition(frame: string, text: string): { x: number; y: number 
     if (index >= 0) return { x: Bun.stringWidth(line.slice(0, index)), y };
   }
   throw new Error(`Frame did not include ${text}`);
+}
+
+function hasStandaloneChiliTitle(frame: string): boolean {
+  return frame.split("\n").some((line) => line.trim() === "Chili");
 }
 
 function selectionBgAt(app: { renderer: { currentRenderBuffer: { width: number; buffers: { bg: Float32Array } } } }, x: number, y: number): boolean {
@@ -2994,6 +4934,22 @@ function selectionBgAt(app: { renderer: { currentRenderBuffer: { width: number; 
     && Math.abs((bg[offset + 1] ?? 0) - g) < 0.001
     && Math.abs((bg[offset + 2] ?? 0) - b) < 0.001
     && Math.abs((bg[offset + 3] ?? 0) - a) < 0.001;
+}
+
+function foregroundMatches(
+  app: { renderer: { currentRenderBuffer: { width: number; buffers: { fg: Float32Array } } } },
+  x: number,
+  y: number,
+  color: string,
+): boolean {
+  const width = app.renderer.currentRenderBuffer.width;
+  const fg = app.renderer.currentRenderBuffer.buffers.fg;
+  const offset = (y * width + x) * 4;
+  const [r, g, b, a] = hexRgba(color);
+  return Math.abs((fg[offset] ?? 0) - r) < 0.001
+    && Math.abs((fg[offset + 1] ?? 0) - g) < 0.001
+    && Math.abs((fg[offset + 2] ?? 0) - b) < 0.001
+    && Math.abs((fg[offset + 3] ?? 0) - a) < 0.001;
 }
 
 function hexRgba(hex: string): [number, number, number, number] {
@@ -3008,7 +4964,6 @@ async function mountChatApp(
   client: HttpRuntimeClient,
   options: {
     sessionId?: SessionId;
-    threadId?: ThreadId;
   } = {},
 ) {
   const app = await testRender(
@@ -3049,6 +5004,10 @@ async function typeText(app: TestRenderHarness, text: string): Promise<void> {
   await app.renderOnce();
 }
 
+function frameRowContaining(frame: string, text: string): number {
+  return frame.split("\n").findIndex((line) => line.includes(text));
+}
+
 async function selectPaletteCommand(app: TestRenderHarness, command: string): Promise<void> {
   for (let index = 0; index < 64; index += 1) {
     if (app.captureCharFrame().includes(`> ${command}`)) return;
@@ -3065,6 +5024,9 @@ async function backspace(app: TestRenderHarness, count: number): Promise<void> {
 
 function chatClientRecords(): {
   create: Array<Record<string, unknown>>;
+  sessionEvents: Array<Record<string, unknown>>;
+  listSessions: Array<Record<string, unknown>>;
+  sessionLifecycle: string[];
   submit: Array<Record<string, unknown>>;
   interrupt: Array<Record<string, unknown>>;
   approve: Array<Record<string, unknown>>;
@@ -3073,10 +5035,15 @@ function chatClientRecords(): {
   getModel: Array<Record<string, unknown>>;
   setModel: Array<Record<string, unknown>>;
   setReasoning: Array<Record<string, unknown>>;
+  listCommands: Array<Record<string, unknown>>;
+  reloadCommands: Array<Record<string, unknown>>;
   stream: Array<Record<string, unknown>>;
 } {
   return {
     create: [],
+    sessionEvents: [],
+    listSessions: [],
+    sessionLifecycle: [],
     submit: [],
     interrupt: [],
     approve: [],
@@ -3085,6 +5052,8 @@ function chatClientRecords(): {
     getModel: [],
     setModel: [],
     setReasoning: [],
+    listCommands: [],
+    reloadCommands: [],
     stream: [],
   };
 }
@@ -3101,10 +5070,14 @@ function fakeChatClient(
     reasoningLevel?: ReasoningLevel;
     setModelError?: Error;
     setReasoningError?: Error;
+    commandCatalog?: RuntimeCommandCatalog;
+    sessions?: readonly RuntimeSessionSummary[];
+    sessionLists?: readonly (readonly RuntimeSessionSummary[])[];
   } = {},
 ): HttpRuntimeClient {
   let currentModelSelection = options.modelSelection;
   let currentReasoningLevel = options.reasoningLevel;
+  const discoveredSessions = sessionSummariesFromEvents(events);
   const client = {
     listModels: async (input: Record<string, unknown> = {}) => {
       records.listModels.push(input);
@@ -3150,28 +5123,51 @@ function fakeChatClient(
       records.create.push(input);
       if (options.createError) throw options.createError;
       const suffix = index === 1 ? "" : `_${index}`;
-      return { sessionId: `session_created${suffix}` as SessionId, threadId: `thread_created${suffix}` as ThreadId };
+      return { sessionId: `session_created${suffix}` as SessionId };
     },
+    sessionEvents: async (input: Record<string, unknown>) => {
+      records.sessionEvents.push(input);
+      records.sessionLifecycle.push(`events:${String(input.sessionId)}`);
+      return events.filter((event) => event.sessionId === input.sessionId);
+    },
+    listSessions: async () => {
+      const callIndex = records.listSessions.length;
+      records.listSessions.push({});
+      records.sessionLifecycle.push("list");
+      const configured = options.sessionLists?.[callIndex]
+        ?? options.sessions
+        ?? discoveredSessions;
+      return [...configured];
+    },
+    renameSession: async (input: Record<string, unknown>) => ({
+      id: input.sessionId as SessionId,
+      cwd: "/repo/chili",
+      title: input.title as string,
+      status: "active" as const,
+      createdAt: 1,
+      updatedAt: 2,
+    }),
     submitPromptAsync: async (input: Record<string, unknown>) => {
       records.submit.push(input);
-      return { status: "accepted", sessionId: input.sessionId as SessionId, threadId: input.threadId as ThreadId };
+      return { status: "accepted", sessionId: input.sessionId as SessionId };
     },
     submitCommandAsync: async (input: Record<string, unknown>) => {
       records.submit.push(input);
-      return { status: "accepted", sessionId: input.sessionId as SessionId, threadId: input.threadId as ThreadId };
+      return { status: "accepted", sessionId: input.sessionId as SessionId };
     },
     submitPrompt: async () => ({ status: "completed", turns: [] }),
-    listCommands: async () => ({
-      commands: [],
-      diagnostics: [],
-      directories: [],
-      skippedConflicts: [],
-    }),
-    reloadCommands: async () => ({
-      commands: [],
-      diagnostics: [],
-      directories: [],
-      skippedConflicts: [],
+    listCommands: async (input: Record<string, unknown> = {}) => {
+      records.listCommands.push(input);
+      return options.commandCatalog ?? ({ roots: [], diagnostics: [] });
+    },
+    reloadCommands: async (input: Record<string, unknown> = {}) => {
+      records.reloadCommands.push(input);
+      return options.commandCatalog ?? ({ roots: [], diagnostics: [] });
+    },
+    getPermissionConfig: async () => ({ profile: "default" as const, profiles: [] }),
+    mcpStatus: async () => ({
+      servers: [],
+      summary: { total: 0, running: 0, disabled: 0, authRequired: 0, errored: 0 },
     }),
     interruptSession: async (input: Record<string, unknown>) => {
       records.interrupt.push(input);
@@ -3226,7 +5222,38 @@ function fakeChatClient(
   return client as unknown as HttpRuntimeClient;
 }
 
-function approvalEvents(sessionId: SessionId, threadId: ThreadId, approvalId: ApprovalId): ChiliEvent[] {
+function sessionSummariesFromEvents(events: readonly ChiliEvent[]): RuntimeSessionSummary[] {
+  const sessions = new Map<SessionId, RuntimeSessionSummary>();
+  for (const event of events) {
+    if (event.type !== "session.created") continue;
+    sessions.set(event.payload.sessionId, {
+      id: event.payload.sessionId,
+      cwd: event.payload.cwd,
+      source: "interactive",
+      status: "active",
+      createdAt: Number(event.time),
+      updatedAt: Number(event.time),
+    });
+  }
+  return [...sessions.values()];
+}
+
+function runtimeSessionSummary(
+  id: SessionId,
+  overrides: Partial<Omit<RuntimeSessionSummary, "id">> = {},
+): RuntimeSessionSummary {
+  return {
+    id,
+    cwd: "/repo/chili",
+    source: "interactive",
+    status: "active",
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  };
+}
+
+function approvalEvents(sessionId: SessionId, approvalId: ApprovalId): ChiliEvent[] {
   const callId = "toolcall_stale" as ToolCallId;
   return [
     {
@@ -3234,7 +5261,6 @@ function approvalEvents(sessionId: SessionId, threadId: ThreadId, approvalId: Ap
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo/chili" },
     },
     {
@@ -3242,7 +5268,6 @@ function approvalEvents(sessionId: SessionId, threadId: ThreadId, approvalId: Ap
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_stale" as TurnId, callId, toolName: "bash", input: { command: "ls -la" } },
     },
     {
@@ -3250,7 +5275,6 @@ function approvalEvents(sessionId: SessionId, threadId: ThreadId, approvalId: Ap
       type: "tool.call_updated",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "waiting_for_approval" },
     },
     {
@@ -3258,7 +5282,6 @@ function approvalEvents(sessionId: SessionId, threadId: ThreadId, approvalId: Ap
       type: "approval.requested",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: { approvalId, callId, permission: "bash", patterns: ["ls -la"] },
     },
   ];
@@ -3281,6 +5304,21 @@ function chatMessages(count: number): ChatTranscriptItem[] {
       ],
     };
   });
+}
+
+function chatTextMessage(
+  id: string,
+  role: "user" | "assistant",
+  text: string,
+  createdAt: number,
+): Extract<ChatTranscriptItem, { kind: "message" }> {
+  return {
+    id: id as MessageId,
+    kind: "message",
+    role,
+    createdAt,
+    parts: [{ type: "text", id: `${id}_part` as PartId, text }],
+  };
 }
 
 function rawOutputToolItems(lineCount: number): ChatTranscriptItem[] {

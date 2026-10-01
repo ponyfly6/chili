@@ -137,7 +137,7 @@ export class McpClientManager {
 
   async callTool(serverName: string, toolName: string, input: unknown, signal?: AbortSignal): Promise<McpCallToolResult> {
     const state = this.requireConnectedState(serverName);
-    return withTimeout(state.client.callTool(toolName, input, signal ? { signal } : {}), state.server.toolTimeoutMs, signal);
+    return withTimeout((operationSignal) => state.client.callTool(toolName, input, { signal: operationSignal }), state.server.toolTimeoutMs, signal);
   }
 
   async readResource(serverName: string, uri: string, signal?: AbortSignal): Promise<McpReadResourceResult> {
@@ -172,18 +172,23 @@ export class McpClientManager {
 
     state.status = "connecting";
     delete state.error;
+    let client: McpClient | undefined;
     try {
-      const client = this.options.createClient(state.server);
+      client = this.options.createClient(state.server);
       state.client = client;
-      await withTimeout(client.initialize(), state.server.startupTimeoutMs);
+      const connectingClient = client;
+      await withTimeout((signal) => connectingClient.initialize({ signal }), state.server.startupTimeoutMs);
+      if (state.client !== client) return;
       this.subscribe(state);
-      await withTimeout(Promise.all([
-        this.refreshStateTools(state),
-        this.refreshStatePrompts(state),
-        this.refreshStateResources(state),
+      await withTimeout((signal) => Promise.all([
+        this.refreshStateTools(state, signal),
+        this.refreshStatePrompts(state, signal),
+        this.refreshStateResources(state, signal),
       ]), state.server.startupTimeoutMs);
+      if (state.client !== client) return;
       state.status = "connected";
     } catch (error) {
+      if (client && state.client !== client) return;
       state.status = "failed";
       state.error = toError(error);
       await this.closeFailedStateClient(state);
@@ -268,28 +273,39 @@ export class McpClientManager {
     this.subscriptions.delete(serverName);
   }
 
-  private async refreshStateTools(state: McpServerState): Promise<void> {
-    if (!state.client) return;
-    state.tools = filterTools(state.server, await listAllTools(state.client));
+  private async refreshStateTools(state: McpServerState, signal?: AbortSignal): Promise<void> {
+    const client = state.client;
+    if (!client) return;
+    const tools = await listAllTools(client, signal);
+    signal?.throwIfAborted();
+    if (state.client === client) state.tools = filterTools(state.server, tools);
   }
 
-  private async refreshStatePrompts(state: McpServerState): Promise<void> {
-    if (!state.client) return;
+  private async refreshStatePrompts(state: McpServerState, signal?: AbortSignal): Promise<void> {
+    const client = state.client;
+    if (!client) return;
     try {
-      state.prompts = await listAllPrompts(state.client);
+      const prompts = await listAllPrompts(client, signal);
+      signal?.throwIfAborted();
+      if (state.client === client) state.prompts = prompts;
     } catch (error) {
+      signal?.throwIfAborted();
       if (!isUnsupportedCapabilityError(error)) throw error;
-      state.prompts = [];
+      if (state.client === client) state.prompts = [];
     }
   }
 
-  private async refreshStateResources(state: McpServerState): Promise<void> {
-    if (!state.client) return;
+  private async refreshStateResources(state: McpServerState, signal?: AbortSignal): Promise<void> {
+    const client = state.client;
+    if (!client) return;
     try {
-      state.resources = await listAllResources(state.client);
+      const resources = await listAllResources(client, signal);
+      signal?.throwIfAborted();
+      if (state.client === client) state.resources = resources;
     } catch (error) {
+      signal?.throwIfAborted();
       if (!isUnsupportedCapabilityError(error)) throw error;
-      state.resources = [];
+      if (state.client === client) state.resources = [];
     }
   }
 
@@ -328,52 +344,77 @@ function filterTools(server: McpServerConfig, tools: readonly McpTool[]): McpToo
   });
 }
 
-async function listAllTools(client: McpClient): Promise<McpTool[]> {
+async function listAllTools(client: McpClient, signal?: AbortSignal): Promise<McpTool[]> {
   const tools: McpTool[] = [];
   let cursor: string | undefined;
   do {
-    const result = await client.listTools(cursor ? { cursor } : {});
+    signal?.throwIfAborted();
+    const result = await client.listTools({ ...(cursor ? { cursor } : {}), ...(signal ? { signal } : {}) });
+    signal?.throwIfAborted();
     tools.push(...result.tools);
     cursor = result.nextCursor;
   } while (cursor);
   return tools;
 }
 
-async function listAllPrompts(client: McpClient): Promise<McpPrompt[]> {
+async function listAllPrompts(client: McpClient, signal?: AbortSignal): Promise<McpPrompt[]> {
   const prompts: McpPrompt[] = [];
   let cursor: string | undefined;
   do {
-    const result = await client.listPrompts(cursor ? { cursor } : {});
+    signal?.throwIfAborted();
+    const result = await client.listPrompts({ ...(cursor ? { cursor } : {}), ...(signal ? { signal } : {}) });
+    signal?.throwIfAborted();
     prompts.push(...result.prompts);
     cursor = result.nextCursor;
   } while (cursor);
   return prompts;
 }
 
-async function listAllResources(client: McpClient): Promise<McpResource[]> {
+async function listAllResources(client: McpClient, signal?: AbortSignal): Promise<McpResource[]> {
   const resources: McpResource[] = [];
   let cursor: string | undefined;
   do {
-    const result = await client.listResources(cursor ? { cursor } : {});
+    signal?.throwIfAborted();
+    const result = await client.listResources({ ...(cursor ? { cursor } : {}), ...(signal ? { signal } : {}) });
+    signal?.throwIfAborted();
     resources.push(...result.resources);
     cursor = result.nextCursor;
   } while (cursor);
   return resources;
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
-  if (!timeoutMs) return promise;
+async function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
+  const controller = new AbortController();
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  let cancel: (error: Error) => void = () => {};
+  const cancelled = new Promise<never>((_, reject) => {
+    cancel = (error) => {
+      // Settle the manager's stable error before SDK abort listeners reject.
+      reject(error);
+      controller.abort(error);
+    };
+  });
+  const onAbort = () => cancel(new Error("MCP operation aborted"));
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
+  if (timeoutMs) {
+    timeout = setTimeout(() => cancel(new Error(`MCP operation timed out after ${timeoutMs}ms`)), timeoutMs);
+  }
   try {
     return await Promise.race([
-      promise,
-      new Promise<T>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error(`MCP operation timed out after ${timeoutMs}ms`)), timeoutMs);
-        signal?.addEventListener("abort", () => reject(new Error("MCP operation aborted")), { once: true });
+      cancelled,
+      Promise.resolve().then(() => {
+        controller.signal.throwIfAborted();
+        return operation(controller.signal);
       }),
     ]);
+  } catch (error) {
+    // Stop sibling initialization requests if one operation failed first.
+    controller.abort(error);
+    throw error;
   } finally {
-    if (timeout) clearTimeout(timeout);
+    if (timeout !== undefined) clearTimeout(timeout);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 

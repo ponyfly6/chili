@@ -9,12 +9,18 @@ import type {
   TeamRunStopReason,
   TeamRunSummaryCounts,
   TeamTaskStatus,
-  ThreadId,
   TimestampMs,
 } from "@chili/protocol";
-import { timestampNow } from "@chili/protocol";
-import type { TeamMemberRow, TeamRow, TeamTaskRow } from "@chili/store";
+import { normalizePersistedError, timestampNow } from "@chili/protocol";
+import type {
+  EventAppendOptions,
+  TeamMemberRow,
+  TeamOwnerSessionBindResult,
+  TeamRow,
+  TeamTaskRow,
+} from "@chili/store";
 import type { LocalSubagentMode } from "./subagent.js";
+import { isTeamTaskArtifactDelivered } from "./team-artifact.js";
 import type {
   TeamTaskDispatchResult,
   TeamTaskDispatchService,
@@ -42,22 +48,37 @@ import {
 } from "./team-verifier.js";
 import { taskMergeMetadata } from "./team-worktree.js";
 import type { TeamControlService } from "./team.js";
+import {
+  RuntimeBusyError,
+  type RuntimeSessionOperation,
+  type SessionOperationCoordinator,
+} from "./runtime-service.js";
+import {
+  authoritativeTeamWorkspaceCwd,
+  boundTeamSessionId,
+  resolveTeamSessionAuthority,
+  TeamSessionAuthorityError,
+  type TeamSessionResolver,
+} from "./team-session-authority.js";
 
 export interface TeamExecutionRunnerOptions {
   teams: TeamControlService;
   dispatcher: TeamTaskDispatchService;
+  sessionOperations: SessionOperationCoordinator;
   verifier?: TeamTaskVerifier;
   merger?: TeamTaskMerger;
   events?: TeamRunEventStore;
   cwd: string;
+  resolveSession: TeamSessionResolver;
   now?: () => TimestampMs;
   createId?: (prefix: string) => string;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   createSession?: (input: TeamExecutionSessionRequest) => Promise<TeamExecutionSession>;
+  assertDelegationEnabled?: (input: { sessionId: SessionId; action: "team.run" }) => Promise<void> | void;
 }
 
 export interface TeamRunEventStore {
-  append(event: ChiliEvent): Promise<void>;
+  append(event: ChiliEvent, options?: EventAppendOptions): Promise<void>;
 }
 
 export interface TeamTaskVerifier {
@@ -76,13 +97,16 @@ export interface TeamExecutionSessionRequest {
 
 export interface TeamExecutionSession {
   sessionId: SessionId;
-  threadId?: ThreadId;
+  /**
+   * Capability to archive this freshly created session if owner binding loses
+   * its CAS race. It is invoked only before this runner starts any team work.
+   */
+  discard: () => Promise<void>;
 }
 
 export interface TeamExecutionRunInput {
   teamId: TeamId;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd?: string;
   mode?: LocalSubagentMode;
   once?: boolean;
@@ -208,8 +232,8 @@ interface TeamExecutionState {
 }
 
 interface SessionState {
-  sessionId?: SessionId;
-  threadId?: ThreadId;
+  sessionId: SessionId;
+  cwd: string;
 }
 
 interface TeamDispatchWork {
@@ -241,7 +265,7 @@ interface TeamDispatchCandidate {
 const DEFAULT_MAX_CYCLES = 50;
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
-const DEFAULT_MAX_CONCURRENT_DISPATCHES = 4;
+const DEFAULT_MAX_CONCURRENT_DISPATCHES = 3;
 const MAX_CONCURRENT_DISPATCHES = 64;
 const DEFAULT_MAX_CONCURRENT_VERIFICATIONS = 2;
 const MAX_CONCURRENT_VERIFICATIONS = 4;
@@ -250,6 +274,8 @@ export class TeamExecutionRunner {
   constructor(private readonly options: TeamExecutionRunnerOptions) {}
 
   async run(input: TeamExecutionRunInput): Promise<TeamExecutionRunSummary> {
+    const startedMonotonic = Date.now();
+    const initialState = await this.loadState(input.teamId);
     const startedAt = Number(this.now());
     const runId = this.id("teamrun");
     const maxCycles = input.once ? 1 : input.maxCycles ?? DEFAULT_MAX_CYCLES;
@@ -257,10 +283,6 @@ export class TeamExecutionRunner {
     const pollIntervalMs = input.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     const maxConcurrentDispatches = normalizeMaxConcurrentDispatches(input.maxConcurrentDispatches);
     const maxConcurrentVerifications = normalizeMaxConcurrentVerifications(input.maxConcurrentVerifications);
-    const startedMonotonic = Date.now();
-    const sessionState: SessionState = {};
-    if (input.sessionId) sessionState.sessionId = input.sessionId;
-    if (input.threadId) sessionState.threadId = input.threadId;
     const summary: TeamExecutionRunSummary = {
       teamId: input.teamId,
       cycles: 0,
@@ -284,249 +306,272 @@ export class TeamExecutionRunner {
       errors: [],
     };
 
-    const initialState = await this.loadState(input.teamId);
-    await this.publishRunStarted(input, sessionState, initialState.team, runId, {
-      maxCycles,
-      timeoutMs,
-      pollIntervalMs,
-      maxConcurrentDispatches,
-      maxConcurrentVerifications,
-    });
-    if (initialState.team.status !== "active") {
-      summary.stopReason = "team_inactive";
+    const preSessionStop = controlStopReason(input, startedMonotonic, timeoutMs);
+    if (preSessionStop) {
+      summary.stopReason = preSessionStop;
       summary.endedAt = Number(this.now());
-      await this.publishRunCompleted(input, sessionState, initialState.team, runId, summary);
       return summary;
     }
 
-    while (true) {
-      const preCycleStop = controlStopReason(input, startedMonotonic, timeoutMs);
-      if (preCycleStop) {
-        summary.stopReason = preCycleStop;
-        break;
-      }
-      if (summary.cycles >= maxCycles) {
-        summary.stopReason = "max_cycles";
-        break;
-      }
+    let sessionState: SessionState;
+    try {
+      sessionState = await this.initializeSessionState(input, initialState);
+    } catch (error) {
+      const sessionStop = controlStopReason(input, startedMonotonic, timeoutMs);
+      if (!sessionStop && !isAbortError(error)) throw error;
+      summary.stopReason = sessionStop ?? "aborted";
+      summary.endedAt = Number(this.now());
+      return summary;
+    }
+    const postSessionStop = controlStopReason(input, startedMonotonic, timeoutMs);
+    if (postSessionStop) {
+      summary.stopReason = postSessionStop;
+      summary.endedAt = Number(this.now());
+      return summary;
+    }
+    return this.options.sessionOperations.withSessionOperation(sessionState.sessionId, async (operation) => {
+      input = withOperationSignal(input, operation.signal);
+      operation.assertCurrent();
+      const guardedInitialState = await this.loadState(input.teamId);
+      await this.assertSessionAuthority(input, sessionState);
+      operation.assertCurrent();
+      await this.options.assertDelegationEnabled?.({
+        sessionId: sessionState.sessionId,
+        action: "team.run",
+      });
+      operation.assertCurrent();
 
-      summary.cycles++;
-      const reconciled = await this.reconcile(input, summary, sessionState);
-      this.collectReconcile(reconciled, summary);
-      const postReconcileStop = controlStopReason(input, startedMonotonic, timeoutMs);
-      await this.publishRunProgress(input, sessionState, initialState.team, runId, summary, "reconcile", postReconcileStop);
-      if (postReconcileStop) {
-        summary.stopReason = postReconcileStop;
-        break;
-      }
-
-      let state = await this.loadState(input.teamId);
-      if (state.team.status !== "active") {
+      await this.publishRunStarted(input, sessionState, guardedInitialState.team, runId, {
+        maxCycles,
+        timeoutMs,
+        pollIntervalMs,
+        maxConcurrentDispatches,
+        maxConcurrentVerifications,
+      }, operation);
+      if (guardedInitialState.team.status !== "active") {
         summary.stopReason = "team_inactive";
-        await this.publishRunProgress(input, sessionState, state.team, runId, summary, "load", "team_inactive");
-        break;
-      }
-      const postLoadStop = controlStopReason(input, startedMonotonic, timeoutMs);
-      await this.publishRunProgress(input, sessionState, state.team, runId, summary, "load", postLoadStop);
-      if (postLoadStop) {
-        summary.stopReason = postLoadStop;
-        break;
+        summary.endedAt = Number(this.now());
+        await this.publishRunCompleted(input, sessionState, guardedInitialState.team, runId, summary, operation);
+        return summary;
       }
 
-      const verified = await this.verifyCompletedTasks(input, summary, sessionState);
-      this.collectVerification(verified, summary);
-      const postVerifyStop = controlStopReason(input, startedMonotonic, timeoutMs);
-      await this.publishRunProgress(input, sessionState, state.team, runId, summary, "verify", postVerifyStop);
-      if (postVerifyStop) {
-        summary.stopReason = postVerifyStop;
-        break;
-      }
-      const merged = await this.mergeVerifiedTasks(input, summary, sessionState);
-      this.collectMerge(merged, summary);
-      const postMergeStop = controlStopReason(input, startedMonotonic, timeoutMs);
-      await this.publishRunProgress(input, sessionState, state.team, runId, summary, "merge", postMergeStop);
-      if (postMergeStop) {
-        summary.stopReason = postMergeStop;
-        break;
-      }
-      if (
-        (verified && (verified.verified.length > 0 || verified.skipped.length > 0)) ||
-        (merged && (merged.applied.length > 0 || merged.failed.length > 0 || merged.conflicted.length > 0 || merged.skipped.length > 0))
-      ) {
-        state = await this.loadState(input.teamId);
-      }
+      while (true) {
+        operation.assertCurrent();
+        await this.assertSessionAuthority(input, sessionState);
+        operation.assertCurrent();
+        const preCycleStop = controlStopReason(input, startedMonotonic, timeoutMs);
+        if (preCycleStop) {
+          summary.stopReason = preCycleStop;
+          break;
+        }
+        if (summary.cycles >= maxCycles) {
+          summary.stopReason = "max_cycles";
+          break;
+        }
 
-      const dispatches: TeamDispatchWork[] = [];
-      const reservations = dispatchReservationsForRunningTasks(state.tasks);
-      for (const task of sortedDispatchCandidates(state.tasks)) {
-        if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
-        if (task.status !== "pending") continue;
+        summary.cycles++;
+        const reconciled = await this.reconcile(input, summary, sessionState, operation);
+        this.collectReconcile(reconciled, summary);
+        const postReconcileStop = controlStopReason(input, startedMonotonic, timeoutMs);
+        await this.publishRunProgress(input, sessionState, guardedInitialState.team, runId, summary, "reconcile", operation, postReconcileStop);
+        if (postReconcileStop) {
+          summary.stopReason = postReconcileStop;
+          break;
+        }
 
-        const blockedBy = incompleteDependencies(task, state.tasks, Boolean(this.options.verifier));
-        if (blockedBy.length > 0) {
-          const skipped: TeamExecutionSkippedTask = {
+        let state = await this.loadState(input.teamId);
+        if (state.team.status !== "active") {
+          summary.stopReason = "team_inactive";
+          await this.publishRunProgress(input, sessionState, state.team, runId, summary, "load", operation, "team_inactive");
+          break;
+        }
+        const postLoadStop = controlStopReason(input, startedMonotonic, timeoutMs);
+        await this.publishRunProgress(input, sessionState, state.team, runId, summary, "load", operation, postLoadStop);
+        if (postLoadStop) {
+          summary.stopReason = postLoadStop;
+          break;
+        }
+
+        const verified = await this.verifyCompletedTasks(input, summary, sessionState, operation);
+        this.collectVerification(verified, summary);
+        const postVerifyStop = controlStopReason(input, startedMonotonic, timeoutMs);
+        await this.publishRunProgress(input, sessionState, state.team, runId, summary, "verify", operation, postVerifyStop);
+        if (postVerifyStop) {
+          summary.stopReason = postVerifyStop;
+          break;
+        }
+        const merged = await this.mergeVerifiedTasks(input, summary, sessionState, operation);
+        this.collectMerge(merged, summary);
+        const postMergeStop = controlStopReason(input, startedMonotonic, timeoutMs);
+        await this.publishRunProgress(input, sessionState, state.team, runId, summary, "merge", operation, postMergeStop);
+        if (postMergeStop) {
+          summary.stopReason = postMergeStop;
+          break;
+        }
+        if (
+          (verified && (verified.verified.length > 0 || verified.skipped.length > 0)) ||
+          (merged && (merged.applied.length > 0 || merged.failed.length > 0 || merged.conflicted.length > 0 || merged.skipped.length > 0))
+        ) {
+          state = await this.loadState(input.teamId);
+        }
+
+        const dispatches: TeamDispatchWork[] = [];
+        const reservations = dispatchReservationsForRunningTasks(state.tasks);
+        const availableDispatchSlots = Math.max(0, maxConcurrentDispatches - runningTasks(state.tasks).length);
+        for (const task of sortedDispatchCandidates(state.tasks)) {
+          if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
+          if (dispatches.length >= availableDispatchSlots) break;
+          if (task.status !== "pending") continue;
+
+          const blockedBy = incompleteDependencies(task, state.tasks, Boolean(this.options.verifier));
+          if (blockedBy.length > 0) {
+            const skipped: TeamExecutionSkippedTask = {
+              teamId: input.teamId,
+              taskId: task.id,
+              reason: "dependency_incomplete",
+              blockedBy,
+            };
+            if (task.ownerPath) skipped.ownerPath = task.ownerPath;
+            pushUniqueSkipped(summary.blocked, skipped);
+            continue;
+          }
+
+          const ownerSelection = task.ownerPath ? { ownerPath: task.ownerPath } : selectDispatchOwner(task, state.members, reservations);
+          const ownerPath = ownerSelection.ownerPath;
+          if (!ownerPath) {
+            this.collectDispatchSkip(input.teamId, task, ownerSelection.reason ?? "missing_owner", summary);
+            continue;
+          }
+          const dispatchTask = task.ownerPath ? task : { ...task, ownerPath };
+
+          const reserved = reserveDispatchResources(dispatchTask, reservations);
+          if (!reserved.allowed) {
+            this.collectDispatchSkip(input.teamId, dispatchTask, reserved.reason, summary);
+            continue;
+          }
+
+          const dispatchInput: Parameters<TeamTaskDispatchService["dispatchTask"]>[0] = {
             teamId: input.teamId,
             taskId: task.id,
-            reason: "dependency_incomplete",
-            blockedBy,
+            mode: input.mode ?? "background",
           };
-          if (task.ownerPath) skipped.ownerPath = task.ownerPath;
-          pushUniqueSkipped(summary.blocked, skipped);
-          continue;
+          dispatchInput.ownerPath = ownerPath;
+          dispatchInput.sessionId = sessionState.sessionId;
+          dispatchInput.cwd = sessionState.cwd;
+          if (input.signal) dispatchInput.signal = input.signal;
+          dispatches.push({ task: dispatchTask, input: dispatchInput });
         }
 
-        const ownerSelection = task.ownerPath ? { ownerPath: task.ownerPath } : selectDispatchOwner(task, state.members, reservations);
-        const ownerPath = ownerSelection.ownerPath;
-        if (!ownerPath) {
-          this.collectDispatchSkip(input.teamId, task, ownerSelection.reason ?? "missing_owner", summary);
-          continue;
-        }
-        const dispatchTask = task.ownerPath ? task : { ...task, ownerPath };
+        if (!controlStopReason(input, startedMonotonic, timeoutMs)) {
+          operation.assertCurrent();
+          const results = await Promise.all(dispatches.map(async (work) => {
+            try {
+              operation.assertCurrent();
+              return { work, result: await this.options.dispatcher.dispatchTask(work.input) };
+            } catch (error) {
+              return { work, error };
+            }
+          }));
 
-        if (!this.currentSessionId(state.team, dispatchTask, sessionState, input)) {
-          let ensured: SessionState;
-          try {
-            ensured = await this.ensureSession(input, sessionState);
-          } catch (error) {
-            const stopReason = controlStopReason(input, startedMonotonic, timeoutMs);
-            if (stopReason) break;
+          for (const item of results) {
+            if ("result" in item) {
+              this.collectDispatch(item.result, summary);
+              continue;
+            }
+            this.assertRecoverableOperationError(item.error, operation);
+            if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
             summary.errors.push({
               teamId: input.teamId,
-              taskId: task.id,
-              error: toError(error).message,
+              taskId: item.work.task.id,
+              error: toError(item.error).message,
             });
-            continue;
           }
-          if (!ensured.sessionId) {
-            pushUniqueSkipped(summary.skipped, {
-              teamId: input.teamId,
-              taskId: task.id,
-              ownerPath,
-              reason: "missing_session",
-            });
-            continue;
-          }
-          if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
         }
 
-        const reserved = reserveDispatchResources(dispatchTask, reservations);
-        if (!reserved.allowed) {
-          this.collectDispatchSkip(input.teamId, dispatchTask, reserved.reason, summary);
-          continue;
+        const postScanStop = controlStopReason(input, startedMonotonic, timeoutMs);
+        await this.publishRunProgress(input, sessionState, state.team, runId, summary, "dispatch", operation, postScanStop);
+        if (postScanStop) {
+          summary.stopReason = postScanStop;
+          break;
         }
 
-        const dispatchInput: Parameters<TeamTaskDispatchService["dispatchTask"]>[0] = {
-          teamId: input.teamId,
-          taskId: task.id,
-          mode: input.mode ?? "background",
-          cwd: input.cwd ?? this.options.cwd,
-        };
-        dispatchInput.ownerPath = ownerPath;
-        const sessionId = sessionState.sessionId ?? dispatchTask.sessionId ?? state.team.sessionId;
-        if (sessionId) dispatchInput.sessionId = sessionId;
-        const threadId = sessionState.threadId ?? input.threadId;
-        if (threadId) dispatchInput.threadId = threadId;
-        if (input.signal) dispatchInput.signal = input.signal;
-        dispatches.push({ task: dispatchTask, input: dispatchInput });
-      }
+        if (input.once) {
+          summary.stopReason = "once";
+          break;
+        }
 
-      for (const batch of chunk(dispatches, maxConcurrentDispatches)) {
-        if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
-        const results = await Promise.all(batch.map(async (work) => {
-          try {
-            return { work, result: await this.options.dispatcher.dispatchTask(work.input) };
-          } catch (error) {
-            return { work, error };
-          }
-        }));
+        const postCycle = await this.loadState(input.teamId);
+        const postCycleStop = controlStopReason(input, startedMonotonic, timeoutMs);
+        if (postCycleStop) {
+          summary.stopReason = postCycleStop;
+          await this.publishRunProgress(input, sessionState, postCycle.team, runId, summary, "wait", operation, postCycleStop);
+          break;
+        }
+        const stillRunning = runningTasks(postCycle.tasks);
+        const runnable = runnablePendingTasks(
+          postCycle,
+          sessionState,
+          Boolean(this.options.verifier),
+        );
+        const unverified = this.unverifiedTasks(postCycle.tasks);
+        const reopened = this.reopenedTasks(postCycle.tasks);
+        const pendingMerge = this.pendingMergeTasks(postCycle.tasks);
+        const pendingVerification = this.pendingVerificationTasks(postCycle.tasks);
+        if (
+          stillRunning.length === 0 &&
+          runnable.length === 0 &&
+          unverified.length === 0 &&
+          reopened.length === 0 &&
+          pendingMerge.length === 0 &&
+          pendingVerification.length === 0
+        ) {
+          summary.stopReason = "drained";
+          await this.publishRunProgress(input, sessionState, postCycle.team, runId, summary, "drain", operation, "drained");
+          break;
+        }
 
-        for (const item of results) {
-          if ("result" in item) {
-            this.collectDispatch(item.result, summary);
-            continue;
-          }
-          if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
-          summary.errors.push({
-            teamId: input.teamId,
-            taskId: item.work.task.id,
-            error: toError(item.error).message,
-          });
+        const dispatchCapacityExhausted = stillRunning.length >= maxConcurrentDispatches;
+        if (
+          (pendingVerification.length > 0 ||
+            (stillRunning.length > 0 &&
+              (runnable.length === 0 || dispatchCapacityExhausted || dispatches.length === 0))) &&
+          !input.signal?.aborted
+        ) {
+          await this.publishRunProgress(input, sessionState, postCycle.team, runId, summary, "wait", operation);
+          operation.assertCurrent();
+          await this.sleep(Math.min(pollIntervalMs, remainingDelay(timeoutMs, startedMonotonic)), input.signal);
         }
       }
 
-      const postScanStop = controlStopReason(input, startedMonotonic, timeoutMs);
-      await this.publishRunProgress(input, sessionState, state.team, runId, summary, "dispatch", postScanStop);
-      if (postScanStop) {
-        summary.stopReason = postScanStop;
-        break;
-      }
-
-      if (input.once) {
-        summary.stopReason = "once";
-        break;
-      }
-
-      const postCycle = await this.loadState(input.teamId);
-      const postCycleStop = controlStopReason(input, startedMonotonic, timeoutMs);
-      if (postCycleStop) {
-        summary.stopReason = postCycleStop;
-        await this.publishRunProgress(input, sessionState, postCycle.team, runId, summary, "wait", postCycleStop);
-        break;
-      }
-      const stillRunning = runningTasks(postCycle.tasks);
-      const runnable = runnablePendingTasks(
-        postCycle,
-        input,
-        sessionState,
-        Boolean(this.options.createSession),
-        Boolean(this.options.verifier),
-      );
-      const unverified = this.unverifiedTasks(postCycle.tasks);
-      const reopened = this.reopenedTasks(postCycle.tasks);
-      const pendingMerge = this.pendingMergeTasks(postCycle.tasks);
-      const pendingVerification = this.pendingVerificationTasks(postCycle.tasks);
-      if (
-        stillRunning.length === 0 &&
-        runnable.length === 0 &&
-        unverified.length === 0 &&
-        reopened.length === 0 &&
-        pendingMerge.length === 0 &&
-        pendingVerification.length === 0
-      ) {
-        summary.stopReason = "drained";
-        await this.publishRunProgress(input, sessionState, postCycle.team, runId, summary, "drain", "drained");
-        break;
-      }
-
-      if ((stillRunning.length > 0 || pendingVerification.length > 0) && !input.signal?.aborted) {
-        await this.publishRunProgress(input, sessionState, postCycle.team, runId, summary, "wait");
-        await this.sleep(Math.min(pollIntervalMs, remainingDelay(timeoutMs, startedMonotonic)), input.signal);
-      }
-    }
-
-    const finalState = await this.loadState(input.teamId);
-    summary.stillRunning = runningTasks(finalState.tasks).map((task) => runningTaskSummary(task));
-    summary.accepted = this.acceptedTasks(finalState.tasks).map((task) => finalTaskSummary(task, undefined)).filter(isDefined);
-    summary.endedAt = Number(this.now());
-    await this.publishRunCompleted(input, sessionState, finalState.team, runId, summary);
-    return summary;
+      operation.assertCurrent();
+      await this.assertSessionAuthority(input, sessionState);
+      const finalState = await this.loadState(input.teamId);
+      operation.assertCurrent();
+      summary.stillRunning = runningTasks(finalState.tasks).map((task) => runningTaskSummary(task));
+      summary.accepted = this.acceptedTasks(finalState.tasks).map((task) => finalTaskSummary(task, undefined)).filter(isDefined);
+      summary.endedAt = Number(this.now());
+      await this.publishRunCompleted(input, sessionState, finalState.team, runId, summary, operation);
+      return summary;
+    });
   }
 
   private async reconcile(
     input: TeamExecutionRunInput,
     summary: TeamExecutionRunSummary,
     sessionState: SessionState,
+    operation: RuntimeSessionOperation,
   ): Promise<TeamTaskReconcileResult | undefined> {
+    operation.assertCurrent();
+    await this.assertSessionAuthority(input, sessionState);
+    operation.assertCurrent();
     try {
       const reconcileInput: Parameters<TeamTaskDispatchService["reconcileTasks"]>[0] = {
         teamId: input.teamId,
       };
-      const sessionId = sessionState.sessionId ?? input.sessionId;
-      const threadId = sessionState.threadId ?? input.threadId;
-      if (sessionId) reconcileInput.sessionId = sessionId;
-      if (threadId) reconcileInput.threadId = threadId;
+      reconcileInput.sessionId = sessionState.sessionId;
       return await this.options.dispatcher.reconcileTasks(reconcileInput);
     } catch (error) {
+      this.assertRecoverableOperationError(error, operation);
       summary.errors.push({
         teamId: input.teamId,
         error: toError(error).message,
@@ -554,7 +599,7 @@ export class TeamExecutionRunner {
       summary.errors.push({
         teamId: error.teamId,
         taskId: error.taskId,
-        error: error.error,
+        error: normalizePersistedError(error.error).message,
       });
     }
   }
@@ -572,21 +617,23 @@ export class TeamExecutionRunner {
     input: TeamExecutionRunInput,
     summary: TeamExecutionRunSummary,
     sessionState: SessionState,
+    operation: RuntimeSessionOperation,
   ): Promise<TeamTaskVerifierSweepResult | undefined> {
     if (!this.options.verifier) return undefined;
+    operation.assertCurrent();
+    await this.assertSessionAuthority(input, sessionState);
+    operation.assertCurrent();
     try {
       const verifierInput: TeamTaskVerifierSweepInput = {
         teamId: input.teamId,
-        cwd: input.cwd ?? this.options.cwd,
+        cwd: sessionState.cwd,
         maxConcurrentVerifications: summary.maxConcurrentVerifications,
       };
-      const sessionId = sessionState.sessionId ?? input.sessionId;
-      const threadId = sessionState.threadId ?? input.threadId;
-      if (sessionId) verifierInput.sessionId = sessionId;
-      if (threadId) verifierInput.threadId = threadId;
+      verifierInput.sessionId = sessionState.sessionId;
       if (input.signal) verifierInput.signal = input.signal;
       return await this.options.verifier.verifyCompletedTasks(verifierInput);
     } catch (error) {
+      this.assertRecoverableOperationError(error, operation);
       if (isAbortError(error)) return undefined;
       summary.errors.push({
         teamId: input.teamId,
@@ -620,7 +667,7 @@ export class TeamExecutionRunner {
       summary.errors.push({
         teamId: error.teamId,
         taskId: error.taskId,
-        error: error.error,
+        error: normalizePersistedError(error.error).message,
       });
     }
   }
@@ -629,20 +676,22 @@ export class TeamExecutionRunner {
     input: TeamExecutionRunInput,
     summary: TeamExecutionRunSummary,
     sessionState: SessionState,
+    operation: RuntimeSessionOperation,
   ): Promise<TeamMergeSweepResult | undefined> {
     if (!this.options.merger) return undefined;
+    operation.assertCurrent();
+    await this.assertSessionAuthority(input, sessionState);
+    operation.assertCurrent();
     try {
       const mergeInput: TeamMergeInput = {
         teamId: input.teamId,
-        cwd: input.cwd ?? this.options.cwd,
+        cwd: sessionState.cwd,
+        sessionId: sessionState.sessionId,
       };
-      const sessionId = sessionState.sessionId ?? input.sessionId;
-      const threadId = sessionState.threadId ?? input.threadId;
-      if (sessionId) mergeInput.sessionId = sessionId;
-      if (threadId) mergeInput.threadId = threadId;
       if (input.signal) mergeInput.signal = input.signal;
       return await this.options.merger.mergeTeamTasks(mergeInput);
     } catch (error) {
+      this.assertRecoverableOperationError(error, operation);
       if (isAbortError(error)) return undefined;
       summary.errors.push({
         teamId: input.teamId,
@@ -662,7 +711,7 @@ export class TeamExecutionRunner {
       summary.errors.push({
         teamId: error.teamId,
         taskId: error.taskId,
-        error: error.error,
+        error: normalizePersistedError(error.error).message,
       });
     }
   }
@@ -719,26 +768,120 @@ export class TeamExecutionRunner {
     }
   }
 
-  private currentSessionId(
-    team: TeamRow,
-    task: TeamTaskRow,
-    state: SessionState,
+  private async initializeSessionState(
     input: TeamExecutionRunInput,
-  ): SessionId | undefined {
-    return state.sessionId ?? input.sessionId ?? task.sessionId ?? team.sessionId;
-  }
-
-  private async ensureSession(input: TeamExecutionRunInput, state: SessionState): Promise<SessionState> {
-    if (state.sessionId || !this.options.createSession) return state;
+    state: TeamExecutionState,
+  ): Promise<SessionState> {
+    const boundSessionId = boundTeamSessionId({
+      team: state.team,
+      tasks: state.tasks,
+      ...(input.sessionId ? { requestedSessionId: input.sessionId } : {}),
+    });
+    if (boundSessionId) {
+      return resolveTeamSessionAuthority({
+        team: state.team,
+        tasks: state.tasks,
+        requestedSessionId: boundSessionId,
+        ...(input.cwd !== undefined ? { requestedCwd: input.cwd } : {}),
+        resolveSession: this.options.resolveSession,
+      });
+    }
+    const cwd = await authoritativeTeamWorkspaceCwd(this.options.cwd, input.cwd);
+    if (!this.options.createSession) {
+      throw new Error(`Team ${input.teamId} has no persisted root session`);
+    }
     const request: TeamExecutionSessionRequest = {
       teamId: input.teamId,
-      cwd: input.cwd ?? this.options.cwd,
+      cwd,
     };
     if (input.signal) request.signal = input.signal;
     const created = await this.options.createSession(request);
-    state.sessionId = created.sessionId;
-    if (created.threadId) state.threadId = created.threadId;
-    return state;
+    const binding = await this.bindCreatedSession(input.teamId, created);
+    if (
+      (!binding.applied && binding.reason !== "already_bound")
+      || binding.ownerSessionId !== created.sessionId
+    ) {
+      const owner = binding.ownerSessionId ? `; already owned by ${binding.ownerSessionId}` : "";
+      const authorityError = new TeamSessionAuthorityError(
+        `Could not persist owner session ${created.sessionId} for team ${input.teamId} (${binding.reason ?? "unknown"}${owner})`,
+      );
+      const current = await this.loadState(input.teamId).catch(() => undefined);
+      if (!current || current.team.sessionId === created.sessionId) throw authorityError;
+      await this.rejectCreatedSession(created, authorityError);
+    }
+    const current = await this.loadState(input.teamId);
+    return resolveTeamSessionAuthority({
+      team: current.team,
+      tasks: current.tasks,
+      requestedSessionId: created.sessionId,
+      requestedCwd: cwd,
+      resolveSession: this.options.resolveSession,
+    });
+  }
+
+  private async bindCreatedSession(
+    teamId: TeamId,
+    created: TeamExecutionSession,
+  ): Promise<TeamOwnerSessionBindResult> {
+    try {
+      return await this.options.teams.bindOwnerSession({
+        teamId,
+        ownerSessionId: created.sessionId,
+      });
+    } catch (error) {
+      // A concurrent binder can win after TeamControlService reads the
+      // unbound team but before its candidate-session operation starts. That
+      // path throws before reaching the store CAS, so re-read the durable
+      // owner before deciding whether this freshly created candidate lost.
+      const current = await this.loadState(teamId).catch(() => undefined);
+      if (current?.team.sessionId === created.sessionId) {
+        return {
+          applied: false,
+          reason: "already_bound" as const,
+          ownerSessionId: created.sessionId,
+          team: current.team,
+          events: [],
+        };
+      } else if (current) {
+        const owner = current.team.sessionId ? `; already owned by ${current.team.sessionId}` : "";
+        await this.rejectCreatedSession(
+          created,
+          new TeamSessionAuthorityError(
+            `Could not persist owner session ${created.sessionId} for team ${teamId} (conflict${owner})`,
+          ),
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async rejectCreatedSession(
+    created: TeamExecutionSession,
+    authorityError: TeamSessionAuthorityError,
+  ): Promise<never> {
+    try {
+      await created.discard();
+    } catch (error) {
+      const cleanupError = toError(error);
+      const failure = new TeamSessionAuthorityError(
+        `${authorityError.message}; could not discard unused session ${created.sessionId}: ${cleanupError.message}`,
+      );
+      (failure as Error & { cause?: unknown }).cause = error;
+      throw failure;
+    }
+    throw authorityError;
+  }
+
+  private async assertSessionAuthority(input: TeamExecutionRunInput, state: SessionState): Promise<void> {
+    const current = await this.loadState(input.teamId);
+    const authority = await resolveTeamSessionAuthority({
+      team: current.team,
+      tasks: current.tasks,
+      requestedSessionId: state.sessionId,
+      requestedCwd: state.cwd,
+      resolveSession: this.options.resolveSession,
+    });
+    state.cwd = authority.cwd;
   }
 
   private async loadState(teamId: TeamId): Promise<TeamExecutionState> {
@@ -793,6 +936,7 @@ export class TeamExecutionRunner {
       maxConcurrentDispatches: number;
       maxConcurrentVerifications: number;
     },
+    operation: RuntimeSessionOperation,
   ): Promise<void> {
     await this.appendRunEvent(input, sessionState, team, "team.run_started", {
       teamId: input.teamId,
@@ -804,7 +948,7 @@ export class TeamExecutionRunner {
       pollIntervalMs: options.pollIntervalMs,
       maxConcurrentDispatches: options.maxConcurrentDispatches,
       maxConcurrentVerifications: options.maxConcurrentVerifications,
-    });
+    }, operation);
   }
 
   private async publishRunProgress(
@@ -814,6 +958,7 @@ export class TeamExecutionRunner {
     runId: string,
     summary: TeamExecutionRunSummary,
     phase: TeamRunLifecyclePhase,
+    operation: RuntimeSessionOperation,
     stopReason?: TeamRunStopReason,
   ): Promise<void> {
     const payload: {
@@ -831,7 +976,7 @@ export class TeamExecutionRunner {
       counts: runSummaryCounts(summary),
     };
     if (stopReason) payload.stopReason = stopReason;
-    await this.appendRunEvent(input, sessionState, team, "team.run_progress", payload);
+    await this.appendRunEvent(input, sessionState, team, "team.run_progress", payload, operation);
   }
 
   private async publishRunCompleted(
@@ -840,6 +985,7 @@ export class TeamExecutionRunner {
     team: TeamRow,
     runId: string,
     summary: TeamExecutionRunSummary,
+    operation: RuntimeSessionOperation,
   ): Promise<void> {
     await this.appendRunEvent(input, sessionState, team, "team.run_completed", {
       teamId: input.teamId,
@@ -849,16 +995,18 @@ export class TeamExecutionRunner {
       startedAt: summary.startedAt,
       endedAt: summary.endedAt,
       counts: runSummaryCounts(summary),
-    });
+    }, operation);
   }
 
   private async appendRunEvent<TType extends ChiliEvent["type"], TPayload>(
-    input: TeamExecutionRunInput,
+    _input: TeamExecutionRunInput,
     sessionState: SessionState,
-    team: TeamRow,
+    _team: TeamRow,
     type: TType,
     payload: TPayload,
+    operation: RuntimeSessionOperation,
   ): Promise<void> {
+    operation.assertCurrent();
     if (!this.options.events) return;
     const event: EventEnvelope<TType, TPayload> = {
       id: this.id("event"),
@@ -866,11 +1014,17 @@ export class TeamExecutionRunner {
       time: this.now(),
       payload,
     };
-    const sessionId = sessionState.sessionId ?? input.sessionId ?? team.sessionId;
-    if (sessionId) event.sessionId = sessionId;
-    const threadId = sessionState.threadId ?? input.threadId;
-    if (threadId) event.threadId = threadId;
-    await this.options.events.append(event as ChiliEvent);
+    event.sessionId = sessionState.sessionId;
+    await this.options.events.append(
+      event as ChiliEvent,
+      operation.runClaim ? { runClaim: operation.runClaim } : undefined,
+    );
+    operation.assertCurrent();
+  }
+
+  private assertRecoverableOperationError(error: unknown, operation: RuntimeSessionOperation): void {
+    operation.assertCurrent();
+    if (error instanceof TeamSessionAuthorityError || error instanceof RuntimeBusyError) throw error;
   }
 
   private sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
@@ -901,14 +1055,6 @@ function normalizeMaxConcurrentVerifications(value: number | undefined): number 
   if (value === undefined) return DEFAULT_MAX_CONCURRENT_VERIFICATIONS;
   if (!Number.isInteger(value) || value <= 0) return DEFAULT_MAX_CONCURRENT_VERIFICATIONS;
   return Math.min(value, MAX_CONCURRENT_VERIFICATIONS);
-}
-
-function chunk<T>(items: readonly T[], size: number): T[][] {
-  const chunks: T[][] = [];
-  for (let index = 0; index < items.length; index += size) {
-    chunks.push(items.slice(index, index + size));
-  }
-  return chunks;
 }
 
 function dispatchReservationsForRunningTasks(tasks: readonly TeamTaskRow[]): DispatchReservations {
@@ -1166,15 +1312,14 @@ function incompleteDependencies(task: TeamTaskRow, tasks: readonly TeamTaskRow[]
   return task.dependsOn.filter((taskId) => {
     const dependency = byId.get(taskId);
     if (!dependency || dependency.status !== "completed") return true;
+    if (!isTeamTaskArtifactDelivered(dependency)) return true;
     return requireAccepted && !isAcceptedTeamTask(dependency);
   });
 }
 
 function runnablePendingTasks(
   state: TeamExecutionState,
-  input: TeamExecutionRunInput,
   sessionState: SessionState,
-  canCreateSession: boolean,
   requireAcceptedDependencies = false,
 ): TeamTaskRow[] {
   const reservations = dispatchReservationsForRunningTasks(state.tasks);
@@ -1183,7 +1328,7 @@ function runnablePendingTasks(
     if (incompleteDependencies(task, state.tasks, requireAcceptedDependencies).length > 0) return false;
     const ownerPath = task.ownerPath ?? selectDispatchOwner(task, state.members, reservations).ownerPath;
     if (!ownerPath) return false;
-    if (!Boolean(sessionState.sessionId ?? input.sessionId ?? task.sessionId ?? state.team.sessionId ?? canCreateSession)) return false;
+    if (!Boolean(sessionState.sessionId)) return false;
     const member = state.members.find((item) => item.path === ownerPath);
     if (!member) return true;
     return member.status !== "closed" && member.status !== "blocked" && !(member.status === "running" && member.currentTaskId !== task.id);
@@ -1215,7 +1360,7 @@ function finalTaskSummary(task: TeamTaskRow, agentTaskId: TaskId | undefined): T
   };
   if (task.ownerPath) summary.ownerPath = task.ownerPath;
   if (task.summary) summary.summary = task.summary;
-  if (task.error) summary.error = task.error;
+  if (task.error) summary.error = normalizePersistedError(task.error).message;
   const resolvedAgentTaskId = agentTaskId ?? dispatchAgentTaskId(task.metadata);
   if (resolvedAgentTaskId) summary.agentTaskId = resolvedAgentTaskId;
   return summary;
@@ -1241,8 +1386,10 @@ function mergeSummary(result: TeamMergeTaskResult): TeamExecutionMergeTask {
   };
   if (result.teamTask.ownerPath) item.ownerPath = result.teamTask.ownerPath;
   if (result.diffSummary) item.diffSummary = result.diffSummary;
-  if (result.error) item.error = result.error;
-  if (result.conflicts) item.conflicts = result.conflicts;
+  if (result.error) item.error = normalizePersistedError(result.error).message;
+  if (result.conflicts) {
+    item.conflicts = result.conflicts.map((conflict) => normalizePersistedError(conflict).message);
+  }
   return item;
 }
 
@@ -1253,7 +1400,7 @@ function mergeSkippedSummary(result: TeamMergeTaskSkipped): TeamExecutionMergeSk
     reason: result.reason,
   };
   if (result.teamTask.ownerPath) item.ownerPath = result.teamTask.ownerPath;
-  if (result.error) item.error = result.error;
+  if (result.error) item.error = normalizePersistedError(result.error).message;
   return item;
 }
 
@@ -1380,12 +1527,25 @@ function controlStopReason(
   return undefined;
 }
 
+function withOperationSignal(
+  input: TeamExecutionRunInput,
+  operationSignal: AbortSignal,
+): TeamExecutionRunInput {
+  if (!input.signal || input.signal === operationSignal) {
+    return { ...input, signal: input.signal ?? operationSignal };
+  }
+  return {
+    ...input,
+    signal: AbortSignal.any([input.signal, operationSignal]),
+  };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  return normalizePersistedError(error);
 }
 
 function isAbortError(error: unknown): boolean {

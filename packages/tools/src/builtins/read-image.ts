@@ -1,6 +1,7 @@
 import { readFile, stat } from "node:fs/promises";
-import { extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { extname } from "node:path";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
+import { assertExistingPathInsideWorkspace, resolveWorkspacePath } from "../workspace-path.js";
 
 export interface ReadImageInput {
   filePath: string;
@@ -55,38 +56,35 @@ export function createReadImageTool(): ChiliToolDefinition<ReadImageInput> {
       };
     },
     async execute(input, context) {
-      const workspace = resolve(context.cwd);
-      const target = resolve(workspace, input.filePath);
-      const rel = relative(workspace, target);
-      if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-        throw new Error(`read_image only supports files inside the workspace: ${input.filePath}`);
-      }
+      const workspace = context.cwd;
+      const target = resolveWorkspacePath(workspace, input.filePath);
+      await assertExistingPathInsideWorkspace(workspace, target, input.filePath);
 
-      const mimeType = mimeTypeForPath(target);
+      const mimeType = mimeTypeForPath(target.absolutePath);
       if (!mimeType) {
         throw new Error(`read_image supports PNG, JPEG, GIF, and WebP images: ${input.filePath}`);
       }
 
-      const info = await stat(target);
+      const info = await stat(target.absolutePath);
       if (!info.isFile()) throw new Error(`read_image only supports files: ${input.filePath}`);
       const maxBytes = input.maxBytes ?? DEFAULT_MAX_IMAGE_BYTES;
       if (info.size > maxBytes) {
         throw new Error(`image is ${info.size} bytes, above the ${maxBytes} byte limit`);
       }
 
-      const buffer = await readFile(target);
+      const buffer = await readFile(target.absolutePath);
       const data = buffer.toString("base64");
       return {
-        title: rel,
+        title: target.relativePath,
         output: [
-          `Image read: ${rel}`,
+          `Image read: ${target.relativePath}`,
           `MIME type: ${mimeType}`,
           `Bytes: ${buffer.byteLength}`,
           "The visual image content is attached to this tool result as an image block. Inspect that image block directly; do not treat this as metadata-only output.",
         ].join("\n"),
         content: [{ type: "image", data, mimeType }],
         metadata: {
-          path: rel,
+          path: target.relativePath,
           bytes: buffer.byteLength,
           mimeType,
         },

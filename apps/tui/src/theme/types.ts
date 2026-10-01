@@ -5,6 +5,9 @@ export interface TuiTheme {
     background: string;
     panel: string;
     overlay: string;
+    message: {
+      userBackground: string;
+    };
     text: {
       primary: string;
       secondary: string;

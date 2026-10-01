@@ -1,5 +1,10 @@
 import type { ModelDescriptor, ModelSelection, ReasoningLevel, ThinkingLevel } from "./types.js";
 import { REASONING_LEVELS } from "./types.js";
+import {
+  CODEX_API_PROVIDER_ID,
+  OPENAI_CODEX_DEFAULT_MODEL,
+  OPENAI_CODEX_PROVIDER_ID,
+} from "./models.js";
 
 export interface ParsedModelSelectionPattern {
   provider?: string;
@@ -23,7 +28,9 @@ export interface ResolveModelSelectionPatternOptions {
 
 const REASONING_LEVEL_SET = new Set<string>(REASONING_LEVELS);
 const REASONING_LEVEL_ORDER: readonly ReasoningLevel[] = REASONING_LEVELS;
-const REASONING_LEVELS_WITHOUT_XHIGH: readonly ReasoningLevel[] = ["off", "minimal", "low", "medium", "high"];
+const REASONING_LEVELS_THROUGH_HIGH: readonly ReasoningLevel[] = ["off", "minimal", "low", "medium", "high"];
+const REASONING_LEVELS_THROUGH_XHIGH: readonly ReasoningLevel[] = [...REASONING_LEVELS_THROUGH_HIGH, "xhigh"];
+const REASONING_LEVELS_THROUGH_MAX: readonly ReasoningLevel[] = [...REASONING_LEVELS_THROUGH_XHIGH, "max"];
 
 export function isReasoningLevel(value: string): value is ReasoningLevel {
   return REASONING_LEVEL_SET.has(value);
@@ -66,10 +73,11 @@ export function resolveModelSelectionPattern(
   models: readonly ModelDescriptor[],
   options: ResolveModelSelectionPatternOptions = {},
 ): ModelSelectionPatternResult {
-  const trimmed = pattern.trim();
-  if (!trimmed) return {};
+  const input = pattern.trim();
+  if (!input) return {};
+  const trimmed = canonicalizeOfficialModelAlias(input, options.defaultProvider);
 
-  const matched = tryMatchModel(trimmed, models, options.allowFuzzy ?? true);
+  const matched = tryMatchModel(trimmed, models, options.allowFuzzy ?? true, options.defaultProvider);
   if (matched) {
     return {
       descriptor: cloneDescriptor(matched),
@@ -120,7 +128,7 @@ export function resolveModelSelectionPattern(
   if (providerModels.length === 0 || !options.allowCustomModel) return {};
 
   const canonicalProvider = providerModels[0]?.provider ?? provider;
-  const clamped = clampReasoningLevel(parsed.reasoning ?? "off", ["off", "minimal", "low", "medium", "high", "xhigh"]);
+  const clamped = clampModelReasoningLevel(parsed.model, parsed.reasoning ?? "off");
   const selection: ModelSelection = {
     provider: canonicalProvider,
     model: parsed.model,
@@ -135,9 +143,27 @@ export function resolveModelSelectionPattern(
   };
 }
 
+function canonicalizeOfficialModelAlias(pattern: string, defaultProvider: string | undefined): string {
+  const match = /^(?:(openai-codex|codex-api)\/)?gpt-5\.6(.*)$/i.exec(pattern);
+  if (!match) return pattern;
+  const suffix = match[2] ?? "";
+  if (suffix && !suffix.startsWith(":")) return pattern;
+
+  const explicitProvider = match[1]?.toLowerCase();
+  const provider = explicitProvider
+    ?? (defaultProvider === OPENAI_CODEX_PROVIDER_ID || defaultProvider === CODEX_API_PROVIDER_ID
+      ? defaultProvider
+      : undefined);
+  if (!provider) return pattern;
+  return `${provider}/${OPENAI_CODEX_DEFAULT_MODEL}${suffix}`;
+}
+
 export function getModelSelectionAvailableReasoningLevels(model: ModelDescriptor | undefined): readonly ReasoningLevel[] {
-  if (model && model.capabilities?.reasoning === false) return ["off"];
-  return supportsXHighReasoning(model) ? REASONING_LEVELS : REASONING_LEVELS_WITHOUT_XHIGH;
+  if (model && model.capabilities?.reasoning === false) return [];
+  if (model?.reasoningLevels !== undefined) return model.reasoningLevels;
+  if (supportsUltraReasoning(model)) return REASONING_LEVELS;
+  if (supportsMaxReasoning(model)) return REASONING_LEVELS_THROUGH_MAX;
+  return supportsXHighReasoning(model) ? REASONING_LEVELS_THROUGH_XHIGH : REASONING_LEVELS_THROUGH_HIGH;
 }
 
 export function clampModelReasoningLevel(model: ModelDescriptor | string | undefined, level: ReasoningLevel): ReasoningLevel {
@@ -164,17 +190,30 @@ export function supportsXHighReasoning(model: ModelDescriptor | string | undefin
   if (!modelId) return false;
   const id = modelId.toLowerCase();
   return (
-    id.includes("gpt-5.2") ||
-    id.includes("gpt-5.3") ||
-    id.includes("gpt-5.4") ||
-    id.includes("gpt-5.5") ||
-    id.includes("deepseek-v4-pro") ||
-    id.includes("deepseek-v4-flash") ||
+    id.includes("gpt-5.6") ||
+    id.includes("grok-4.6") ||
     id.includes("opus-4-6") ||
     id.includes("opus-4.6") ||
     id.includes("opus-4-7") ||
     id.includes("opus-4.7")
   );
+}
+
+export function supportsMaxReasoning(model: ModelDescriptor | string | undefined): boolean {
+  const modelId = typeof model === "string" ? model : model?.model;
+  if (!modelId) return false;
+  const id = modelId.toLowerCase();
+  return id.includes("gpt-5.6")
+    || id.includes("deepseek-v4-")
+    || id.includes("kimi-k3")
+    || id.includes("glm-5.3");
+}
+
+export function supportsUltraReasoning(model: ModelDescriptor | string | undefined): boolean {
+  const modelId = typeof model === "string" ? model : model?.model;
+  if (!modelId) return false;
+  const id = modelId.toLowerCase();
+  return id.includes("gpt-5.6") && !id.includes("gpt-5.6-luna");
 }
 
 export function formatModelSelection(selection: Pick<ModelSelection, "provider" | "model" | "reasoning">): string {
@@ -196,7 +235,17 @@ function tryMatchModel(
   modelPattern: string,
   models: readonly ModelDescriptor[],
   allowFuzzy: boolean,
+  defaultProvider?: string,
 ): ModelDescriptor | undefined {
+  if (!modelPattern.includes("/")) {
+    const normalized = modelPattern.trim().toLowerCase();
+    const bareMatches = models.filter((model) => model.model.toLowerCase() === normalized);
+    if (bareMatches.length > 1) {
+      if (!defaultProvider) return undefined;
+      const providerMatches = bareMatches.filter((model) => equalsIgnoreCase(model.provider, defaultProvider));
+      return providerMatches.length === 1 ? providerMatches[0] : undefined;
+    }
+  }
   const exact = findExactModelReferenceMatch(modelPattern, models);
   if (exact || !allowFuzzy) return exact;
 
@@ -210,7 +259,15 @@ function tryMatchModel(
   if (matches.length === 0) return undefined;
 
   const aliases = matches.filter((model) => isAlias(model.model));
-  const candidates = aliases.length > 0 ? aliases : matches;
+  let candidates = aliases.length > 0 ? aliases : matches;
+  if (!modelPattern.includes("/")) {
+    const matchingProviders = new Set(candidates.map((model) => model.provider.toLowerCase()));
+    if (matchingProviders.size > 1) {
+      if (!defaultProvider) return undefined;
+      candidates = candidates.filter((model) => equalsIgnoreCase(model.provider, defaultProvider));
+      if (candidates.length === 0) return undefined;
+    }
+  }
   return candidates.slice().sort((a, b) => b.model.localeCompare(a.model))[0];
 }
 
@@ -256,6 +313,8 @@ function cloneDescriptor(model: ModelDescriptor): ModelDescriptor {
   if (model.capabilities) clone.capabilities = { ...model.capabilities };
   if (model.compatibility) clone.compatibility = { ...model.compatibility };
   if (model.inputCapabilities) clone.inputCapabilities = [...model.inputCapabilities];
+  if (model.reasoningLevels) clone.reasoningLevels = [...model.reasoningLevels];
+  if (model.serviceTiers) clone.serviceTiers = [...model.serviceTiers];
   if (model.cost) clone.cost = { ...model.cost };
   return clone;
 }

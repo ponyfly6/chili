@@ -5,7 +5,7 @@ import type { CommandDefinition } from "./types.js";
 const INIT_ALLOWED_TOOLS = ["read", "glob", "grep", "git_status", "git_diff", "edit", "write", "apply_patch", "tool_search"] as const;
 const INIT_WRITE_SCOPE = ["AGENTS.md"] as const;
 
-const INIT_PROMPT = `You are running Chili's /init command for this repository.
+const INIT_PROMPT = `You are running Chili's /prompt builtin init command for this repository.
 
 Goal: create or update the repository agent instruction file. The default target artifact is AGENTS.md, and the document title must be exactly:
 
@@ -34,20 +34,22 @@ Suggested sections:
 
 After editing, summarize what you changed and mention any repository facts you could not verify.`;
 
-export const initCommand: CommandDefinition = defineCommand({
+export const builtinInitCommand: CommandDefinition = defineCommand({
+  id: "prompt.builtin.init",
   name: "init",
-  category: "builtin",
+  title: "Initialize repository guidance",
   description: "Create or update AGENTS.md repository guidelines",
+  group: "prompt",
   source: "builtin",
   argumentHint: "[focus]",
   argumentMode: "optional",
-  supportsNonInteractive: true,
-  isSafeConcurrent: true,
-  run: (_ctx, args) => ({
+  executionTarget: "prompt",
+  run: (_context, args) => ({
     type: "prompt",
     prompt: expandPromptTemplate(INIT_PROMPT, args),
     metadata: {
-      commandName: "init",
+      commandId: "prompt.builtin.init",
+      commandPath: "/prompt builtin init",
       source: "builtin",
       allowedTools: INIT_ALLOWED_TOOLS,
       writeScope: INIT_WRITE_SCOPE,
@@ -55,4 +57,30 @@ export const initCommand: CommandDefinition = defineCommand({
   }),
 });
 
-export const builtinCommands: readonly CommandDefinition[] = [initCommand];
+export const builtinPromptCommands: readonly CommandDefinition[] = [
+  defineCommand({
+    id: "prompt",
+    name: "prompt",
+    title: "Prompts",
+    description: "Run reusable prompts",
+    group: "prompt",
+    source: "builtin",
+    selectionMode: "drilldown",
+    executionTarget: "prompt",
+    children: [
+      {
+        id: "prompt.builtin",
+        name: "builtin",
+        title: "Builtin prompts",
+        description: "Run Chili builtin prompts",
+        group: "prompt",
+        source: "builtin",
+        selectionMode: "drilldown",
+        executionTarget: "prompt",
+        children: [builtinInitCommand],
+      },
+    ],
+  }),
+];
+
+export const builtinCommands = builtinPromptCommands;
