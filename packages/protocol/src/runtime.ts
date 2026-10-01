@@ -274,6 +274,22 @@ export interface RuntimeMcpLogoutResponse {
   loggedOut: boolean;
 }
 
+export interface RuntimeMcpScopeInput {
+  cwd?: string;
+}
+
+export interface RuntimeMcpControlService {
+  list(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpListResponse>;
+  status?(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpStatusResponse>;
+  get?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpServerDescriptor | undefined>;
+  reload?(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpReloadResponse>;
+  add?(input: RuntimeMcpAddServerRequest): Promise<RuntimeMcpServerDescriptor>;
+  remove?(server: string): Promise<RuntimeMcpRemoveServerResponse>;
+  tools?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpToolsResponse>;
+  auth?(server: string, input?: RuntimeMcpAuthRequest): Promise<RuntimeMcpAuthResponse>;
+  logout?(server: string): Promise<RuntimeMcpLogoutResponse>;
+}
+
 export type RuntimeCommand =
   | RuntimeCreateSessionCommand
   | RuntimeSubmitPromptCommand

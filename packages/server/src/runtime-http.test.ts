@@ -3422,6 +3422,38 @@ test("serves prompt commands and submits expanded command prompts", async () => 
   expect(service.lastPrompt).toBeUndefined();
 });
 
+test("rejects invalid command options before rendering a prompt or mutating the session", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const service = new FakeRuntimeService(store);
+  const commands = new FakePromptCommandControl();
+  const handler = createRuntimeHttpHandler({ service, store, commands });
+  const session = await service.createSession({ cwd: "/persisted/project" });
+  const invalidOptions = [
+    { modelSelection: { provider: "openai-codex" } },
+    { modelSelection: null },
+    { reasoningLevel: "unknown" },
+    { reasoningLevel: "" },
+    { serviceTier: "unknown" },
+    { serviceTier: false },
+    { output: "must not invoke MCP" },
+    { toolPolicy: { allowedTools: ["bash"] } },
+    { displayText: "forged invocation" },
+  ];
+
+  for (const action of ["command", "command_async"]) {
+    for (const options of invalidOptions) {
+      const response = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/${action}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ commandId: "prompt.project.joke", ...options }),
+      }));
+      expect(response.status).toBe(400);
+      expect(commands.lastRun).toBeUndefined();
+      expect(service.lastPrompt).toBeUndefined();
+    }
+  }
+});
+
 test("canonicalizes a persisted legacy workspace for command catalogs and execution", async () => {
   const fixture = await mkdtemp(join(tmpdir(), "chili-http-command-cwd-"));
   const workspace = join(fixture, "workspace");

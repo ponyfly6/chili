@@ -36,15 +36,12 @@ import type {
   RuntimeModelConfig,
   RuntimeModelDescriptor,
   RuntimeMcpAddServerRequest,
+  RuntimeMcpControlService,
+  RuntimeMcpScopeInput,
   RuntimeMcpAuthRequest,
-  RuntimeMcpAuthResponse,
   RuntimeMcpListResponse,
-  RuntimeMcpLogoutResponse,
-  RuntimeMcpReloadResponse,
-  RuntimeMcpRemoveServerResponse,
   RuntimeMcpServerDescriptor,
   RuntimeMcpStatusResponse,
-  RuntimeMcpToolsResponse,
   RuntimeMcpTransport,
   MessageImageContent,
   RuntimePermissionConfig,
@@ -114,8 +111,12 @@ import {
   type RuntimePendingApprovalWindow,
   type RuntimeSessionEventWindow,
 } from "@chili/sdk";
-import type { PromptCommandControl, PromptCommandRunResult } from "./commands.js";
-import { PromptCommandNotFoundError, PromptCommandUsageError } from "./commands.js";
+import {
+  preparePromptCommandSubmission,
+  PromptCommandNotFoundError,
+  PromptCommandUsageError,
+  type PromptCommandControl,
+} from "@chili/commands";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
@@ -207,21 +208,7 @@ export interface RuntimeTeamMergeService {
   mergeTeamTasks(input: TeamMergeInput): Promise<TeamMergeSweepResult>;
 }
 
-export interface RuntimeMcpScopeInput {
-  cwd?: string;
-}
-
-export interface RuntimeMcpControlService {
-  list(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpListResponse>;
-  status?(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpStatusResponse>;
-  get?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpServerDescriptor | undefined>;
-  reload?(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpReloadResponse>;
-  add?(input: RuntimeMcpAddServerRequest): Promise<RuntimeMcpServerDescriptor>;
-  remove?(server: string): Promise<RuntimeMcpRemoveServerResponse>;
-  tools?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpToolsResponse>;
-  auth?(server: string, input?: RuntimeMcpAuthRequest): Promise<RuntimeMcpAuthResponse>;
-  logout?(server: string): Promise<RuntimeMcpLogoutResponse>;
-}
+export type { RuntimeMcpScopeInput, RuntimeMcpControlService } from "@chili/protocol";
 
 export interface RuntimeHttpHandlerOptions {
   service: RuntimeHttpService;
@@ -892,24 +879,20 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         if (body.args !== undefined && typeof body.args !== "string") throw badRequest("args must be a string when provided");
         const cwd = await authoritativeRequestCwd(session.cwd, body.cwd);
 
-        const command = await requireCommandControl(options).run({
+        // Validate all caller-supplied options before expanding an MCP command.
+        const input = buildSubmitPromptInput(route.sessionId, {
+          text: "",
+          cwd,
+          ...(body.modelSelection !== undefined ? { modelSelection: body.modelSelection } : {}),
+          ...(body.reasoningLevel !== undefined ? { reasoningLevel: body.reasoningLevel } : {}),
+          ...(body.serviceTier !== undefined ? { serviceTier: body.serviceTier } : {}),
+        });
+        const command = await preparePromptCommandSubmission(requireCommandControl(options), {
           commandId: body.commandId.trim(),
           ...(body.args ? { args: body.args } : {}),
           cwd,
         });
-        const displayText = body.args?.trim()
-          ? `${command.command.path} ${body.args.trim()}`
-          : command.command.path;
-        const input = buildSubmitPromptInput(route.sessionId, {
-          text: command.prompt,
-          displayText,
-          cwd,
-          ...(body.modelSelection ? { modelSelection: body.modelSelection } : {}),
-          ...(body.reasoningLevel ? { reasoningLevel: body.reasoningLevel } : {}),
-          ...(body.serviceTier ? { serviceTier: body.serviceTier } : {}),
-        });
-        const toolPolicy = commandToolPolicy(command.metadata);
-        if (toolPolicy) input.toolPolicy = toolPolicy;
+        Object.assign(input, command);
 
         if (route.name === "command") {
           return json(serializeSubmitPromptResult(await options.service.submitPrompt(input)));
@@ -1664,24 +1647,6 @@ function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody, parsedIm
     input.serviceTier = body.serviceTier;
   }
   return input;
-}
-
-function commandToolPolicy(metadata: PromptCommandRunResult["metadata"]): SubmitPromptInput["toolPolicy"] | undefined {
-  const allowedTools = metadataStringArray(metadata.allowedTools);
-  const writeScope = metadataStringArray(metadata.writeScope);
-  const executeScope = metadataStringArray(metadata.executeScope);
-  if (!allowedTools && !writeScope && !executeScope) return undefined;
-  return {
-    ...(allowedTools ? { allowedTools } : {}),
-    ...(writeScope ? { writeScope } : {}),
-    ...(executeScope ? { executeScope } : {}),
-  };
-}
-
-function metadataStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const strings = value.map((item) => typeof item === "string" ? item.trim() : "").filter(Boolean);
-  return strings.length > 0 ? strings : undefined;
 }
 
 function goalSetInput(sessionId: SessionId, body: GoalBody): {

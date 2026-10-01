@@ -10,3 +10,5 @@ export * from "./mcp-prompts.js";
 export * from "./builtin.js";
 export * from "./catalog.js";
 export * from "./runtime-import.js";
+export * from "./control.js";
+export * from "./submission.js";

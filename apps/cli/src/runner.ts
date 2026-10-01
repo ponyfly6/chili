@@ -1,3 +1,5 @@
+import { preparePromptCommandSubmission } from "@chili/commands";
+import type { SubmitPromptInput } from "@chili/core";
 import type { ModelSelection, ReasoningLevel, ServiceTier, SessionId } from "@chili/protocol";
 import type { CliHarness } from "./harness.js";
 
@@ -5,6 +7,8 @@ export interface RunPromptOptions {
   harness: CliHarness;
   sessionId: SessionId;
   prompt: string;
+  displayText?: string;
+  toolPolicy?: SubmitPromptInput["toolPolicy"];
   maxTurns: number;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
@@ -26,12 +30,41 @@ export function runSessionPrompt(options: RunSessionPromptOptions): Promise<void
   return runPrompt(options);
 }
 
+export interface RunSessionCommandOptions extends Omit<RunSessionPromptOptions, "prompt" | "displayText" | "toolPolicy"> {
+  commandId: string;
+  args?: string;
+}
+
+export async function runSessionCommand(options: RunSessionCommandOptions): Promise<void> {
+  options.signal?.throwIfAborted();
+  await options.harness.service.assertSessionTurnAllowed(options.sessionId);
+  const session = (await options.harness.store.sessions()).find((candidate) => candidate.id === options.sessionId);
+  if (!session) throw new Error(`Session not found: ${options.sessionId}`);
+  const prepared = await preparePromptCommandSubmission(options.harness.commands, {
+    commandId: options.commandId,
+    ...(options.args !== undefined ? { args: options.args } : {}),
+    cwd: session.cwd,
+  });
+  options.signal?.throwIfAborted();
+  await runSessionPrompt({
+    harness: options.harness,
+    sessionId: options.sessionId,
+    prompt: prepared.text,
+    displayText: prepared.displayText,
+    ...(prepared.toolPolicy ? { toolPolicy: prepared.toolPolicy } : {}),
+    maxTurns: options.maxTurns,
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
+}
+
 export async function runPrompt(options: RunPromptOptions): Promise<void> {
-  const input = {
+  const input: SubmitPromptInput = {
     sessionId: options.sessionId,
     text: options.prompt,
     maxTurns: options.maxTurns,
   };
+  if (options.displayText !== undefined) input.displayText = options.displayText;
+  if (options.toolPolicy !== undefined) input.toolPolicy = options.toolPolicy;
   if (options.modelSelection) Object.assign(input, { modelSelection: options.modelSelection });
   if (options.reasoningLevel !== undefined) Object.assign(input, { reasoningLevel: options.reasoningLevel });
   if (options.serviceTier !== undefined) Object.assign(input, { serviceTier: options.serviceTier });

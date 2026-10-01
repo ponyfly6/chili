@@ -29,7 +29,7 @@ import { applyCliEnvironmentDefaults, cliEnvironmentDefaults } from "./environme
 import { createCliHarness } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
 import { createCliReplCommandRegistry, dispatchCliReplCommand, type CliReplCommandContext } from "./repl-commands.js";
-import { runSessionPrompt } from "./runner.js";
+import { runSessionCommand, runSessionPrompt } from "./runner.js";
 import { resolveSession } from "./session.js";
 import { revertSessionSnapshot } from "./session-recovery.js";
 import { formatStoreDoctorText } from "./store-doctor.js";
@@ -1538,17 +1538,13 @@ async function repl(input: {
     addMemory: async (cwd, value) => handleMemoryReplCommand(input.harness, `add ${value}`.trim(), cwd),
     reloadMemory: async (cwd, scope) => handleMemoryReplCommand(input.harness, `reload ${scope}`.trim(), cwd),
     runPromptCommand: async (sessionId, commandId, args) => {
-      const command = await input.harness.commands.run({
-        commandId,
-        ...(args ? { args } : {}),
-        cwd: sessionCwd,
-      });
       const interrupt = installReplInterruptHandler(input.shutdownSignal);
       try {
-        await runSessionPrompt({
+        await runSessionCommand({
           harness: input.harness,
           sessionId,
-          prompt: command.prompt,
+          commandId,
+          ...(args ? { args } : {}),
           maxTurns: input.maxTurns,
           signal: interrupt.signal,
         });
