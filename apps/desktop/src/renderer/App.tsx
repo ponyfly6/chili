@@ -6,8 +6,6 @@ import { conversationTitle, matchingDesktopCommands,
   type DesktopCommand, type SettingsPage } from "./conversation-design.js";
 import { ProjectSidebar } from "./ProjectSidebar.js";
 import { SessionList } from "./SessionList.js";
-import { AgentDetailsPanel } from "./AgentDetailsPanel.js";
-import { DiffViewer } from "./DiffViewer.js";
 import { TimelineViewport } from "./TimelineViewport.js";
 import { eventMatchesProject, ProjectViewMemory } from "./project-view-state.js";
 import { useDesktopTheme } from "./useDesktopTheme.js";
@@ -34,7 +32,6 @@ import type {
   DesktopEvent,
   DesktopSessionConfig,
   DesktopState,
-  DiffScope,
   RuntimeSnapshot,
   UserInputRequest,
 } from "../shared/contracts.js";
@@ -80,7 +77,6 @@ import {
   availableReasoningLevels,
   availableServiceTiers,
   canExposeTaskActions,
-  canReloadSessionMcp,
   canResumeTask,
   createNewTaskDraft,
   filterSessions,
@@ -130,15 +126,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const [working, setWorking] = useState(false);
   const [loadingSession, setLoadingSession] = useState(false);
   const [resyncing, setResyncing] = useState(false);
-  const [diffScope, setDiffScope] = useState<DiffScope>("turn");
-  const [diffView, setDiffView] = useState<{ text: string; truncated: boolean; scope?: string }>({
-    text: "Select a session to inspect changes.", truncated: false,
-  });
-  const setDiffText = useCallback((text: string) => setDiffView({ text, truncated: false }), []);
-  const [diffLoading, setDiffLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 640);
-  const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [inspectorTab, setInspectorTab] = useState<"activity" | "changes">("activity");
   const [resyncRetryAvailable, setResyncRetryAvailable] = useState(false);
   const [sessionQuery, setSessionQuery] = useState("");
   const [sessionListStatus, setSessionListStatus] = useState<SessionListStatus>("active");
@@ -150,7 +138,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const [models, setModels] = useState<RuntimeModelDescriptor[]>([]);
   const [newTaskPermissionConfig, setNewTaskPermissionConfig] = useState<RuntimePermissionConfig>();
   const [sessionConfigState, setSessionConfig] = useState<DesktopSessionConfig>();
-  const [configLoading, setConfigLoading] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<RuntimeSessionSummary>();
   const [archiveTarget, setArchiveTarget] = useState<RuntimeSessionSummary>();
@@ -162,7 +149,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const selectedRef = useRef<string | undefined>(undefined);
   const projectionRef = useRef(projection);
   const projectionRefreshes = useMemo(() => new IndependentRefreshScheduler(), []);
-  const diffRefreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const configRefreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const resyncRetryTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const resyncRetryAttempts = useRef(0);
@@ -171,23 +157,16 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     (select) => select(),
   );
   const actionInFlightRef = useRef(false);
-  const diffRequestGate = useRef(createLatestRequestGate());
   const configRequestGate = useRef(createLatestRequestGate());
   const newTaskChoicesGate = useRef(createLatestRequestGate());
   const workspaceRef = useRef<string | undefined>(undefined);
   const sidecarPhaseRef = useRef<DesktopState["sidecar"]["phase"]>("idle");
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const sidebarRef = useRef<HTMLElement>(null);
-  const inspectorRef = useRef<HTMLElement>(null);
   const sidebarToggleRef = useRef<HTMLButtonElement>(null);
-  const inspectorToggleRef = useRef<HTMLButtonElement>(null);
   const closeSidebar = useCallback(() => {
     if (sidebarRef.current?.contains(document.activeElement)) sidebarToggleRef.current?.focus({ preventScroll: true });
     setSidebarOpen(false);
-  }, []);
-  const closeInspector = useCallback(() => {
-    if (inspectorRef.current?.contains(document.activeElement)) inspectorToggleRef.current?.focus({ preventScroll: true });
-    setInspectorOpen(false);
   }, []);
 
   const desktop = projection.state;
@@ -197,7 +176,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   useEffect(() => {
     projectViews.current.remember(desktop.workspace, selectedId, composer);
   }, [desktop.workspace, selectedId, composer]);
-  const diffRevision = projection.diffRevision;
   const sessionConfig = sessionConfigState
     ? sessionConfigResponseForSelection(selectedId, sessionConfigState)
     : undefined;
@@ -227,9 +205,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       const { snapshot: _snapshot, ...withoutSnapshot } = current;
       return snapshotNext ? { ...withoutSnapshot, snapshot: snapshotNext } : withoutSnapshot;
     });
-  }, []);
-  const setDiffRevision = useCallback((next: (current: number) => number) => {
-    setProjection((current) => ({ ...current, diffRevision: next(current.diffRevision) }));
   }, []);
   const projectTransport = useCallback((state = projectionRef.current.state) => state.projectId && hostTransport.forProject
     ? hostTransport.forProject(state.projectId) : hostTransport, [hostTransport]);
@@ -281,7 +256,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       projectionRef.current = published;
       setProjection(published);
       setLoadingSession(false);
-      setDiffLoading(false);
     },
     complete: async ({ barrierId }) => barrierId
       ? hostTransport.completeResync(barrierId)
@@ -314,10 +288,8 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     () => filterSessions(sessions, sessionQuery, sessionListStatus),
     [sessionListStatus, sessionQuery, sessions],
   );
-  const selectedModel = sessionConfig?.model.modelSelection;
   const selectedGoal = sessionConfig?.goal ?? undefined;
   const canResumeSession = canResumeTask(presentation?.chat.status, selectedGoal?.status, Boolean(selectedArchived), snapshot?.inputQueue?.paused);
-  const mcpReloadEnabled = canReloadSessionMcp(selectedId, Boolean(selectedArchived), runtimeActionsDisabled);
   const emptyConversation = !loadingSession && timelineItems.length === 0;
   const commands = commandsOpen ? matchingDesktopCommands(composer.startsWith("/") ? composer : "/") : [];
   useEffect(() => {
@@ -338,13 +310,12 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     let previousWidth = window.innerWidth;
     const handleResize = (): void => {
       const width = window.innerWidth;
-      if (previousWidth > 1080 && width <= 1080) closeInspector();
       if (previousWidth > 640 && width <= 640) closeSidebar();
       previousWidth = width;
     };
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
-  }, [closeInspector, closeSidebar]);
+  }, [closeSidebar]);
 
   useEffect(() => {
     if (!taskMenuId) return;
@@ -391,7 +362,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     if (!sessionId || sidecarPhaseRef.current !== "healthy") return;
     const isCurrent = configRequestGate.current.begin();
     const owner = projectionRef.current.state.projectId;
-    setConfigLoading(true);
     try {
       const next = await projectTransport().sessionConfig(sessionId);
       if (isCurrent() && selectedRef.current === sessionId && projectionRef.current.state.projectId === owner) {
@@ -403,8 +373,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       }
     } catch (cause) {
       if (isCurrent()) setError(messageFor(cause));
-    } finally {
-      if (isCurrent()) setConfigLoading(false);
     }
   }, [projectTransport]);
 
@@ -412,7 +380,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     if (!selectedId || !healthy || resyncing) {
       configRequestGate.current.invalidate();
       setSessionConfig(undefined);
-      setConfigLoading(false);
       return;
     }
     void reloadSessionConfig(selectedId);
@@ -439,9 +406,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       setSnapshot(undefined);
       setLoadingSession(true);
     }
-    diffRequestGate.current.invalidate();
-    setDiffLoading(false);
-    setDiffText("Loading changes…");
     setError(undefined);
     try {
       const next = await coordinator.refreshSessionSnapshot(sessionId);
@@ -558,12 +522,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       resyncRetryAttempts.current = 0;
       setResyncRetryAvailable(false);
       projectionRefreshes.cancel();
-      if (diffRefreshTimer.current) clearTimeout(diffRefreshTimer.current);
-      diffRefreshTimer.current = undefined;
-      diffRequestGate.current.invalidate();
       setLoadingSession(Boolean(selectedRef.current));
-      setDiffLoading(false);
-      setDiffText(selectedRef.current ? "Resyncing changes…" : "Select a session to inspect changes.");
       setError(undefined);
       void coordinator.barrier(barrier).then((outcome) => {
         finishResync(generation, outcome);
@@ -593,9 +552,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         resyncRetryAttempts.current = 0;
         setResyncRetryAvailable(false);
         projectionRefreshes.cancel();
-        if (diffRefreshTimer.current) clearTimeout(diffRefreshTimer.current);
-        diffRefreshTimer.current = undefined;
-        diffRequestGate.current.invalidate();
         coordinator.cancel();
       },
       selectWorkspace,
@@ -625,9 +581,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         if (event.state.sidecar.phase !== "healthy") {
           projectionRefreshes.cancel();
           coordinator.invalidateRequests("sessions", "snapshot", "diff");
-          diffRequestGate.current.invalidate();
-          setDiffLoading(false);
-          if (selectedRef.current) setDiffText("Runtime unavailable; changes will refresh after recovery.");
         }
         if (workspaceChanged) {
           projectionRefreshes.cancel();
@@ -641,7 +594,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           setTaskMenuId(undefined);
           workspaceRef.current = event.state.workspace;
           coordinator.invalidateRequests("sessions", "snapshot", "diff");
-          diffRequestGate.current.invalidate();
           const previousSelectedId = selectedRef.current;
           selectedRef.current = undefined;
           setSessionConfig((current) => sessionConfigAfterSelectionChange(
@@ -654,8 +606,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           projectionRef.current = next;
           setProjection(next);
           setLoadingSession(false);
-          setDiffLoading(false);
-          setDiffText("Select a session to inspect changes.");
         } else {
           setDesktop(event.state);
         }
@@ -687,10 +637,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         if (!current || !runtimeEventRelated(current, event.event)) return current;
         return appendRuntimeEvent(current, event.event);
       });
-      if (refreshesDiff(event.event)) {
-        if (diffRefreshTimer.current) clearTimeout(diffRefreshTimer.current);
-        diffRefreshTimer.current = setTimeout(() => setDiffRevision((current) => current + 1), 100);
-      }
       if (refreshesSessionConfig(event.event)) {
         if (configRefreshTimer.current) clearTimeout(configRefreshTimer.current);
         configRefreshTimer.current = setTimeout(() => void reloadSessionConfig(), 120);
@@ -731,55 +677,15 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       selectWorkspaceWithRecoveryEscape.current = (select) => select();
       unsubscribe();
       projectionRefreshes.cancel();
-      if (diffRefreshTimer.current) clearTimeout(diffRefreshTimer.current);
-      diffRefreshTimer.current = undefined;
       if (configRefreshTimer.current) clearTimeout(configRefreshTimer.current);
       configRefreshTimer.current = undefined;
       clearResyncRetryTimer();
-      diffRequestGate.current.invalidate();
       coordinator.cancel();
     };
   }, [coordinator, projectionRefreshes, refreshSessions, reloadSelected, reloadSessionConfig, setDesktop, setSnapshot, hostTransport]);
 
-  const diffViewScope = JSON.stringify([desktop.projectId, desktop.workspace, selectedId, diffScope,
-    diffScope === "turn" ? presentation?.latestTurnId : undefined]);
-  const diffBelongsToScope = diffView.scope === undefined || diffView.scope === diffViewScope;
-
-  useEffect(() => {
-    const isCurrent = diffRequestGate.current.begin();
-    if (!selectedId || !healthy || resyncing || loadingSession || snapshot?.sessionId !== selectedId) {
-      setDiffLoading(false);
-      if (!selectedId) setDiffText("Select a session to inspect changes.");
-      return () => diffRequestGate.current.invalidate();
-    }
-    let requestToken;
-    try {
-      requestToken = coordinator.beginRequest("diff");
-    } catch {
-      setDiffLoading(false);
-      return () => diffRequestGate.current.invalidate();
-    }
-    setDiffLoading(true);
-    void transport.diff(diffScope, selectedId, presentation?.latestTurnId)
-      .then((result) => {
-        if (isCurrent() && requestToken && coordinator.isRequestCurrent(requestToken)) {
-          setDiffView({ text: result.text, truncated: result.truncated, scope: diffViewScope });
-        }
-      })
-      .catch((cause) => {
-        if (isCurrent() && requestToken && coordinator.isRequestCurrent(requestToken)) {
-          setDiffView({ text: `Unable to load diff: ${messageFor(cause)}`, truncated: false, scope: diffViewScope });
-        }
-      })
-      .finally(() => {
-        if (isCurrent() && requestToken && coordinator.isRequestCurrent(requestToken)) setDiffLoading(false);
-      });
-    return () => diffRequestGate.current.invalidate();
-  }, [coordinator, diffRevision, diffScope, diffViewScope, healthy, loadingSession, presentation?.latestTurnId, resyncing, selectedId, snapshot?.sessionId, transport]);
-
   const chooseWorkspace = async (projectId?: string, sessionId?: string) => runAction(async () => {
     requestedProjectSession.current = projectId && sessionId ? { projectId, sessionId } : undefined;
-    diffRequestGate.current.invalidate();
     coordinator.invalidateRequests();
     const previousWorkspace = workspaceRef.current;
     let stateToken;
@@ -811,8 +717,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         sessions: [],
       }));
       setLoadingSession(false);
-      setDiffLoading(false);
-      setDiffText("Select a session to inspect changes.");
     } else {
       setDesktop(state);
     }
@@ -1087,19 +991,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             <span>{selectedId ? selectedTitle : "新会话"}</span>
           </div>
         </div>
-        <div className="titlebar-actions">
-          <button
-            ref={inspectorToggleRef}
-            className={`chrome-button workbench-toggle ${inspectorOpen ? "active" : ""}`}
-            type="button"
-            aria-label={inspectorOpen ? "Hide workbench" : "Show workbench"}
-            aria-pressed={inspectorOpen}
-            onClick={() => setInspectorOpen((current) => !current)}
-          >
-            <Icon name="activity" />
-            <span>工作过程</span>
-          </button>
-        </div>
       </header>
 
       <div className="status-stack">
@@ -1130,7 +1021,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         ) : null}
       </div>
 
-      <main className={`workspace-grid ${sidebarOpen ? "" : "sidebar-collapsed"} ${inspectorOpen ? "" : "inspector-collapsed"}`}>
+      <main className={`workspace-grid ${sidebarOpen ? "" : "sidebar-collapsed"}`}>
         <aside ref={sidebarRef} className="sidebar panel" aria-hidden={!sidebarOpen} inert={!sidebarOpen}>
           <div className="brand" aria-label="Chili">
             <ChiliMark />
@@ -1289,6 +1180,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           <div className="conversation-body">
           <div className="chat-surface">
           <TimelineViewport scopeKey={JSON.stringify([desktop.projectId, desktop.workspace, selectedId])}>
+            {snapshot?.truncated ? <p className="transcript-warning" role="status">{snapshot.warning ?? "This large session was trimmed for desktop safety."}</p> : null}
             {loadingSession ? <p className="empty-copy centered">正在恢复会话…</p> : null}
             {!loadingSession && timelineItems.map((item) => <TimelineItem key={`${item.kind}:${item.id}`} item={item} expandWork={preferences.expandWork} />)}
             {emptyConversation ? <div className="welcome-card">
@@ -1396,129 +1288,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             ].map(([label, prompt]) => <button key={label} disabled={!composerEditable} onClick={() => { setComposer(prompt!); composerRef.current?.focus(); }}>{label}<span aria-hidden="true">↗</span></button>)}</div> : null}
           </div>
         </section>
-
-        <aside ref={inspectorRef} className="inspector panel" aria-hidden={!inspectorOpen} inert={!inspectorOpen}>
-          <div className="inspector-heading">
-            <div><p className="eyebrow">Workbench</p><strong>Live work</strong></div>
-            <button className="icon-button" type="button" aria-label="Close workbench" onClick={closeInspector}><Icon name="close" /></button>
-          </div>
-          <div className="inspector-tabs" role="tablist" aria-label="Workbench views">
-            <button role="tab" aria-selected={inspectorTab === "activity"} className={inspectorTab === "activity" ? "active" : ""} onClick={() => setInspectorTab("activity")}>
-              Activity <span>{(snapshot?.agentTree.agents.length ?? 0) + (snapshot?.tasks.length ?? 0)}</span>
-            </button>
-            <button role="tab" aria-selected={inspectorTab === "changes"} className={inspectorTab === "changes" ? "active" : ""} onClick={() => setInspectorTab("changes")}>
-              Changes
-            </button>
-          </div>
-
-          {inspectorTab === "activity" ? (
-            <div className="inspector-scroll">
-              {snapshot?.truncated ? <p className="inspector-warning">{snapshot.warning ?? "This large session was trimmed for desktop safety."}</p> : null}
-              <section className="root-agent-card">
-                <span className="root-agent-mark"><ChiliMark /></span>
-                <div><strong>Chili</strong><span>{presentation?.chat.status.replaceAll("_", " ") ?? (healthy ? "ready" : "offline")}</span></div>
-                <span className={`agent-signal ${sessionBusy ? "working" : ""}`} aria-hidden="true" />
-              </section>
-              <section className="inspector-section goal-section">
-                <div className="section-heading compact"><p className="eyebrow">Goal</p>{selectedGoal ? <span className={`goal-status goal-${selectedGoal.status}`}>{goalStatusLabel(selectedGoal.status)}</span> : null}</div>
-                {selectedGoal ? (
-                  <GoalCard
-                    goal={selectedGoal}
-                    disabled={runtimeActionsDisabled || selectedArchived}
-                    busy={Boolean(sessionBusy)}
-                    onStatus={(status) => void changeGoalStatus(status)}
-                    onRaiseBudget={() => setGoalBudgetOpen(true)}
-                    onClear={() => void clearGoal()}
-                  />
-                ) : (
-                  <div className="compact-empty-action">
-                    <p className="empty-copy">No autonomous Goal is attached to this task.</p>
-                    {selectedId && !selectedArchived ? (
-                      <button className="secondary" disabled={runtimeActionsDisabled} onClick={() => setGoalSetupOpen(true)}>Add Goal</button>
-                    ) : null}
-                  </div>
-                )}
-              </section>
-
-              <section className="inspector-section runtime-config-section">
-                <div className="section-heading compact"><p className="eyebrow">Runtime</p>{!selectedArchived && sessionConfig ? <button className="text-button" onClick={() => setSettingsOpen(true)}>Change</button> : null}</div>
-                {sessionConfig ? (
-                  <dl className="config-list">
-                    <div><dt>Model</dt><dd>{selectedModel?.model ?? "Runtime default"}</dd></div>
-                    <div><dt>Reasoning</dt><dd>{sessionConfig.model.reasoningLevel ?? "default"}</dd></div>
-                    <div><dt>Service tier</dt><dd>{sessionConfig.model.serviceTier ?? "Provider default"}</dd></div>
-                    <div><dt>Permission</dt><dd>{sessionConfig.permission.profile} <em>global</em></dd></div>
-                    <div><dt>Delegation</dt><dd>{sessionConfig.delegation.policy}</dd></div>
-                  </dl>
-                ) : <p className="empty-copy">{selectedId ? "Loading runtime settings…" : "Select a task to inspect its runtime."}</p>}
-              </section>
-
-              <section className="inspector-section mcp-section">
-                <div className="section-heading compact">
-                  <p className="eyebrow">MCP connections</p>
-                  <button className="text-button" disabled={!mcpReloadEnabled} onClick={() => void reloadMcp()}>Reload</button>
-                </div>
-                {sessionConfig ? (
-                  <>
-                    <p className="mcp-summary">
-                      <strong>{sessionConfig.mcp.summary.running}/{sessionConfig.mcp.summary.total}</strong> running
-                      {sessionConfig.mcp.summary.errored > 0 ? <span>{sessionConfig.mcp.summary.errored} errors</span> : null}
-                      {sessionConfig.mcp.summary.authRequired > 0 ? <span>{sessionConfig.mcp.summary.authRequired} need auth</span> : null}
-                    </p>
-                    <div className="mcp-server-list">
-                      {sessionConfig.mcp.servers.map((server) => (
-                        <div className="mcp-server" key={server.name} title={server.error}>
-                          <span className={`mcp-dot mcp-${server.status}`} aria-hidden="true" />
-                          <strong>{server.name}</strong>
-                          <span>{server.status.replaceAll("_", " ")}</span>
-                        </div>
-                      ))}
-                      {sessionConfig.mcp.servers.length === 0 ? <p className="empty-copy">No MCP servers configured.</p> : null}
-                    </div>
-                  </>
-                ) : <p className="empty-copy">MCP status follows the selected task.</p>}
-              </section>
-              <AgentDetailsPanel
-                projectId={desktop.projectId}
-                sessionId={selectedId}
-                tree={snapshot?.sessionId === selectedId ? snapshot?.agentTree : undefined}
-                tasks={snapshot?.sessionId === selectedId ? snapshot?.tasks ?? [] : []}
-              />
-
-              <section className="inspector-section task-section">
-                <div className="section-heading compact"><p className="eyebrow">Task plan</p><span>{snapshot?.tasks.length ?? 0}</span></div>
-                <div className="task-list">
-                  {snapshot?.tasks.map((task) => (
-                    <div className="task-row" key={task.id}>
-                      <span className={`task-state task-${task.status}`} />
-                      <div><strong>{task.taskName}</strong><span>{task.status}{task.summary ? ` · ${task.summary}` : ""}</span></div>
-                    </div>
-                  ))}
-                  {!snapshot || snapshot.tasks.length === 0 ? <p className="empty-copy">The plan will appear as Chili breaks down the work.</p> : null}
-                </div>
-              </section>
-            </div>
-          ) : (
-            <section className="diff-section">
-              <div className="diff-toolbar">
-                <div>
-                  <strong>Repository changes</strong>
-                  <span>{selectedId ? "Review what this task changed" : "Select a task to inspect changes"}</span>
-                </div>
-                <div className="segmented">
-                  <button disabled={runtimeActionsDisabled || !selectedId} className={diffScope === "turn" ? "active" : ""} onClick={() => setDiffScope("turn")}>Turn</button>
-                  <button disabled={runtimeActionsDisabled || !selectedId} className={diffScope === "workspace" ? "active" : ""} onClick={() => setDiffScope("workspace")}>All</button>
-                </div>
-              </div>
-              <DiffViewer
-                text={diffBelongsToScope ? diffView.text : ""}
-                truncated={diffBelongsToScope && diffView.truncated}
-                loading={diffLoading || !diffBelongsToScope}
-                resetKey={diffViewScope}
-              />
-            </section>
-          )}
-        </aside>
       </main>
 
       {newTaskOpen ? (
@@ -1560,6 +1329,26 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         <DesktopSettings page={settingsPage} onPage={setSettingsPage} project={projectLabel} session={selectedId} config={sessionConfig}
           models={models} disabled={runtimeActionsDisabled || Boolean(selectedArchived)} busy={working} error={error} theme={theme} onTheme={changeTheme}
           themeSaveFailed={themeSaveFailed} themeSaving={themeSaving || preferencesSaving} preferences={preferences} onPreferences={savePreferences} preferenceSaveFailed={preferenceSaveFailed}
+          goalControls={<section className="settings-section goal-section" aria-label="持续任务">
+            <div className="section-heading compact"><h4>持续任务</h4>{selectedGoal ? <span className={`goal-status goal-${selectedGoal.status}`}>{goalStatusLabel(selectedGoal.status)}</span> : null}</div>
+            {selectedGoal ? (
+              <GoalCard
+                goal={selectedGoal}
+                disabled={runtimeActionsDisabled || selectedArchived}
+                busy={Boolean(sessionBusy)}
+                onStatus={(status) => void changeGoalStatus(status)}
+                onRaiseBudget={() => { setSettingsOpen(false); setGoalBudgetOpen(true); }}
+                onClear={() => void clearGoal()}
+              />
+            ) : (
+              <div className="compact-empty-action">
+                <p className="empty-copy">No autonomous Goal is attached to this task.</p>
+                {selectedId && !selectedArchived ? (
+                  <button className="secondary" disabled={runtimeActionsDisabled} onClick={() => { setSettingsOpen(false); setGoalSetupOpen(true); }}>Add Goal</button>
+                ) : null}
+              </div>
+            )}
+          </section>}
           onSave={(values, section) => void saveSessionSettings(values, section)} onReloadMcp={() => void reloadMcp()}
           onPrompt={(text) => { setSettingsOpen(false); setComposer(text); requestAnimationFrame(() => composerRef.current?.focus()); }}
           onNewSession={() => { setSettingsOpen(false); openNewTask(); }} onClose={() => setSettingsOpen(false)} />
@@ -1829,7 +1618,7 @@ function GoalSetupDialog({
       <form onSubmit={(event) => { event.preventDefault(); if (objective.trim() && budgetValid && !disabled) onSubmit(objective.trim(), budget ? Number(budget) : undefined); }}>
         <header className="modal-heading"><div><p className="eyebrow">Autonomous work</p><h2 id="add-goal-title">Add Goal</h2><p>The Goal starts immediately and continues across turns.</p></div></header>
         <div className="compact-dialog-body"><label className="field-label"><span>Goal objective</span><textarea autoFocus data-modal-initial-focus="true" aria-label="Goal objective" rows={4} value={objective} disabled={disabled} onChange={(event) => setObjective(event.target.value)} /></label><label className="field-label"><span>Token budget <em>optional</em></span><input type="number" min="1" step="1" aria-label="Goal token budget" aria-invalid={!budgetValid} value={budget} disabled={disabled} onChange={(event) => setBudget(event.target.value)} placeholder="Default · 50,000" />{!budgetValid ? <small className="field-error">Token budget must be a positive whole number.</small> : <small>Leave blank to use the runtime default (50,000 tokens).</small>}</label></div>
-        <footer className="modal-actions"><span>Monitor or pause it from the Workbench.</span><div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary" type="submit" disabled={disabled || !objective.trim() || !budgetValid}>Start Goal</button></div></footer>
+        <footer className="modal-actions"><span>可在设置中的“权限与协作”查看或暂停任务。</span><div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary" type="submit" disabled={disabled || !objective.trim() || !budgetValid}>Start Goal</button></div></footer>
       </form>
     </ModalFrame>
   );
@@ -2509,15 +2298,6 @@ function humanizeToolTitle(value: string): string {
 function humanizeStatus(value: string): string {
   const readable = value.replaceAll("_", " ");
   return `${readable[0]?.toUpperCase() ?? ""}${readable.slice(1)}`;
-}
-
-function refreshesDiff(event: ChiliEvent): boolean {
-  return event.type === "tool.call_finished"
-    || event.type === "snapshot.reverted"
-    || event.type === "turn.completed"
-    || event.type === "turn.compaction_completed"
-    || event.type === "turn.compaction_failed"
-    || event.type === "session.status_changed";
 }
 
 function refreshesSessionConfig(event: ChiliEvent): boolean {

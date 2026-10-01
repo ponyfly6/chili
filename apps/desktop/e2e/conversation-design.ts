@@ -27,7 +27,8 @@ export async function openAdvancedTaskDialog(page: Page) {
 export async function assertConversationDesign(page: Page, artifacts: string): Promise<void> {
   await page.getByRole("heading", { name: "你想做点什么？", exact: true }).waitFor();
   assert.equal(await page.getByRole("dialog").count(), 0, "A fresh workspace must offer the composer directly");
-  assert.equal(await page.locator(".inspector").getAttribute("aria-hidden"), "true");
+  assert.equal(await page.locator(".inspector").count(), 0);
+  assert.equal(await page.getByRole("button", { name: /workbench/i }).count(), 0);
   await page.screenshot({ path: join(artifacts, "conversation-new.png") });
   const composer = page.getByLabel("Message composer", { exact: true });
   await composer.fill("hello conversation redesign");

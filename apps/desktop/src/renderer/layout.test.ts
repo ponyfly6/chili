@@ -21,18 +21,17 @@ test("keeps the workspace in the flexible shell row when the status stack is emp
 test("defines real desktop, tablet, and narrow-phone layout gates without horizontal minimums", async () => {
   const styles = await readFile(stylesPath, "utf8");
 
-  expect(rule(styles, ".workspace-grid")).toContain("grid-template-columns: 260px minmax(460px, 1fr) 316px;");
+  expect(rule(styles, ".workspace-grid")).toContain('grid-template-areas: "sidebar conversation";');
+  expect(rule(styles, ".workspace-grid")).toContain("grid-template-columns: 260px minmax(460px, 1fr);");
   expect(styles).toContain("@media (max-width: 1080px)");
-  expect(styles).toContain("grid-template-columns: 224px minmax(0, 1fr) 0;");
+  expect(styles).toContain("grid-template-columns: 224px minmax(0, 1fr);");
   expect(styles).toContain("@media (max-width: 640px)");
   expect(styles).toContain([
     ".workspace-grid,",
-    "  .workspace-grid.inspector-collapsed,",
-    "  .workspace-grid.sidebar-collapsed,",
-    "  .workspace-grid.sidebar-collapsed.inspector-collapsed {",
-    "    grid-template-columns: 0 minmax(0, 1fr) 0;",
+    "  .workspace-grid.sidebar-collapsed {",
+    "    grid-template-columns: 0 minmax(0, 1fr);",
   ].join("\n"));
-  expect(styles).toContain("grid-template-columns: 0 minmax(0, 1fr) 0;");
+  expect(styles).toContain("grid-template-columns: 0 minmax(0, 1fr);");
   expect(styles).toContain("@media (max-width: 420px)");
   expect(styles).toContain("width: min(286px, calc(100% - 28px));");
   expect(styles).toContain(".modal-card,");

@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { assertDesktopAppearance, assertDesktopAppearanceRestored } from "./appearance.js";
-import { assertWorkbenchPanels } from "./workbench-panels.js";
+import { assertDelegatedConversation } from "./delegated-conversation.js";
 import { assertResponsiveNavigation } from "./responsive-navigation.js";
 import { assertTimelineFollowStream, TIMELINE_FOLLOW_PROMPT, TimelineFollowFixture } from "./timeline-follow-stream.js";
 import { assertTimelineNavigation } from "./timeline-navigation.js";
@@ -191,7 +191,7 @@ try {
     await resolveApprovalThroughUi(currentLaunch.page);
     await resolveUserInputThroughUi(currentLaunch.page);
     await renameSearchAndArchiveThroughUi(currentLaunch.page);
-    await assertWorkbenchPanels(currentLaunch.page, workspace, artifacts);
+    await assertDelegatedConversation(currentLaunch.page, workspace, artifacts);
     await closeDesktop(currentLaunch);
     currentLaunch = undefined;
 
@@ -264,7 +264,7 @@ try {
 
 process.stdout.write(
   "electron desktop E2E passed: click-driven Goal create/recovery, approval, input, steer, stop, "
-  + "rename/search/archive, delegated task details and Git changes, background projects and isolated drafts, "
+  + "rename/search/archive, delegated conversations and Goal settings, background projects and isolated drafts, "
   + "theme switching/system tracking/restart persistence, nine native widths from 390 to 1440, keyboard panel navigation, and live timeline following\n",
 );
 
@@ -474,8 +474,9 @@ async function proveCloseAbortRetryInvariant(launch: DesktopLaunch): Promise<voi
   assert.equal(request.aborted, false);
   await expectVisible(launch.page.locator(".timeline")
     .getByText(`Fixture stream opened: ${SLOW_STEER_PROMPT}`, { exact: true }));
-  await expectVisible(launch.page.locator(".inspector-section.goal-section")
-    .locator(".goal-status.goal-active"));
+  const settings = await openGoalSettings(launch.page);
+  await expectVisible(settings.locator(".goal-status.goal-active"));
+  await closeGoalSettings(launch.page);
   await expectVisible(launch.page.locator(".composer-buttons")
     .getByRole("button", { name: "Stop current turn and pause Goal", exact: true }));
   let closeAttempts = 0;
@@ -567,23 +568,32 @@ async function createGoalThroughUi(page: Page): Promise<void> {
   await waitForTaskTitle(page, GOAL_TITLE);
 }
 
+async function openGoalSettings(page: Page) {
+  const settings = await openDesktopSettings(page);
+  await settings.getByRole("button", { name: "权限与协作", exact: true }).click();
+  await settings.getByRole("region", { name: "持续任务", exact: true }).waitFor();
+  return settings;
+}
+
+async function closeGoalSettings(page: Page) {
+  const settings = page.getByRole("dialog", { name: "设置", exact: true });
+  await settings.getByRole("button", { name: "关闭设置", exact: true }).click();
+  await settings.waitFor({ state: "hidden" });
+}
+
 async function assertGoalSurface(page: Page): Promise<void> {
-  const show = page.getByRole("button", { name: "Show workbench", exact: true });
-  if (await show.isVisible()) await show.click();
-  const goal = page.locator(".inspector-section.goal-section");
-  await expectVisible(goal.getByText("Goal", { exact: true }));
+  const settings = await openGoalSettings(page);
+  const goal = settings.locator(".goal-section");
   await expectVisible(goal.getByText(GOAL_OBJECTIVE, { exact: true }));
   await expectVisible(goal.locator(".goal-status.goal-complete"));
-  await expectVisible(page.locator(".inspector-section.mcp-section").getByText("MCP connections", { exact: true }));
+  await settings.getByRole("button", { name: "工具与技能", exact: true }).click();
+  await expectVisible(settings.getByRole("heading", { name: "工具连接 · MCP", exact: true }));
+  await closeGoalSettings(page);
 }
 
 async function assertRecoveredGoalAndControls(page: Page): Promise<void> {
-  const show = page.getByRole("button", { name: "Show workbench", exact: true });
-  if (await show.isVisible()) await show.click();
   await waitForTaskTitle(page, GOAL_TITLE);
-  const goal = page.locator(".inspector-section.goal-section");
-  await expectVisible(goal.getByText(GOAL_OBJECTIVE, { exact: true }));
-  await expectVisible(goal.locator(".goal-status.goal-complete"));
+  await assertGoalSurface(page);
 }
 
 async function createApprovalTaskThroughUi(page: Page): Promise<void> {
@@ -698,19 +708,16 @@ async function createSlowProviderTaskThroughUi(page: Page): Promise<void> {
 }
 
 async function recoverSlowGoalThroughUi(page: Page): Promise<void> {
-  const show = page.getByRole("button", { name: "Show workbench", exact: true });
-  if (await show.isVisible()) await show.click();
   await waitForTaskTitle(page, SLOW_TITLE);
-  const goal = page.locator(".inspector-section.goal-section");
+  const settings = await openGoalSettings(page);
+  const goal = settings.locator(".goal-section");
   const objective = goal.locator(".goal-card > p", { hasText: SLOW_STEER_PROMPT });
   await expectVisible(objective);
   assert.equal((await objective.innerText()).trim(), SLOW_STEER_PROMPT);
-  const configuration = page.locator(".inspector-section.runtime-config-section");
-  await expectVisible(configuration);
-  await waitUntil("Default permission reset after sidecar restart", async () => (
-    /Permission\s+default/iu.test(await configuration.innerText())
-  ));
-  await expectVisible(configuration.getByText(/^Provider default$/iu));
+  assert.equal(await settings.getByLabel("Task permission profile", { exact: true }).inputValue(), "default");
+  await settings.getByRole("button", { name: "模型与账号", exact: true }).click();
+  assert.equal(await settings.getByLabel("Task service tier", { exact: true }).inputValue(), "");
+  await settings.getByRole("button", { name: "权限与协作", exact: true }).click();
   const requestsBeforeResume = provider.requests.filter((request) => request.text.includes(SLOW_STEER_PROMPT)).length;
   await sleep(750);
   assert.equal(
@@ -718,26 +725,26 @@ async function recoverSlowGoalThroughUi(page: Page): Promise<void> {
     requestsBeforeResume,
     "A durable Goal resumed without an explicit desktop action",
   );
-
-  const resumeTask = page.locator(".conversation-heading-actions")
-    .getByRole("button", { name: "继续处理", exact: true });
   const resumeGoal = goal.getByRole("button", { name: "Resume Goal", exact: true });
-  if (await isVisible(resumeTask, 2_000)) {
-    await resumeTask.click();
-  } else {
-    await expectVisible(resumeGoal);
+  if (await resumeGoal.isVisible()) {
     await resumeGoal.click();
+    await closeGoalSettings(page);
+  } else {
+    await closeGoalSettings(page);
+    await page.getByRole("button", { name: "继续处理", exact: true }).click();
   }
   await waitForProviderRequest(SLOW_STEER_PROMPT, requestsBeforeResume + 1);
 }
 
 async function clearSlowGoalThroughUi(page: Page): Promise<void> {
-  const goal = page.locator(".inspector-section.goal-section");
+  const settings = await openGoalSettings(page);
+  const goal = settings.locator(".goal-section");
   const clearGoal = goal.getByRole("button", { name: "Clear Goal", exact: true });
   await expectVisible(clearGoal);
   await clearGoal.click();
   await clearGoal.waitFor({ state: "hidden" });
   await expectVisible(goal.getByText("No autonomous Goal is attached to this task.", { exact: true }));
+  await closeGoalSettings(page);
 }
 
 async function steerSlowTurnThroughUi(page: Page): Promise<void> {
@@ -778,8 +785,9 @@ async function resumeStoppedTaskThroughUi(page: Page): Promise<void> {
   await resume.click();
   await resume.waitFor({ state: "hidden" });
   await waitForProviderRequest(SLOW_STEER_PROMPT, slowRequestsBefore + 1);
-  const goal = page.locator(".inspector-section.goal-section");
-  await expectVisible(goal.locator(".goal-status.goal-active"));
+  const settings = await openGoalSettings(page);
+  await expectVisible(settings.locator(".goal-status.goal-active"));
+  await closeGoalSettings(page);
   await expectVisible(page.locator(".composer-buttons")
     .getByRole("button", { name: "Stop current turn and pause Goal", exact: true }));
 }
@@ -796,9 +804,6 @@ async function sendRecoveryFollowUpThroughUi(page: Page): Promise<void> {
 }
 
 async function assertNativeResponsiveWidths(launch: DesktopLaunch): Promise<void> {
-  const hideWorkbench = launch.page.getByRole("button", { name: "Hide workbench", exact: true });
-  if (await isVisible(hideWorkbench, 1_000)) await hideWorkbench.click();
-
   for (const width of [1440, 1081, 1080, 820, 696, 695, 641, 640, 390]) {
     const expected = { width, height: 820 };
     const contentSize = await launch.app.evaluate(({ BrowserWindow }, size) => {
@@ -823,7 +828,7 @@ async function assertNativeResponsiveWidths(launch: DesktopLaunch): Promise<void
     assert.ok(metrics.bodyWidth <= width + 1, `body overflow at ${width}px: ${metrics.bodyWidth}`);
     if ([640, 641, 695, 696, 1080, 1081].includes(width)) {
       await assertResponsiveNavigation(launch.page);
-      await launch.page.waitForFunction(() => [".sidebar", ".inspector"].every((selector) => {
+      await launch.page.waitForFunction(() => [".sidebar"].every((selector) => {
         const panel = document.querySelector(selector);
         return panel && getComputedStyle(panel).opacity === "0" && getComputedStyle(panel).visibility === "hidden";
       }));

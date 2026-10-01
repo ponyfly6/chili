@@ -68,14 +68,12 @@ Preview 使用本地 ad-hoc 签名，不是已公证的正式发布包。打包�
 - 左侧 **目录 +** 添加本地目录，侧边栏按项目展示任务及后台运行/待处理数量；点击项目或其任务切换。已打开项目各自保留 runtime，切换不会中断任务、Goal 或消息队列。当前窗口内记住各项目选中的任务与未发送草稿。
 - 每个目录可通过名称前的箭头独立收起，当前目录也可点击名称折叠。展开时默认显示最近 5 条会话，“展开更多会话”每次增加 5 条，“收起更多会话”恢复精简列表；正在查看的较早会话也会保留在这 5 条中。搜索涵盖整个目录，切换目录或新建会话会展开对应列表。
 - 搜索 active/archived task，创建、重新载入或继续未归档 task，并对 active task 执行 rename/archive；subagent session 不会作为独立 task 暴露，也不支持 unarchive。
-- **设置** 按通用、模型与账号、权限与协作、工具与技能、偏好与记忆、手机连接分类；模型、思考深度与响应速度按模型能力展示，权限标明影响此目录的所有会话，协作方式属于当前会话。工作过程面板继续提供 Goal、agent/task 状态；工具设置读取 MCP 状态并支持重新加载；不支持显式 tier 的模型使用 provider default，Desktop 不会提交伪造 tier。
-- 实时查看消息、工具和审批，并在 inspector 中查看 agent/task 状态。
+- **设置** 按通用、模型与账号、权限与协作、工具与技能、偏好与记忆、手机连接分类；模型、思考深度与响应速度按模型能力展示，权限标明影响此目录的所有会话，协作方式属于当前会话。“权限与协作”中可管理当前会话的持续任务（Goal）；工具设置读取 MCP 状态并支持重新加载；不支持显式 tier 的模型使用 provider default，Desktop 不会提交伪造 tier。
+- 在对话中实时查看消息、执行步骤、工具结果和审批。
 - 发送消息；忙碌时 Queue，或 Steer（中断当前 turn 后优先发送）。
 - Stop 当前 session。
 - 汇总 root 与 descendant session 的 pending approvals，并允许 deny、allow once、allow session、always allow。
 - 展示并提交 `request_user_input` 请求。
-- **Activity** 展示子代理层级与任务状态；选择节点后可展开任务说明、结果、错误和运行历史。长正文分页读取，执行统计与时间默认折叠。切换项目或任务会重置详情选择。
-- **Changes** 按文件查看当前 turn 或 workspace diff，提供增删统计、双侧行号、文件折叠和 Patch / Raw 切换；长补丁与原始文本分页，截断提示保留。
 - 窗口失焦或后台项目发生审批、输入请求和 turn 完成时发原生通知，点击后切到对应项目并聚焦窗口。
 
 ## 新会话与高级任务
@@ -84,7 +82,7 @@ Preview 使用本地 ad-hoc 签名，不是已公证的正式发布包。打包�
 
 输入 `/` 或点击 **更多** 打开可搜索的命令菜单，支持方向键、Enter、Escape。`/settings`、`/model`、`/permissions`、`/mcp`、`/skills`、`/memory` 打开对应设置；`/review` 和 `/help` 填入待发送的需求。`⌘ ,` 随时打开设置。
 
-所有回复直接显示在对话中，可以持续追问并查看历史消息。工作过程默认折叠；通用设置中的“默认展开工作过程”由主进程原子保存到客户端的 `reading-settings.json`。文件改动可在工作过程面板的 **Changes** 中查看。网页内嵌预览、点选页面元素修改及附件上传尚未接入，不显示模拟操作入口。
+所有回复直接显示在对话中，可以持续追问并查看历史消息。工作过程默认折叠；通用设置中的“默认展开工作过程”由主进程原子保存到客户端的 `reading-settings.json`。网页内嵌预览、点选页面元素修改及附件上传尚未接入，不显示模拟操作入口。
 
 模型账号继续使用已有本机配置；设置显示真实模型可用性，不在网页收集密钥。技能和目录说明通过明确标注的“在会话中查看”入口填入需求，不模拟连接或记忆管理。当前无独立的个人记忆库，目录偏好由已有 `AGENTS.md` 机制承载。
 
@@ -104,9 +102,9 @@ Permission profile 是当前项目 runtime/sidecar 的**全局内存状态**，�
 
 MCP 面板读取当前 session scope 的 server 状态与汇总，并提供 reload。Desktop 当前不暴露 add/remove/auth 配置流程；这些仍由现有 CLI/TUI/runtime 配置完成。
 
-## 多项目与面板验收
+## 多项目与对话验收
 
-`bun run test:e2e:desktop` 使用真实 Electron、编译后的 sidecar 与本地 fake model，覆盖主题持久化、多项目切换、Goal 恢复、审批/提问、任务操作，以及实际委派后的 Activity 结果和真实 Git 文件的 Changes 视图。
+`bun run test:e2e:desktop` 使用真实 Electron、编译后的 sidecar 与本地 fake model，覆盖主题持久化、多项目切换、Goal 恢复、审批/提问、任务操作，以及委派任务的对话结果、设置中的持续任务管理、目录折叠和会话分页。
 
 `bun run smoke:desktop-projects` 是独立的 macOS 多项目进程门禁：三个项目同时运行，反复切换、分别 Stop，并验证正常退出和强制终止 Electron 后的 sidecar、工具及 Git 进程回收。测试只管理本次启动并确认身份的进程，保留无关进程；成功或失败均留下性能与进程证据。CI 已构建当前源码时可设置 `CHILI_DESKTOP_PROJECTS_SKIP_BUILD=1`。
 
