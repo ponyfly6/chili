@@ -62,7 +62,7 @@ bun run chili -- --resume <session-id> "继续"
 
 ### 桌面控制端
 
-Electron 桌面端复用同一个 Chili runtime，通过受限 preload bridge 控制本地 Bun sidecar；renderer 不接触 Node、sidecar URL 或 bearer token。
+CLI 和 Electron 桌面端通过 [`@chili/host`](packages/host/README.md) 装配同一套运行能力，TUI 通过 HTTP/SSE 接入。桌面通过受限 preload bridge 控制本地 Bun sidecar；renderer 不接触 Node、sidecar URL 或 bearer token。当前统一的是公共业务装配，跨进程发现和连接同一个 Host 实例仍在迁移中。
 
 开发运行：
 
