@@ -1,3 +1,4 @@
+import { DesktopReadingSettings } from "./reading-settings.js";
 import { stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import type { ChiliEvent } from "@chili/protocol";
@@ -99,6 +100,8 @@ async function bootstrap(): Promise<void> {
 
   const appearanceSettings = new DesktopAppearanceSettings(resolve(app.getPath("userData"), "appearance-settings.json"));
   nativeTheme.themeSource = await appearanceSettings.initialize();
+  const readingSettings = new DesktopReadingSettings(resolve(app.getPath("userData"), "reading-settings.json"));
+  await readingSettings.initialize();
   if (!bootstrapLifecycle.canContinue()) return;
 
   // The empty runtime lets connection setup remain available before a project is opened.
@@ -180,6 +183,8 @@ async function bootstrap(): Promise<void> {
   const desktopRemote = remoteControl;
   desktopIpc = registerDesktopIpc(mainWindow, {
     async invoke(request) {
+      if (request.type === "reading.get") return parseDesktopResponse(request, await readingSettings.get());
+      if (request.type === "reading.set") return parseDesktopResponse(request, await readingSettings.set({ autoResult: request.autoResult, expandWork: request.expandWork }));
       if (request.type === "appearance.get") return parseDesktopResponse(request, { theme: await appearanceSettings.getTheme() });
       if (request.type === "appearance.set") {
         const theme = await appearanceSettings.setTheme(request.theme);

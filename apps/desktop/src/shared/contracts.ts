@@ -1,3 +1,4 @@
+import type { ReadingPreferences } from "./reading-preferences.js";
 import type { DesktopTheme } from "./appearance.js";
 import {
   normalizeSessionTitle,
@@ -178,6 +179,8 @@ export interface DesktopSessionConfig {
 }
 
 type DesktopOperation =
+  | { type: "reading.get" }
+  | ({ type: "reading.set" } & ReadingPreferences)
   | { type: "appearance.get" }
   | { type: "appearance.set"; theme: DesktopTheme }
   | { type: "app.state" }
@@ -232,6 +235,8 @@ type DesktopOperation =
 export type DesktopRequest = DesktopOperation & { projectId?: string };
 
 export interface DesktopResponseMap {
+  "reading.get": ReadingPreferences;
+  "reading.set": ReadingPreferences;
   "appearance.get": { theme: DesktopTheme };
   "appearance.set": { theme: DesktopTheme };
   "app.state": DesktopState;
@@ -310,6 +315,8 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
   assertOnlyKeys(record, requestKeys(type));
 
   if (type === "workspace.activate") return { type, id: requireProjectId(record.id, "id") };
+  if (type === "reading.get") return { type };
+  if (type === "reading.set") return { type, autoResult: requireBoolean(record.autoResult, "autoResult"), expandWork: requireBoolean(record.expandWork, "expandWork") };
   if (type === "appearance.get") return { type };
   if (type === "appearance.set") {
     return { type, theme: requireEnum(record.theme, ["system", "dark", "light"], "theme") as DesktopTheme };
@@ -617,7 +624,11 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
 ): DesktopResponse<Request> {
   assertDesktopJsonValue(value, "Desktop response");
   let response: unknown;
-  if (request.type === "appearance.get" || request.type === "appearance.set") {
+  if (request.type === "reading.get" || request.type === "reading.set") {
+    const record = requireRecord(value, "reading preferences");
+    assertOnlyKeys(record, ["autoResult", "expandWork"]);
+    response = { autoResult: requireBoolean(record.autoResult, "autoResult"), expandWork: requireBoolean(record.expandWork, "expandWork") };
+  } else if (request.type === "appearance.get" || request.type === "appearance.set") {
     const record = requireRecord(value, "appearance response");
     assertOnlyKeys(record, ["theme"]);
     response = { theme: requireEnum(record.theme, ["system", "dark", "light"], "theme") };
@@ -1140,6 +1151,8 @@ function parseUserInputQuestion(value: unknown): UserInputQuestion {
 
 function requestKeys(type: string): readonly string[] {
   if (type === "workspace.activate") return ["type", "id"];
+  if (type === "reading.get") return ["type"];
+  if (type === "reading.set") return ["type", "autoResult", "expandWork"];
   if (type === "appearance.get") return ["type"];
   if (type === "appearance.set") return ["type", "theme"];
   if (type === "app.state" || type === "workspace.select" || type === "permissions.get") return ["type"];
