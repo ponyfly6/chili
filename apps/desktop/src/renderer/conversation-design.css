@@ -53,13 +53,18 @@ button { cursor: pointer; }
 .project-heading { flex: 1; min-width: 0; padding: 8px 6px; background: none; border: 0; }
 .project-heading:hover { background: var(--panel-hover); }
 .project-name strong { font-size: 12px; font-weight: 500; }
-.project-heading .project-folder { color: var(--muted); font-size: 11px; }
+.project-disclosure { display: flex; flex: none; align-items: center; justify-content: center; width: 22px; height: 28px; padding: 0; border-radius: 5px; background: none; color: var(--muted); font-size: 11px; }
+.project-disclosure:hover { background: var(--panel-hover); color: var(--text); }
 .directory-new { width: 26px; height: 26px; font-size: 18px; }
 .project-task-preview { padding: 3px 5px 3px 23px; }
 .project-task-preview button { padding: 9px; font-size: 12px; color: var(--muted); }
 .session-section { padding: 0 0 0 18px; }
 .session-section > .section-heading { display: none; }
 .session-list { gap: 2px; }
+.session-list-controls { display: flex; flex-wrap: wrap; gap: 2px 8px; padding: 4px 0; }
+.session-list-more, .session-list-less { display: flex; align-items: center; gap: 7px; padding: 7px 9px; border-radius: 5px; background: none; color: var(--muted); font-size: 11px; text-align: left; }
+.session-list-more:hover, .session-list-less:hover { background: var(--panel-hover); color: var(--text); }
+.session-list-more span { font-size: 10px; }
 .session-entry .session-row { min-height: 35px; padding: 8px 30px 8px 9px; gap: 7px; border: 0; border-radius: 6px; background: transparent; }
 .session-row.selected { box-shadow: none; background: var(--panel-active); }
 .session-row:hover:not(:disabled) { background: var(--panel-hover); }

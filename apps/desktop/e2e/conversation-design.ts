@@ -74,6 +74,60 @@ export async function assertConversationDesign(page: Page, artifacts: string): P
   await page.getByRole("heading", { name: "你想做点什么？", exact: true }).waitFor();
   assert.equal(await page.getByRole("dialog").count(), 0, "New conversation must never open the advanced configuration form");
   assert.equal(await composer.inputValue(), "");
+  await assertProjectSessionList(page, artifacts);
+}
+
+async function assertProjectSessionList(page: Page, artifacts: string): Promise<void> {
+  const composer = page.getByLabel("Message composer", { exact: true });
+  const project = page.locator(".project-active");
+  const rows = project.locator(".session-row");
+  for (let index = 1; index <= 11; index++) {
+    if (index > 1) await page.getByRole("button", { name: "New task", exact: true }).click();
+    const title = `Sidebar conversation ${index}`;
+    await composer.fill(title);
+    await composer.press("Enter");
+    await page.getByRole("heading", { name: title, exact: true }).waitFor();
+    await page.getByText(`Echo: ${title}`, { exact: true }).waitFor();
+    await page.getByRole("button", { name: "Send message", exact: true }).waitFor();
+  }
+  assert.equal(await rows.count(), 5, "A directory initially shows only five conversations");
+  await composer.fill("保留折叠时的草稿");
+  await project.getByRole("button", { name: "收起 workspace 的会话", exact: true }).click();
+  assert.equal(await rows.count(), 0);
+  assert.equal(await composer.inputValue(), "保留折叠时的草稿");
+  await page.getByRole("heading", { name: "Sidebar conversation 11", exact: true }).waitFor();
+  await project.getByRole("button", { name: "展开 workspace 的会话", exact: true }).press("Enter");
+  assert.equal(await rows.count(), 5, "Reopening a directory resets it to the compact list");
+  const more = project.getByRole("button", { name: /^展开更多会话/ });
+  await more.click();
+  assert.equal(await rows.count(), 10, "Each expansion reveals five more conversations");
+  await more.click();
+  assert.equal(await rows.count(), 12);
+  assert.equal(await more.count(), 0, "The expansion button disappears after the last page");
+  await composer.fill("");
+  await rows.filter({ has: page.getByText("hello conversation redesign", { exact: true }) }).click();
+  await page.getByRole("heading", { name: "hello conversation redesign", exact: true }).waitFor();
+  await project.getByRole("button", { name: "收起更多会话", exact: true }).click();
+  assert.equal(await rows.count(), 5);
+  assert.equal(await rows.filter({ has: page.getByText("hello conversation redesign", { exact: true }) }).count(), 1,
+    "An older current conversation remains visible when the list is shortened");
+  await page.screenshot({ path: join(artifacts, "sidebar-compact.png") });
+  await project.getByRole("button", { name: "Open project workspace", exact: true }).click();
+  assert.equal(await rows.count(), 0, "The active directory name can also collapse the list");
+  await page.getByRole("button", { name: "搜索会话", exact: true }).click();
+  const search = page.getByRole("searchbox", { name: "Search tasks", exact: true });
+  await search.fill("Sidebar conversation 1");
+  assert.equal(await rows.count(), 3, "Search reaches conversations outside the initial page and reveals the directory");
+  await search.fill("no matching conversation");
+  assert.equal(await rows.count(), 0);
+  await project.getByText("没有找到匹配的会话。", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "搜索会话", exact: true }).click();
+  assert.equal(await rows.count(), 5);
+  await project.getByRole("button", { name: "收起 workspace 的会话", exact: true }).click();
+  await page.getByRole("button", { name: "New task", exact: true }).click();
+  await page.getByRole("heading", { name: "你想做点什么？", exact: true }).waitFor();
+  await project.getByRole("button", { name: "收起 workspace 的会话", exact: true }).waitFor();
+  assert.equal(await rows.count(), 5, "A new conversation is revealed even if the directory was collapsed");
 }
 
 export async function openPhoneSettings(page: Page) {

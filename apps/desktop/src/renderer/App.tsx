@@ -5,6 +5,7 @@ import { DesktopSettings, type SessionSettingsValues } from "./DesktopSettings.j
 import { conversationTitle, matchingDesktopCommands,
   type DesktopCommand, type SettingsPage } from "./conversation-design.js";
 import { ProjectSidebar } from "./ProjectSidebar.js";
+import { SessionList } from "./SessionList.js";
 import { AgentDetailsPanel } from "./AgentDetailsPanel.js";
 import { DiffViewer } from "./DiffViewer.js";
 import { TimelineViewport } from "./TimelineViewport.js";
@@ -1175,15 +1176,16 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           </div>
           <div className="directory-heading"><span>目录</span><div><button className="icon-button" aria-label="搜索会话" aria-expanded={searchOpen} onClick={() => { setSearchOpen(!searchOpen); if (searchOpen) { setSessionQuery(""); setSessionListStatus("active"); } }}><Icon name="search" /></button><button className="icon-button" aria-label="Add project" title="打开目录" disabled={!workspaceSwitchEnabled} onClick={() => void chooseWorkspace()}><Icon name="plus" /></button></div></div>
           <ProjectSidebar projects={desktop.projects ?? []} activeId={desktop.projectId} disabled={!workspaceSwitchEnabled}
+            selectedSessionId={selectedId} revealKey={JSON.stringify([searchOpen, sessionQuery, sessionListStatus])}
             onActivate={(id, sessionId) => void chooseWorkspace(id, sessionId)}
             onNewSession={openNewTask}>
-          <section className="session-section">
+          {(initialLimit) => <section className="session-section">
             <div className="section-heading">
               <p className="eyebrow">{sessionListStatus === "active" ? "Recent tasks" : "Archived tasks"}</p>
               <span>{visibleSessions.length}</span>
             </div>
-            <div className="session-list">
-              {visibleSessions.map((session) => (
+            <SessionList key={JSON.stringify([desktop.projectId, sessionQuery, sessionListStatus, initialLimit])} sessions={visibleSessions} selectedId={selectedId} initialLimit={initialLimit}>
+              {(session) => (
                 <div className={`session-entry ${taskMenuId === session.id ? "menu-open" : ""}`} key={session.id}>
                   <button
                     className={`session-row ${selectedId === session.id ? "selected" : ""}`}
@@ -1253,14 +1255,14 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                     </>
                   ) : null}
                 </div>
-              ))}
+              )}
+            </SessionList>
               {healthy && sessions.length === 0 ? <p className="empty-copy sidebar-empty">这个目录的会话会出现在这里。</p> : null}
               {healthy && sessions.length > 0 && visibleSessions.length === 0 ? (
                 <p className="empty-copy sidebar-empty">没有找到匹配的会话。</p>
               ) : null}
               {!healthy ? <p className="empty-copy sidebar-empty">打开一个目录，开始你的第一个想法。</p> : null}
-            </div>
-          </section>
+          </section>}
           </ProjectSidebar>
           <footer className="workspace-picker">
             <button className="sidebar-settings" aria-label="打开设置" onClick={() => openSettings()}><Icon name="settings" /><span>设置</span><kbd>⌘ ,</kbd></button>

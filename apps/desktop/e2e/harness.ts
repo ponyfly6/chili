@@ -916,8 +916,16 @@ async function assertMultipleProjects(launch: DesktopLaunch): Promise<void> {
   await waitForTaskTitle(page, PROJECT_B_TITLE);
   await waitUntil("project B draft restoration", async () => await activeComposer(page).inputValue() === PROJECT_B_DRAFT);
   await page.screenshot({ path: join(artifacts, "multiple-projects.png") });
-  await page.getByRole("button", { name: "Open project workspace", exact: true }).click();
+  const backgroundProject = page.locator(".project-group").filter({ has: page.getByRole("button", { name: "Open project workspace", exact: true }) });
+  await backgroundProject.getByRole("button", { name: "收起 workspace 的会话", exact: true }).click();
+  assert.equal(await backgroundProject.locator(".project-task-preview").count(), 0);
+  await waitForTaskTitle(page, PROJECT_B_TITLE);
+  assert.equal(await activeComposer(page).inputValue(), PROJECT_B_DRAFT, "Collapsing another directory preserves the active chat and draft");
+  await backgroundProject.getByRole("button", { name: "展开 workspace 的会话", exact: true }).click();
+  assert.equal(await backgroundProject.getByRole("button", { name: /^Open .+ in workspace$/ }).count(), 5);
+  await backgroundProject.getByRole("button", { name: "展开更多会话", exact: true }).click();
   await waitForTaskTitle(page, SLOW_TITLE);
+  assert.equal(await page.locator(".project-active .session-row").count(), 10, "Expanding a background directory loads more than its five cached previews");
   assert.equal(slow.aborted, false);
   await activeComposer(page).fill("");
 }
