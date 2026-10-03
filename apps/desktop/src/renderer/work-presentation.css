@@ -1,0 +1,69 @@
+.work-summary > summary {
+  display: flex;
+  flex-wrap: wrap;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 32px;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+
+.work-headline { min-width: 0; overflow-wrap: anywhere; }
+.work-metrics { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.work-metrics::before { content: "·"; margin-right: 7px; }
+.work-current-detail, .work-terminal-detail {
+  flex-basis: 100%;
+  min-width: 0;
+  max-width: 100%;
+  padding-left: 17px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 11px;
+}
+.work-terminal-detail { color: var(--red); }
+.work-details { margin-top: 8px; padding-top: 0; padding-bottom: 0; }
+.work-stage { margin: 0 0 7px; }
+.work-stage > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 0;
+  list-style: none;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.work-stage > summary::-webkit-details-marker { display: none; }
+.work-stage-indicator { display: inline-block; width: 9px; flex: none; text-align: center; color: var(--muted); }
+.work-stage[open] > summary .work-stage-indicator { transform: rotate(90deg); }
+.work-stage.active > summary .work-stage-indicator { color: var(--accent); }
+.work-stage-meta { margin-left: auto; font-size: 11px; color: var(--muted); text-align: right; }
+.work-stage-details { padding: 3px 0 8px 17px; }
+.work-note { margin: 4px 0 9px; }
+.work-commentary > summary { display: flex; align-items: baseline; gap: 6px; list-style: none; cursor: pointer; }
+.work-commentary > summary::-webkit-details-marker { display: none; }
+.work-commentary > summary::before { content: "›"; flex: none; }
+.work-commentary[open] > summary::before { transform: rotate(90deg); }
+.work-commentary > summary > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.work-commentary > div, .work-reasoning > .markdown { padding: 7px 0; }
+.work-note .markdown { font-size: 12px; line-height: 1.7; }
+.work-reasoning > summary { font-size: 11px; cursor: pointer; color: var(--muted); }
+.work-tool-copy strong { font-weight: 500; }
+.work-tool-copy span, .work-tool-status, .work-tool-row .tool-details summary { font-size: 11px; }
+.work-tool-copy span { font-family: inherit; }
+.work-tool-row .tool-input { margin-top: 8px; }
+.work-history-note { margin: 7px 0 10px; font-size: 11px; color: var(--muted); }
+.work-tool-row.tool-cancelled .work-tool-status { color: var(--muted); }
+.work-summary summary:focus-visible { outline: 2px solid var(--line-strong); outline-offset: 3px; border-radius: 3px; }
+
+@media (max-width: 520px) {
+  .work-stage-meta { max-width: 45%; }
+  .work-stage-details { padding-left: 8px; }
+  .work-tool-row { gap: 6px; }
+  .work-tool-copy { flex-wrap: wrap; gap: 1px 5px; }
+  .work-tool-copy span { flex-basis: 100%; }
+}

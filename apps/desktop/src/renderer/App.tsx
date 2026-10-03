@@ -7,6 +7,7 @@ import { conversationTitle, matchingDesktopCommands,
 import { ProjectSidebar } from "./ProjectSidebar.js";
 import { SessionList } from "./SessionList.js";
 import { TimelineViewport } from "./TimelineViewport.js";
+import { formatWorkDuration, workCurrentDetail, workHeadline, workStages, workToolStatus, workToolSubject, workToolTitle, type WorkStage } from "./work-presentation.js";
 import { eventMatchesProject, ProjectViewMemory } from "./project-view-state.js";
 import { useDesktopTheme } from "./useDesktopTheme.js";
 import { getDesktopBuildInfo } from "../shared/build-info.js";
@@ -1814,46 +1815,70 @@ function TimelineItem({ item, expandWork }: { item: DesktopTimelineItem; expandW
 
 function WorkSummary({ item, expandWork }: { item: DesktopWorkItem; expandWork: boolean }) {
   const [open, setOpen] = useState(expandWork);
-  const wasActive = useRef(item.active);
+  const [hasOpened, setHasOpened] = useState(expandWork);
+  const [now, setNow] = useState(Date.now);
 
   useEffect(() => {
-    if (expandWork) setOpen(true);
-    else if (wasActive.current && !item.active) setOpen(false);
-    wasActive.current = item.active;
-  }, [item.active, expandWork]);
+    setOpen(expandWork);
+  }, [expandWork]);
+  useEffect(() => {
+    if (!item.active) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [item.active]);
 
-  const elapsed = Math.max(0, item.updatedAt - item.startedAt);
-  const label = item.active
-    ? "Working"
-    : elapsed >= 1_000
-      ? `Worked for ${formatWorkDuration(elapsed)}`
-      : "Worked";
+  const elapsed = Math.max(0, (item.active ? Math.max(now, item.updatedAt) : item.updatedAt) - item.startedAt);
+  const stages = useMemo(() => workStages(item), [item]);
+  const detail = item.active ? workCurrentDetail(item) : undefined;
 
   return (
     <details
-      className={`timeline-item work-summary ${item.active ? "active" : ""} ${item.failureCount > 0 ? "has-failure" : ""}`}
+      className={`timeline-item work-summary ${item.active ? "active" : ""} ${item.status === "failed" ? "has-failure" : ""}`}
       open={open}
-      onToggle={(event) => setOpen(event.currentTarget.open)}
+      onToggle={(event) => {
+        setOpen(event.currentTarget.open);
+        if (event.currentTarget.open) setHasOpened(true);
+      }}
     >
       <summary>
         <span className="work-indicator" aria-hidden="true" />
-        <span aria-live={item.active ? "polite" : undefined}>{label}</span>
-        {item.failureCount > 0 ? <span className="work-failure">{item.failureCount} issue{item.failureCount === 1 ? "" : "s"}</span> : null}
+        <span className="work-headline" aria-live="polite">{workHeadline(item)}</span>
+        <span className="work-metrics">{item.toolCount > 0 ? `${item.toolCount} 次操作 · ` : ""}{formatWorkDuration(elapsed)}</span>
+        {detail ? <span className="work-current-detail" title={detail}>{detail}</span> : null}
+        {item.statusReason && item.status === "failed" ? <span className="work-terminal-detail" title={item.statusReason}>{item.statusReason}</span> : null}
       </summary>
       <div className="work-details">
-        {item.items.map((detail, index) => (
-          <WorkDetail key={`${detail.kind}:${detail.id}:${index}`} item={detail} />
-        ))}
+        {open || hasOpened ? stages.map((stage) => <WorkStageDetail key={stage.id} stage={stage} />) : null}
+        {item.failureCount > 0 ? <p className="work-history-note">记录中有 {item.failureCount} 次调用未成功，详情保留在对应操作中。</p> : null}
       </div>
+    </details>
+  );
+}
+
+function WorkStageDetail({ stage }: { stage: WorkStage }) {
+  const [open, setOpen] = useState(false);
+  const [hasOpened, setHasOpened] = useState(false);
+  return (
+    <details className={`work-stage ${stage.active ? "active" : ""}`} open={open} onToggle={(event) => {
+      setOpen(event.currentTarget.open);
+      if (event.currentTarget.open) setHasOpened(true);
+    }}>
+      <summary><span className="work-stage-indicator" aria-hidden="true">{stage.active ? "·" : "›"}</span><span>{stage.label}</span><span className="work-stage-meta">{stage.active ? "进行中" : stage.failureCount > 0 ? "含未成功操作" : "已结束"}{stage.toolCount > 0 ? ` · ${stage.toolCount} 次` : ""}</span></summary>
+      <div className="work-stage-details">{open || hasOpened ? stage.items.map((detail) => <WorkDetail key={`${detail.kind}:${detail.id}`} item={detail} />) : null}</div>
     </details>
   );
 }
 
 function WorkDetail({ item }: { item: ChatTranscriptItem }) {
   if (item.kind === "message") {
+    const note = item.parts.filter((part) => part.type !== "reasoning");
+    const reasoning = item.parts.filter((part) => part.type === "reasoning");
+    const preview = note.find((part) => part.type === "text");
     return (
       <div className="work-note">
-        {item.parts.map((part) => <MessagePart key={part.id} part={part} compact />)}
+        {reasoning.map((part) => <MessagePart key={part.id} part={part} compact />)}
+        {note.length > 0 ? <details className="work-commentary"><summary><span>{preview?.type === "text" ? preview.text.split("\n").find((line) => line.trim()) || "过程说明" : "过程说明"}</span></summary><div>{note.map((part) => <MessagePart key={part.id} part={part} compact />)}</div></details> : null}
       </div>
     );
   }
@@ -1861,18 +1886,21 @@ function WorkDetail({ item }: { item: ChatTranscriptItem }) {
   if (item.kind === "tool") {
     const liveOutput = visibleToolLiveOutput(item.output, item.liveOutput);
     const hasOutput = Boolean(liveOutput || item.output || item.error);
-    const showStatus = item.displayStatus !== "succeeded";
+    const subject = workToolSubject(item);
+    const command = item.inputSummary.command ?? item.inputSummary.detail;
     return (
       <div className={`work-tool-row tool-${item.displayStatus}`}>
         <span className="work-tool-dot" aria-hidden="true" />
         <div className="work-tool-copy">
-          <strong>{humanizeToolTitle(item.inputSummary.title || item.toolName)}</strong>
-          {item.inputSummary.detail ? <span title={item.inputSummary.detail}>{item.inputSummary.detail}</span> : null}
+          <strong>{workToolTitle(item)}</strong>
+          {subject ? <span title={subject}>{subject}</span> : null}
         </div>
-        {showStatus ? <span className="work-tool-status">{humanizeStatus(item.displayStatus)}</span> : null}
-        {hasOutput ? (
+        <span className="work-tool-status">{workToolStatus(item.displayStatus)}</span>
+        {hasOutput || command || item.input ? (
           <details className="tool-details">
-            <summary>{item.error ? "View error" : liveOutput ? "Live output" : "View result"}</summary>
+            <summary>{item.error ? "查看调用与错误" : liveOutput ? "查看调用与实时输出" : "查看调用与结果"}</summary>
+            {command ? <pre className="tool-command">{command}</pre> : null}
+            {item.input !== undefined ? <details className="tool-input"><summary>完整参数</summary><pre>{JSON.stringify(item.input, null, 2)}</pre></details> : null}
             {liveOutput ? <pre className="tool-live-output">{liveOutput}</pre> : null}
             {item.output ? <pre>{item.output}</pre> : null}
             {item.error ? <pre className="tool-error">{item.error}</pre> : null}
@@ -1886,18 +1914,18 @@ function WorkDetail({ item }: { item: ChatTranscriptItem }) {
     <div className={`work-tool-row work-approval-row approval-${item.status}`}>
       <span className="work-tool-dot" aria-hidden="true" />
       <div className="work-tool-copy">
-        <strong>{item.status === "pending" ? "Requested approval" : "Approval"}</strong>
+        <strong>{item.status === "pending" ? "请求授权" : "授权记录"}</strong>
         <span>{item.patterns.join(", ") || item.permission}</span>
       </div>
-      {item.status === "pending" ? <span className="work-tool-status">Waiting</span> : null}
-      {item.status === "resolved" && item.decision === "deny" ? <span className="work-tool-status">Denied</span> : null}
+      {item.status === "pending" ? <span className="work-tool-status">等待处理</span> : null}
+      {item.status === "resolved" && item.decision === "deny" ? <span className="work-tool-status">已拒绝</span> : null}
     </div>
   );
 }
 
 export function MessagePart({ part, compact = false }: { part: ChatMessagePart; compact?: boolean }) {
   if (part.type === "text") return <MarkdownText text={part.text} compact={compact} />;
-  if (part.type === "reasoning") return <details><summary>Reasoning</summary><MarkdownText text={part.text} compact /></details>;
+  if (part.type === "reasoning") return <details className="work-reasoning"><summary>思考过程</summary><MarkdownText text={part.text} compact /></details>;
   if (part.type === "summary") return <div className="summary-part"><MarkdownText text={part.text} compact /></div>;
   if (part.type === "image") return <p className="attachment">Image · {part.filename ?? part.mimeType}</p>;
   if (part.type === "tool_call") {
@@ -2234,17 +2262,6 @@ function formatRelativeTime(value: number): string {
   if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)}h`;
   if (elapsed < 604_800_000) return `${Math.floor(elapsed / 86_400_000)}d`;
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(new Date(value));
-}
-
-function formatWorkDuration(value: number): string {
-  const seconds = Math.max(1, Math.round(value / 1_000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  if (minutes < 60) return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
 }
 
 function formatGoalTime(seconds: number): string {

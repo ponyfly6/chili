@@ -73,6 +73,8 @@ export interface DesktopWorkItem {
   active: boolean;
   toolCount: number;
   failureCount: number;
+  status: "running" | "waiting" | "completed" | "failed" | "cancelled";
+  statusReason?: string;
   startedAt: number;
   updatedAt: number;
   turnId?: string;
@@ -146,12 +148,12 @@ export function compactDesktopTranscript(chat: ChatSessionView): ChatSessionView
 }
 
 /**
- * Match ChatGPT's conversation hierarchy: working commentary, reasoning,
- * tools, and approval history become one quiet disclosure per turn. User
- * messages and answer text remain the only first-class transcript rows.
+ * A submitted user request can span many runtime turns (one per model/tool
+ * exchange). Keep all of those turns in one stable disclosure. Resolve turn
+ * ownership from messages first so late tool results stay with their request.
  *
  * Assistant messages are created before their later tool calls and may receive
- * both commentary and final-answer parts over time. Group by turn first, then
+ * both commentary and final-answer parts over time. Group by request first, then
  * place the work disclosure immediately before the answer so projection order
  * can never put a tool row below its final response.
  */
@@ -160,6 +162,45 @@ export function desktopTimelineItems(
   runtime?: DesktopTimelineRuntime,
 ): DesktopTimelineItem[] {
   const compact = compactDesktopTranscript(chat);
+  const requestByTurn = new Map<string, string>();
+  const requestByIndex: string[] = [];
+  const toolTurns = new Set<string>();
+  const toolMessageIds = new Set<string>();
+  let requestKey = "legacy:head";
+  let latestRequestKey = requestKey;
+  let precedingAssistant: string | undefined;
+  // Use the original transcript: compacting removes duplicate tool-call parts.
+  for (const item of chat.items) {
+    const turnId = desktopTranscriptItemTurnId(item, runtime);
+    if (item.kind === "message") {
+      if (item.role === "user") {
+        precedingAssistant = undefined;
+        requestKey = turnId ? `turn:${turnId}` : `legacy:${String(item.id)}`;
+      } else if (requestKey === "legacy:head" && turnId) {
+        requestKey = `turn:${turnId}`;
+      }
+      if (turnId && !requestByTurn.has(turnId)) requestByTurn.set(turnId, requestKey);
+      if (item.role === "assistant") precedingAssistant = String(item.id);
+      if (item.parts.some((part) => part.type === "tool_call")) toolMessageIds.add(String(item.id));
+    } else if (item.kind === "tool") {
+      if (turnId) toolTurns.add(turnId);
+      else if (precedingAssistant) toolMessageIds.add(precedingAssistant);
+    }
+  }
+  requestKey = "legacy:head";
+  compact.items.forEach((item, index) => {
+    const turnId = desktopTranscriptItemTurnId(item, runtime);
+    if (item.kind === "message" && item.role === "user") {
+      requestKey = turnId ? `turn:${turnId}` : `legacy:${String(item.id)}`;
+    } else if (requestKey === "legacy:head" && turnId) {
+      requestKey = `turn:${turnId}`;
+    }
+    latestRequestKey = requestKey;
+    requestByIndex[index] = requestKey;
+    if (item.kind === "message" && turnId && !requestByTurn.has(turnId)) {
+      requestByTurn.set(turnId, requestKey);
+    }
+  });
   const visible: Array<{
     item: DesktopMessageItem;
     key: string;
@@ -171,9 +212,10 @@ export function desktopTimelineItems(
     firstSourceIndex: number;
     firstSequence: number;
     turnId?: string;
+    turnIds: Set<string>;
   }>();
   const timingByKey = new Map<string, { startedAt: number; updatedAt: number }>();
-  let currentRoundKey = "legacy:head";
+  const turnsByKey = new Map<string, Set<string>>();
   let sequence = 0;
   const sessionActive = chat.status === "running"
     || chat.status === "waiting_for_approval"
@@ -187,12 +229,14 @@ export function desktopTimelineItems(
     const existing = workByKey.get(key);
     if (existing) {
       existing.items.push({ item, sourceIndex, sequence });
+      if (turnId) existing.turnIds.add(turnId);
     } else {
       workByKey.set(key, {
         items: [{ item, sourceIndex, sequence }],
         firstSourceIndex: sourceIndex,
         firstSequence: sequence,
-        ...(turnId ? { turnId } : {}),
+        turnIds: new Set(turnId ? [turnId] : []),
+        ...(key.startsWith("turn:") ? { turnId: key.slice(5) } : {}),
       });
     }
     sequence += 1;
@@ -211,12 +255,12 @@ export function desktopTimelineItems(
 
   compact.items.forEach((item, sourceIndex) => {
     const turnId = desktopTranscriptItemTurnId(item, runtime);
-    if (item.kind === "message" && item.role === "user") {
-      currentRoundKey = turnId ? `turn:${turnId}` : `legacy:${String(item.id)}`;
-    } else if (turnId && currentRoundKey === "legacy:head") {
-      currentRoundKey = `turn:${turnId}`;
+    const key = (turnId ? requestByTurn.get(turnId) : undefined) ?? requestByIndex[sourceIndex] ?? "legacy:head";
+    if (turnId) {
+      const turns = turnsByKey.get(key) ?? new Set<string>();
+      turns.add(turnId);
+      turnsByKey.set(key, turns);
     }
-    const key = turnId ? `turn:${turnId}` : currentRoundKey;
     updateTiming(key, item);
 
     if (item.kind === "tool" || item.kind === "approval") {
@@ -231,8 +275,11 @@ export function desktopTimelineItems(
       addVisible(item, key, sourceIndex);
       return;
     }
-    const workParts = item.parts.filter(isDesktopWorkPart);
-    const answerParts = item.parts.filter((part) => !isDesktopWorkPart(part));
+    const hasTools = toolMessageIds.has(String(item.id)) || Boolean(turnId && toolTurns.has(turnId));
+    const isWork = (part: DesktopMessageItem["parts"][number]): boolean => isDesktopWorkPart(part)
+      || (hasTools && part.type === "text" && part.phase === undefined && !part.synthetic);
+    const workParts = item.parts.filter(isWork);
+    const answerParts = item.parts.filter((part) => !isWork(part));
     if (workParts.length > 0) addWork({ ...item, parts: workParts }, key, turnId, sourceIndex);
     if (answerParts.length > 0) addVisible({ ...item, parts: answerParts }, key, sourceIndex);
   });
@@ -243,9 +290,6 @@ export function desktopTimelineItems(
     const current = firstAnswerPosition.get(atom.key);
     if (current === undefined || atom.position < current) firstAnswerPosition.set(atom.key, atom.position);
   }
-  const latestWorkKey = [...workByKey.entries()]
-    .sort((left, right) => left[1].firstSourceIndex - right[1].firstSourceIndex)
-    .at(-1)?.[0];
   const work = [...workByKey.entries()].map(([key, bucket]) => {
     const ordered = bucket.items
       .sort((left, right) => left.sourceIndex - right.sourceIndex || left.sequence - right.sequence)
@@ -253,15 +297,25 @@ export function desktopTimelineItems(
     const tools = ordered.filter((item): item is Extract<ChatTranscriptItem, { kind: "tool" }> => item.kind === "tool");
     const timing = timingByKey.get(key);
     const turnStartedAt = bucket.turnId ? runtime?.turnStartedAt[String(bucket.turnId)] : undefined;
-    const turnStatus = bucket.turnId ? runtime?.turnStatuses[String(bucket.turnId)] : undefined;
-    const active = turnStatus === "running"
-      || tools.some((item) => ACTIVE_TOOL_STATUSES.has(item.displayStatus))
-      || (turnStatus === undefined && key === latestWorkKey && sessionActive);
+    const lastTurn = [...(turnsByKey.get(key) ?? bucket.turnIds)].sort((left, right) =>
+      (runtime?.turnStartedAt[left] ?? 0) - (runtime?.turnStartedAt[right] ?? 0)).at(-1);
+    const turnStatus = lastTurn ? runtime?.turnStatuses[lastTurn] : undefined;
+    const latest = key === latestRequestKey;
+    const active = latest && (sessionActive || (chat.status === "unknown" && (
+      turnStatus === "running" || tools.some((tool) => ACTIVE_TOOL_STATUSES.has(tool.displayStatus))
+    )));
+    const status: DesktopWorkItem["status"] = active
+      ? chat.status === "waiting_for_approval" || tools.some((tool) => tool.waitingForApproval) ? "waiting" : "running"
+      : (latest && chat.status === "failed") || turnStatus === "failed" ? "failed"
+      : (latest && chat.status === "cancelled") || turnStatus === "cancelled" ? "cancelled"
+      : "completed";
     const item: DesktopWorkItem = {
       id: bucket.turnId ? `work:${bucket.turnId}` : `work:${key}`,
       kind: "work",
       items: ordered,
       active,
+      status,
+      ...(latest && chat.statusReason && (status === "failed" || status === "cancelled") ? { statusReason: chat.statusReason } : {}),
       toolCount: tools.length,
       failureCount: tools.filter((tool) => FAILED_TOOL_STATUSES.has(tool.displayStatus)).length,
       startedAt: turnStartedAt ?? timing?.startedAt ?? 0,
@@ -282,7 +336,7 @@ export function desktopTimelineItems(
 }
 
 const ACTIVE_TOOL_STATUSES = new Set(["queued", "checking", "waiting_permission", "running"]);
-const FAILED_TOOL_STATUSES = new Set(["failed", "rejected", "cancelled"]);
+const FAILED_TOOL_STATUSES = new Set(["failed", "rejected"]);
 
 function isDesktopWorkPart(
   part: Extract<ChatTranscriptItem, { kind: "message" }>["parts"][number],
