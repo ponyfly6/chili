@@ -236,6 +236,33 @@ test("source-truncated live output points to the full transcript", () => {
   expect(rendered.bodyTruncated).toBe(true);
 });
 
+test("interrupted live previews explain their gap and do not join lines across the disconnect", () => {
+  const rendered = renderToolActivity(toolInput({
+    toolName: "bash", status: "running", displayStatus: "running",
+    inputSummary: { title: "bash", command: "npm install" },
+    liveOutput: [
+      { stream: "stdout", delta: "before", time: 1 },
+      { stream: "stderr", delta: "warning before", time: 2 },
+      { stream: "stdout", delta: "", time: 2, truncated: true, gapBefore: true },
+      { stream: "stdout", delta: "after\n", time: 3 },
+    ],
+  }));
+  expect(rendered.bodyLines).toEqual([
+    "… live output interrupted; missing preview cannot be replayed",
+    "before", "warning before", "after",
+  ]);
+  expect(rendered.bodyTruncated).toBe(true);
+});
+
+test("an interrupted tool with no available preview still displays the recovery limitation", () => {
+  const rendered = renderToolActivity(toolInput({
+    toolName: "bash", status: "running", displayStatus: "running",
+    inputSummary: { title: "bash", command: "npm install" },
+    liveOutput: [{ stream: "stdout", delta: "", time: 1, truncated: true, gapBefore: true }],
+  }));
+  expect(rendered.bodyLines).toEqual(["… live output interrupted; missing preview cannot be replayed"]);
+});
+
 test("exploration tools keep running live output out of compact semantic summaries", () => {
   for (const toolName of ["read", "grep", "glob"]) {
     const base = toolInput({

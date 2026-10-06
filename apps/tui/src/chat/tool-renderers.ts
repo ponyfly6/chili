@@ -476,7 +476,8 @@ function isLargeOutput(value: string): boolean {
 }
 
 function hasVisibleLiveOutput(input: ToolRenderInput): boolean {
-  return input.displayStatus !== "succeeded" && input.liveOutput?.some((delta) => delta.delta.length > 0) === true;
+  return input.displayStatus !== "succeeded"
+    && input.liveOutput?.some((delta) => delta.delta.length > 0 || delta.gapBefore) === true;
 }
 
 function liveOutputPreview(
@@ -485,19 +486,22 @@ function liveOutputPreview(
 ): { lines: string[]; lineTones: ("muted" | "error")[]; truncated: boolean } {
   const entries = liveOutputLineEntries(deltas, options.maxLineLength, options.stderrTone);
   const sourceTruncated = deltas.some((delta) => delta.truncated === true);
+  const hasGap = deltas.some((delta) => delta.gapBefore === true);
   const shortened = entries.some((entry) => entry.shortened);
   const budget = Number.isFinite(options.maxLines)
     ? Math.max(1, Math.floor(options.maxLines))
     : Math.max(1, entries.length);
   const overflow = entries.length > budget;
-  const truncated = sourceTruncated || shortened || overflow;
+  const truncated = hasGap || sourceTruncated || shortened || overflow;
   let visible = entries.slice(-budget);
   if (truncated) {
     const contentBudget = Math.max(0, budget - 1);
     const retained = contentBudget === 0 ? [] : entries.slice(-contentBudget);
-    const omission = overflow && !sourceTruncated && !shortened
-      ? `… +${entries.length - retained.length} lines (${TRANSCRIPT_HINT})`
-      : `… output truncated (${TRANSCRIPT_HINT})`;
+    const omission = hasGap
+      ? "… live output interrupted; missing preview cannot be replayed"
+      : overflow && !sourceTruncated && !shortened
+        ? `… +${entries.length - retained.length} lines (${TRANSCRIPT_HINT})`
+        : `… output truncated (${TRANSCRIPT_HINT})`;
     visible = [
       { line: omission, tone: "muted", shortened: false },
       ...retained,
@@ -535,6 +539,16 @@ function liveOutputLineEntries(
   };
 
   for (const [deltaIndex, delta] of deltas.entries()) {
+    if (delta.gapBefore) {
+      // Missing output may contain a line boundary on either stream. Preserve
+      // known partial text, but never join it to text received after the gap.
+      for (const stream of ["stdout", "stderr"] as const) {
+        if (states[stream].pending) {
+          entries.push(liveOutputLineEntry(states[stream].pending, liveOutputTone(stream, stderrTone), maxLineLength));
+          states[stream].pending = "";
+        }
+      }
+    }
     const state = states[delta.stream];
     const tone = liveOutputTone(delta.stream, stderrTone);
     state.lastSeen = deltaIndex;
