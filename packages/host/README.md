@@ -68,18 +68,75 @@ parallel session state machine. Root and restricted child registries remain
 separate. Store location (`<workspace>/.chili/chili.sqlite`), session identities,
 event persistence, and JSONL mirroring remain compatible.
 
-## Current migration boundary
+## Execution identity and ownership
 
-This package provides shared composition and SQLite-backed root input admission.
-It does **not** yet implement a discoverable owner, cross-process attach, or an
-independent background supervisor. Creating two Hosts does not connect them;
-SQLite session leases do not forward cancellation or approval callbacks.
-Desktop retains its existing parent watchdog and process containment.
+Host resolves canonical profile, authentication path, project and workspace
+identities. Git worktrees share the common repository project ID while retaining
+separate workspace IDs. Session-specific cwd selection continues to work: skills,
+Memory, rules and child execution follow that session's project rather than the
+initial Host directory. The identity is persisted when a session is created;
+legacy sessions bind on their first owned execution. Resume and execution reject
+a changed profile/project/workspace binding before model or tool effects.
 
-`chiliHome` is currently honored by configuration, model-selection persistence,
-commands, MCP, and transcript mirroring. The existing auth/Memory/skills paths
-are not yet fully unified around this option. Do not treat it as complete profile
-isolation until the context/configuration migration is finished.
+An explicit `chiliHome` isolates auth, Memory, skills, commands, MCP and model
+selection. Without one, `CHILI_HOME` and the legacy `CHILI_AUTH_FILE` override
+remain supported. The auth path contributes to profile identity. CLI exposes
+`--chili-home`. Account resolution is recorded separately, immediately before
+provider dispatch; no credential value is stored in the audit identity.
+
+Each SQLite store now admits one live Host. A second Host throws
+`HostOwnerConflictError`; it does not pretend to attach or forward Stop. Host
+ownership has no time-based expiry. After an owner dies, recorded guardians and
+their process groups must also be gone before a new Host can open the store.
+Session leases still fence individual operations; a lease expiry alone proves
+nothing about an external process. PID reuse is handled conservatively by
+refusing takeover. Cross-process attach and independent background residency
+remain unimplemented.
+
+Prompt, Stop, Steer, archive and snapshot recovery use the same runtime operation
+ownership. Low-level RuntimeService callers using separate store connections also
+reject control of a foreign live execution. Child first runs, follow-ups and
+mailbox deliveries use the shared child RuntimeService and retain Task/Run
+leases, generations, concurrency limits and completion repair.
+
+## Tools, context and durable compatibility
+
+The runtime advertises a versioned tool catalog, then prepares each call once for
+schema validation, permission analysis, scheduling and execution. Catalog changes
+invalidate stale calls. The effect boundary rechecks current policy and resource
+identity, including after approval and file-lock waits. Structured program data
+is stored separately from model previews and compact UI transport.
+
+Each authorization boundary captures one copied policy observation. Permission
+decisions, revision hashes and file-resource checks share that observation; the
+next boundary captures fresh rules. An approval returns its accepted policy
+version with the decision, so a stale reply cannot acquire a newer version during
+handoff to the executor. Worker admission and backend scopes likewise use one
+copied worker policy per check. This does not pin permissions for an entire turn:
+revocation during approval, backup or file-lock waits still blocks later effects.
+See the [permission refactor record](../../docs/agent-foundation-implementation-2026-10-03.md#2026-10-06权限执行链收拢).
+
+Explicit file denies also constrain Bash through the actual process backend.
+They force macOS Seatbelt even under full-access; escalation and opaque runners
+cannot bypass them. Unsupported platforms and deny patterns fail closed. Scoped
+commands keep their complete invocation, write and network restrictions through
+the final process-start authorization check. See [process isolation](../../docs/managed-processes.md).
+
+File tools share session/workspace/version observations and cooperative mutation
+locks. Snapshot v3 restoration checks ownership and all target versions before
+mutating files. Changed v2 snapshots remain available as backup artifacts but
+cannot be safely auto-restored without historical ownership evidence. See
+[the file contract](../../docs/file-observation-contract.md).
+
+The actual budgeted model request is persisted, with sources and omission reasons;
+`inspectPrompt` returns that record unless a hypothetical turn is requested.
+[Context](../core/src/context/README.md), [Memory](../core/src/memory/README.md),
+[providers](../providers/README.md), [MCP](../mcp/README.md) and
+[commands](../commands/README.md) document their shared contracts and migrations.
+Existing SQLite/session history is retained. Internal tool IDs are now independent
+of provider IDs, and old history keeps its protocol mapping. Memory Markdown is
+imported transactionally once into the profile database and is thereafter an
+export format, not a second mutable authority.
 
 ## Durable root inputs
 
@@ -135,8 +192,9 @@ schema guards reject older writers trying to claim sessions protected by durable
 input state. Store migrations are additive; JSONL mirroring is a best-effort
 secondary copy and is drained before Host closes SQLite.
 
-Two Hosts still do not form one logical execution owner. Queuing into a different
-process is not an attach protocol, and cancellation/approval routing still needs
-owner discovery. Keep that work separate from background residency and complete
-Memory/profile isolation. Stores without durable input support retain the legacy
-runtime behavior; they do not provide these receipt guarantees.
+A second Host is rejected until the current owner and its resources have stopped.
+There is no control forwarding or attach protocol. Stores without durable input
+support retain the legacy runtime behavior; they do not provide these receipt
+guarantees. A synchronous accepted receipt may precede asynchronous identity
+validation; a mismatch settles as a failure before execution and is never allowed
+to silently switch the queued task's profile.
