@@ -426,6 +426,18 @@ export class SessionStateConflictError extends Error {
   }
 }
 
+export class AgentTaskChildLimitError extends Error {
+  override readonly name = "AgentTaskChildLimitError";
+
+  constructor(
+    readonly parentSessionId: SessionId,
+    readonly maxChildren: number,
+    readonly childCount: number,
+  ) {
+    super(`Agent ${parentSessionId} already has ${childCount} direct children (maxChildren: ${maxChildren}); resume an existing agent instead`);
+  }
+}
+
 export class TeamAlreadyExistsError extends Error {
   override readonly name = "TeamAlreadyExistsError";
 
@@ -1936,6 +1948,9 @@ export class SqliteEventStore
     if (!isAgentTaskAdmissionOwner(input.owner)) {
       throw new Error("agent task admission requires a non-empty admission:v1: owner token");
     }
+    if (input.maxChildren !== undefined && (!Number.isSafeInteger(input.maxChildren) || input.maxChildren < 0)) {
+      throw new Error("agent task admission maxChildren must be a nonnegative safe integer");
+    }
     const run = this.db.transaction((item: AgentTaskAdmissionInput) => {
       const now = item.now ?? Date.now();
       assertAgentTaskAdmissionLeaseWindow(now, item.ttlMs);
@@ -1952,6 +1967,18 @@ export class SqliteEventStore
       // creator's token, even when the original lease has already expired.
       if (this.agentTaskProjectionState(event.payload.taskId)) {
         return { applied: false, events: [] as ChiliEvent[] };
+      }
+      if (item.maxChildren !== undefined) {
+        const parentSessionId = event.payload.parentSessionId;
+        if (!parentSessionId) {
+          throw new Error("agent task admission with maxChildren requires a parentSessionId");
+        }
+        const childCount = this.db.query<{ count: number }, [string]>(
+          "select count(*) as count from agent_tasks where parent_session_id = ?",
+        ).get(parentSessionId)!.count;
+        if (childCount >= item.maxChildren) {
+          throw new AgentTaskChildLimitError(parentSessionId, item.maxChildren, childCount);
+        }
       }
       const events = this.writeTransactionEvents([event], item.runClaim);
       const lease = this.db.query(
@@ -1973,7 +2000,7 @@ export class SqliteEventStore
       }
       return { applied: true, events };
     });
-    const result = this.runWithWriteRetry(() => run(input));
+    const result = this.runWithWriteRetry(() => run.immediate(input));
     await this.writeMirrors(result.events);
     const task = await this.agentTask(input.event.payload.taskId);
     return { ...result, ...(task ? { task } : {}) };

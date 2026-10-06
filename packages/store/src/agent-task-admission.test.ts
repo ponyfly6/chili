@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import type { AgentPath, AgentRunId, ChiliEvent, SessionId, TaskId, TimestampMs } from "@chili/protocol";
-import { SqliteEventStore, SessionRunClaimConflictError } from "./sqlite-event-store.js";
+import { AgentTaskChildLimitError, SqliteEventStore, SessionRunClaimConflictError } from "./sqlite-event-store.js";
 import type { AgentTaskBeginRunCasInput, EventMirror } from "./types.js";
 
 const owner = "admission:v1:creator";
@@ -232,4 +232,143 @@ test("admission respects the parent session run claim and rolls back on a stale 
       event, owner, ttlMs: 100, now: 100, runClaim: { sessionId, claimId: "claim_live" },
     })).applied).toBe(true);
   });
+});
+
+test("child limits reject invalid values and zero capacity without an event or reservation", async () => {
+  await withStores(async (writer, peer) => {
+    for (const maxChildren of [-1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      await expect(writer.admitAgentTask({ event: created(), owner, ttlMs: 100, now: 100, maxChildren }))
+        .rejects.toThrow("maxChildren must be a nonnegative safe integer");
+    }
+    await expect(writer.admitAgentTask({ event: created(), owner, ttlMs: 100, now: 100, maxChildren: 0 }))
+      .rejects.toMatchObject({ name: "AgentTaskChildLimitError", parentSessionId: "session_parent", maxChildren: 0, childCount: 0 });
+    expect(await peer.agentTasks()).toEqual([]);
+    expect(await peer.events()).toEqual([]);
+    expect((await peer.admitAgentTask({ event: created(), owner, ttlMs: 100, now: 100, maxChildren: 1 })).applied).toBe(true);
+  });
+});
+
+test("duplicate admissions keep their lease and do not consume another child slot", async () => {
+  await withStores(async (writer, peer) => {
+    const event = created();
+    const initial = await writer.admitAgentTask({ event, owner, ttlMs: 100, now: 100, maxChildren: 1 });
+    if (!initial.task) throw new Error("admitted task was not persisted");
+    for (const maxChildren of [1, 0]) {
+      expect(await peer.admitAgentTask({ event, owner, ttlMs: 500, now: 150, maxChildren }))
+        .toEqual({ applied: false, task: initial.task, events: [] });
+    }
+    await expect(peer.admitAgentTask({ event: created("extra"), owner, ttlMs: 100, now: 100, maxChildren: 1 }))
+      .rejects.toBeInstanceOf(AgentTaskChildLimitError);
+    expect(await peer.agentTask("task_extra" as TaskId)).toBeUndefined();
+    expect(await peer.events({ type: "agent.task_created" })).toEqual([event]);
+    expect(await peer.agentTasks()).toHaveLength(1);
+  });
+});
+
+test("terminal children still consume capacity and another parent has an independent limit", async () => {
+  await withStores(async (writer, peer) => {
+    const event = created();
+    await writer.admitAgentTask({ event, owner, ttlMs: 100, now: 100, maxChildren: 1 });
+    const claim = begin(event);
+    await writer.beginAgentTaskRunCas(claim);
+    expect(await writer.completeAgentTaskCas({
+      taskId: event.payload.taskId,
+      path: event.payload.path,
+      status: "completed",
+      eventId: "complete_initial",
+      agentEventId: "run_complete_initial",
+      expectedGeneration: 1,
+      expectedRunId: claim.runId,
+      expectedLeaseOwner: owner,
+      runId: claim.runId,
+      time: 150,
+    })).toMatchObject({ applied: true, task: { status: "completed" } });
+    await expect(peer.admitAgentTask({ event: created("extra"), owner, ttlMs: 100, now: 200, maxChildren: 1 }))
+      .rejects.toMatchObject({ name: "AgentTaskChildLimitError", maxChildren: 1, childCount: 1 });
+    const other = created("other");
+    other.sessionId = "session_another_parent" as SessionId;
+    other.payload.parentSessionId = other.sessionId;
+    other.payload.path = "/another/other" as AgentPath;
+    other.payload.parentPath = "/another" as AgentPath;
+    expect((await peer.admitAgentTask({ event: other, owner, ttlMs: 100, now: 200, maxChildren: 1 })).applied).toBe(true);
+    expect(await peer.events({ type: "agent.task_created" })).toEqual([event, other]);
+  });
+});
+
+test("child capacity survives closing and reopening the store", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "chili-child-capacity-restart-"));
+  const path = join(directory, "events.sqlite");
+  let store = new SqliteEventStore(path);
+  try {
+    const event = created();
+    await store.admitAgentTask({ event, owner, ttlMs: 100, now: 100, maxChildren: 1 });
+    store.close();
+    store = new SqliteEventStore(path);
+    await expect(store.admitAgentTask({ event: created("extra"), owner, ttlMs: 100, now: 300, maxChildren: 1 }))
+      .rejects.toBeInstanceOf(AgentTaskChildLimitError);
+    expect(await store.admitAgentTask({ event, owner, ttlMs: 100, now: 300, maxChildren: 1 }))
+      .toMatchObject({ applied: false, task: { id: event.payload.taskId }, events: [] });
+    expect(await store.events({ type: "agent.task_created" })).toEqual([event]);
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("competing processes atomically admit only the available direct children", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "chili-child-capacity-race-"));
+  const path = join(directory, "events.sqlite");
+  const store = new SqliteEventStore(path);
+  const moduleUrl = new URL("./sqlite-event-store.ts", import.meta.url).href;
+  const workerCode = `
+    import { SqliteEventStore, AgentTaskChildLimitError } from ${JSON.stringify(moduleUrl)};
+    const store = new SqliteEventStore(${JSON.stringify(path)});
+    console.log("ready");
+    const input = JSON.parse(await Bun.stdin.text());
+    try {
+      await store.admitAgentTask(input);
+      console.log("admitted");
+    } catch (error) {
+      if (!(error instanceof AgentTaskChildLimitError)) throw error;
+      console.log("limited");
+    } finally {
+      store.close();
+    }
+  `;
+  const workers = Array.from({ length: 4 }, () => {
+    const subprocess = Bun.spawn([process.execPath, "--eval", workerCode], {
+      stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    });
+    return { process: subprocess, reader: subprocess.stdout.getReader() };
+  });
+  try {
+    await Promise.all(workers.map(async ({ reader }) => {
+      const chunk = await reader.read();
+      expect(new TextDecoder().decode(chunk.value).trim()).toBe("ready");
+    }));
+    workers.forEach(({ process }, index) => {
+      process.stdin.write(JSON.stringify({ event: created(`contender_${index}`), owner, ttlMs: 100, now: 100, maxChildren: 2 }));
+      process.stdin.end();
+    });
+    const outcomes = await Promise.all(workers.map(async ({ process, reader }) => {
+      let output = "";
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        output += new TextDecoder().decode(chunk.value);
+      }
+      const stderr = await new Response(process.stderr).text();
+      expect(await process.exited, stderr).toBe(0);
+      return output.trim();
+    }));
+    expect(outcomes.filter((outcome) => outcome === "admitted")).toHaveLength(2);
+    expect(outcomes.filter((outcome) => outcome === "limited")).toHaveLength(2);
+    expect(await store.agentTasks()).toHaveLength(2);
+    expect(await store.events({ type: "agent.task_created" })).toHaveLength(2);
+  } finally {
+    for (const worker of workers) worker.process.kill();
+    await Promise.all(workers.map(({ process }) => process.exited));
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });

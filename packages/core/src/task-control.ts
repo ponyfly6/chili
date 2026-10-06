@@ -33,7 +33,7 @@ import {
   assessSubagentCompletion,
   type SubagentCompletionAssessment,
 } from "./subagent-completion.js";
-import type { LocalSubagentRunLimiter } from "./subagent-run-limiter.js";
+import type { LocalSubagentRunLimiter, LocalSubagentRunPermit } from "./subagent-run-limiter.js";
 
 export type AgentTaskFinalStatus = Exclude<AgentTaskStatus, "pending" | "running">;
 
@@ -280,6 +280,7 @@ export class AgentTaskControlService {
 
     const controller = linkedAbortController(input.signal, this.shutdownController.signal);
     let releasePermit: (() => void) | undefined;
+    let runPermit: LocalSubagentRunPermit | undefined;
     this.pendingRuns.set(input.taskId, controller);
     try {
       if (controller.signal.aborted) throw abortError("Task follow-up aborted");
@@ -287,7 +288,12 @@ export class AgentTaskControlService {
       if (controller.signal.aborted) throw abortError("Task follow-up aborted");
       await this.assertFollowupDelegationEnabled(initialTask);
       if (controller.signal.aborted) throw abortError("Task follow-up aborted");
-      releasePermit = await this.options.runLimiter?.acquire(controller.signal);
+      if (this.options.runLimiter?.acquireRun && initialTask.childSessionId) {
+        runPermit = await this.options.runLimiter.acquireRun(initialTask.childSessionId, controller.signal);
+        releasePermit = () => runPermit?.release();
+      } else {
+        releasePermit = await this.options.runLimiter?.acquire(controller.signal);
+      }
       if (controller.signal.aborted) throw abortError("Task follow-up aborted");
       await this.assertFollowupDelegationEnabled(initialTask);
       if (controller.signal.aborted) throw abortError("Task follow-up aborted");
@@ -331,9 +337,8 @@ export class AgentTaskControlService {
         }
         this.startFollowupLeaseHeartbeat(activeRun);
         if (controller.signal.aborted) throw abortError("Task follow-up aborted");
-        const result = normalizePromptResult(
-          await this.options.runtime.submitPrompt(this.submitPromptInput(task, input, controller.signal)),
-        );
+        const run = () => this.options.runtime.submitPrompt(this.submitPromptInput(task, input, controller.signal));
+        const result = normalizePromptResult(await (runPermit ? runPermit.run(run) : run()));
         await this.quiesceFollowupLease(activeRun);
         if (activeRun.leaseLost) throw abortError("Task follow-up lease lost");
         if (await this.shouldCompleteRun(task.id, runId, activeRun)) {

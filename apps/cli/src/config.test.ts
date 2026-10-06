@@ -5,6 +5,7 @@ import { expect, test } from "bun:test";
 import { evaluatePolicy } from "@chili/policy";
 import {
   addPersistentPermissionGrants,
+  DEFAULT_HOST_AGENT_CONFIG,
   formatPermissionSpec,
   loadCliConfig,
   parsePermissionRuleSpec,
@@ -32,6 +33,7 @@ test("CLI config loads user and project permission layers with Tool(content) rul
 
     const config = await loadCliConfig(repo, { chiliHome: home });
 
+    expect(config.agents).toEqual(DEFAULT_HOST_AGENT_CONFIG);
     expect(config.userPermissions).toContainEqual(
       expect.objectContaining({ permission: "bash", pattern: "git status*", action: "allow" }),
     );

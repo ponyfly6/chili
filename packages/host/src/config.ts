@@ -6,7 +6,20 @@ import { defaultChiliHome } from "@chili/providers";
 export interface HostConfig {
   userPermissions: PermissionRule[];
   projectPermissions: PermissionRule[];
+  agents?: HostAgentConfig;
 }
+
+export interface HostAgentConfig {
+  maxChildren: number;
+  maxDepth: number;
+  maxConcurrent: number;
+}
+
+export const DEFAULT_HOST_AGENT_CONFIG: Readonly<HostAgentConfig> = Object.freeze({
+  maxChildren: 64,
+  maxDepth: 1,
+  maxConcurrent: 3,
+});
 
 export interface LoadHostConfigOptions {
   chiliHome?: string;
@@ -18,22 +31,34 @@ export interface AddPersistentPermissionGrantOptions {
 
 export const PERMISSION_ACTIONS = ["allow", "ask", "deny"] as const satisfies readonly PermissionAction[];
 const PROJECT_PERMISSION_ACTIONS = ["ask", "deny"] as const satisfies readonly PermissionAction[];
+const AGENT_CONFIG_FIELDS = {
+  max_children: { property: "maxChildren", min: 0, max: 64 },
+  max_depth: { property: "maxDepth", min: 0, max: 16 },
+  max_concurrent: { property: "maxConcurrent", min: 1, max: 32 },
+} as const;
 
-export async function loadHostConfig(cwd: string, options: LoadHostConfigOptions = {}): Promise<HostConfig> {
+export async function loadHostConfig(
+  cwd: string,
+  options: LoadHostConfigOptions = {},
+): Promise<HostConfig & { agents: HostAgentConfig }> {
   const chiliHome = options.chiliHome ?? defaultChiliHome();
-  const userPermissions = await loadPermissionRules(userConfigPath(chiliHome), {
+  const userLayer = await loadConfigLayer(userConfigPath(chiliHome), {
     source: "user config.toml",
     allowedActions: PERMISSION_ACTIONS,
   });
   const projectConfig = await findProjectConfigPath(cwd, userConfigPath(chiliHome));
-  const projectPermissions = projectConfig
-    ? await loadPermissionRules(projectConfig, {
+  const projectLayer = projectConfig
+    ? await loadConfigLayer(projectConfig, {
         source: "project .chili/config.toml",
         allowedActions: PROJECT_PERMISSION_ACTIONS,
       })
-    : [];
+    : undefined;
 
-  return { userPermissions, projectPermissions };
+  return {
+    userPermissions: userLayer.permissions,
+    projectPermissions: projectLayer?.permissions ?? [],
+    agents: { ...DEFAULT_HOST_AGENT_CONFIG, ...userLayer.agents, ...projectLayer?.agents },
+  };
 }
 
 export async function addPersistentPermissionGrant(
@@ -175,20 +200,41 @@ interface HostConfigFile {
   originalText?: string;
 }
 
-async function loadPermissionRules(
+async function loadConfigLayer(
   path: string,
   options: { source: string; allowedActions: readonly PermissionAction[] },
-): Promise<PermissionRule[]> {
+): Promise<{ permissions: PermissionRule[]; agents: Partial<HostAgentConfig> }> {
   let text: string;
   try {
     text = await readFile(path, "utf8");
   } catch (error) {
-    if (isNotFound(error)) return [];
+    if (isNotFound(error)) return { permissions: [], agents: {} };
     throw error;
   }
 
   const parsed = Bun.TOML.parse(text);
-  return permissionRulesFromConfig(parsed, options);
+  return {
+    permissions: permissionRulesFromConfig(parsed, options),
+    agents: agentConfigFromConfig(parsed, options.source),
+  };
+}
+
+function agentConfigFromConfig(config: unknown, source: string): Partial<HostAgentConfig> {
+  const root = record(config, source);
+  if (!("agents" in root)) return {};
+  const agents = record(root.agents, `${source} [agents]`);
+  const result: Partial<HostAgentConfig> = {};
+  for (const [key, value] of Object.entries(agents)) {
+    if (!Object.hasOwn(AGENT_CONFIG_FIELDS, key)) {
+      throw new Error(`${source} agents.${key} is not a supported setting`);
+    }
+    const field = AGENT_CONFIG_FIELDS[key as keyof typeof AGENT_CONFIG_FIELDS];
+    if (typeof value !== "number" || !Number.isInteger(value) || value < field.min || value > field.max) {
+      throw new Error(`${source} agents.${key} must be an integer between ${field.min} and ${field.max}`);
+    }
+    result[field.property] = value;
+  }
+  return result;
 }
 
 async function readConfigFile(path: string): Promise<HostConfigFile> {

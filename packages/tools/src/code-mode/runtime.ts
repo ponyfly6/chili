@@ -1,5 +1,6 @@
 /// <reference path="./wasm-asset.d.ts" />
 import { readFile } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
@@ -77,6 +78,10 @@ interface PendingCall {
 
 /** One isolated VM per call. Only explicitly registered tools can cross the host boundary. */
 export async function executeCodeMode(options: CodeModeOptions): Promise<CodeModeResult> {
+  // Bun Worker message callbacks do not retain the caller's async context.
+  // Bind the capability bridge before crossing that boundary so session
+  // ownership, concurrency permits, and other host scopes remain attached.
+  const invokeTool = AsyncLocalStorage.bind(options.invokeTool);
   const failure = (kind: CodeModeError["kind"], message: string): CodeModeResult => ({ ok: false, output: "", calls: [], error: { kind, message } });
   if (typeof options.code !== "string" || !options.code.trim()) return failure("script", "code must be a non-empty string");
   if (encoder.encode(options.code).byteLength > CODE_MODE_LIMITS.scriptBytes) return failure("limit", `Script exceeds ${CODE_MODE_LIMITS.scriptBytes} bytes`);
@@ -162,7 +167,7 @@ export async function executeCodeMode(options: CodeModeOptions): Promise<CodeMod
       try {
         // Recheck at the last boundary before invoking any host capability.
         if (finished || call.controller.signal.aborted) return;
-        const value = await options.invokeTool(call.record.name, call.args, call.controller.signal);
+        const value = await invokeTool(call.record.name, call.args, call.controller.signal);
         call.record.status = "ok";
         pending.delete(id);
         if (finished) return;

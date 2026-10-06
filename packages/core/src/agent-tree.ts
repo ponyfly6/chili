@@ -37,7 +37,7 @@ import type {
   TeamProjectionStore,
 } from "@chili/store";
 import type { SubmitPromptInput, SubmitPromptResult } from "./runtime-service.js";
-import type { LocalSubagentRunLimiter } from "./subagent-run-limiter.js";
+import type { LocalSubagentRunLimiter, LocalSubagentRunPermit } from "./subagent-run-limiter.js";
 import {
   isRecoverableTaskFollowup,
   taskFollowupLeaseRetryAfterMs,
@@ -845,12 +845,19 @@ export class AgentTreeControlService {
           })).result;
         } else {
           let releasePermit: (() => void) | undefined;
+          let runPermit: LocalSubagentRunPermit | undefined;
           try {
             if (message.path !== ROOT_AGENT_PATH) {
-              releasePermit = await this.options.runLimiter?.acquire(signal);
+              if (this.options.runLimiter?.acquireRun) {
+                runPermit = await this.options.runLimiter.acquireRun(sessionId, signal);
+                releasePermit = () => runPermit?.release();
+              } else {
+                releasePermit = await this.options.runLimiter?.acquire(signal);
+              }
             }
             await this.assertMailboxTriggerDelegationEnabled(message, deliveryTask, sessionId);
-            result = await runtime.submitPrompt(input);
+            const run = () => runtime.submitPrompt(input);
+            result = await (runPermit ? runPermit.run(run) : run());
           } finally {
             releasePermit?.();
           }

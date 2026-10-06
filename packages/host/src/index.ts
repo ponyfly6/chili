@@ -46,7 +46,9 @@ export {
   parsePermissionRuleSpec,
   formatPermissionSpec,
   PERMISSION_ACTIONS,
+  DEFAULT_HOST_AGENT_CONFIG,
   type HostConfig,
+  type HostAgentConfig,
   type LoadHostConfigOptions,
   type AddPersistentPermissionGrantOptions,
 } from "./config.js";

@@ -48,6 +48,7 @@ import {
   DEFAULT_LOCAL_SUBAGENT_MAX_ACTIVE_RUNS,
   LocalSubagentConcurrencyLimiter,
   type LocalSubagentRunLimiter,
+  type LocalSubagentRunPermit,
 } from "./subagent-run-limiter.js";
 import {
   completeWorkerToolPolicy,
@@ -64,6 +65,7 @@ export {
   LocalSubagentConcurrencyLimiter,
   type LocalSubagentRunLimiter,
   type LocalSubagentRunLimiterSnapshot,
+  type LocalSubagentRunPermit,
 } from "./subagent-run-limiter.js";
 
 export type LocalSubagentMode = "one_shot" | "resumable" | "background";
@@ -93,6 +95,10 @@ export interface LocalSubagentTaskInput extends LocalSubagentSchedulingMetadata 
   prompt: string;
   mode?: LocalSubagentMode;
   workerPolicy?: WorkerToolPolicyTemplate;
+  /** Trusted Host limits; omitted by legacy embedders and Team dispatch. */
+  maxChildren?: number;
+  /** Bind an inherited policy to the runtime-generated child identity. */
+  bindWorkerIdentity?: boolean;
   signal?: AbortSignal;
 }
 
@@ -441,6 +447,14 @@ export class LocalSubagentManager implements SubagentController {
       action: "task.spawn",
     });
     throwIfAborted(controller.signal);
+    if (input.maxChildren !== undefined) {
+      if (!Number.isSafeInteger(input.maxChildren) || input.maxChildren < 0) {
+        throw new Error("maxChildren must be a non-negative safe integer");
+      }
+      if (!this.admissionStore() || input.dispatchId || input.workerPolicy?.teamId || input.workerPolicy?.taskId) {
+        throw new Error("Agent child limits require atomic ad-hoc task admission");
+      }
+    }
     const taskId = input.taskId ?? this.id<TaskId>("task");
     const runId = input.runId ?? this.id<AgentRunId>("agent");
     const parentPath = input.parentPath ?? ROOT_AGENT_PATH;
@@ -455,7 +469,9 @@ export class LocalSubagentManager implements SubagentController {
       throwIfAborted(controller.signal);
     };
     const workerPolicy = input.workerPolicy
-      ? completeWorkerToolPolicy(input.workerPolicy, childSessionId)
+      ? completeWorkerToolPolicy(input.bindWorkerIdentity
+        ? { ...input.workerPolicy, memberPath: path, parentSessionId: input.parentSessionId }
+        : input.workerPolicy, childSessionId)
       : undefined;
 
     let task: LocalSubagentTaskResult = {
@@ -600,6 +616,7 @@ export class LocalSubagentManager implements SubagentController {
               owner: state.lease!.owner,
               ttlMs,
               now: admittedAt,
+              ...(input.maxChildren !== undefined ? { maxChildren: input.maxChildren } : {}),
               ...(input.runClaim ? { runClaim: input.runClaim } : {}),
             });
             if (!result.applied) throw new Error(`Local subagent admission conflicts with an existing task: ${taskId}`);
@@ -654,12 +671,18 @@ export class LocalSubagentManager implements SubagentController {
   private async completeFromRunner(state: LocalSubagentTaskState): Promise<LocalSubagentTaskResult> {
     const { task, runInput: input } = state;
     const releases: Array<() => void> = [];
+    let runPermit: LocalSubagentRunPermit | undefined;
     let countedActive = false;
     try {
       this.queuedRuns++;
       try {
         if (state.batchLimiter) releases.push(await state.batchLimiter.limiter.acquire(input.signal));
-        releases.push(await this.runLimiter.acquire(input.signal));
+        if (this.runLimiter.acquireRun) {
+          runPermit = await this.runLimiter.acquireRun(input.childSessionId, input.signal);
+          releases.push(() => runPermit?.release());
+        } else {
+          releases.push(await this.runLimiter.acquire(input.signal));
+        }
       } finally {
         this.queuedRuns = Math.max(0, this.queuedRuns - 1);
       }
@@ -725,7 +748,8 @@ export class LocalSubagentManager implements SubagentController {
         return task;
       }
       if (input.signal?.aborted) throw abortError();
-      const result = await this.options.runner.run(input);
+      const run = () => this.options.runner.run(input);
+      const result = await (runPermit ? runPermit.run(run) : run());
       if (state.externallyClosed) {
         await state.externalFinalization;
         return task;
@@ -879,7 +903,8 @@ export class LocalSubagentManager implements SubagentController {
     validateSchedulingMetadata(input);
     if (input.maxConcurrency === undefined || !input.batchId) return undefined;
 
-    const existing = this.batchLimiters.get(input.batchId);
+    const key = `${input.parentSessionId}\0${input.batchId}`;
+    const existing = this.batchLimiters.get(key);
     if (existing) {
       if (existing.limiter.maxActiveRuns !== input.maxConcurrency) {
         throw new Error(
@@ -891,11 +916,11 @@ export class LocalSubagentManager implements SubagentController {
     }
 
     const entry: BatchLimiterEntry = {
-      id: input.batchId,
+      id: key,
       limiter: new LocalSubagentConcurrencyLimiter(input.maxConcurrency),
       references: 1,
     };
-    this.batchLimiters.set(input.batchId, entry);
+    this.batchLimiters.set(key, entry);
     return entry;
   }
 

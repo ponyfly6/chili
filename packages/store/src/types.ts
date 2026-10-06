@@ -197,6 +197,8 @@ export interface AgentTaskAdmissionInput {
   ttlMs: number;
   now?: number;
   runClaim?: SessionRunClaimFence;
+  /** Maximum persisted direct children, including terminal tasks. Existing admissions do not consume another slot. */
+  maxChildren?: number;
 }
 
 export interface AgentTaskAdmissionResult {
