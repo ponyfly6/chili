@@ -4,6 +4,7 @@ import { mcpDefinitionFingerprint, mcpServerIdentity } from "./identity.js";
 import type { McpConfig, McpDiagnostic, McpServerConfig } from "./config.js";
 import type {
   McpCallToolResult,
+  McpInteractionOptions,
   McpClient,
   McpGetPromptResult,
   McpListPromptsResult,
@@ -151,7 +152,7 @@ export class McpClientManager {
     return `${this.identity}:${mcpServerIdentity(state.server)}:${this.revisions.get(state) ?? 0}:${mcpDefinitionFingerprint(tool)}`;
   }
 
-  async callTool(serverName: string, toolName: string, input: unknown, signal?: AbortSignal, revision?: string): Promise<McpCallToolResult> {
+  async callTool(serverName: string, toolName: string, input: unknown, signal?: AbortSignal, revision?: string, interaction: McpInteractionOptions = {}): Promise<McpCallToolResult> {
     const state = this.requireConnectedState(serverName);
     const client = state.client;
     return withTimeout((operationSignal) => {
@@ -159,7 +160,12 @@ export class McpClientManager {
         || revision !== undefined && this.getToolRevision(serverName, toolName) !== revision) {
         throw new Error("MCP tool definition or connection changed; prepare the call again");
       }
-      return client.callTool(toolName, input, { signal: operationSignal });
+      return client.callTool(toolName, input, { ...interaction, signal: operationSignal, beforeRetry: async () => {
+        await interaction.beforeRetry?.();
+        if (state.client !== client || state.status !== "connected" || revision !== undefined && this.getToolRevision(serverName, toolName) !== revision) {
+          throw new Error("MCP tool definition or connection changed; prepare the call again");
+        }
+      } });
     }, state.server.toolTimeoutMs, signal, this.connectionAborts.get(state)?.signal);
   }
 
@@ -177,14 +183,19 @@ export class McpClientManager {
     return `${this.identity}:${mcpServerIdentity(state.server)}:${this.revisions.get(state) ?? 0}:prompt:${this.refreshes.get(state)?.prompts ?? 0}:${mcpDefinitionFingerprint({ name, prompt })}`;
   }
 
-  async readResource(serverName: string, uri: string, signal?: AbortSignal, revision?: string): Promise<McpReadResourceResult> {
+  async readResource(serverName: string, uri: string, signal?: AbortSignal, revision?: string, interaction: McpInteractionOptions = {}): Promise<McpReadResourceResult> {
     const state = this.requireConnectedState(serverName);
     const client = state.client;
     return withTimeout((operationSignal) => {
       if (state.client !== client || revision !== undefined && revision !== this.getResourceRevision(serverName, uri)) {
         throw new Error("MCP resource definition or connection changed; prepare the read again");
       }
-      return client.readResource(uri, { signal: operationSignal });
+      return client.readResource(uri, { ...interaction, signal: operationSignal, beforeRetry: async () => {
+        await interaction.beforeRetry?.();
+        if (state.client !== client || revision !== undefined && revision !== this.getResourceRevision(serverName, uri)) {
+          throw new Error("MCP resource definition or connection changed; prepare the read again");
+        }
+      } });
     }, state.server.toolTimeoutMs, signal, this.connectionAborts.get(state)?.signal);
   }
 

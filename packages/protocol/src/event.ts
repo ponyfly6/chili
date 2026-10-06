@@ -198,8 +198,8 @@ export function parseUserInputQuestions(value: unknown): UserInputQuestion[] {
 
     const optionsValue = question.options;
     if (!Array.isArray(optionsValue)) throw new TypeError(`${field}.options must be an array`);
-    if (optionsValue.length < 2 || optionsValue.length > USER_INPUT_LIMITS.options) {
-      throw new TypeError(`${field}.options must contain between 2 and ${USER_INPUT_LIMITS.options} items`);
+    if (optionsValue.length === 1 || optionsValue.length > USER_INPUT_LIMITS.options) {
+      throw new TypeError(`${field}.options must be empty for free text, or contain between 2 and ${USER_INPUT_LIMITS.options} items`);
     }
     const optionLabels = new Set<string>();
     const options = optionsValue.map((candidateOption, optionIndex) => {

@@ -227,3 +227,95 @@ test("a truncated modern tool stream does not replay a possibly mutating call", 
     await remote.close();
   }
 });
+
+test("modern concurrent multi-round input stays bound to its caller and echoes only each round's answers", async () => {
+  const pending = new Map<string, (value: { action: "accept"; content: { answer: string } }) => void>();
+  const remote = fixture((request) => {
+    if (request.method === "server/discover") return discover();
+    const name = String(request.params?.name);
+    const state = request.params?.requestState;
+    if (state === `${name}:second`) return { result: { resultType: "complete", content: [], structuredContent: request.params?.inputResponses } };
+    return { result: {
+      resultType: "input_required", requestState: `${name}:${state ? "second" : "first"}`,
+      inputRequests: { [state ? "second" : "first"]: { method: "elicitation/create", params: {
+        mode: "form", message: name, requestedSchema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+      } } },
+    } };
+  });
+  const client = createSdkMcpClient(remote.config, { enableElicitation: true });
+  let rechecks = 0;
+  try {
+    await client.initialize();
+    const calls = ["a", "b"].map((name) => client.callTool(name, {}, {
+      beforeRetry: async () => { rechecks++; },
+      elicitation: async (request) => {
+        expect(request.message).toBe(name);
+        return new Promise((resolve) => { pending.set(name, resolve); });
+      },
+    }));
+    for (let round = 0; round < 2; round++) {
+      for (let attempt = 0; pending.size < 2 && attempt < 100; attempt++) await Bun.sleep(5);
+      expect(pending.size).toBe(2);
+      const answers = [...pending.entries()].reverse();
+      pending.clear();
+      for (const [name, resolve] of answers) resolve({ action: "accept", content: { answer: `${name}-${round}` } });
+    }
+    const results = await Promise.all(calls);
+    expect(results.map((result) => result.structuredContent)).toEqual([
+      { second: { action: "accept", content: { answer: "a-1" } } },
+      { second: { action: "accept", content: { answer: "b-1" } } },
+    ]);
+    expect(rechecks).toBe(4);
+    const requests = remote.requests.filter(({ body }) => body.method === "tools/call");
+    expect(new Set(requests.map(({ body }) => body.id)).size).toBe(6);
+  } finally { await client.close(); await remote.close(); }
+});
+
+test("MCP continuation cannot execute after its approval is revoked", async () => {
+  const remote = fixture((request) => request.method === "server/discover" ? discover() : { result: {
+    resultType: "input_required", requestState: "pending", inputRequests: { confirm: {
+      method: "elicitation/create", params: { mode: "url", message: "Confirm", url: "https://example.test/confirm" },
+    } },
+  } });
+  const client = createSdkMcpClient(remote.config, { enableElicitation: true });
+  try {
+    await client.initialize();
+    await expect(client.callTool("mutate", {}, {
+      elicitation: async () => ({ action: "accept" }),
+      beforeRetry: async () => { throw new Error("Approval revoked"); },
+    })).rejects.toThrow("Approval revoked");
+    expect(remote.requests.filter(({ body }) => body.method === "tools/call")).toHaveLength(1);
+  } finally { await client.close(); await remote.close(); }
+});
+
+test("cancelling a modern input wait cannot resend the tool", async () => {
+  const remote = fixture((request) => request.method === "server/discover" ? discover() : { result: {
+    resultType: "input_required", requestState: "waiting", inputRequests: { question: {
+      method: "elicitation/create", params: { mode: "url", message: "Confirm", url: "https://example.test/confirm" },
+    } },
+  } });
+  const client = createSdkMcpClient(remote.config, { enableElicitation: true });
+  const abort = new AbortController();
+  try {
+    await client.initialize();
+    await expect(client.callTool("mutate", {}, { signal: abort.signal, elicitation: async (_request, signal) => {
+      abort.abort(new Error("Interrupted input"));
+      signal.throwIfAborted();
+      return { action: "accept" };
+    } })).rejects.toThrow("Interrupted input");
+    expect(remote.requests.filter(({ body }) => body.method === "tools/call")).toHaveLength(1);
+  } finally { await client.close(); await remote.close(); }
+});
+
+test("legacy fallback does not advertise uncorrelated server-initiated input", async () => {
+  const remote = fixture((request) => {
+    if (request.method === "server/discover") return { error: { code: -32601, message: "Method not found" } };
+    if (request.method === "initialize") return { result: { protocolVersion: "2025-11-25", capabilities: {}, serverInfo: { name: "legacy", version: "1" } } };
+    return new Response(null, { status: 202 });
+  });
+  const client = createSdkMcpClient(remote.config, { enableElicitation: true });
+  try {
+    await client.initialize();
+    expect(remote.requests.find(({ body }) => body.method === "initialize")?.body.params?.capabilities).toEqual({});
+  } finally { await client.close(); await remote.close(); }
+});

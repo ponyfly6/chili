@@ -16,6 +16,9 @@ import {
 import {
   McpClientManager,
   McpOAuthManager,
+  type McpElicitationRequest,
+  type McpElicitationResult,
+  type McpToolElicitationHandler,
   McpStdioGuardianOwner,
   type McpGuardianLifecycleEvent,
   createMcpChiliTools,
@@ -56,7 +59,7 @@ import type {
   TimestampMs,
 } from "@chili/protocol";
 import type { RuntimeMcpControlService } from "@chili/protocol";
-import { validateStructuredToolData } from "@chili/tools";
+import { type DeferredUserInputQueue, validateStructuredToolData } from "@chili/tools";
 import type {
   McpResourceReadResult,
   McpResourceReadInput,
@@ -67,10 +70,12 @@ import type {
   MutableToolRegistry,
 } from "@chili/tools";
 import type { PromptCommandControl, PromptCommandRunResult } from "@chili/commands";
+import { elicitMcpInput, type McpElicitationContext } from "./mcp-elicitation.js";
 
 export interface HostMcpRuntimeOptions {
   cwd: string;
   chiliHome: string;
+  userInputQueue?: DeferredUserInputQueue;
   oauthFetch?: typeof fetch;
   registries: readonly MutableToolRegistry[];
   events?: { publish(event: ChiliEvent): Promise<void> };
@@ -375,6 +380,12 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
     return Promise.all(states.map((state) => this.authDescriptor(state)));
   }
 
+  private elicit(server: McpServerConfig, request: McpElicitationRequest, context: McpElicitationContext): Promise<McpElicitationResult> {
+    this.assertOpen();
+    if (!this.options.userInputQueue || !this.options.events) throw new Error("MCP input is unavailable without an interactive session.");
+    return elicitMcpInput({ queue: this.options.userInputQueue, events: this.options.events }, server, request, context);
+  }
+
   async listResources(
     input: { serverName?: string },
     context: McpToolControllerContext,
@@ -416,7 +427,10 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
     // Revalidate policy at the effect boundary; manager also fences the revision.
     await context.assertCurrentAuthorization?.();
     this.assertOpen();
-    const result = await manager.readResource(input.serverName, input.uri, context.signal, input.revision);
+    const result = await manager.readResource(input.serverName, input.uri, context.signal, input.revision, {
+      elicitation: (request, signal) => this.elicit(manager.getState(input.serverName)!.server, request, { ...context, signal }),
+      beforeRetry: async () => { this.assertOpen(); await context.assertCurrentAuthorization?.(); },
+    });
     const content = firstResourceContent(result, input.uri);
     return {
       serverName: safeIdentity(input.serverName, "MCP server name", MCP_DESCRIPTOR_LIMITS.identityBytes),
@@ -694,6 +708,7 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
         return createSdkMcpClient(server, {
           ...(this.stdioGuardian ? { stdioGuardian: this.stdioGuardian } : {}),
           ...(authProvider ? { authProvider: authProvider.transportAuth() } : {}),
+          enableElicitation: Boolean(this.options.userInputQueue && this.options.events),
         });
       },
       onDiagnostic: (diagnostic) => {
@@ -752,7 +767,7 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
       registry.replaceContextualSource(MCP_TOOL_SOURCE, async (context) => {
         const view = await this.scopeView(context.cwd);
         this.assertOpen();
-        return scopedToolDefinitions(view, () => this.assertOpen());
+        return scopedToolDefinitions(view, () => this.assertOpen(), (server, request, context) => this.elicit(server, request, context));
       });
     }
   }
@@ -1885,6 +1900,7 @@ function scopedStates(view: McpScopeView): McpServerState[] {
 function scopedToolDefinitions(
   view: McpScopeView,
   assertOpen: () => void,
+  elicitation: McpToolElicitationHandler,
 ): ReturnType<typeof createMcpChiliTools> {
   const definitions: ReturnType<typeof createMcpChiliTools> = [];
   let descriptorBytes = 2;
@@ -1900,11 +1916,11 @@ function scopedToolDefinitions(
     }
     definitions.push(...createMcpChiliTools(state.server, tools, {
       getToolRevision: (serverName, toolName) => manager.getToolRevision(serverName, toolName),
-      callTool(serverName, toolName, input, signal, revision) {
+      callTool(serverName, toolName, input, signal, revision, interaction) {
         assertOpen();
-        return manager.callTool(serverName, toolName, input, signal, revision);
+        return manager.callTool(serverName, toolName, input, signal, revision, interaction);
       },
-    }));
+    }, elicitation));
     descriptorBytes += toolsBytes;
   }
   if (jsonUtf8Bytes(definitions) > MCP_DESCRIPTOR_LIMITS.catalogJsonBytes) {

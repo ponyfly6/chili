@@ -50,6 +50,15 @@ function boundedJson(toolName: string, value: unknown, label: string, maxBytes: 
   return json;
 }
 
+/** Validate untrusted MCP form schemas with the same worker bounds as tool inputs. */
+export async function validateExternalInputSchema(schema: object | boolean, input: unknown, signal?: AbortSignal): Promise<void> {
+  const result = await validateExternalSchema("MCP input", {
+    schema: boundedJson("MCP input", schema, "schema", MAX_SCHEMA_BYTES)!,
+    input: boundedJson("MCP input", input, "input", MAX_EXTERNAL_INPUT_BYTES),
+  }, signal);
+  if (!result.ok) throw new ToolValidationError("MCP input", result.message);
+}
+
 async function validateExternalSchema(
   toolName: string,
   workerData: SchemaWorkerInput,

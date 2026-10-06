@@ -747,6 +747,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       cwd,
       chiliHome,
       registries: [registry, childRegistry],
+      ...(options.userInputQueue ? { userInputQueue: options.userInputQueue } : {}),
       guardianLifecycle: (event) => {
         if (event.type === "started") owner.registerGuardian(event.pid);
         else owner.unregisterGuardian(event.pid);

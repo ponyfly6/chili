@@ -1,3 +1,4 @@
+import type { ElicitRequestParams, ElicitResult } from "@modelcontextprotocol/client";
 import type { McpServerConfig } from "./config.js";
 
 /** Current handshake revision for the legacy JSON-RPC adapter. */
@@ -12,7 +13,7 @@ export interface McpClientInfo {
 export interface McpClientCapabilities {
   roots?: { listChanged?: boolean };
   sampling?: Record<string, never>;
-  elicitation?: Record<string, never>;
+  elicitation?: { form?: Record<string, never>; url?: Record<string, never> };
 }
 
 export interface McpServerCapabilities {
@@ -138,7 +139,18 @@ export interface McpClient {
   close(): Promise<void>;
 }
 
-export interface McpRequestOptions {
+export type McpElicitationRequest = Exclude<ElicitRequestParams, { mode: "url" }>
+  | (Omit<Extract<ElicitRequestParams, { mode: "url" }>, "elicitationId"> & { elicitationId?: string });
+export type McpElicitationResult = ElicitResult;
+export type McpElicitationHandler = (request: McpElicitationRequest, signal: AbortSignal) => Promise<McpElicitationResult>;
+
+export interface McpInteractionOptions {
+  elicitation?: McpElicitationHandler;
+  /** Recheck the originating approval and definition before every continuation. */
+  beforeRetry?: () => Promise<void>;
+}
+
+export interface McpRequestOptions extends McpInteractionOptions {
   signal?: AbortSignal;
 }
 

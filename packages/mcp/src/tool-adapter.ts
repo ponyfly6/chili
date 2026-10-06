@@ -2,7 +2,7 @@ import { normalizePersistedError, type ToolResultContent, type ToolRisk, type To
 import { validateStructuredToolData } from "@chili/tools";
 import type { ChiliToolDefinition, ChiliToolExecutionContext, ToolApprovalSpec } from "@chili/tools";
 import type { McpServerConfig } from "./config.js";
-import type { McpCallToolResult, McpTool, McpToolAnnotations } from "./client.js";
+import type { McpCallToolResult, McpTool, McpToolAnnotations, McpElicitationRequest, McpElicitationResult } from "./client.js";
 import type { McpClientManager } from "./manager.js";
 import { mcpServerIdentity, mcpDefinitionFingerprint } from "./identity.js";
 import { createMcpModelToolName } from "./names.js";
@@ -29,11 +29,14 @@ export interface McpChiliToolDefinition extends ChiliToolDefinition {
   mcp: McpToolMetadata;
 }
 
+export type McpToolElicitationHandler = (server: McpServerConfig, request: McpElicitationRequest, context: ChiliToolExecutionContext) => Promise<McpElicitationResult>;
+
 export interface McpToolAdapterOptions {
   server: McpServerConfig;
   tool: McpTool;
   manager: Pick<McpClientManager, "callTool"> & Partial<Pick<McpClientManager, "getToolRevision">>;
   modelName?: string;
+  elicitation?: McpToolElicitationHandler;
 }
 
 export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliToolDefinition {
@@ -85,7 +88,10 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
     },
     async execute(input: unknown, context: ChiliToolExecutionContext): Promise<ToolResult> {
       try {
-        const rawResult = await options.manager.callTool(options.server.name, options.tool.name, input, context.signal, preparedRevision);
+        const rawResult = await options.manager.callTool(options.server.name, options.tool.name, input, context.signal, preparedRevision, {
+          ...(options.elicitation ? { elicitation: (request, signal) => options.elicitation!(options.server, request, { ...context, signal }) } : {}),
+          ...(context.assertCurrentAuthorization ? { beforeRetry: context.assertCurrentAuthorization } : {}),
+        });
         const result = boundMcpToolResult(rawResult);
         if (result.isError) {
           const error = new Error(formatMcpToolOutput(result)) as Error & { code?: string };
@@ -138,11 +144,12 @@ export function createMcpChiliTools(
   server: McpServerConfig,
   tools: readonly McpTool[],
   manager: Pick<McpClientManager, "callTool"> & Partial<Pick<McpClientManager, "getToolRevision">>,
+  elicitation?: McpToolElicitationHandler,
 ): McpChiliToolDefinition[] {
   const modelNames = uniqueModelNames(server, tools);
   return tools.map((tool, index) => {
     const modelName = modelNames[index];
-    return createMcpChiliTool(modelName ? { server, tool, manager, modelName } : { server, tool, manager });
+    return createMcpChiliTool({ server, tool, manager, ...(modelName ? { modelName } : {}), ...(elicitation ? { elicitation } : {}) });
   });
 }
 

@@ -1,3 +1,4 @@
+import { InteractiveMcpSdkClient } from "./sdk-interaction.js";
 import type { AuthProvider, OAuthClientProvider } from "@modelcontextprotocol/client";
 import type { McpStdioGuardianOwner } from "./stdio-guardian.js";
 import { Client, SSEClientTransport, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
@@ -44,6 +45,7 @@ import {
 
 export interface SdkMcpClientOptions {
   authProvider?: AuthProvider | OAuthClientProvider;
+  enableElicitation?: boolean;
   stdioGuardian?: McpStdioGuardianOwner;
   clientInfo?: McpClientInfo;
   capabilities?: McpClientCapabilities;
@@ -87,8 +89,11 @@ export class SdkMcpClient implements McpClient {
 
   private createClient(options: McpInitializeOptions = {}): Client {
     const version = options.protocolVersion;
-    const client = new Client(toImplementation(options.clientInfo ?? this.options.clientInfo ?? { name: "chili", version: "0.0.0" }), {
-      capabilities: toSdkClientCapabilities(options.capabilities ?? this.options.capabilities),
+    const client = new InteractiveMcpSdkClient(toImplementation(options.clientInfo ?? this.options.clientInfo ?? { name: "chili", version: "0.0.0" }), {
+      capabilities: {
+        ...toSdkClientCapabilities(options.capabilities ?? this.options.capabilities),
+        ...(this.options.enableElicitation ? { elicitation: { form: {}, url: {} } } : {}),
+      },
       versionNegotiation: {
         mode: this.server.type === "sse" ? "legacy" : version
           ? version >= "2026-07-28" ? { pin: version } : "legacy"
@@ -96,9 +101,7 @@ export class SdkMcpClient implements McpClient {
         probe: { timeoutMs: 2_000, maxRetries: 0 },
       },
       ...(version ? { supportedProtocolVersions: [version] } : {}),
-      // Interactive MCP requests need a host approval/input bridge before they
-      // can run. Keep them explicit failures instead of silently retrying tools.
-      inputRequired: { autoFulfill: false },
+      inputRequired: { autoFulfill: this.options.enableElicitation === true, maxRounds: 8 },
       listMaxPages: 64,
       listChanged: {
         tools: { onChanged: () => this.emitChanged("tools") },
@@ -106,6 +109,7 @@ export class SdkMcpClient implements McpClient {
         resources: { onChanged: () => this.emitChanged("resources") },
       },
     });
+    if (this.options.enableElicitation) client.installElicitationHandler();
     client.onclose = () => {
       if (this.client !== client) return;
       this.connected = false;
@@ -160,6 +164,19 @@ export class SdkMcpClient implements McpClient {
           onIngressLimit: (error) => this.handleFatalIngress(error, transport),
           onStdioIngressLimit: (error) => this.handleFatalIngress(error, transport),
         });
+        if (this.options.enableElicitation) {
+          // Legacy server-initiated input has no reliable session/call binding.
+          // Advertise interactive input only on the modern per-request envelope.
+          const send = transport.send.bind(transport);
+          transport.send = (message, sendOptions) => {
+            if ("method" in message && message.method === "initialize" && message.params) {
+              const capabilities = { ...(message.params.capabilities as Record<string, unknown>) };
+              delete capabilities.elicitation;
+              return send({ ...message, params: { ...message.params, capabilities } }, sendOptions);
+            }
+            return send(message, sendOptions);
+          };
+        }
         this.activeTransport = transport;
         try {
           await client.connect(transport, { ...requestOptions(options), signal: controller.signal });
@@ -343,7 +360,10 @@ export function createSdkMcpTransport(server: McpServerConfig, options: SdkMcpTr
 }
 
 function requestOptions(options: McpRequestOptions): RequestOptions {
-  return options.signal ? { signal: options.signal } : {};
+  return {
+    ...(options.signal ? { signal: options.signal } : {}),
+    chiliInteraction: options,
+  } as RequestOptions;
 }
 
 function cursorParams(options: McpCursorOptions): { cursor?: string } | undefined {
