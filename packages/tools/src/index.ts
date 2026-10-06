@@ -2,6 +2,7 @@ export * from "./approval.js";
 export * from "./resource-policy.js";
 export * from "./structured-data.js";
 export * from "./builtins/activate-skill.js";
+export * from "./builtins/agent.js";
 export * from "./builtins/agent-message.js";
 export * from "./builtins/apply-patch.js";
 export * from "./builtins/bash.js";

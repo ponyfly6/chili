@@ -1198,6 +1198,139 @@ test("closes a running task with a run-scoped local interrupt", async () => {
   }
 });
 
+test("stop is idempotent and a restarted controller resumes the preserved child history", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-task-control-stop-resume-"));
+  const databasePath = join(dir, "events.sqlite");
+  let store = new SqliteEventStore(databasePath);
+  const taskId = "task_stop_resume" as TaskId;
+  const childSessionId = "session_preserved_child" as SessionId;
+  const historyMessageId = "message_before_stop" as MessageId;
+  const interrupts: TaskId[] = [];
+
+  try {
+    await seedTask(store, { taskId, status: "running", childSessionId, mode: "resumable" });
+    await store.appendMany([
+      {
+        id: "event_before_stop_message",
+        type: "message.created",
+        time: 2 as TimestampMs,
+        sessionId: childSessionId,
+        payload: { messageId: historyMessageId, role: "user" },
+      },
+      {
+        id: "event_before_stop_part",
+        type: "message.part_added",
+        time: 2 as TimestampMs,
+        sessionId: childSessionId,
+        payload: {
+          messageId: historyMessageId,
+          part: {
+            id: "part_before_stop" as PartId,
+            messageId: historyMessageId,
+            sessionId: childSessionId,
+            type: "text",
+            text: "Preserve this work when the agent is resumed.",
+          },
+        },
+      },
+    ]);
+    const controller = new AgentTaskControlService({
+      store,
+      runtime: new FakeTaskRuntime(store),
+      interruptTask(id) { interrupts.push(id); return true; },
+      createId: createSequentialId("stop"),
+    });
+
+    const stopped = await controller.closeTask({ taskId });
+    expect(stopped).toMatchObject({ status: "cancelled", childSessionId });
+    expect(await controller.closeTask({ taskId })).toEqual(stopped);
+    expect(interrupts).toEqual([taskId]);
+    expect(await store.events({ type: "agent.task_completed", limit: 100 })).toHaveLength(1);
+
+    store.close();
+    store = new SqliteEventStore(databasePath);
+    const runtime = new FakeTaskRuntime(store);
+    runtime.onSubmit = async (input) => {
+      expect(input.sessionId).toBe(childSessionId);
+      expect(await store.messages(input.sessionId)).toMatchObject([
+        { id: historyMessageId, parts: [{ text: "Preserve this work when the agent is resumed." }] },
+      ]);
+    };
+    const restarted = new AgentTaskControlService({ store, runtime, createId: createSequentialId("resume") });
+    const resumed = await restarted.followupTask({ taskId, text: "Continue the previous task." });
+
+    expect(resumed.task).toMatchObject({
+      id: taskId,
+      childSessionId,
+      status: "completed",
+      generation: stopped.generation + 1,
+    });
+    expect(await store.agentRuns({ taskId })).toHaveLength(2);
+    expect(await store.messages(childSessionId)).toHaveLength(2);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stopped follow-up cannot resume concurrently while the provider is still unwinding", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-task-control-stop-drain-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const runtime = new FakeTaskRuntime(store);
+  const taskId = "task_stop_drain" as TaskId;
+  const started = deferred<void>();
+  const aborted = deferred<void>();
+  const finishCleanup = deferred<void>();
+  let activeProviders = 0;
+  let maxActiveProviders = 0;
+  let running: Promise<unknown> | undefined;
+
+  try {
+    await seedTask(store, { taskId, status: "completed", mode: "resumable" });
+    const service = new AgentTaskControlService({ store, runtime, createId: createSequentialId() });
+    runtime.onSubmit = async (input) => {
+      activeProviders++;
+      maxActiveProviders = Math.max(maxActiveProviders, activeProviders);
+      try {
+        if (runtime.inputs.length !== 1) return;
+        const signal = input.signal;
+        if (!signal) throw new Error("Expected a cancellation signal");
+        signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+        started.resolve();
+        await aborted.promise;
+        await finishCleanup.promise;
+        throw abortTestError();
+      } finally {
+        activeProviders--;
+      }
+    };
+    running = service.followupTask({ taskId, text: "Run until stopped." })
+      .then(() => undefined, (error: unknown) => error);
+    await started.promise;
+
+    await expect(service.followupTask({ taskId, text: "Do not run concurrently." }))
+      .rejects.toMatchObject({ name: "AgentTaskNotRunnableError" });
+    expect(await service.closeTask({ taskId })).toMatchObject({ status: "cancelled" });
+    await aborted.promise;
+    await expect(service.followupTask({ taskId, text: "Wait for the old provider to finish." }))
+      .rejects.toMatchObject({ name: "AgentTaskNotRunnableError" });
+    expect(runtime.inputs).toHaveLength(1);
+
+    finishCleanup.resolve();
+    expect(await running).toMatchObject({ name: "AbortError" });
+    expect((await service.followupTask({ taskId, text: "Continue now." })).task.status).toBe("completed");
+    expect(runtime.inputs).toHaveLength(2);
+    expect(maxActiveProviders).toBe(1);
+    expect(runtime.inputs.map((input) => input.sessionId)).toEqual(["session_child" as SessionId, "session_child" as SessionId]);
+  } finally {
+    aborted.resolve();
+    finishCleanup.resolve();
+    await running;
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("reconciles stale running background tasks without touching live task ids", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-task-control-reconcile-stale-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));

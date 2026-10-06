@@ -19,7 +19,8 @@ const SCOPED_TEAM_TOOL_NAMES = new Set([
   "team_message_send",
   "team_message_list",
 ]);
-const SCOPED_AGENT_MESSAGE_TOOL_NAMES = new Set(["agent_message_send", "agent_message_list"]);
+const SCOPED_AGENT_MESSAGE_TOOL_NAMES = new Set(["agent_message_send", "agent_message_list", "agent_send", "agent_list"]);
+const INTERNAL_AGENT_LIFECYCLE_TOOL_NAMES = new Set(["agent_spawn", "agent_resume", "agent_stop"]);
 const TEAM_TASK_RUNTIME_METADATA_KEY_SET = new Set<string>(TEAM_TASK_RUNTIME_METADATA_KEYS);
 
 export function filterToolsByPolicy(
@@ -92,7 +93,12 @@ export async function authorizeToolByPolicy<Input>(input: {
     }
   }
 
-  if (input.tool.risk === "execute") {
+  // These trusted controllers operate on agents, not OS commands. Their task
+  // permission, worker grants, and host ownership checks still apply; an empty
+  // shell execution scope must not prevent an explicitly granted delegation.
+  const internalAgentLifecycle = input.tool.resourcePolicy === "internal" &&
+    INTERNAL_AGENT_LIFECYCLE_TOOL_NAMES.has(input.tool.name);
+  if (input.tool.risk === "execute" && !internalAgentLifecycle) {
     const isReadOnly = await input.isReadOnly(input.tool, input.validatedInput);
     // Read-only is a scheduling hint, not proof of OS resource isolation. An
     // explicit execute scope always applies, including to read-only commands.
@@ -123,11 +129,24 @@ export function toolPolicyContext(input: ExecuteToolInput): ToolPolicyContext {
 
 function toolNameAllowed(tool: ChiliToolDefinition, allowedTools: readonly string[]): boolean {
   const names = new Set(allowedTools.map((name) => normalizeToolName(name)));
+  // Existing worker sessions retain their messaging grants after the tool rename.
+  if (names.has("agent_message_send")) names.add("agent_send");
+  if (names.has("agent_message_list")) names.add("agent_list");
   return names.has("*") || toolNameMatches(tool, names);
 }
 
 function toolNameDenied(tool: ChiliToolDefinition, deniedTools: readonly string[]): boolean {
   const names = new Set(deniedTools.map((name) => normalizeToolName(name)));
+  // A renamed or merged tool must not bypass an existing explicit deny.
+  const legacyNames: Record<string, readonly string[]> = {
+    agent_spawn: ["task", "task_batch", "agent", "agent_batch", "spawn_tasks", "spawn_agents"],
+    agent_list: ["task_list", "list_tasks", "agent_message_list", "list_agent_messages", "mailbox_list", "list_mailbox", "agent_mailbox"],
+    agent_send: ["agent_message_send", "send_agent_message", "send_message"],
+    agent_wait: ["task_wait", "task_wait_batch", "wait_task", "wait_tasks", "agent_wait_batch"],
+    agent_stop: ["task_close", "close_task", "agent_close"],
+    agent_resume: ["task_followup", "followup_task", "agent_followup"],
+  };
+  if ((legacyNames[normalizeToolName(tool.name)] ?? []).some((name) => names.has(name))) return true;
   return names.has("*") || toolNameMatches(tool, names);
 }
 
@@ -277,7 +296,7 @@ function authorizeAgentMessageToolByPolicy<Input>(
   if (from && policy.memberPath && from !== policy.memberPath) {
     throw new ToolDeniedError(tool.name, "Agent message sender must match this worker's agent path.");
   }
-  if (normalizeToolName(tool.name) !== "agent_message_send" || !policy.memberPath) return;
+  if (!["agent_message_send", "agent_send"].includes(normalizeToolName(tool.name)) || !policy.memberPath) return;
 
   const to = stringField(input, "to");
   if (!to || to === "parent" || !to.startsWith("/")) return;

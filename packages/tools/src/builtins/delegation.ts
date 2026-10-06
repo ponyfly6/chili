@@ -12,6 +12,9 @@ import type { ChiliToolDefinition, ChiliToolExecutionContext, ValidationResult }
  * available while policy is off.
  */
 export const DELEGATION_OFF_DENIED_TOOL_NAMES = [
+  "agent_spawn",
+  "agent_resume",
+  "agent_send",
   "task",
   "task_batch",
   "task_followup",

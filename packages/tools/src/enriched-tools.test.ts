@@ -1796,11 +1796,11 @@ test("scoped worker policy restricts team messages to the worker identity", asyn
   }
 });
 
-test("scoped worker policy confines direct agent messages to parent and descendants", async () => {
+for (const toolName of ["agent_message_send", "agent_send"]) test(`${toolName} confines direct agent messages to parent and descendants`, async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-tools-policy-agent-message-"));
   try {
     const registry = new InMemoryToolRegistry();
-    registry.register(fakeAgentMessageSendTool());
+    registry.register({ ...fakeAgentMessageSendTool(), name: toolName });
     const executor = createExecutor(registry, {
       resolve: () => ({
         allowedTools: ["agent_message_send"],
@@ -1811,7 +1811,7 @@ test("scoped worker policy confines direct agent messages to parent and descenda
 
     for (const to of ["parent", "/root", "/root/worker/reader"]) {
       const allowed = await executor.execute(toolInput(
-        "agent_message_send",
+        toolName,
         { from: "/root/worker", to, content: "hello" },
         workspace,
       ));
@@ -1819,7 +1819,7 @@ test("scoped worker policy confines direct agent messages to parent and descenda
     }
 
     const sibling = await executor.execute(toolInput(
-      "agent_message_send",
+      toolName,
       { from: "/root/worker", to: "/root/other", content: "no" },
       workspace,
     ));
@@ -1827,7 +1827,7 @@ test("scoped worker policy confines direct agent messages to parent and descenda
     if (sibling.status === "failed") expect(sibling.error.message).toContain("parent or descendants");
 
     const impersonation = await executor.execute(toolInput(
-      "agent_message_send",
+      toolName,
       { from: "/root/other", to: "parent", content: "no" },
       workspace,
     ));
