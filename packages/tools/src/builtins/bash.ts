@@ -92,6 +92,34 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
   const allowEscalation = options.allowEscalation ?? true;
   return {
     name: "bash",
+    codeMode: true,
+    outputSchema: {
+      oneOf: [
+        {
+          type: "object",
+          required: ["background", "stdout", "stderr", "exitCode", "signal", "timedOut", "stdoutTruncated", "stderrTruncated", "stdoutBytes", "stderrBytes", "durationMs"],
+          properties: {
+            background: { const: false },
+            stdout: { type: "string", description: "Captured standard output without display notices." },
+            stderr: { type: "string", description: "Captured standard error without display notices." },
+            exitCode: { type: ["integer", "null"] }, signal: { type: ["string", "null"] },
+            timedOut: { type: "boolean" }, stdoutTruncated: { type: "boolean" }, stderrTruncated: { type: "boolean" },
+            stdoutBytes: { type: "integer" }, stderrBytes: { type: "integer" }, durationMs: { type: "number" },
+            outputPath: { type: "string", description: "Workspace-relative path to persisted output when available." },
+          },
+        },
+        {
+          type: "object",
+          required: ["background", "processId", "status", "outputTail", "truncated"],
+          properties: {
+            background: { const: true }, processId: { type: "string" },
+            status: { type: "string", enum: ["running", "exited", "stopped", "failed"] },
+            outputTail: { type: "string", description: "Bounded combined output tail. A running status does not imply readiness." },
+            truncated: { type: "boolean" },
+          },
+        },
+      ],
+    },
     resourcePolicy: "process",
     aliases: ["run_shell_command"],
     searchHint: options.processes
@@ -306,7 +334,16 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
           const snapshot = await processes.read(owner, processId, { waitMs: 250, signal: context.signal });
           await context.metadata({ metadata: { processId, background: true } });
           context.signal.throwIfAborted();
-          return managedProcessToolResult(snapshot);
+          return {
+            ...managedProcessToolResult(snapshot),
+            structuredData: {
+              background: true,
+              processId,
+              status: snapshot.status,
+              outputTail: snapshot.output.preview,
+              truncated: snapshot.output.truncated,
+            },
+          };
         } catch (error) {
           await processes.stop(owner, processId);
           throw error;
@@ -370,6 +407,20 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       return {
         title: result.timedOut ? `timed out after ${timeoutMs}ms` : `exit ${result.exitCode ?? "signal"}`,
         output,
+        structuredData: {
+          background: false,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          signal: result.signal,
+          timedOut: result.timedOut,
+          stdoutTruncated: result.stdoutTruncated,
+          stderrTruncated: result.stderrTruncated,
+          stdoutBytes: result.stdoutBytes,
+          stderrBytes: result.stderrBytes,
+          durationMs: result.durationMs,
+          ...(outputSnapshot.outputPath ? { outputPath: outputSnapshot.outputPath } : {}),
+        },
         metadata: {
           command: input.command,
           cwd,

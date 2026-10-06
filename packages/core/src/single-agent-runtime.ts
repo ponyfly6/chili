@@ -29,7 +29,7 @@ import {
 } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
 import type { ChiliToolDefinition, ExecuteToolInput, PreparedToolCall, ToolAccessPolicy, ToolAccessPolicyResolver, ToolRegistry } from "@chili/tools";
-import { ToolExecutor, ToolValidationError, UnknownToolError, filterToolsByPolicy } from "@chili/tools";
+import { ToolDispatchScope, ToolExecutor, ToolValidationError, UnknownToolError, filterToolsByPolicy } from "@chili/tools";
 import {
   ContextCompactionService,
   ContextWindowExceededError,
@@ -111,6 +111,11 @@ interface AssistantStreamResult {
 interface CompactionAttemptResult {
   completed: boolean;
   usage?: ModelUsage;
+}
+
+interface TurnToolDispatch {
+  scope: ToolDispatchScope;
+  guardError?: DoomLoopError;
 }
 
 const MAX_MODEL_METADATA_TEXT_BYTES = 4_096;
@@ -271,6 +276,29 @@ export class SingleAgentRuntime implements AgentRunner {
     try {
       await this.append(input, "turn.started", { turnId });
       const guard = this.guardForTurn(input);
+      const dispatch: TurnToolDispatch = {
+        scope: new ToolDispatchScope({
+          maxConcurrentCalls: this.options.maxConcurrentToolCalls ?? 10,
+          beforeCall: async (request) => {
+            if (dispatch.guardError) throw dispatch.guardError;
+            const result = guard.check(request);
+            if (result.ok) return;
+            const error = new DoomLoopError(
+              result.reason === "repeated_tool_call"
+                ? `Repeated tool call blocked: ${request.toolName}`
+                : `Tool call limit exceeded: ${result.total}`,
+            );
+            dispatch.guardError ??= error;
+            await this.append(input, "turn.guard_triggered", {
+              turnId,
+              reason: result.reason,
+              toolName: boundedToolName(request.toolName),
+              count: result.count,
+            });
+            throw error;
+          },
+        }),
+      };
 
       const visibleTools = await this.visibleTools(input, turnId);
       const advertisedCatalogRevision = this.options.toolRegistry.getRevision?.();
@@ -389,6 +417,7 @@ export class SingleAgentRuntime implements AgentRunner {
         streamResult.toolCalls,
         pendingToolCalls,
         request.toolCatalogRevision,
+        dispatch,
         new Set(
           visibleTools
             .map((tool) => tool.name)
@@ -1045,6 +1074,7 @@ export class SingleAgentRuntime implements AgentRunner {
     toolCalls: readonly PendingToolCall[],
     pendingToolCalls: Set<PendingToolCall>,
     advertisedCatalogRevision: number | undefined,
+    dispatch: TurnToolDispatch,
     envelopeHiddenToolNames: ReadonlySet<string>,
   ): Promise<void> {
     const concurrentLimit = this.options.maxConcurrentToolCalls ?? 10;
@@ -1059,7 +1089,7 @@ export class SingleAgentRuntime implements AgentRunner {
         current.map((toolCall) => {
           // ToolExecutor owns terminal events once a call is dispatched.
           pendingToolCalls.delete(toolCall);
-          return this.runToolCall(input, turnId, assistantMessageId, toolCall);
+          return this.runToolCall(input, turnId, assistantMessageId, toolCall, dispatch.scope);
         }),
       );
       let failure: Error | undefined;
@@ -1071,6 +1101,7 @@ export class SingleAgentRuntime implements AgentRunner {
         await this.appendPart(input, assistantMessageId, result.value.part);
         failure ??= result.value.cancelledError;
       }
+      failure ??= dispatch.guardError;
       if (failure) throw failure;
     };
 
@@ -1137,9 +1168,10 @@ export class SingleAgentRuntime implements AgentRunner {
       await flush();
       throwIfTurnAborted(input.signal);
       pendingToolCalls.delete(toolCall);
-      const result = await this.runToolCall(input, turnId, assistantMessageId, toolCall);
+      const result = await this.runToolCall(input, turnId, assistantMessageId, toolCall, dispatch.scope);
       await this.appendPart(input, assistantMessageId, result.part);
       if (result.cancelledError) throw result.cancelledError;
+      if (dispatch.guardError) throw dispatch.guardError;
     }
 
     await flush();
@@ -1222,9 +1254,11 @@ export class SingleAgentRuntime implements AgentRunner {
     turnId: TurnId,
     assistantMessageId: MessageId,
     toolCall: PendingToolCall,
+    dispatchScope: ToolDispatchScope,
   ): Promise<{ part: MessagePart; cancelledError?: Error }> {
     const result = await this.options.toolExecutor.execute({
       ...this.executeInput(input, turnId, toolCall),
+      dispatchScope,
       ...(toolCall.prepared ? { prepared: toolCall.prepared } : {}),
     });
 

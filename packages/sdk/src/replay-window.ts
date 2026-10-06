@@ -253,6 +253,8 @@ export function runtimeEventRequires(event: ChiliEvent): RuntimeEventDependencyR
         reference("message", event.payload.messageId),
         reference("part", event.payload.partId),
       ];
+    case "tool.call_started":
+      return event.payload.parentCallId ? [toolReference(event, event.payload.parentCallId)] : [];
     case "tool.call_updated":
       // Provider input previews precede execution and already contain the
       // information needed to project a tool. Status-only updates do not.
@@ -363,6 +365,16 @@ function retainOrderedRuntimeEvents(
   for (let index = 0; index < nodes.length; index += 1) {
     const chainKey = nodes[index]?.chainKey;
     if (chainKey) latestByChain.set(chainKey, index);
+  }
+
+  // A retained child must not resurrect its completed parent as a running call.
+  // Keep the parent's latest state together with the start that anchors the link.
+  for (const node of nodes) {
+    const event = node.row.event;
+    if (event.type !== "tool.call_started" || !event.payload.parentCallId) continue;
+    const parentKey = runtimeEventDependencyKey(toolReference(event, event.payload.parentCallId));
+    const latestParent = latestByChain.get(parentKey);
+    if (latestParent !== undefined && !node.dependencies.includes(latestParent)) node.dependencies.push(latestParent);
   }
 
   const requestedPins = new Set(input.pinnedEventIds ?? []);

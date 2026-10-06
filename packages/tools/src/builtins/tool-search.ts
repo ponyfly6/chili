@@ -8,10 +8,26 @@ export interface ToolSearchInput {
 export function createToolSearchTool(registry: ToolRegistry): ChiliToolDefinition<ToolSearchInput> {
   return {
     name: "tool_search",
+    codeMode: true,
+    outputSchema: {
+      type: "object",
+      required: ["tools", "truncated"],
+      properties: {
+        tools: { type: "array", items: {
+          type: "object", required: ["name", "description", "inputSchema", "outputSchema", "codeMode", "call"],
+          properties: {
+            name: { type: "string" }, description: { type: "string" }, inputSchema: {}, outputSchema: {},
+            codeMode: { type: "boolean" },
+            call: { type: ["string", "null"], description: "Exact JavaScript tools access expression, or null if this tool is unavailable in code mode." },
+          },
+        } },
+        truncated: { type: "boolean", description: "More matching tools exist; refine the query." },
+      },
+    },
     aliases: ["toolsearch"],
     searchHint: "Search available tool names, aliases, descriptions, and search hints.",
     alwaysLoad: true,
-    description: "Search available tools by capability or name.",
+    description: "Search available tools by capability or name. Returns parameter and structuredData schemas and the exact JavaScript access expression for code mode. JavaScript calls return a ToolResult envelope: read .structuredData for machine values and .output for display text; Tools may omit .structuredData; inspect each tool's description and .metadata for its data contract. Use select:name1,name2 for exact names or aliases.",
     risk: "read",
     resourcePolicy: "internal",
     isReadOnly: true,
@@ -40,13 +56,28 @@ export function createToolSearchTool(registry: ToolRegistry): ChiliToolDefinitio
     approval: () => false,
     async execute(input, context) {
       const tools = context.visibleTools ? await context.visibleTools() : registry.list();
-      const results = searchTools(tools, input.query, input.maxResults ?? 8);
+      const maxResults = input.maxResults ?? 8;
+      const matches = searchTools(tools, input.query, maxResults + 1);
+      const results = matches.slice(0, maxResults);
+      const descriptions = results.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema ?? {},
+        outputSchema: tool.outputSchema ?? {},
+        codeMode: tool.codeMode === true,
+        call: tool.codeMode === true ? `tools[${JSON.stringify(tool.name)}]` : null,
+      }));
       const output = results.length
-        ? results.map((tool) => `${tool.name}: ${tool.description}`).join("\n")
+        ? descriptions.map((tool) => [
+          `${tool.name}: ${tool.description}`,
+          `Parameters: ${JSON.stringify(tool.inputSchema)}`,
+          ...(tool.codeMode ? [`Code mode: await ${tool.call}(input)`, `Returns a ToolResult envelope; .structuredData schema: ${JSON.stringify(tool.outputSchema)}`] : []),
+        ].join("\n")).join("\n\n")
         : "(no matching tools)";
       return {
         title: `tool search ${input.query}`,
         output,
+        structuredData: { tools: descriptions, truncated: matches.length > results.length },
         metadata: {
           query: input.query,
           count: results.length,

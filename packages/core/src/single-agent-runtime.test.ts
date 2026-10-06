@@ -320,7 +320,6 @@ test("fails undispatched tools after a planning error without repeating complete
       yield { type: "finish", reason: "tool_use" };
     },
   });
-  let planned = 0;
   let executed = 0;
   fixture.registry.register({
     name: "planned",
@@ -328,8 +327,8 @@ test("fails undispatched tools after a planning error without repeating complete
     risk: "read",
     inputSchema: { type: "object" },
     approval: () => false,
-    isConcurrencySafe: () => {
-      if (++planned === 2) throw new Error("tool scheduling failed");
+    isConcurrencySafe: (input: { path: string }) => {
+      if (input.path === "planned_second") throw new Error("tool scheduling failed");
       return false;
     },
     execute: async () => {

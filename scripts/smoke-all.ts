@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const suites = [
+  "smoke:code-mode",
   "smoke",
   "smoke:cli",
   "smoke:p0p1",

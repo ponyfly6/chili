@@ -11,9 +11,27 @@ export type ProcessInput =
 export function createProcessTool(processes: ManagedProcessManager): ChiliToolDefinition<ProcessInput> {
   return {
     name: "process",
+    codeMode: true,
+    outputSchema: {
+      oneOf: [
+        { type: "object", required: ["processes"], properties: { processes: { type: "array", items: {
+          type: "object", required: ["processId", "status", "command", "cwd", "startedAt"],
+          properties: {
+            processId: { type: "string" }, status: { type: "string" }, command: { type: "string" }, cwd: { type: "string" },
+            startedAt: { type: "number" }, finishedAt: { type: "number" },
+          },
+        } } } },
+        { type: "object", required: ["processId", "status", "command", "cwd", "outputTail", "truncated", "outputBytes"], properties: {
+          processId: { type: "string" }, status: { type: "string", enum: ["running", "exited", "stopped", "failed"] },
+          command: { type: "string" }, cwd: { type: "string" }, outputTail: { type: "string" },
+          truncated: { type: "boolean" }, outputBytes: { type: "integer" },
+          exitCode: { type: ["integer", "null"] }, timedOut: { type: "boolean" }, error: { type: "string" },
+        } },
+      ],
+    },
     resourcePolicy: "process",
     searchHint: "Read logs and status, list, or stop this task's managed background commands.",
-    description: "Inspect or stop background commands started by bash(background=true) in this task. read returns the latest bounded stdout/stderr tail and actual status; waitMs optionally waits for exit before taking the snapshot (maximum 30000 ms). Repeated reads can contain the same output. list finds this task's handles. stop terminates the owned command and its process group. Handles and logs are local to this host lifetime; no stdin or arbitrary PID control is available.",
+    description: "Inspect or stop background commands started by bash(background=true) in this task. read returns the latest bounded stdout/stderr tail and actual status; waitMs optionally waits for exit before taking the snapshot (maximum 30000 ms). Repeated reads can contain the same output. list finds this task's handles. stop terminates the owned command and its process group. Handles and logs are local to this host lifetime; no stdin or arbitrary PID control is available. Managed commands can outlive a code-mode script; JavaScript work itself is not kept alive between scripts.",
     risk: "execute",
     isReadOnly: (input) => input.action !== "stop",
     isConcurrencySafe: (input) => input.action !== "stop",
@@ -70,7 +88,7 @@ export function createProcessTool(processes: ManagedProcessManager): ChiliToolDe
       const owner = { sessionId: context.sessionId, workspaceRoot: context.cwd };
       if (input.action === "list") {
         const items = processes.list(owner);
-        return { title: `${items.length} managed processes`, output: JSON.stringify(items, null, 2) };
+        return { title: `${items.length} managed processes`, output: JSON.stringify(items, null, 2), structuredData: { processes: items } };
       }
       const snapshot = input.action === "stop"
         ? await processes.stop(owner, input.processId)
@@ -98,6 +116,12 @@ export function managedProcessToolResult(snapshot: ManagedProcessSnapshot): Tool
   return {
     title: `process ${status}`,
     output: details.join("\n"),
+    structuredData: {
+      processId, status, command, cwd,
+      outputTail: output.preview, truncated: output.truncated, outputBytes: output.totalBytes,
+      ...(result ? { exitCode: result.exitCode, timedOut: result.timedOut } : {}),
+      ...(error ? { error } : {}),
+    },
     metadata: {
       processId, processStatus: status, command, cwd, background: true,
       outputBytes: output.totalBytes, outputTruncated: output.truncated,

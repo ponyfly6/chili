@@ -1,8 +1,8 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, spyOn, test } from "bun:test";
-import { AgentMailboxDeliveryPump } from "@chili/core";
+import { AgentMailboxDeliveryPump, type ModelStreamEvent } from "@chili/core";
 import type { ChiliEvent, RuntimePermissionProfileId, SessionId, TimestampMs } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import type { ApprovalBrokerRequest, BashRunner } from "@chili/tools";
@@ -155,6 +155,172 @@ test("Host rejects the unavailable auto-review profile at construction and runti
       expect(() => host.permissions.set("auto-review")).toThrow("not implemented");
       expect(() => host.permissions.set(unknownProfile)).toThrow("Unsupported permission profile");
       expect(host.permissions.get().profile).toBe("default");
+    } finally {
+      await host.close();
+    }
+  });
+});
+
+test("Host code mode composes reads while only its selected output enters model history", async () => {
+  await withWorkspace(async (options) => {
+    await writeFile(join(options.cwd, "first.txt"), "first private intermediate");
+    await writeFile(join(options.cwd, "second.txt"), "second private intermediate");
+    let requests = 0;
+    const host = await createChiliHost({
+      ...options,
+      modelRouter: {
+        async *stream(input): AsyncIterable<ModelStreamEvent> {
+          requests++;
+          expect(input.tools.map((tool) => tool.name)).toContain("code_mode");
+          expect(input.tools.map((tool) => tool.name)).toContain("read");
+          if (requests === 1) {
+            expect(input.developer?.join("\n")).toContain("Tool permissions, approvals, and worker scope still apply");
+            yield { type: "tool_call_start", toolCallId: "provider_code_mode_call", name: "code_mode" };
+            yield {
+              type: "tool_call_end",
+              toolCallId: "provider_code_mode_call",
+              name: "code_mode",
+              input: {
+                code: 'const results = await Promise.allSettled([tools.read({filePath:"first.txt"}), tools.read({filePath:"second.txt"})]); text(results.map(r => r.status === "fulfilled" ? r.value.structuredData.path : "failed"));',
+              },
+            };
+            yield { type: "finish", reason: "tool_use" };
+            return;
+          }
+          const parts = input.messages.flatMap((message) => message.parts);
+          expect(parts.filter((part) => part.type === "tool_call")).toHaveLength(1);
+          expect(parts.filter((part) => part.type === "tool_result")).toMatchObject([
+            { output: '["first.txt","second.txt"]' },
+          ]);
+          expect(JSON.stringify(input.messages)).not.toContain("private intermediate");
+          yield { type: "text_delta", text: "Read both files." };
+          yield { type: "finish", reason: "stop" };
+        },
+      },
+    });
+    try {
+      await host.service.createSession({ sessionId, cwd: host.cwd });
+      expect((await host.service.submitPrompt({ sessionId, text: "Read and summarize two files." })).status).toBe("completed");
+      expect(requests).toBe(2);
+      const started = (await host.store.events({ sessionId, type: "tool.call_started" }))
+        .filter((event): event is Extract<ChiliEvent, { type: "tool.call_started" }> => event.type === "tool.call_started");
+      const outer = started.find((event) => event.payload.toolName === "code_mode");
+      expect(outer).toBeDefined();
+      expect(outer?.payload.providerCallId).toBe("provider_code_mode_call");
+      expect(outer?.payload.callId).not.toBe("provider_code_mode_call");
+      expect(started.filter((event) => event.payload.toolName === "read")).toMatchObject([
+        { payload: { parentCallId: outer?.payload.callId } },
+        { payload: { parentCallId: outer?.payload.callId } },
+      ]);
+      expect(started.filter((event) => event.payload.parentCallId).every((event) => event.payload.providerCallId === undefined)).toBe(true);
+    } finally {
+      await host.close();
+    }
+  });
+});
+
+test("Host code mode sends nested shell execution through the approval interface", async () => {
+  await withWorkspace(async (options) => {
+    let executions = 0;
+    const requests: ApprovalBrokerRequest[] = [];
+    const host = await createChiliHost({
+      ...options,
+      bashRunner: fakeRunner(() => { executions++; }),
+      askApproval: async (request) => {
+        expect(executions).toBe(0);
+        requests.push(request);
+        return { action: "deny", feedback: "Denied nested command for this test." };
+      },
+      modelRouter: {
+        async *stream(): AsyncIterable<ModelStreamEvent> {
+          yield {
+            type: "tool_call",
+            name: "code_mode",
+            input: { code: 'await tools.bash({command:"/usr/bin/true",sandbox_permissions:"require_escalated",justification:"Approval fixture"});' },
+          };
+          yield { type: "finish", reason: "tool_use" };
+        },
+      },
+    });
+    try {
+      await host.runtime.createSession({ sessionId, cwd: host.cwd });
+      await host.runtime.runTurn({ sessionId, cwd: host.cwd });
+      expect(executions).toBe(0);
+      expect(requests).toMatchObject([{ toolName: "bash", permission: "bash.unsandboxed" }]);
+      const completed = (await host.store.events({ sessionId, type: "tool.call_finished" }))
+        .filter((event): event is Extract<ChiliEvent, { type: "tool.call_finished" }> => event.type === "tool.call_finished");
+      expect(completed).toHaveLength(2);
+      expect(completed.every((event) => event.payload.status === "failed")).toBe(true);
+    } finally {
+      await host.close();
+    }
+  });
+});
+
+test("Host code mode retains the turn allowlist for its nested tool catalog", async () => {
+  await withWorkspace(async (options) => {
+    const host = await createChiliHost({
+      ...options,
+      modelRouter: {
+        async *stream(): AsyncIterable<ModelStreamEvent> {
+          yield { type: "tool_call", name: "code_mode", input: { code: 'text(ALL_TOOLS.map(tool => tool.name)); text(typeof tools.write);' } };
+          yield { type: "finish", reason: "tool_use" };
+        },
+      },
+    });
+    try {
+      await host.runtime.createSession({ sessionId, cwd: host.cwd });
+      expect((await host.runtime.runTurn({
+        sessionId,
+        cwd: host.cwd,
+        toolPolicy: { allowedTools: ["code_mode", "read"] },
+      })).status).toBe("completed");
+      const parts = (await host.store.messages(sessionId)).flatMap((message) => message.parts);
+      expect(parts.filter((part) => part.type === "tool_result")).toMatchObject([
+        { output: '["read"]\nundefined' },
+      ]);
+      expect(await host.store.events({ sessionId, type: "tool.call_started" })).toHaveLength(1);
+    } finally {
+      await host.close();
+    }
+  });
+});
+
+test("Host code mode shares file observations within a session without granting them to another session", async () => {
+  await withWorkspace(async (options) => {
+    const path = join(options.cwd, "observed.txt");
+    await writeFile(path, "alpha");
+    let requests = 0;
+    const host = await createChiliHost({
+      ...options,
+      permissionProfile: "full-access",
+      modelRouter: {
+        async *stream(): AsyncIterable<ModelStreamEvent> {
+          const code = requests++ === 0
+            ? 'await tools.read({filePath:"observed.txt"}); text((await tools.edit({filePath:"observed.txt",oldString:"alpha",newString:"bravo"})).structuredData);'
+            : 'await tools.edit({filePath:"observed.txt",oldString:"bravo",newString:"charlie"});';
+          yield { type: "tool_call", name: "code_mode", input: { code } };
+          yield { type: "finish", reason: "tool_use" };
+        },
+      },
+    });
+    try {
+      const first = await host.runtime.createSession({ cwd: host.cwd });
+      const second = await host.runtime.createSession({ cwd: host.cwd });
+      await host.runtime.runTurn({ sessionId: first, cwd: host.cwd });
+      expect(await readFile(path, "utf8")).toBe("bravo");
+      const firstFinished = (await host.store.events({ sessionId: first, type: "tool.call_finished" }))
+        .filter((event): event is Extract<ChiliEvent, { type: "tool.call_finished" }> => event.type === "tool.call_finished");
+      expect(firstFinished).toHaveLength(3);
+      expect(firstFinished.every((event) => event.type === "tool.call_finished" && event.payload.status === "completed")).toBe(true);
+
+      await host.runtime.runTurn({ sessionId: second, cwd: host.cwd });
+      expect(await readFile(path, "utf8")).toBe("bravo");
+      const secondFinished = (await host.store.events({ sessionId: second, type: "tool.call_finished" }))
+        .filter((event): event is Extract<ChiliEvent, { type: "tool.call_finished" }> => event.type === "tool.call_finished");
+      expect(secondFinished).toHaveLength(2);
+      expect(secondFinished.every((event) => event.type === "tool.call_finished" && event.payload.status === "failed")).toBe(true);
+      expect(JSON.stringify(secondFinished)).toContain("Read observed.txt before modifying it");
     } finally {
       await host.close();
     }

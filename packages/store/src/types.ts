@@ -53,6 +53,7 @@ export interface SessionRow {
 export interface ToolCallRow {
   id: string;
   providerCallId?: string;
+  parentCallId?: ToolCallId;
   sessionId?: SessionId;
   turnId?: TurnId;
   toolName: string;

@@ -54,6 +54,14 @@ interface GitBranchState {
 export function createGitDiffTool(): ChiliToolDefinition<GitDiffInput> {
   return {
     name: "git_diff",
+    codeMode: true,
+    outputSchema: {
+      type: "object", required: ["diff", "truncated"],
+      properties: {
+        diff: { type: "string", description: "Git diff or stat text without Chili display notices." },
+        truncated: { type: "boolean", description: "Whether the process output byte limit was reached." },
+      },
+    },
     searchHint: "Inspect git diff output, staged changes, stats, or path-specific diffs.",
     description: "Read git diff output for the current workspace.",
     risk: "read",
@@ -159,6 +167,7 @@ export function createGitDiffTool(): ChiliToolDefinition<GitDiffInput> {
         return {
           title: input.stat ? "git diff --stat" : "git diff",
           output,
+          structuredData: { diff: result.stdout, truncated: result.stdoutTruncated || result.stderrTruncated },
           metadata: {
             staged: input.staged ?? false,
             stat: input.stat ?? false,
@@ -177,6 +186,18 @@ export function createGitDiffTool(): ChiliToolDefinition<GitDiffInput> {
 export function createGitStatusTool(): ChiliToolDefinition<GitStatusInput> {
   return {
     name: "git_status",
+    codeMode: true,
+    outputSchema: {
+      type: "object", required: ["branch", "detached", "head", "clean", "staged", "unstaged", "untracked", "paths", "truncated"],
+      properties: {
+        branch: { type: ["string", "null"] }, detached: { type: "boolean" }, head: { type: ["string", "null"] },
+        clean: { type: "boolean", description: "Only authoritative when truncated is false." },
+        staged: { type: "array", items: gitChangedItemSchema() },
+        unstaged: { type: "array", items: gitChangedItemSchema() },
+        untracked: { type: "array", items: gitChangedItemSchema() },
+        paths: { type: "array", items: { type: "string" } }, truncated: { type: "boolean" },
+      },
+    },
     searchHint: "Inspect current git branch, staged changes, unstaged changes, and untracked files.",
     description: "Return structured git status for the current workspace.",
     risk: "read",
@@ -272,6 +293,12 @@ export function createGitStatusTool(): ChiliToolDefinition<GitStatusInput> {
         return {
           title: "git status",
           output: JSON.stringify(status, null, 2),
+          structuredData: {
+            ...status,
+            branch: branch.current ?? null,
+            head: branch.head ?? null,
+            truncated: staged.stdoutTruncated || unstaged.stdoutTruncated || untracked.stdoutTruncated,
+          },
           metadata: {
             ...status,
             durationMs: Math.max(staged.durationMs, unstaged.durationMs, untracked.durationMs),
@@ -286,6 +313,14 @@ export function createGitStatusTool(): ChiliToolDefinition<GitStatusInput> {
 export function createGitStageTool(): ChiliToolDefinition<GitStageInput> {
   return {
     name: "git_stage",
+    codeMode: true,
+    outputSchema: {
+      type: "object", required: ["staged", "paths", "all", "truncated"],
+      properties: {
+        staged: { type: "array", items: gitChangedItemSchema() }, paths: { type: "array", items: { type: "string" } },
+        all: { type: "boolean" }, truncated: { type: "boolean" },
+      },
+    },
     searchHint: "Stage selected files or all workspace changes with git add.",
     description: "Stage workspace changes in the git index.",
     risk: "write",
@@ -363,6 +398,7 @@ export function createGitStageTool(): ChiliToolDefinition<GitStageInput> {
         return {
           title: "git stage",
           output: JSON.stringify(output, null, 2),
+          structuredData: { ...output, truncated: staged.stdoutTruncated || staged.stderrTruncated },
           metadata: {
             ...output,
             durationMs: result.durationMs,
@@ -376,6 +412,11 @@ export function createGitStageTool(): ChiliToolDefinition<GitStageInput> {
 export function createGitCommitTool(): ChiliToolDefinition<GitCommitInput> {
   return {
     name: "git_commit",
+    codeMode: true,
+    outputSchema: {
+      type: "object", required: ["hash", "subject", "truncated"],
+      properties: { hash: { type: "string" }, subject: { type: "string" }, truncated: { type: "boolean" } },
+    },
     searchHint: "Create a local git commit from currently staged changes.",
     description: "Commit staged changes in the current workspace.",
     risk: "write",
@@ -464,6 +505,7 @@ export function createGitCommitTool(): ChiliToolDefinition<GitCommitInput> {
         return {
           title: `git commit ${info.hash.slice(0, 12)}`,
           output: JSON.stringify(output, null, 2),
+          structuredData: { ...output, truncated: info.truncated },
           metadata: {
             ...output,
             durationMs: result.durationMs,
@@ -477,6 +519,20 @@ export function createGitCommitTool(): ChiliToolDefinition<GitCommitInput> {
 export function createGitBranchTool(): ChiliToolDefinition<GitBranchInput> {
   return {
     name: "git_branch",
+    codeMode: true,
+    outputSchema: {
+      oneOf: [
+        { type: "object", required: ["current", "detached", "head", "branches", "truncated"], properties: {
+          current: { type: ["string", "null"] }, detached: { type: "boolean" }, head: { type: ["string", "null"] },
+          branches: { type: ["array", "null"], items: { type: "string" } },
+          truncated: { type: "boolean" },
+        } },
+        { type: "object", required: ["action", "name", "startPoint", "before", "after"], properties: {
+          action: { type: "string" }, name: { type: "string" }, startPoint: { type: ["string", "null"] },
+          before: gitBranchStateSchema(), after: gitBranchStateSchema(),
+        } },
+      ],
+    },
     searchHint: "Read the current branch, list local branches, or safely create/switch branches.",
     description: "Inspect or update local git branches without destructive checkout flags.",
     risk: "write",
@@ -565,7 +621,8 @@ export function createGitBranchTool(): ChiliToolDefinition<GitBranchInput> {
         const before = await readCurrentBranch(context.cwd, context.signal);
 
         if (action === "current" || action === "list") {
-          const branches = action === "list" ? await listBranches(context.cwd, context.signal) : undefined;
+          const branchList = action === "list" ? await listBranches(context.cwd, context.signal) : undefined;
+          const branches = branchList?.branches;
           const output = {
             current: before.current,
             detached: before.detached,
@@ -573,9 +630,10 @@ export function createGitBranchTool(): ChiliToolDefinition<GitBranchInput> {
             branches,
           };
           await assertGitResourceAccess(context, branchAction(input) !== "current" && branchAction(input) !== "list");
-        return {
+          return {
             title: action === "list" ? "git branch --list" : "git branch",
             output: JSON.stringify(output, null, 2),
+            structuredData: { ...output, current: before.current ?? null, head: before.head ?? null, branches: branches ?? null, truncated: branchList?.truncated ?? false },
             metadata: output,
           };
         }
@@ -609,6 +667,7 @@ export function createGitBranchTool(): ChiliToolDefinition<GitBranchInput> {
         return {
           title: `git branch ${action}`,
           output: JSON.stringify(output, null, 2),
+          structuredData: { ...output, startPoint: input.startPoint ?? null },
           metadata: {
             ...output,
             durationMs: result.durationMs,
@@ -717,7 +776,7 @@ async function readCurrentBranch(cwd: string, signal: AbortSignal): Promise<GitB
   return state;
 }
 
-async function readCommitInfo(cwd: string, signal: AbortSignal): Promise<{ hash: string; subject: string }> {
+async function readCommitInfo(cwd: string, signal: AbortSignal): Promise<{ hash: string; subject: string; truncated: boolean }> {
   const result = await runGit(["show", "-s", "--format=%H%x00%s", "HEAD"], {
     cwd,
     signal,
@@ -729,10 +788,11 @@ async function readCommitInfo(cwd: string, signal: AbortSignal): Promise<{ hash:
   return {
     hash: hash?.trim() ?? "",
     subject: subject?.trim() ?? "",
+    truncated: result.stdoutTruncated || result.stderrTruncated,
   };
 }
 
-async function listBranches(cwd: string, signal: AbortSignal): Promise<string[]> {
+async function listBranches(cwd: string, signal: AbortSignal): Promise<{ branches: string[]; truncated: boolean }> {
   const result = await runGit(["branch", "--format=%(refname:short)"], {
     cwd,
     signal,
@@ -740,7 +800,11 @@ async function listBranches(cwd: string, signal: AbortSignal): Promise<string[]>
     maxOutputBytes: 256_000,
   });
   assertGitSuccess(result, "git branch --format");
-  return result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const text = result.stdoutTruncated ? result.stdout.slice(0, result.stdout.lastIndexOf("\n") + 1) : result.stdout;
+  return {
+    branches: text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
+    truncated: result.stdoutTruncated || result.stderrTruncated,
+  };
 }
 
 async function assertValidBranchName(name: string, cwd: string, signal: AbortSignal): Promise<void> {
@@ -753,6 +817,20 @@ async function assertValidBranchName(name: string, cwd: string, signal: AbortSig
   if (result.exitCode !== 0) {
     throw new Error(result.stderr || `Invalid branch name: ${name}`);
   }
+}
+
+function gitBranchStateSchema() {
+  return {
+    type: "object", required: ["detached"],
+    properties: { current: { type: "string" }, detached: { type: "boolean" }, head: { type: "string" } },
+  };
+}
+
+function gitChangedItemSchema() {
+  return {
+    type: "object", required: ["path", "status", "code"],
+    properties: { path: { type: "string" }, status: { type: "string" }, code: { type: "string" }, oldPath: { type: "string" } },
+  };
 }
 
 function parseNameStatus(output: string): GitChangedItem[] {
@@ -784,7 +862,10 @@ function parseNameStatus(output: string): GitChangedItem[] {
 }
 
 function parsePathList(output: string): string[] {
-  return output.split("\0").filter(Boolean);
+  // Git's -z records end in NUL. A byte-limited capture may end inside a
+  // filename; never expose that partial filename as an actionable path.
+  const end = output.lastIndexOf("\0");
+  return end < 0 ? [] : output.slice(0, end).split("\0").filter(Boolean);
 }
 
 function statusFromCode(code: string): string {

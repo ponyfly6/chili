@@ -70,6 +70,7 @@ export const SQLITE_SCHEMA = [
   `create table if not exists tool_calls (
     id text primary key,
     provider_call_id text,
+    parent_call_id text,
     session_id text,
     turn_id text,
     tool_name text not null,
@@ -83,6 +84,7 @@ export const SQLITE_SCHEMA = [
   )`,
   `create index if not exists tool_calls_session_status_idx on tool_calls(session_id, status)`,
   `create index if not exists tool_calls_turn_idx on tool_calls(turn_id)`,
+  `create index if not exists tool_calls_parent_idx on tool_calls(parent_call_id)`,
 
   `create table if not exists approvals (
     id text primary key,

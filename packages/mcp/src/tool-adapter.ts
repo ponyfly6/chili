@@ -46,14 +46,19 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
 
   return {
     name: modelName,
+    codeMode: true,
+    outputSchema: options.tool.outputSchema ?? {
+      description: "Original structuredContent when provided by the MCP server (schema unspecified). The ToolResult envelope has no structuredData when the server supplies only content blocks; rendered output and content may be bounded previews.",
+    },
     revision: preparedRevision ?? `${mcpServerIdentity(options.server)}:${mcpDefinitionFingerprint(options.tool)}`,
     description: sanitizeMcpToolDescription(
       options.tool.description ?? `MCP tool ${options.server.name}/${options.tool.name}`,
       options.server.name,
       options.tool.name,
-    ),
+    ) + "\n\nToolResult.structuredData preserves valid MCP structuredContent up to 4 MiB of serialized JSON. Invalid or larger structuredContent fails validation. If the server supplies no structuredContent, structuredData is absent; rendered output and content may be bounded previews. Code-mode result transport has its own size limit.",
     risk: inferRisk(annotations),
     inputSchema: options.tool.inputSchema ?? { type: "object" },
+    inputSchemaSource: "external",
     shouldDefer: true,
     isReadOnly,
     isConcurrencySafe,
@@ -150,6 +155,7 @@ export function inferRisk(annotations: McpToolAnnotations): ToolRisk {
 
 export function inferConcurrencySafe(annotations: McpToolAnnotations): boolean {
   if (annotations.destructiveHint === true) return false;
+  // Idempotence does not make differently parameterized writes safe to overlap.
   return annotations.readOnlyHint === true;
 }
 

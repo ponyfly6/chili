@@ -13,6 +13,15 @@ export interface GlobInput {
 export function createGlobTool(): ChiliToolDefinition<GlobInput> {
   return {
     name: "glob",
+    codeMode: true,
+    outputSchema: {
+      type: "object",
+      required: ["paths", "truncated"],
+      properties: {
+        paths: { type: "array", items: { type: "string" }, description: "Matching workspace-relative file paths; each item is a complete path." },
+        truncated: { type: "boolean", description: "The match limit stopped the scan; additional matches may exist." },
+      },
+    },
     aliases: ["file_glob"],
     searchHint: "Find workspace files by glob pattern such as **/*.ts or packages/*/package.json.",
     description: "Find files in the workspace using a glob pattern. Supports *, **, and ?; use separate calls instead of brace expansion.",
@@ -114,6 +123,7 @@ export function createGlobTool(): ChiliToolDefinition<GlobInput> {
       return {
         title: `glob ${input.pattern}`,
         output: truncated ? `${output}\n[truncated after ${limit} matches]` : output,
+        structuredData: { paths: matches, truncated },
         metadata: {
           pattern: input.pattern,
           path: input.path,

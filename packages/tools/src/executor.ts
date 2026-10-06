@@ -27,6 +27,7 @@ import { validateToolSchema } from "./input-schema.js";
 import { canonicalApprovalSpec } from "./resource-policy.js";
 import { validateStructuredToolData } from "./structured-data.js";
 import { FileReadStateStore } from "./file-read-state.js";
+import { ToolDispatchScope } from "./dispatch-scope.js";
 import { authorizeToolByPolicy, filterToolsByPolicy, executionPolicyFor, toolPolicyContext } from "./tool-policy.js";
 import {
   persistToolOutput,
@@ -101,9 +102,13 @@ export class ToolExecutor {
   }
 
   async execute(input: ExecuteToolInput): Promise<ExecuteToolResult> {
+    const dispatchScope = input.dispatchScope ?? new ToolDispatchScope();
+    dispatchScope.throwIfFailed();
+    const signal = AbortSignal.any(input.signal ? [input.signal, dispatchScope.signal] : [dispatchScope.signal]);
+    const scopedInput = { ...input, dispatchScope, signal };
     return this.options.executionContext
-      ? this.options.executionContext(() => this.executeOwned(input))
-      : this.executeOwned(input);
+      ? this.options.executionContext(() => this.executeOwned(scopedInput))
+      : this.executeOwned(scopedInput);
   }
 
   private async executeOwned(input: ExecuteToolInput): Promise<ExecuteToolResult> {
@@ -116,6 +121,7 @@ export class ToolExecutor {
       turnId: input.turnId,
       callId,
       ...(input.providerCallId === undefined ? {} : { providerCallId: input.providerCallId }),
+      ...(input.parentCallId === undefined ? {} : { parentCallId: input.parentCallId }),
       toolName: boundToolEventName(input.toolName),
       input: boundToolEventValue(input.input, "tool input"),
     });
@@ -124,12 +130,14 @@ export class ToolExecutor {
       return this.fail(input, callId, new Error(`Tool call id is already active: ${callId}`));
     }
     this.activeCallIds.add(activeCallKey);
+    let release: (() => void) | undefined;
 
     try {
       if (input.signal?.aborted) {
         return await this.cancel(input, callId, abortReason(input.signal));
       }
       try {
+        if (input.parentCallId) await input.dispatchScope?.checkNestedCall({ toolName: input.toolName, input: input.input });
         const prepared = input.prepared ?? await this.prepare(input);
         await this.update(input, callId, "validating");
         const details = this.preparedCalls.get(prepared);
@@ -138,6 +146,12 @@ export class ToolExecutor {
         }
         const { tool, spec } = details;
         const validated = prepared.validatedInput;
+        if (input.parentCallId && (tool.codeMode !== true || tool.isOrchestrator)) {
+          throw new ToolDeniedError(tool.name, "Tool is not available to code mode.");
+        }
+        if (!tool.isOrchestrator) {
+          release = await input.dispatchScope!.acquire(prepared.isConcurrencySafe, input.signal);
+        }
         await this.assertPreparedCurrent(prepared, input);
         const executionPolicy = await this.authorizeWorkerPolicy(tool, validated, input, spec);
 
@@ -181,6 +195,7 @@ export class ToolExecutor {
         // No lifecycle event or policy preparation may await after this final check.
         await context.assertCurrentAuthorization?.();
         const rawResult = await tool.execute(validated, context);
+        input.dispatchScope?.throwIfFailed();
         throwIfAborted(input.signal);
         if (registeredOutput) {
           try {
@@ -220,6 +235,7 @@ export class ToolExecutor {
         return { status: "completed", callId, result };
       } catch (error) {
         if (this.isEventPublishFailure(error)) throw error;
+        input.dispatchScope?.throwIfFailed();
         const normalizedError = input.signal?.aborted
           ? abortReason(input.signal)
           : toError(error);
@@ -229,25 +245,27 @@ export class ToolExecutor {
         return this.fail(input, callId, normalizedError);
       }
     } finally {
+      release?.();
       this.activeCallIds.delete(activeCallKey);
     }
   }
 
   async prepare(input: ExecuteToolInput): Promise<PreparedToolCall> {
     throwIfAborted(input.signal);
+    await this.assertCatalogCurrent(input);
     const registryRevision = this.options.registry.getRevision?.();
-    const tool = await this.toolForContext(input.toolName, toolRegistryContext(input));
+    const tool = input.catalogTool ?? await this.toolForContext(input.toolName, toolRegistryContext(input));
     if (!tool) throw new UnknownToolError(input.toolName);
-    const validated = await this.validate(tool, input.input, toolRegistryContext(input));
+    const validated = await this.validate(tool, input.input, toolRegistryContext(input), input.signal);
     const originalSpec = this.approvalSpec(tool, validated);
     if (originalSpec !== false) await canonicalApprovalSpec(input.cwd, originalSpec);
     const preparedInput = tool.prepareInput ? await tool.prepareInput(validated, toolRegistryContext(input)) : validated;
-    validateToolSchema(tool, preparedInput);
+    await validateToolSchema(tool, preparedInput, input.signal);
     const validatedInput = freezePreparedValue(preparedInput);
     const preparedSpec = this.approvalSpec(tool, validatedInput);
     const spec = preparedSpec === false ? false : await canonicalApprovalSpec(input.cwd, preparedSpec);
     const explicit = await this.resolvePredicate(tool.isConcurrencySafe, validatedInput);
-    const isConcurrencySafe = explicit ?? (await this.resolvePredicate(tool.isReadOnly, validatedInput)) ?? false;
+    const isConcurrencySafe = !tool.isOrchestrator && (explicit ?? (await this.resolvePredicate(tool.isReadOnly, validatedInput)) ?? false);
     throwIfAborted(input.signal);
     const prepared: PreparedToolCall = Object.freeze({
       toolName: tool.name,
@@ -269,19 +287,33 @@ export class ToolExecutor {
     if (context) return (await this.prepare({ ...context, toolName, input })).isConcurrencySafe;
     const tool = this.options.registry.get(toolName);
     if (!tool) return false;
+    if (tool.isOrchestrator) return false;
     const validated = await this.validate(tool, input);
     return (await this.resolvePredicate(tool.isConcurrencySafe, validated))
       ?? (await this.resolvePredicate(tool.isReadOnly, validated)) ?? false;
   }
 
-  private async validate<Input>(tool: ChiliToolDefinition<Input>, input: unknown, context?: ToolRegistryContext): Promise<Input> {
+  private async assertCatalogCurrent(input: ExecuteToolInput): Promise<void> {
+    if (input.catalogRevision !== undefined && input.catalogRevision !== this.options.registry.getRevision?.()) {
+      throw new ToolDeniedError(input.toolName, "Tool catalog changed; start a new code_mode call.");
+    }
+    if (input.catalogTool) {
+      const current = await this.toolForContext(input.toolName, toolRegistryContext(input));
+      if (!current || toolFingerprint(current) !== toolFingerprint(input.catalogTool)) {
+        throw new ToolDeniedError(input.toolName, "Tool catalog changed; start a new code_mode call.");
+      }
+    }
+  }
+
+  private async validate<Input>(tool: ChiliToolDefinition<Input>, input: unknown, context?: ToolRegistryContext, signal?: AbortSignal): Promise<Input> {
     const result = tool.validate ? await tool.validate(input, context) : { ok: true as const, value: input as Input };
     if (!result.ok) throw new ToolValidationError(tool.name, result.message);
-    validateToolSchema(tool, result.value);
+    await validateToolSchema(tool, result.value, signal);
     return result.value;
   }
 
   private async assertPreparedCurrent(prepared: PreparedToolCall, input: ExecuteToolInput): Promise<void> {
+    await this.assertCatalogCurrent(input);
     const details = this.preparedCalls.get(prepared)!;
     const current = await this.toolForContext(input.toolName, toolRegistryContext(input));
     if (!current || prepared.registryRevision !== this.options.registry.getRevision?.()
@@ -586,6 +618,13 @@ export class ToolExecutor {
   ): ChiliToolExecutionContext {
     let outputSequence = 0;
     let streamedOutputBytes = 0;
+    let catalog: Promise<{ tools: ChiliToolDefinition[]; revision: number | undefined }> | undefined;
+    const loadCatalog = () => catalog ??= (async () => {
+      const revision = this.options.registry.getRevision?.();
+      const tools = (await this.visibleTools(input)).map(snapshotToolDefinition);
+      if (revision !== this.options.registry.getRevision?.()) throw new Error("Tool catalog changed; start a new code_mode call.");
+      return { tools, revision };
+    })();
     const resourceRequest: import("./types.js").ApprovalPreflightRequest = {
       sessionId: input.sessionId, callId, toolName: tool.name, risk: tool.risk,
       permission: tool.name, patterns: ["*"], workspaceRoot: input.cwd,
@@ -606,7 +645,30 @@ export class ToolExecutor {
         await this.options.approvals.assertFileResourceAccess?.(resourceRequest, paths, access);
         throwIfAborted(input.signal);
       },
-      visibleTools: () => this.visibleTools(input),
+      visibleTools: tool.isOrchestrator ? async () => (await loadCatalog()).tools : () => this.visibleTools(input),
+      ...(tool.isOrchestrator ? {
+        invokeTool: async (name: string, childInput: unknown, childSignal?: AbortSignal): Promise<ToolResult> => {
+          input.dispatchScope?.throwIfFailed();
+          const snapshot = await loadCatalog();
+          const child = snapshot.tools.find((candidate) => candidate.name === name);
+          if (!child || child.codeMode !== true || child.isOrchestrator) {
+            throw new ToolDeniedError(name, "Tool is not in this script's callable catalog.");
+          }
+          const signals = [input.signal, childSignal].filter((signal): signal is AbortSignal => signal !== undefined);
+          const signal = AbortSignal.any(signals);
+          signal.throwIfAborted();
+          const result = await this.execute({
+            sessionId: input.sessionId, turnId: input.turnId, cwd: input.cwd,
+            toolName: child.name, input: childInput, parentCallId: callId,
+            ...(input.policy ? { policy: input.policy } : {}),
+            ...(input.dispatchScope ? { dispatchScope: input.dispatchScope } : {}),
+            ...(snapshot.revision === undefined ? {} : { catalogRevision: snapshot.revision }),
+            catalogTool: child, signal,
+          });
+          if (result.status !== "completed") throw Object.assign(result.error, { callId: result.callId });
+          return result.result;
+        },
+      } : {}),
       persistedOutputLimits: {
         ...(this.options.maxPersistedOutputBytes !== undefined
           ? { maxBytes: this.options.maxPersistedOutputBytes }
@@ -854,6 +916,7 @@ export class ToolExecutor {
     } catch (error) {
       const normalizedError = toError(error);
       this.eventPublishFailures.add(normalizedError);
+      input.dispatchScope?.fail(normalizedError);
       throw normalizedError;
     }
   }
@@ -1589,7 +1652,20 @@ function preparationContext(input: ExecuteToolInput): string {
 }
 
 function toolFingerprint(tool: ChiliToolDefinition): string {
-  return JSON.stringify([tool.name, tool.revision, tool.inputSchema, tool.risk, tool.aliases, tool.resourcePolicy]);
+  return JSON.stringify([
+    tool.name, tool.revision, tool.inputSchema, tool.risk, tool.aliases, tool.resourcePolicy,
+    tool.codeMode, tool.isOrchestrator, tool.inputSchemaSource, tool.outputSchema,
+    tool.description, String(tool.isReadOnly), String(tool.isConcurrencySafe), String(tool.isDestructive),
+  ]);
+}
+
+function snapshotToolDefinition(tool: ChiliToolDefinition): ChiliToolDefinition {
+  return {
+    ...tool,
+    inputSchema: freezePreparedValue(tool.inputSchema),
+    ...(tool.outputSchema === undefined ? {} : { outputSchema: freezePreparedValue(tool.outputSchema) }),
+    ...(tool.aliases === undefined ? {} : { aliases: [...tool.aliases] }),
+  };
 }
 
 function freezePreparedValue(value: unknown): unknown {

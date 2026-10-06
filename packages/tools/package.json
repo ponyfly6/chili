@@ -13,7 +13,8 @@
     "@chili/policy": "workspace:*",
     "@chili/protocol": "workspace:*",
     "@chili/skills": "workspace:*",
-    "ajv": "^8.20.0"
+    "quickjs-wasi": "3.6.2",
+    "ajv": "8.20.0"
   },
   "scripts": {
     "typecheck": "tsc -b"

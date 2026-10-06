@@ -28,6 +28,17 @@ export interface GrepInput {
 export function createGrepTool(): ChiliToolDefinition<GrepInput> {
   return {
     name: "grep",
+    codeMode: true,
+    outputSchema: {
+      type: "object",
+      required: ["lines", "outputMode", "truncated", "maxColumns"],
+      properties: {
+        lines: { type: "array", items: { type: "string" }, description: "Ripgrep output lines before Chili display notices. These are text lines, not parsed match records; context separators and ripgrep long-line omission notices may appear." },
+        outputMode: { type: "string", enum: ["content", "files_with_matches", "count"] },
+        truncated: { type: "boolean", description: "Whether the line or process output byte limit was reached." },
+        maxColumns: { type: "integer", description: "Ripgrep replaces longer content lines with an omission notice." },
+      },
+    },
     aliases: ["grep_search"],
     searchHint: "Search file contents with ripgrep, optional path/paths, glob/type filters, context lines, counts, or file names.",
     description: "Search workspace file contents using ripgrep. Use paths for multiple search roots.",
@@ -217,6 +228,7 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
       return {
         title: `grep ${input.pattern}`,
         output: truncated ? `${output}\n[truncated after ${visible.length} line(s)]` : output,
+        structuredData: { lines: visible, outputMode: input.outputMode ?? "content", truncated, maxColumns: 500 },
         metadata: {
           pattern: input.pattern,
           path: input.path,

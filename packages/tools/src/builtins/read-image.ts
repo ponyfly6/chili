@@ -23,6 +23,13 @@ const MIME_BY_EXTENSION: Record<string, string> = {
 export function createReadImageTool(): ChiliToolDefinition<ReadImageInput> {
   return {
     name: "read_image",
+    codeMode: false,
+    outputSchema: {
+      type: "object",
+      description: "Image metadata. Image pixels are attached separately to the tool result, not embedded in this JSON value.",
+      required: ["path", "bytes", "mimeType"],
+      properties: { path: { type: "string" }, bytes: { type: "integer" }, mimeType: { type: "string" } },
+    },
     aliases: ["view_image", "image_read"],
     searchHint: "Read an image file from the workspace and send it to vision-capable models. For text-only pasted-image prompts, prefer an OCR or image-understanding MCP tool that returns text.",
     description: "Read a PNG, JPEG, GIF, or WebP image within the current workspace and return it as an image block for vision-capable models.",
@@ -93,6 +100,7 @@ export function createReadImageTool(): ChiliToolDefinition<ReadImageInput> {
             "The visual image content is attached to this tool result as an image block. Inspect that image block directly; do not treat this as metadata-only output.",
           ].join("\n"),
           content: [{ type: "image", data, mimeType }],
+          structuredData: { path: target.relativePath, bytes: buffer.byteLength, mimeType },
           metadata: {
             path: target.relativePath,
             bytes: buffer.byteLength,
