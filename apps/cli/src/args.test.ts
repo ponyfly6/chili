@@ -158,100 +158,6 @@ test("parses the read-only store doctor command", () => {
   expect(() => parseArgs(["store", "recover"])).toThrow("Unknown store command: recover");
 });
 
-test("parses incomplete as a terminal task close status", () => {
-  expect(parseArgs(["--status", "incomplete", "close", "task_1"])).toMatchObject({
-    command: "task-close",
-    taskId: "task_1",
-    taskStatus: "incomplete",
-  });
-});
-
-test("parses team status and nested team view commands", () => {
-  expect(parseArgs(["team", "status", "team_1", "--json"])).toMatchObject({
-    command: "team",
-    teamId: "team_1",
-    json: true,
-  });
-  expect(parseArgs(["team", "tasks", "team_1"])).toMatchObject({
-    command: "team-tasks",
-    teamId: "team_1",
-  });
-  expect(parseArgs(["team", "members", "team_1"])).toMatchObject({
-    command: "team-members",
-    teamId: "team_1",
-  });
-  expect(parseArgs(["team", "messages", "team_1"])).toMatchObject({
-    command: "team-messages",
-    teamId: "team_1",
-  });
-});
-
-test("keeps legacy team command aliases working", () => {
-  expect(parseArgs(["team", "team_1"])).toMatchObject({
-    command: "team",
-    teamId: "team_1",
-  });
-  expect(parseArgs(["team-status", "team_1"])).toMatchObject({
-    command: "team",
-    teamId: "team_1",
-  });
-  expect(parseArgs(["team-tasks", "team_1", "--json"])).toMatchObject({
-    command: "team-tasks",
-    teamId: "team_1",
-    json: true,
-  });
-});
-
-test("parses team run loop command and runner flags", () => {
-  expect(parseArgs([
-    "team-run-loop",
-    "team_1",
-    "--until-drained",
-    "--max-cycles",
-    "3",
-    "--timeout-ms",
-    "5000",
-    "--max-concurrent-dispatches",
-    "6",
-    "--max-concurrent-verifications",
-    "3",
-    "--json",
-  ])).toMatchObject({
-    command: "team-run-loop",
-    teamId: "team_1",
-    once: false,
-    untilDrained: true,
-    maxCycles: 3,
-    timeoutMs: 5000,
-    maxConcurrentDispatches: 6,
-    maxConcurrentVerifications: 3,
-    json: true,
-  });
-  expect(parseArgs(["team", "run-loop", "team_1"])).toMatchObject({
-    command: "team-run-loop",
-    teamId: "team_1",
-  });
-});
-
-test("usage documents team run loop fan-out flag", () => {
-  expect(usage()).toContain("--until-drained");
-  expect(usage()).toContain("--max-concurrent-dispatches <n>");
-  expect(usage()).toContain("--max-concurrent-verifications <n>");
-  expect(usage()).toContain("openai-codex | codex-api");
-  expect(usage()).toContain("codex-api/gpt-6.1-sol");
-  expect(usage()).toContain("xai | grok");
-  expect(usage()).toContain("xai/grok-4.6");
-});
-
-test("parses team merge command", () => {
-  expect(parseArgs(["team-merge", "team_1", "--task", "task_1", "--json"])).toMatchObject({
-    command: "team-merge",
-    teamId: "team_1",
-    taskId: "task_1",
-    json: true,
-  });
-});
-
 test("parses memory commands", () => {
   expect(parseArgs(["memory", "show"])).toMatchObject({
     command: "memory-show",
@@ -360,4 +266,28 @@ test("parses mcp management commands", () => {
     mcpAction: "remove",
     mcpServer: "github",
   });
+});
+
+test("agent controls identify the parent session and the target agent separately", () => {
+  expect(parseArgs(["agents", "--resume", "session_parent", "--json"])).toMatchObject({
+    command: "agents", resume: "session_parent", json: true,
+  });
+  expect(parseArgs(["agent-stop", "session_child", "--resume", "session_parent"])).toMatchObject({
+    command: "agent-stop", agentId: "session_child", resume: "session_parent",
+  });
+  expect(parseArgs(["agent-resume", "session_child", "--resume", "session_parent"])).toMatchObject({
+    command: "agent-resume", agentId: "session_child", resume: "session_parent",
+  });
+  expect(() => parseArgs(["agent-stop"])).toThrow("requires a value");
+});
+
+test("retired workflow flags are rejected and help exposes only agent controls", () => {
+  for (const flag of ["--team", "--task", "--status", "--until-drained", "--max-cycles", "--max-concurrent-dispatches"]) {
+    expect(() => parseArgs([flag, "1"])).toThrow(`Unknown option: ${flag}`);
+  }
+  expect(usage()).toContain("agent-stop <agent-id>");
+  expect(usage()).toContain("agent-resume <agent-id>");
+  expect(usage()).not.toContain("team-run");
+  expect(usage()).not.toContain("recover-tasks");
+  expect(parseArgs(["task", "is", "to", "review", "code"]).prompt).toBe("task is to review code");
 });

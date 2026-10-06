@@ -1,20 +1,17 @@
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import {
   chiliBasePromptFragment,
-  type AgentTaskControlService,
-  type AgentTreeControlService,
   type ModelRouter,
   type ModelStreamEvent,
   type ModelStreamInput,
   type PromptFragment,
-  type TeamControlService,
 } from "@chili/core";
-import type { AgentPath, AgentRunId, ApprovalId, ChiliEvent, SessionId, TaskId, TeamId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { AgentPath, ApprovalId, ChiliEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { SkillRegistry, type Skill } from "@chili/skills";
-import { SqliteEventStore, type AgentMailboxRow, type AgentTaskRow } from "@chili/store";
+import { SqliteEventStore } from "@chili/store";
 import {
   DeferredUserInputQueue,
   PolicyApprovalBroker,
@@ -24,12 +21,8 @@ import {
   type ChiliToolExecutionContext,
 } from "@chili/tools";
 import {
-  buildCliChildPromptFragments,
   buildCliPromptFragments,
   createCliHarness,
-  createCompleteTaskController,
-  createSubagentControlController,
-  createTeamToolController,
   type CliHarness,
 } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
@@ -327,326 +320,6 @@ test("CLI harness retries stale-turn reconciliation after a crashed run claim le
   }
 });
 
-test("CLI harness recovers an expired child task, agent run, and child turn through live events exactly once", async () => {
-  const root = await mkdtempName();
-  const repo = join(root, "repo");
-  const stateDir = join(repo, ".chili");
-  const dbPath = join(stateDir, "chili.sqlite");
-  const parentSessionId = "session_harness_child_parent" as SessionId;
-  const childSessionId = "session_harness_child_crash" as SessionId;
-  const taskId = "task_harness_child_crash" as TaskId;
-  const runId = "agent_harness_child_crash" as AgentRunId;
-  const turnId = "turn_harness_child_crash" as TurnId;
-  const path = "/root/task_harness_child_crash" as AgentPath;
-  let harness: CliHarness | undefined;
-  let unsubscribe: (() => void) | undefined;
-  const observed: ChiliEvent[] = [];
-  try {
-    await mkdir(stateDir, { recursive: true });
-    const crashed = new SqliteEventStore(dbPath);
-    const now = Date.now();
-    try {
-      await crashed.appendMany([
-        {
-          id: "event_harness_child_parent",
-          type: "session.created",
-          time: (now - 1_000) as TimestampMs,
-          sessionId: parentSessionId,
-          payload: { sessionId: parentSessionId, cwd: repo },
-        },
-        {
-          id: "event_harness_child_task",
-          type: "agent.task_created",
-          time: (now - 950) as TimestampMs,
-          sessionId: parentSessionId,
-          payload: {
-            taskId,
-            path,
-            parentPath: "/root" as AgentPath,
-            parentSessionId,
-            childSessionId,
-            taskName: "crashed child",
-            cwd: repo,
-            prompt: "keep working",
-            mode: "background",
-          },
-        },
-        {
-          id: "event_harness_child_spawned",
-          type: "agent.spawned",
-          time: (now - 900) as TimestampMs,
-          sessionId: parentSessionId,
-          payload: {
-            runId,
-            taskId,
-            path,
-            parentPath: "/root" as AgentPath,
-            parentSessionId,
-            childSessionId,
-            taskName: "crashed child",
-            cwd: repo,
-            mode: "background",
-            generation: 1,
-          },
-        },
-        {
-          id: "event_harness_child_session",
-          type: "session.created",
-          time: (now - 850) as TimestampMs,
-          sessionId: childSessionId,
-          payload: { sessionId: childSessionId, cwd: repo },
-        },
-        {
-          id: "event_harness_child_running",
-          type: "session.status_changed",
-          time: (now - 800) as TimestampMs,
-          sessionId: childSessionId,
-          payload: { sessionId: childSessionId, status: "running" },
-        },
-        {
-          id: "event_harness_child_turn",
-          type: "turn.started",
-          time: (now - 750) as TimestampMs,
-          sessionId: childSessionId,
-          payload: { turnId },
-        },
-      ]);
-      expect(await crashed.claimAgentTaskLease({
-        taskId,
-        runId,
-        generation: 1,
-        owner: "crashed-child-owner",
-        ttlMs: 100,
-        now,
-      })).toMatchObject({ acquired: true });
-    } finally {
-      crashed.close();
-    }
-
-    harness = await createCliHarness({
-      cwd: repo,
-      model: "fake",
-      quiet: true,
-      yes: true,
-      mcpConnectMode: "manual",
-      staleTurnRecoveryMs: 0,
-      staleTurnRecoveryIntervalMs: 10,
-    });
-    unsubscribe = harness.events.subscribe((event) => observed.push(event));
-
-    await waitFor(async () => {
-      const task = await harness?.events.agentTask(taskId);
-      const statuses = await harness?.events.events({
-        sessionId: childSessionId,
-        type: "session.status_changed",
-        limit: 20,
-      });
-      const childStatus = (statuses?.at(-1)?.payload as { status?: string } | undefined)?.status;
-      return task?.status === "cancelled" && childStatus === "failed";
-    });
-
-    // Background completion also wakes the parent. Let its events settle so
-    // recovery assertions cannot accidentally count another session's turn.
-    await harness.mailboxPump.waitForIdle();
-
-    expect(await harness.events.agentTask(taskId)).toMatchObject({
-      id: taskId,
-      status: "cancelled",
-      error: "stale_agent_worker",
-    });
-    expect((await harness.events.agentRuns({ taskId, limit: 10 }))[0]).toMatchObject({
-      id: runId,
-      status: "cancelled",
-    });
-    expect(observed.filter((event) => event.type === "agent.task_completed")).toHaveLength(1);
-    expect(observed.filter((event) => event.type === "agent.completed")).toHaveLength(1);
-    expect(observed.filter((event) => event.type === "turn.completed"
-      && event.sessionId === childSessionId)).toHaveLength(1);
-    expect(observed.filter((event) => event.type === "session.status_changed"
-      && event.sessionId === childSessionId)).toHaveLength(1);
-    expect(observed.some((event) => event.type === "turn.completed"
-      && event.sessionId === parentSessionId)).toBe(true);
-
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 30));
-    const durable = await harness.events.events({ limit: 100 });
-    expect(durable.filter((event) => event.type === "agent.task_completed"
-      && (event.payload as { taskId?: TaskId }).taskId === taskId)).toHaveLength(1);
-    expect(durable.filter((event) => event.type === "agent.completed"
-      && (event.payload as { runId?: AgentRunId }).runId === runId)).toHaveLength(1);
-    expect(durable.filter((event) => event.type === "turn.completed"
-      && (event.payload as { turnId?: TurnId }).turnId === turnId)).toHaveLength(1);
-  } finally {
-    unsubscribe?.();
-    await harness?.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("CLI harness recovery never steals another store's pending or lease-null running task", async () => {
-  const root = await mkdtempName();
-  const repo = join(root, "repo");
-  const stateDir = join(repo, ".chili");
-  const dbPath = join(stateDir, "chili.sqlite");
-  const parentSessionId = "session_harness_live_peer" as SessionId;
-  const pendingTaskId = "task_harness_peer_pending" as TaskId;
-  const runningTaskId = "task_harness_peer_running" as TaskId;
-  const runningRunId = "agent_harness_peer_running" as AgentRunId;
-  const leasedTaskId = "task_harness_peer_leased" as TaskId;
-  const leasedRunId = "agent_harness_peer_leased" as AgentRunId;
-  const pendingPath = "/root/task_harness_peer_pending" as AgentPath;
-  const runningPath = "/root/task_harness_peer_running" as AgentPath;
-  const leasedPath = "/root/task_harness_peer_leased" as AgentPath;
-  let peer: SqliteEventStore | undefined;
-  let harness: CliHarness | undefined;
-  try {
-    await mkdir(stateDir, { recursive: true });
-    peer = new SqliteEventStore(dbPath);
-    const now = Date.now();
-    await peer.appendMany([
-      {
-        id: "event_harness_peer_session",
-        type: "session.created",
-        time: (now - 1_000) as TimestampMs,
-        sessionId: parentSessionId,
-        payload: { sessionId: parentSessionId, cwd: repo },
-      },
-      {
-        id: "event_harness_peer_pending",
-        type: "agent.task_created",
-        time: (now - 900) as TimestampMs,
-        sessionId: parentSessionId,
-        payload: {
-          taskId: pendingTaskId,
-          path: pendingPath,
-          parentPath: "/root" as AgentPath,
-          parentSessionId,
-          childSessionId: "session_harness_peer_pending" as SessionId,
-          taskName: "peer pending",
-          cwd: repo,
-          prompt: "queued behind a peer limiter",
-          mode: "background",
-        },
-      },
-      {
-        id: "event_harness_peer_running_task",
-        type: "agent.task_created",
-        time: (now - 850) as TimestampMs,
-        sessionId: parentSessionId,
-        payload: {
-          taskId: runningTaskId,
-          path: runningPath,
-          parentPath: "/root" as AgentPath,
-          parentSessionId,
-          childSessionId: "session_harness_peer_running" as SessionId,
-          taskName: "peer beginning",
-          cwd: repo,
-          prompt: "between spawn commit and lease claim",
-          mode: "background",
-        },
-      },
-      {
-        id: "event_harness_peer_spawned",
-        type: "agent.spawned",
-        time: (now - 800) as TimestampMs,
-        sessionId: parentSessionId,
-        payload: {
-          runId: runningRunId,
-          taskId: runningTaskId,
-          path: runningPath,
-          parentPath: "/root" as AgentPath,
-          parentSessionId,
-          childSessionId: "session_harness_peer_running" as SessionId,
-          taskName: "peer beginning",
-          cwd: repo,
-          mode: "background",
-          generation: 1,
-        },
-      },
-      {
-        id: "event_harness_peer_leased_task",
-        type: "agent.task_created",
-        time: (now - 750) as TimestampMs,
-        sessionId: parentSessionId,
-        payload: {
-          taskId: leasedTaskId,
-          path: leasedPath,
-          parentPath: "/root" as AgentPath,
-          parentSessionId,
-          childSessionId: "session_harness_peer_leased" as SessionId,
-          taskName: "peer leased",
-          cwd: repo,
-          prompt: "owned by a live peer before startup recovery",
-          mode: "background",
-        },
-      },
-      {
-        id: "event_harness_peer_leased_spawned",
-        type: "agent.spawned",
-        time: (now - 700) as TimestampMs,
-        sessionId: parentSessionId,
-        payload: {
-          runId: leasedRunId,
-          taskId: leasedTaskId,
-          path: leasedPath,
-          parentPath: "/root" as AgentPath,
-          parentSessionId,
-          childSessionId: "session_harness_peer_leased" as SessionId,
-          taskName: "peer leased",
-          cwd: repo,
-          mode: "background",
-          generation: 1,
-        },
-      },
-    ]);
-    expect(await peer.claimAgentTaskLease({
-      taskId: leasedTaskId,
-      runId: leasedRunId,
-      generation: 1,
-      owner: "startup-live-peer-owner",
-      ttlMs: 10_000,
-      now,
-    })).toMatchObject({ acquired: true });
-
-    harness = await createCliHarness({
-      cwd: repo,
-      model: "fake",
-      quiet: true,
-      yes: true,
-      mcpConnectMode: "manual",
-      staleTurnRecoveryMs: 0,
-      staleTurnRecoveryIntervalMs: 5,
-    });
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 30));
-
-    expect(await peer.agentTask(pendingTaskId)).toMatchObject({ status: "pending" });
-    expect(await peer.agentTask(leasedTaskId)).toMatchObject({
-      status: "running",
-      leaseOwner: "startup-live-peer-owner",
-    });
-    const runningBeforeLease = await peer.agentTask(runningTaskId);
-    expect(runningBeforeLease).toMatchObject({ status: "running" });
-    expect(runningBeforeLease?.leaseOwner).toBeUndefined();
-
-    expect(await peer.claimAgentTaskLease({
-      taskId: runningTaskId,
-      runId: runningRunId,
-      generation: 1,
-      owner: "live-peer-owner",
-      ttlMs: 1_000,
-      now: Date.now(),
-    })).toMatchObject({ acquired: true });
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
-    expect(await peer.agentTask(runningTaskId)).toMatchObject({
-      status: "running",
-      leaseOwner: "live-peer-owner",
-    });
-  } finally {
-    await harness?.close();
-    peer?.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
 test("CLI harness isolates a stale-recovery reporter that throws", async () => {
   const root = await mkdtempName();
   const repo = join(root, "repo");
@@ -885,7 +558,7 @@ test("CLI harness scopes skill catalogs, mentions, and activation to each sessio
   }
 });
 
-test("CLI harness does not expose an opaque injected Bash runner to scoped workers", async () => {
+test("CLI agents share Bash availability while scoped execution fails closed on an opaque runner", async () => {
   const root = await mkdtempName();
   const repo = join(root, "repo");
   let harness: CliHarness | undefined;
@@ -905,7 +578,7 @@ test("CLI harness does not expose an opaque injected Bash runner to scoped worke
       bashRunner: injectedRunner,
     });
 
-    type ToolRegistryView = { list(): Array<{ name: string }> };
+    type ToolRegistryView = { list(): Array<{ name: string }>; get(name: string): ChiliToolDefinition | undefined };
     const rootRegistry = (harness.runtime as unknown as {
       options: { toolRegistry: ToolRegistryView };
     }).options.toolRegistry;
@@ -920,593 +593,27 @@ test("CLI harness does not expose an opaque injected Bash runner to scoped worke
     }).options.runtime?.options.runtime.options.toolRegistry;
 
     expect(rootRegistry.list().some((tool) => tool.name === "bash")).toBe(true);
-    expect(childRegistry?.list().some((tool) => tool.name === "bash")).toBe(false);
+    expect(childRegistry?.list().some((tool) => tool.name === "bash")).toBe(true);
+    const bash = childRegistry?.get("bash");
+    if (!bash) throw new Error("Expected the shared Bash tool");
+    const callId = "call_scoped_bash" as ToolCallId;
+    await expect(bash.execute({ command: "git status" }, {
+      cwd: repo,
+      sessionId: "session_scoped_bash" as SessionId,
+      turnId: "turn_scoped_bash" as TurnId,
+      callId,
+      outputArtifactId: callId,
+      signal: new AbortController().signal,
+      executionPolicy: { executeScope: ["git status"] },
+      metadata: async () => {},
+      streamOutput: async () => {},
+      requestApproval: async () => ({ action: "allow_once" }),
+      registerPersistedOutput: async () => {},
+    })).rejects.toThrow("cannot enforce the current execution policy");
     expect(rootRegistry.list().some((tool) => tool.name === "delegation_status")).toBe(true);
     expect(rootRegistry.list().some((tool) => tool.name === "delegation_set")).toBe(true);
     expect(childRegistry?.list().some((tool) => tool.name === "delegation_status")).toBe(false);
     expect(childRegistry?.list().some((tool) => tool.name === "delegation_set")).toBe(false);
-  } finally {
-    await harness?.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("CLI task tool adapter forwards the tool AbortSignal to task follow-up", async () => {
-  let receivedSignal: AbortSignal | undefined;
-  const task: AgentTaskRow = {
-    id: "task_signal" as TaskId,
-    path: "/root/task_signal" as AgentPath,
-    taskName: "signal worker",
-    parentSessionId: "session_signal" as SessionId,
-    status: "completed",
-    generation: 1,
-    createdAt: 1,
-    updatedAt: 2,
-  };
-  const tasks = {
-    async getTask() {
-      return task;
-    },
-    async followupTask(input: { signal?: AbortSignal }) {
-      receivedSignal = input.signal;
-      return {
-        task,
-        result: { status: "completed", turns: [], finishReason: "stop" },
-      };
-    },
-  } as unknown as AgentTaskControlService;
-  const controller = createSubagentControlController(
-    tasks,
-    {} as AgentTreeControlService,
-  );
-  const context = agentMessageToolContext(
-    "/repo",
-    "session_signal" as SessionId,
-  );
-
-  await controller.followupTask({ taskId: task.id, prompt: "continue" }, context);
-
-  expect(receivedSignal).toBe(context.signal);
-});
-
-test("CLI task and mailbox controls reject targets owned by another root session", async () => {
-  const sessionId = "session_control_current" as SessionId;
-  const otherSessionId = "session_control_other" as SessionId;
-  const currentChildSessionId = "session_control_current_child" as SessionId;
-  const otherChildSessionId = "session_control_other_child" as SessionId;
-  const sharedPath = "/root/shared" as AgentPath;
-  const currentTask: AgentTaskRow = {
-    id: "task_control_current" as TaskId,
-    path: sharedPath,
-    taskName: "current worker",
-    parentSessionId: sessionId,
-    childSessionId: currentChildSessionId,
-    status: "completed",
-    generation: 1,
-    createdAt: 1,
-    updatedAt: 2,
-  };
-  const otherTask: AgentTaskRow = {
-    id: "task_control_other" as TaskId,
-    path: sharedPath,
-    taskName: "other worker",
-    parentSessionId: otherSessionId,
-    childSessionId: otherChildSessionId,
-    status: "completed",
-    generation: 1,
-    createdAt: 1,
-    updatedAt: 2,
-  };
-  const mailbox: AgentMailboxRow[] = [
-    {
-      id: "message_control_current",
-      path: sharedPath,
-      fromPath: "/root" as AgentPath,
-      triggerTurn: false,
-      status: "queued",
-      taskId: currentTask.id,
-      recipientSessionId: currentChildSessionId,
-      createdAt: 1,
-    },
-    {
-      id: "message_control_other",
-      path: sharedPath,
-      fromPath: "/root" as AgentPath,
-      triggerTurn: false,
-      status: "queued",
-      taskId: otherTask.id,
-      recipientSessionId: otherChildSessionId,
-      createdAt: 2,
-    },
-    {
-      id: "message_control_mismatched",
-      path: sharedPath,
-      fromPath: "/root" as AgentPath,
-      triggerTurn: false,
-      status: "queued",
-      taskId: currentTask.id,
-      recipientSessionId: otherChildSessionId,
-      createdAt: 3,
-    },
-  ];
-  let followupCalls = 0;
-  let closeCalls = 0;
-  let consumeCalls = 0;
-  const tasks = {
-    async getTask(taskId: TaskId) {
-      const task = [currentTask, otherTask].find((candidate) => candidate.id === taskId);
-      if (!task) throw new Error(`Agent task not found: ${taskId}`);
-      return task;
-    },
-    async listTasks() {
-      // Deliberately ignore the query so the controller must enforce ownership itself.
-      return [currentTask, otherTask];
-    },
-    async followupTask() {
-      followupCalls += 1;
-      return {
-        task: otherTask,
-        result: { status: "completed", turns: [], finishReason: "stop" },
-      };
-    },
-    async closeTask() {
-      closeCalls += 1;
-      return otherTask;
-    },
-  } as unknown as AgentTaskControlService;
-  const agents = {
-    async mailbox(query?: { messageId?: string }) {
-      return query?.messageId
-        ? mailbox.filter((message) => message.id === query.messageId)
-        : mailbox;
-    },
-    async consumeMailbox() {
-      consumeCalls += 1;
-      return mailbox[0];
-    },
-  } as unknown as AgentTreeControlService;
-  const controller = createSubagentControlController(tasks, agents);
-  const context = agentMessageToolContext("/repo", sessionId);
-
-  await expect(controller.followupTask({
-    taskId: otherTask.id,
-    prompt: "continue foreign work",
-  }, context)).rejects.toThrow(`Agent task is not visible to this session: ${otherTask.id}`);
-  await expect(controller.closeTask({ taskId: otherTask.id }, context)).rejects.toThrow(
-    `Agent task is not visible to this session: ${otherTask.id}`,
-  );
-  expect(followupCalls).toBe(0);
-  expect(closeCalls).toBe(0);
-  expect(await controller.listTasks({ all: true }, context)).toEqual([
-    expect.objectContaining({ taskId: currentTask.id }),
-  ]);
-
-  for (const input of [
-    { all: true },
-    { path: sharedPath },
-  ]) {
-    expect(await controller.listMailbox(input, context)).toEqual([
-      expect.objectContaining({ messageId: "message_control_current" }),
-    ]);
-  }
-  expect(await controller.listMailbox({ taskId: otherTask.id }, context)).toEqual([]);
-  await expect(controller.consumeMailbox({
-    messageId: "message_control_mismatched",
-  }, context)).rejects.toThrow("Mailbox message is not visible to this session");
-  expect(consumeCalls).toBe(0);
-});
-
-test("CLI complete_task cannot complete or abort sibling and foreign runs", async () => {
-  const sessionId = "session_complete_owner" as SessionId;
-  const siblingSessionId = "session_complete_sibling" as SessionId;
-  const otherSessionId = "session_complete_other" as SessionId;
-  const rows: AgentTaskRow[] = [
-    {
-      id: "task_complete_owner" as TaskId,
-      path: "/root/owner" as AgentPath,
-      taskName: "owner",
-      parentSessionId: "session_complete_parent" as SessionId,
-      childSessionId: sessionId,
-      status: "running",
-      generation: 1,
-      createdAt: 1,
-      updatedAt: 1,
-    },
-    {
-      id: "task_complete_sibling" as TaskId,
-      path: "/root/sibling" as AgentPath,
-      taskName: "sibling",
-      parentSessionId: "session_complete_parent" as SessionId,
-      childSessionId: siblingSessionId,
-      status: "running",
-      generation: 1,
-      createdAt: 1,
-      updatedAt: 1,
-    },
-    {
-      id: "task_complete_foreign" as TaskId,
-      path: "/root/foreign" as AgentPath,
-      taskName: "foreign",
-      parentSessionId: otherSessionId,
-      childSessionId: "session_complete_foreign_child" as SessionId,
-      status: "running",
-      generation: 1,
-      createdAt: 1,
-      updatedAt: 1,
-    },
-  ];
-  let targetRunAbortCalls = 0;
-  const tasks = {
-    async getTask(taskId: TaskId) {
-      const task = rows.find((candidate) => candidate.id === taskId);
-      if (!task) throw new Error(`Agent task not found: ${taskId}`);
-      return task;
-    },
-    async listTasks(query: { childSessionId?: SessionId }) {
-      return rows.filter((task) => task.childSessionId === query.childSessionId);
-    },
-    async completeTask() {
-      targetRunAbortCalls += 1;
-      throw new Error("must not abort target run");
-    },
-  } as unknown as AgentTaskControlService;
-  const fallback = {
-    async completeTask() {
-      targetRunAbortCalls += 1;
-      throw new Error("must not abort fallback run");
-    },
-  } as unknown as import("@chili/tools").SubagentController;
-  const controller = createCompleteTaskController(tasks, fallback);
-  const context = agentMessageToolContext("/repo", sessionId);
-
-  for (const taskId of [rows[1]?.id, rows[2]?.id]) {
-    await expect(controller.completeTask({
-      taskId: taskId as TaskId,
-      summary: "forged completion",
-    }, context)).rejects.toThrow(`Agent task cannot be completed by this session: ${taskId}`);
-  }
-  expect(targetRunAbortCalls).toBe(0);
-});
-
-test("CLI team tools isolate teams and descendant session bindings between roots", async () => {
-  const sessionId = "session_team_scope_current" as SessionId;
-  const otherSessionId = "session_team_scope_other" as SessionId;
-  const teamId = "team_scope_current" as TeamId;
-  const otherTeamId = "team_scope_other" as TeamId;
-  const teamPath = "/root" as AgentPath;
-  const memberPath = "/root/member" as AgentPath;
-  const teamRows = [
-    {
-      id: teamId,
-      sessionId,
-      name: "current team",
-      leadPath: teamPath,
-      status: "active" as const,
-      createdAt: 1,
-      updatedAt: 1,
-    },
-    {
-      id: otherTeamId,
-      sessionId: otherSessionId,
-      name: "other team",
-      leadPath: teamPath,
-      status: "active" as const,
-      createdAt: 1,
-      updatedAt: 1,
-    },
-  ];
-  let addMemberCalls = 0;
-  let createTaskCalls = 0;
-  let createTeamCalls = 0;
-  const teams = {
-    async listTeams() {
-      return teamRows;
-    },
-    async members(targetTeamId: TeamId) {
-      const ownerSessionId = targetTeamId === teamId ? sessionId : otherSessionId;
-      return [{
-        teamId: targetTeamId,
-        path: teamPath,
-        name: "lead",
-        role: "leader",
-        status: "running" as const,
-        childSessionId: ownerSessionId,
-        createdAt: 1,
-        updatedAt: 1,
-      }];
-    },
-    async addMember() {
-      addMemberCalls += 1;
-      throw new Error("must not mutate");
-    },
-    async createTeam() {
-      createTeamCalls += 1;
-      throw new Error("must not mutate");
-    },
-    async createTask() {
-      createTaskCalls += 1;
-      throw new Error("must not mutate");
-    },
-  } as unknown as TeamControlService;
-  const directChildSessionId = "session_team_scope_child" as SessionId;
-  const foreignChildSessionId = "session_team_scope_foreign_child" as SessionId;
-  const duplicateChildSessionId = "session_team_scope_duplicate_child" as SessionId;
-  const taskRows: AgentTaskRow[] = [
-    {
-      id: "task_team_scope_child" as TaskId,
-      path: memberPath,
-      taskName: "member",
-      parentSessionId: sessionId,
-      childSessionId: directChildSessionId,
-      status: "completed",
-      generation: 1,
-      createdAt: 1,
-      updatedAt: 1,
-    },
-    {
-      id: "task_team_scope_foreign" as TaskId,
-      path: memberPath,
-      taskName: "foreign member",
-      parentSessionId: otherSessionId,
-      childSessionId: foreignChildSessionId,
-      status: "completed",
-      generation: 1,
-      createdAt: 1,
-      updatedAt: 1,
-    },
-    ...[0, 1].map((index): AgentTaskRow => ({
-      id: `task_team_scope_duplicate_${index}` as TaskId,
-      path: memberPath,
-      taskName: `duplicate ${index}`,
-      parentSessionId: sessionId,
-      childSessionId: duplicateChildSessionId,
-      status: "completed",
-      generation: 1,
-      createdAt: 1,
-      updatedAt: 1,
-    })),
-  ];
-  const tasks = {
-    async listTasks(query: { childSessionId?: SessionId }) {
-      return taskRows.filter((task) => (
-        query.childSessionId ? task.childSessionId === query.childSessionId : true
-      ));
-    },
-  } as unknown as AgentTaskControlService;
-  const controller = createTeamToolController(teams, tasks, "root");
-  const context = agentMessageToolContext("/repo", sessionId);
-
-  await expect(controller.createTeam({
-    name: "spoofed root team",
-    leadPath: "/root/fake",
-  }, context)).rejects.toThrow("does not match current agent /root");
-  const childController = createTeamToolController(teams, tasks, "child");
-  await expect(childController.createTeam({
-    name: "spoofed child team",
-    leadPath: "/root",
-  }, agentMessageToolContext("/repo", directChildSessionId))).rejects.toThrow(
-    "does not match current agent /root/member",
-  );
-  expect(createTeamCalls).toBe(0);
-
-  expect(await controller.listTeams({}, context)).toEqual([
-    expect.objectContaining({ teamId }),
-  ]);
-  await expect(controller.createTask({
-    teamId: otherTeamId,
-    title: "cross-root mutation",
-  }, context)).rejects.toThrow(`Team is not visible to this session: ${otherTeamId}`);
-  expect(createTaskCalls).toBe(0);
-
-  for (const childSessionId of [
-    foreignChildSessionId,
-    sessionId,
-    duplicateChildSessionId,
-  ]) {
-    await expect(controller.addMember({
-      teamId,
-      path: memberPath,
-      name: "attacker",
-      role: "worker",
-      childSessionId,
-    }, context)).rejects.toThrow("Team member session is not a unique visible descendant");
-  }
-  expect(addMemberCalls).toBe(0);
-});
-
-test("CLI child team task updates are marked as scoped worker mutations", async () => {
-  const ownerSessionId = "session_team_update_owner" as SessionId;
-  const workerSessionId = "session_team_update_worker" as SessionId;
-  const teamId = "team_update_scope" as TeamId;
-  const taskId = "task_update_scope" as TaskId;
-  const workerPath = "/root/worker" as AgentPath;
-  const updates: Array<Record<string, unknown>> = [];
-  const teams = {
-    async listTeams() {
-      return [{
-        id: teamId,
-        sessionId: ownerSessionId,
-        name: "update scope",
-        leadPath: "/root" as AgentPath,
-        status: "active" as const,
-        createdAt: 1,
-        updatedAt: 1,
-      }];
-    },
-    async members() {
-      return [{
-        teamId,
-        path: workerPath,
-        name: "worker",
-        role: "implementer",
-        status: "running" as const,
-        childSessionId: workerSessionId,
-        createdAt: 1,
-        updatedAt: 1,
-      }];
-    },
-    async updateTask(input: Record<string, unknown>) {
-      updates.push(input);
-      return {
-        id: taskId,
-        teamId,
-        status: "in_progress" as const,
-        title: "scoped update",
-        ownerPath: workerPath,
-        dependsOn: [],
-        summary: input.summary as string | undefined,
-        createdAt: 1,
-        updatedAt: 2,
-      };
-    },
-  } as unknown as TeamControlService;
-  const tasks = {} as AgentTaskControlService;
-
-  await createTeamToolController(teams, tasks, "child").updateTask({
-    teamId,
-    taskId,
-    status: "in_progress",
-    summary: "halfway",
-  }, agentMessageToolContext("/repo", workerSessionId));
-  expect(updates[0]).toMatchObject({
-    sessionId: workerSessionId,
-    actorScope: "scoped_worker",
-    teamId,
-    taskId,
-    status: "in_progress",
-    summary: "halfway",
-  });
-
-  await createTeamToolController(teams, tasks, "root").updateTask({
-    teamId,
-    taskId,
-    status: "completed",
-  }, agentMessageToolContext("/repo", ownerSessionId));
-  expect(updates[1]).not.toHaveProperty("actorScope");
-});
-
-test("CLI agent message controllers bind senders, list descendants, and isolate root sessions", async () => {
-  const root = await mkdtempName();
-  const repo = join(root, "repo");
-  let harness: CliHarness | undefined;
-  const rootSessionId = "session_message_root" as SessionId;
-  const workerSessionId = "session_message_worker" as SessionId;
-
-  try {
-    await mkdir(repo, { recursive: true });
-    harness = await createCliHarness({
-      cwd: repo,
-      model: "fake",
-      quiet: true,
-      yes: true,
-      mcpConnectMode: "manual",
-    });
-    await harness.events.appendMany([
-      agentMessageTaskCreated({
-        id: "task_message_worker" as TaskId,
-        path: "/root/worker" as AgentPath,
-        parentPath: "/root" as AgentPath,
-        taskName: "worker",
-        parentSessionId: rootSessionId,
-        childSessionId: workerSessionId,
-      }),
-      agentMessageTaskCreated({
-        id: "task_message_nested" as TaskId,
-        path: "/root/worker/reader" as AgentPath,
-        parentPath: "/root/worker" as AgentPath,
-        taskName: "nested-reader",
-        parentSessionId: workerSessionId,
-        childSessionId: "session_message_nested" as SessionId,
-      }),
-    ]);
-
-    type ToolRegistryView = { get(name: string): ChiliToolDefinition | undefined };
-    const rootRegistry = (harness.runtime as unknown as {
-      options: { toolRegistry: ToolRegistryView };
-    }).options.toolRegistry;
-    const childRegistry = (harness.agents as unknown as {
-      options: {
-        runtime?: {
-          options: {
-            runtime: { options: { toolRegistry: ToolRegistryView } };
-          };
-        };
-      };
-    }).options.runtime?.options.runtime.options.toolRegistry;
-    const rootSend = rootRegistry.get("agent_send");
-    const rootList = rootRegistry.get("agent_list");
-    const childSend = childRegistry?.get("agent_send");
-    expect(rootSend).toBeDefined();
-    expect(rootList).toBeDefined();
-    expect(childSend).toBeDefined();
-
-    await expect(rootSend?.execute({
-      messageId: "message_nested_from_root",
-      to: "nested-reader",
-      content: "nested context",
-      delivery: "queueOnly",
-    }, agentMessageToolContext(repo, rootSessionId))).resolves.toMatchObject({
-      metadata: { messageId: "message_nested_from_root", from: "/root", to: "/root/worker/reader" },
-    });
-    await harness.agents.sendMessage({
-      messageId: "message_current_root",
-      from: "/root/worker" as AgentPath,
-      to: "/root",
-      content: "private to the current root session",
-      delivery: "queueOnly",
-      recipientSessionId: rootSessionId,
-      sessionId: workerSessionId,
-    });
-    await harness.agents.sendMessage({
-      messageId: "message_other_root",
-      from: "/root" as AgentPath,
-      to: "/root",
-      content: "private to another root session",
-      delivery: "queueOnly",
-      recipientSessionId: "session_message_other_root" as SessionId,
-      sessionId: "session_message_other_root" as SessionId,
-    });
-    await harness.events.append({
-      id: "message_mismatched_scope",
-      type: "agent.message_queued",
-      time: 2 as TimestampMs,
-      sessionId: rootSessionId,
-      payload: {
-        path: "/root" as AgentPath,
-        from: "/root/worker" as AgentPath,
-        triggerTurn: false,
-        taskId: "task_message_worker" as TaskId,
-        recipientSessionId: "session_message_other_root" as SessionId,
-        message: { role: "user", content: "corrupt mixed ownership metadata" },
-      },
-    });
-    const listed = await rootList?.execute({ view: "messages" }, agentMessageToolContext(repo, rootSessionId));
-    const listedOutput = JSON.parse(listed?.output ?? "{}") as {
-      count?: number;
-      messages?: Array<{ message_id?: string; to_path?: string }>;
-    };
-    expect(listedOutput.count).toBe(2);
-    expect(listedOutput.messages).toEqual(expect.arrayContaining([
-      expect.objectContaining({ message_id: "message_nested_from_root", to_path: "/root/worker/reader" }),
-      expect.objectContaining({ message_id: "message_current_root", to_path: "/root" }),
-    ]));
-    expect(listed?.output).not.toContain("message_other_root");
-    expect(listed?.output).not.toContain("message_mismatched_scope");
-
-    await expect(childSend?.execute({
-      from: "/root",
-      to: "parent",
-      content: "spoof",
-    }, agentMessageToolContext(repo, workerSessionId))).rejects.toThrow(
-      "does not match current agent /root/worker",
-    );
-    await expect(childSend?.execute({
-      to: "parent",
-      content: "orphan must not become root",
-    }, agentMessageToolContext(
-      repo,
-      "session_message_orphan" as SessionId,
-    ))).rejects.toThrow("sender is unavailable for child session");
   } finally {
     await harness?.close();
     await rm(root, { recursive: true, force: true });
@@ -1616,34 +723,24 @@ test("CLI harness resolves root and child approval policy from each persisted se
     });
     await harness.service.createSession({ sessionId: parentA, cwd: repoA });
     await harness.service.createSession({ sessionId: parentB, cwd: repoBLink });
-    await harness.service.createSession({ sessionId: childA, cwd: repoA });
-    await harness.service.createSession({ sessionId: childB, cwd: repoBLink });
 
     await harness.events.append({
-      id: "event_policy_harness_spawn_b",
-      type: "agent.spawned",
-      time: 1 as TimestampMs,
-      sessionId: parentB,
-      payload: {
-        runId: "run_policy_harness_child_b" as never,
-        path: "/root/child-b" as AgentPath,
-        taskName: "child-b",
-        parentSessionId: parentB,
-        childSessionId: childB,
-      },
+      id: "event_policy_harness_child_b",
+      type: "session.created",
+      time: 2 as TimestampMs,
+      sessionId: childB,
+      payload: { sessionId: childB, cwd: await realpath(repoBLink), agent: {
+        parentSessionId: parentB, name: "child-b", path: "/root/child-b" as AgentPath, policy: {},
+      } },
     });
     await harness.events.append({
-      id: "event_policy_harness_spawn_a",
-      type: "agent.spawned",
+      id: "event_policy_harness_child_a",
+      type: "session.created",
       time: 2 as TimestampMs,
-      sessionId: parentA,
-      payload: {
-        runId: "run_policy_harness_child_a" as never,
-        path: "/root/child-a" as AgentPath,
-        taskName: "child-a",
-        parentSessionId: parentA,
-        childSessionId: childA,
-      },
+      sessionId: childA,
+      payload: { sessionId: childA, cwd: await realpath(repoA), agent: {
+        parentSessionId: parentA, name: "child-a", path: "/root/child-a" as AgentPath, policy: {},
+      } },
     });
 
     type RuntimeWithApprovals = {
@@ -1759,12 +856,11 @@ test("CLI harness approval resolver denies preflight and decide after session ar
   }
 });
 
-test("CLI harness approval resolver denies archived and orphan subagent ancestry roots", async () => {
+test("CLI harness approval resolver denies agents whose parent session is archived", async () => {
   const root = await mkdtempName();
   const repo = join(root, "repo");
   const rootSessionId = "session_policy_root_archived" as SessionId;
   const childSessionId = "session_policy_child_active" as SessionId;
-  const orphanSessionId = "session_policy_orphan_subagent" as SessionId;
   let harness: CliHarness | undefined;
   try {
     await mkdir(repo, { recursive: true });
@@ -1775,39 +871,22 @@ test("CLI harness approval resolver denies archived and orphan subagent ancestry
       mcpConnectMode: "manual",
     });
     await harness.service.createSession({ sessionId: rootSessionId, cwd: repo });
-    await harness.service.createSession({ sessionId: childSessionId, cwd: repo });
-    await harness.service.createSession({ sessionId: orphanSessionId, cwd: repo });
-    await harness.events.append({
-      id: "event_policy_archived_root_child",
-      type: "agent.spawned",
-      time: 1 as TimestampMs,
-      sessionId: rootSessionId,
-      payload: {
-        runId: "run_policy_archived_root_child" as never,
-        path: "/root/active-child" as AgentPath,
-        taskName: "active-child",
-        parentSessionId: rootSessionId,
-        childSessionId,
-      },
-    });
-    await harness.events.append({
-      id: "event_policy_orphan_subagent",
-      type: "agent.spawned",
-      time: 2 as TimestampMs,
-      payload: {
-        runId: "run_policy_orphan_subagent" as never,
-        path: "/root/orphan" as AgentPath,
-        taskName: "orphan",
-        childSessionId: orphanSessionId,
-      },
-    });
+    for (const [sessionId, parentSessionId, name] of [
+      [childSessionId, rootSessionId, "active-child"],
+    ] as const) {
+      await harness.events.append({
+        id: `event_policy_child_${name}`,
+        type: "session.created",
+        time: 2 as TimestampMs,
+        sessionId,
+        payload: { sessionId, cwd: await realpath(repo), agent: {
+          parentSessionId, name, path: `/root/${name}` as AgentPath, policy: {},
+        } },
+      });
+    }
 
     const beforeArchive = await harness.events.sessions();
     expect(beforeArchive.find((session) => session.id === childSessionId)).toMatchObject({
-      source: "subagent",
-      status: "active",
-    });
-    expect(beforeArchive.find((session) => session.id === orphanSessionId)).toMatchObject({
       source: "subagent",
       status: "active",
     });
@@ -1833,7 +912,6 @@ test("CLI harness approval resolver denies archived and orphan subagent ancestry
 
     for (const [sessionId, suffix] of [
       [childSessionId, "archived_root"],
-      [orphanSessionId, "orphan_root"],
     ] as const) {
       const approvalRequest = request(sessionId, suffix);
       expect(await broker.preflight(approvalRequest)).toMatchObject({
@@ -2086,117 +1164,6 @@ test("CLI runPrompt leaves system prompt selection to the harness service", asyn
   expect(submitted[0]).not.toHaveProperty("system");
 });
 
-test("CLI exact-session resume rejects a subagent session and points to agent_resume", async () => {
-  const root = await mkdtempName();
-  const repo = join(root, "repo");
-  let harness: CliHarness | undefined;
-  const parentSessionId = "session_cli_parent" as SessionId;
-  const childSessionId = "session_cli_child" as SessionId;
-  try {
-    await mkdir(repo, { recursive: true });
-    harness = await createCliHarness({
-      cwd: repo,
-      model: "fake",
-      quiet: true,
-      yes: true,
-      mcpConnectMode: "manual",
-    });
-    await harness.events.appendMany([
-      {
-        id: "event_session_cli_parent_created",
-        type: "session.created",
-        time: 1 as TimestampMs,
-        sessionId: parentSessionId,
-        payload: { sessionId: parentSessionId, cwd: repo },
-      },
-      {
-        id: "event_session_cli_child_created",
-        type: "session.created",
-        time: 1 as TimestampMs,
-        sessionId: childSessionId,
-        payload: { sessionId: childSessionId, cwd: repo },
-      },
-      agentMessageTaskCreated({
-        id: "task_cli_child" as TaskId,
-        path: "/root/task_cli_child" as AgentPath,
-        parentPath: "/root" as AgentPath,
-        taskName: "cli child",
-        parentSessionId,
-        childSessionId,
-      }),
-    ]);
-
-    await expect(runSessionPrompt({
-      harness,
-      sessionId: childSessionId,
-      prompt: "resume by raw child session id",
-      maxTurns: 1,
-    })).rejects.toThrow("Use agent_resume for the owning task");
-
-    await harness.events.append({
-      id: "event_task_cli_child_terminal",
-      type: "agent.task_completed",
-      time: 2 as TimestampMs,
-      sessionId: parentSessionId,
-      payload: {
-        taskId: "task_cli_child" as TaskId,
-        path: "/root/task_cli_child" as AgentPath,
-        status: "completed",
-        generation: 1,
-        summary: "initial child turn complete",
-      },
-    });
-    await expect(harness.tasks.followupTask({
-      taskId: "task_cli_child" as TaskId,
-      text: "resume through the authorized task lifecycle",
-      maxTurns: 1,
-    })).resolves.toMatchObject({
-      task: { id: "task_cli_child" },
-      result: { status: "completed" },
-    });
-  } finally {
-    await harness?.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("CLI exact-session resume rejects a pending child before session creation", async () => {
-  const root = await mkdtempName();
-  const repo = join(root, "repo");
-  let harness: CliHarness | undefined;
-  const parentSessionId = "session_cli_pending_parent" as SessionId;
-  const childSessionId = "session_cli_pending_child" as SessionId;
-  try {
-    await mkdir(repo, { recursive: true });
-    harness = await createCliHarness({
-      cwd: repo,
-      model: "fake",
-      quiet: true,
-      yes: true,
-      mcpConnectMode: "manual",
-    });
-    await harness.events.append(agentMessageTaskCreated({
-      id: "task_cli_pending_child" as TaskId,
-      path: "/root/task_cli_pending_child" as AgentPath,
-      parentPath: "/root" as AgentPath,
-      taskName: "pending CLI child",
-      parentSessionId,
-      childSessionId,
-    }));
-    expect((await harness.events.sessions()).some((session) => session.id === childSessionId)).toBe(false);
-
-    await expect(runSessionPrompt({
-      harness,
-      sessionId: childSessionId,
-      prompt: "resume the capacity-queued child directly",
-      maxTurns: 1,
-    })).rejects.toThrow("Use agent_resume for the owning task");
-  } finally {
-    await harness?.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
 test("CLI session prompts leave harness model defaults to Runtime normalization", async () => {
   const submitted: Record<string, unknown>[] = [];
   const harness = {
@@ -2310,72 +1277,6 @@ test("CLI prompt-debug json output is machine-readable and omits content unless 
   expect(parsedWithContent.fragments?.some((fragment) => fragment.content === "SECRET fragment content")).toBe(true);
 });
 
-test("CLI child prompt fragments only inject follow-up context for the matching child session", async () => {
-  const root = await mkdtempName();
-  const home = join(root, "home");
-  const repo = join(root, "repo");
-  try {
-    await mkdir(home, { recursive: true });
-    await mkdir(repo, { recursive: true });
-    const task = {
-      id: "task_reader" as TaskId,
-      path: "/root/task_reader" as AgentPath,
-      status: "completed",
-      taskName: "reader",
-      generation: 1,
-      childSessionId: "session_child" as SessionId,
-      cwd: "/stale/task-projection",
-      createdAt: 1,
-      updatedAt: 1,
-    } satisfies AgentTaskRow;
-    const store = {
-      agentTasks: async (query?: { childSessionId?: SessionId; limit?: number }) => {
-        expect(query?.limit).toBe(10);
-        return query?.childSessionId === task.childSessionId ? [task] : [];
-      },
-    } as unknown as Parameters<typeof buildCliChildPromptFragments>[0]["store"];
-    const common = {
-      cwd: repo,
-      sessionId: "session_child" as SessionId,
-      skillRegistry: new SkillRegistry([]),
-      store,
-      homeDir: home,
-      projectRoot: repo,
-    };
-
-    const mismatched = await buildCliChildPromptFragments({ ...common, sessionId: "session_other" as SessionId });
-    expect(mismatched.some((fragment) => fragment.id.startsWith("chili.task.followup."))).toBe(false);
-
-    const matched = await buildCliChildPromptFragments(common);
-    const followupFragment = matched.find((fragment) => fragment.id.startsWith("chili.task.followup."));
-    expect(followupFragment).toEqual(
-      expect.objectContaining({
-        id: "chili.task.followup.task_reader",
-        layer: "developer",
-        source: "runtime",
-      }),
-    );
-    expect(followupFragment?.content).toContain(`Repository cwd: ${repo}.`);
-    expect(followupFragment?.content).not.toContain("/stale/task-projection");
-
-    const duplicateStore = {
-      agentTasks: async () => [
-        task,
-        {
-          ...task,
-          id: "task_duplicate" as TaskId,
-          path: "/root/task_duplicate" as AgentPath,
-        },
-      ],
-    } as unknown as Parameters<typeof buildCliChildPromptFragments>[0]["store"];
-    await expect(buildCliChildPromptFragments({ ...common, store: duplicateStore })).rejects.toThrow(
-      "Agent task metadata invariant violated: child session session_child maps to 2 tasks",
-    );
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
 async function mkdtempName(): Promise<string> {
   return mkdtemp(join(tmpdir(), "chili-harness-"));
 }
@@ -2455,52 +1356,6 @@ async function writeWorkspaceModelEvent(
   } finally {
     store.close();
   }
-}
-
-function agentMessageTaskCreated(input: {
-  id: TaskId;
-  path: AgentPath;
-  parentPath: AgentPath;
-  taskName: string;
-  parentSessionId: SessionId;
-  childSessionId: SessionId;
-}): ChiliEvent {
-  return {
-    id: `event_created_${input.id}`,
-    type: "agent.task_created",
-    time: 1 as TimestampMs,
-    sessionId: input.parentSessionId,
-    payload: {
-      taskId: input.id,
-      path: input.path,
-      parentPath: input.parentPath,
-      parentSessionId: input.parentSessionId,
-      childSessionId: input.childSessionId,
-      taskName: input.taskName,
-      cwd: "/repo",
-      prompt: "work",
-      mode: "resumable",
-    },
-  };
-}
-
-function agentMessageToolContext(
-  cwd: string,
-  sessionId: SessionId,
-): ChiliToolExecutionContext {
-  const callId = `call_agent_message_${sessionId}` as ToolCallId;
-  return {
-    cwd,
-    sessionId,
-    turnId: `turn_agent_message_${sessionId}` as TurnId,
-    callId,
-    outputArtifactId: callId,
-    signal: new AbortController().signal,
-    metadata: async () => {},
-    streamOutput: async () => {},
-    requestApproval: async () => ({ action: "allow_once" }),
-    registerPersistedOutput: async () => {},
-  };
 }
 
 function skill(name: string, source: Skill["source"] = "project", baseDir?: string): Skill {

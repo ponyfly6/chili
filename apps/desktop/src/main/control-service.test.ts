@@ -6,6 +6,58 @@ import { RuntimeHttpError } from "@chili/sdk";
 import { DesktopControlService } from "./control-service.js";
 
 describe("desktop prompt controls", () => {
+  test("Agent controls preserve caller and target identity and return input receipts", async () => {
+    const calls: Array<{ operation: string; sessionId: string; agentId: string; text?: string; mode?: string }> = [];
+    const client = {
+      sendAgent: async (input: { sessionId: string; agentId: string; text: string; mode?: string }) => {
+        calls.push({ operation: "send", ...input });
+        return { agentId: input.agentId, inputId: "input_accepted" };
+      },
+      stopAgent: async (input: { sessionId: string; agentId: string }) => {
+        calls.push({ operation: "stop", ...input });
+        return { agentId: input.agentId };
+      },
+      resumeAgent: async (input: { sessionId: string; agentId: string }) => {
+        calls.push({ operation: "resume", ...input });
+        return { agentId: input.agentId, inputId: "input_resumed" };
+      },
+    } as unknown as RuntimeClient;
+    const service = serviceFor(client);
+    const target = { sessionId: "parent", agentId: "child" };
+    expect(await service.invoke({ type: "agent.send", ...target, text: "Review", mode: "steer" }))
+      .toEqual({ agentId: "child", inputId: "input_accepted" });
+    expect(await service.invoke({ type: "agent.stop", ...target })).toEqual({ agentId: "child" });
+    expect(await service.invoke({ type: "agent.resume", ...target }))
+      .toEqual({ agentId: "child", inputId: "input_resumed" });
+    expect(calls).toMatchObject([
+      { operation: "send", ...target, text: "Review", mode: "steer" },
+      { operation: "stop", ...target },
+      { operation: "resume", ...target },
+    ]);
+  });
+
+  test("Agent control writes serialize by target without blocking other Agents", async () => {
+    const gate = deferred<void>();
+    const calls: string[] = [];
+    const client = {
+      sendAgent: async ({ agentId }: { agentId: string }) => {
+        calls.push(`send:${agentId}`);
+        await gate.promise;
+        return { agentId, inputId: "input_accepted" };
+      },
+      stopAgent: async ({ agentId }: { agentId: string }) => { calls.push(`stop:${agentId}`); return { agentId }; },
+    } as unknown as RuntimeClient;
+    const service = serviceFor(client);
+    const sending = service.invoke({ type: "agent.send", sessionId: "root", agentId: "first", text: "Work" });
+    await waitUntil(() => calls.length === 1);
+    const stopping = service.invoke({ type: "agent.stop", sessionId: "root", agentId: "first" });
+    await service.invoke({ type: "agent.stop", sessionId: "root", agentId: "second" });
+    expect(calls).toEqual(["send:first", "stop:second"]);
+    gate.resolve();
+    await Promise.all([sending, stopping]);
+    expect(calls).toEqual(["send:first", "stop:second", "stop:first"]);
+  });
+
   test("forwards every input and its mode to durable admission without reading busy state", async () => {
     const submitted: unknown[] = [];
     const client = {
@@ -785,12 +837,13 @@ describe("desktop session projections", () => {
       .toEqual(["session_new"]);
   });
 
-  test("hides subagent sessions while keeping legacy interactive sessions", async () => {
+  test("hides child Agent identities while keeping interactive sessions", async () => {
     const client = {
       listSessions: async () => [
         { id: "legacy", cwd: "/repo", status: "active", createdAt: 1, updatedAt: 1 },
         { id: "interactive", cwd: "/repo", source: "interactive", status: "active", createdAt: 2, updatedAt: 2 },
-        { id: "child", cwd: "/repo", source: "subagent", status: "active", createdAt: 3, updatedAt: 3 },
+        { id: "child", cwd: "/repo", agent: { parentSessionId: "root", name: "child", path: "/root/child", policy: {} }, status: "active", createdAt: 3, updatedAt: 3 },
+        { id: "historical_child", cwd: "/repo", source: "subagent", status: "active", createdAt: 3, updatedAt: 3 },
       ],
     } as unknown as RuntimeClient;
 
@@ -819,8 +872,7 @@ describe("desktop session projections", () => {
           },
         },
       ],
-      agentTree: async () => ({ nodes: [], agents: [], tasks: [], mailbox: [] }),
-      listTasks: async () => [],
+      listAgents: async () => [],
       listUserInputs: async () => [],
     } as unknown as RuntimeClient;
 
@@ -829,6 +881,21 @@ describe("desktop session projections", () => {
     expect(reduceRuntimeEvents(snapshot.events).messages.message_1?.parts).toMatchObject([
       { id: "part_1", type: "text", text: "kept" },
     ]);
+  });
+
+  test("keeps archived root history readable when Agent control listing is forbidden", async () => {
+    const client = {
+      ...snapshotClientMethods(),
+      listAgents: async () => { throw new RuntimeHttpError(403, "Agent control requires an active root session"); },
+      sessionEventWindow: async () => ({
+        events: [{ id: "historical", type: "session.renamed", sessionId: "archived", time: 1, payload: { sessionId: "archived", title: "History" } }],
+        pendingApprovals: [], truncated: false, bytes: 2, pinnedEventIds: [],
+      }),
+    } as unknown as RuntimeClient;
+    const snapshot = await serviceFor(client).invoke({ type: "session.snapshot", sessionId: "archived" });
+    expect(snapshot.events.map((event) => event.id)).toEqual(["historical"]);
+    expect(snapshot.agents).toEqual([]);
+    expect(snapshot.warning).toContain("Agent controls are unavailable");
   });
 
   test("uses stable descendant and durable ordinals when retaining the event-budget tail", async () => {
@@ -861,9 +928,8 @@ describe("desktop session projections", () => {
           payload: { sessionId, title: `title_${sessionId}_${index}` },
         };
       }),
-      agentTree: async () => ({ nodes: [], agents: [], tasks: [], mailbox: [] }),
-      listTasks: async ({ parentSessionId }: { parentSessionId: string }) => parentSessionId === "root"
-        ? childSessionIds.map((childSessionId, index) => taskRecord(
+      listAgents: async ({ sessionId: parentSessionId }: { sessionId: string }) => parentSessionId === "root"
+        ? childSessionIds.map((childSessionId, index) => agentRecord(
           `task_${index}`,
           `/root/task_${index}`,
           "root",
@@ -908,9 +974,8 @@ describe("desktop session projections", () => {
             sessionId,
             payload: { sessionId, title: largeError },
           }],
-      agentTree: async () => ({ nodes: [], agents: [], tasks: [], mailbox: [] }),
-      listTasks: async ({ parentSessionId }: { parentSessionId: string }) => parentSessionId === "root"
-        ? childSessionIds.map((childSessionId, index) => taskRecord(
+      listAgents: async ({ sessionId: parentSessionId }: { sessionId: string }) => parentSessionId === "root"
+        ? childSessionIds.map((childSessionId, index) => agentRecord(
           `task_${index}`,
           `/root/task_${index}`,
           "root",
@@ -936,9 +1001,8 @@ describe("desktop session projections", () => {
             sizedSessionRename("event_a", 3, sessionId, 3_999_500),
           ]
         : [sizedSessionRename("event_n", 4, sessionId, 600)],
-      agentTree: async () => ({ nodes: [], agents: [], tasks: [], mailbox: [] }),
-      listTasks: async ({ parentSessionId }: { parentSessionId: string }) => parentSessionId === "root"
-        ? [taskRecord("task_child", "/root/task_child", "root", "child")]
+      listAgents: async ({ sessionId: parentSessionId }: { sessionId: string }) => parentSessionId === "root"
+        ? [agentRecord("task_child", "/root/task_child", "root", "child")]
         : [],
       listUserInputs: async () => [],
     } as unknown as RuntimeClient;
@@ -955,8 +1019,7 @@ describe("desktop session projections", () => {
         sizedSessionRename("event_first", 1, "root", 250),
         sizedSessionRename("event_last", 2, "root", 3_999_747),
       ],
-      agentTree: async () => ({ nodes: [], agents: [], tasks: [], mailbox: [] }),
-      listTasks: async () => [],
+      listAgents: async () => [],
       listUserInputs: async () => [],
     } as unknown as RuntimeClient;
     const overClient = {
@@ -1002,9 +1065,8 @@ describe("desktop session projections", () => {
         legacyEventReads += 1;
         return [];
       },
-      agentTree: async () => ({ nodes: [], agents: [], tasks: [], mailbox: [] }),
-      listTasks: async ({ parentSessionId }: { parentSessionId: string }) => parentSessionId === "root"
-        ? [taskRecord("task_child", "/root/task_child", "root", "child")]
+      listAgents: async ({ sessionId: parentSessionId }: { sessionId: string }) => parentSessionId === "root"
+        ? [agentRecord("task_child", "/root/task_child", "root", "child")]
         : [],
       listUserInputs: async () => [],
     } as unknown as RuntimeClient;
@@ -1036,9 +1098,8 @@ describe("desktop session projections", () => {
           bytes: Buffer.byteLength(JSON.stringify(approvals), "utf8"),
         };
       },
-      agentTree: async () => ({ nodes: [], agents: [], tasks: [], mailbox: [] }),
-      listTasks: async ({ parentSessionId }: { parentSessionId: string }) => parentSessionId === "root"
-        ? childSessionIds.map((childSessionId, index) => taskRecord(
+      listAgents: async ({ sessionId: parentSessionId }: { sessionId: string }) => parentSessionId === "root"
+        ? childSessionIds.map((childSessionId, index) => agentRecord(
           `task_${index}`,
           `/root/task_${index}`,
           "root",
@@ -1075,9 +1136,8 @@ describe("desktop session projections", () => {
           bytes: Buffer.byteLength(JSON.stringify(approvals), "utf8"),
         };
       },
-      agentTree: async () => ({ nodes: [], agents: [], tasks: [], mailbox: [] }),
-      listTasks: async ({ parentSessionId }: { parentSessionId: string }) => parentSessionId === "root"
-        ? [taskRecord("task_child", "/root/task_child", "root", "child")]
+      listAgents: async ({ sessionId: parentSessionId }: { sessionId: string }) => parentSessionId === "root"
+        ? [agentRecord("task_child", "/root/task_child", "root", "child")]
         : [],
       listUserInputs: async () => [],
     } as unknown as RuntimeClient;
@@ -1090,47 +1150,18 @@ describe("desktop session projections", () => {
     expect(snapshot.warning).toContain("pending approvals");
   });
 
-  test("recursively includes nested child sessions in one snapshot", async () => {
-    const children: Record<string, string | undefined> = {
-      root: "child",
-      child: "grandchild",
-      grandchild: undefined,
-    };
+  test("includes the root-visible hierarchy without using child identities as HTTP callers", async () => {
     const queried: string[] = [];
     const client = {
       sessionEvents: async ({ sessionId }: { sessionId: string }) => {
         queried.push(`events:${sessionId}`);
         return [{ id: `event_${sessionId}`, type: "turn.started", time: queried.length, sessionId, payload: { turnId: `turn_${sessionId}` } }];
       },
-      agentTree: async ({ sessionId }: { sessionId: string }) => {
-        const childSessionId = children[sessionId];
-        const path = sessionId === "root" ? "/root" : sessionId === "child" ? "/root/child" : "/root/child/grandchild";
-        const parentPath = sessionId === "root" ? undefined : sessionId === "child" ? "/root" : "/root/child";
-        const task = childSessionId ? taskRecord(`tree_task_${sessionId}`, path, sessionId, childSessionId) : undefined;
-        return {
-          nodes: [{
-            path,
-            ...(parentPath ? { parentPath } : {}),
-            taskName: sessionId,
-            status: task ? "running" : "completed",
-            runIds: [],
-            runs: [],
-            tasks: task ? [task] : [],
-            mailbox: [],
-            children: [],
-            createdAt: 1,
-            updatedAt: 1,
-          }],
-          agents: [],
-          tasks: task ? [task] : [],
-          mailbox: [],
-        };
-      },
-      listTasks: async ({ parentSessionId }: { parentSessionId: string }) => {
-        const childSessionId = children[parentSessionId];
-        return childSessionId
-          ? [taskRecord(`list_task_${parentSessionId}`, `/root/${parentSessionId}`, parentSessionId, childSessionId)]
-          : [];
+      listAgents: async ({ sessionId }: { sessionId: string }) => {
+        expect(sessionId).toBe("root");
+        queried.push(`agents:${sessionId}`);
+        return [agentRecord("child", "/root/child", "root", "child"),
+          agentRecord("grandchild", "/root/child/grandchild", "child", "grandchild")];
       },
       listUserInputs: async ({ sessionId }: { sessionId: string }) => [{
         id: `input_${sessionId}`,
@@ -1142,11 +1173,11 @@ describe("desktop session projections", () => {
     } as unknown as RuntimeClient;
 
     const snapshot = await serviceFor(client).invoke({ type: "session.snapshot", sessionId: "root" });
+    expect(queried.filter((item) => item.startsWith("agents:"))).toEqual(["agents:root"]);
     expect(new Set(snapshot.events.map((event) => String(event.sessionId)))).toEqual(new Set(["root", "child", "grandchild"]));
     expect(new Set(snapshot.pendingInputs.map((input) => String(input.sessionId)))).toEqual(new Set(["root", "child", "grandchild"]));
-    expect(new Set(snapshot.tasks.map((task) => String(task.childSessionId)))).toEqual(new Set(["child", "grandchild"]));
-    expect(snapshot.agentTree.tasks.some((task) => task.childSessionId === "grandchild")).toBe(true);
-    expect(flattenPaths(snapshot.agentTree.nodes)).toContain("/root/child/grandchild");
+    expect(new Set(snapshot.agents.map((agent) => agent.agentId))).toEqual(new Set(["child", "grandchild"]));
+    expect(snapshot.agents.find((agent) => agent.agentId === "grandchild")).toMatchObject({ parentAgentId: "child", path: "/root/child/grandchild" });
   });
 
   test("bounds descendant snapshot concurrency and output size", async () => {
@@ -1175,10 +1206,9 @@ describe("desktop session projections", () => {
           payload: { sessionId, title: `title_${sessionId}_${index}` },
         })));
       },
-      agentTree: () => tracked({ nodes: [], agents: [], tasks: [], mailbox: [] }),
-      listTasks: ({ parentSessionId }: { parentSessionId: string }) => tracked(
+      listAgents: ({ sessionId: parentSessionId }: { sessionId: string }) => tracked(
         parentSessionId === "root"
-          ? childSessionIds.map((childSessionId, index) => taskRecord(
+          ? childSessionIds.map((childSessionId, index) => agentRecord(
             `task_${index}`,
             `/root/task_${index}`,
             "root",
@@ -1193,7 +1223,7 @@ describe("desktop session projections", () => {
     expect(queriedSessions.size).toBe(512);
     expect(maxActiveRequests).toBeLessThanOrEqual(6);
     expect(snapshot.events.length).toBeLessThanOrEqual(20_000);
-    expect(snapshot.tasks.length).toBeLessThanOrEqual(2_000);
+    expect(snapshot.agents.length).toBeLessThanOrEqual(2_000);
     expect(Buffer.byteLength(JSON.stringify(snapshot), "utf8")).toBeLessThanOrEqual(8_500_000);
     expect(snapshot.truncated).toBe(true);
     expect(snapshot.warning).toContain("timeline events");
@@ -1267,24 +1297,13 @@ function snapshotClientMethods() {
       bytes: 2,
       pinnedEventIds: [],
     }),
-    agentTree: async () => ({ nodes: [], agents: [], tasks: [], mailbox: [] }),
-    listTasks: async () => [],
+    listAgents: async () => [],
     listUserInputs: async () => [],
   };
 }
 
-function taskRecord(id: string, path: string, parentSessionId: string, childSessionId: string) {
-  return {
-    id,
-    path,
-    status: "running",
-    taskName: id,
-    generation: 0,
-    parentSessionId,
-    childSessionId,
-    createdAt: 1,
-    updatedAt: 1,
-  } as never;
+function agentRecord(name: string, path: string, parentAgentId: string, agentId: string) {
+  return { agentId, name, path, parentAgentId, state: "running" } as const;
 }
 
 function pendingApproval(id: string, sessionId: string, createdAt: number, pattern = "safe") {
@@ -1309,15 +1328,6 @@ function sizedSessionRename(id: string, time: number, sessionId: string, targetB
   if (targetBytes < baseBytes) throw new Error(`Target event size ${targetBytes} is below ${baseBytes}`);
   event.payload.title = "x".repeat(targetBytes - baseBytes);
   return event;
-}
-
-function flattenPaths(nodes: TreeNode[]): string[] {
-  return nodes.flatMap((node) => [node.path, ...flattenPaths(node.children)]);
-}
-
-interface TreeNode {
-  path: string;
-  children: TreeNode[];
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {

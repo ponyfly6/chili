@@ -1,4 +1,4 @@
-import type { ChatSessionView, TeamLiveView } from "@chili/sdk";
+import type { ChatSessionView } from "@chili/sdk";
 import type { ServiceTier } from "@chili/protocol";
 import { basename, resolve } from "node:path";
 import type { ModelSelection, ReasoningLevel } from "../model-state.js";
@@ -18,19 +18,8 @@ export interface StatusFooterOptions {
   gitBranch?: string | undefined;
 }
 
-export function TeamStatusRow(props: { model: TeamLiveView; theme: TuiTheme }) {
-  const status = teamStatusText(props.model);
-  if (!status) return null;
-  return (
-    <box width="100%" paddingX={2}>
-      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{status}</text>
-    </box>
-  );
-}
-
 export function StatusFooter(props: {
   options: StatusFooterOptions;
-  model: TeamLiveView;
   agentExperience?: AgentsViewModel | undefined;
   chatView: ChatSessionView;
   canSubmit: boolean;
@@ -44,7 +33,7 @@ export function StatusFooter(props: {
     contextText(props.chatView.latestModelMetadata?.usage, contextWindowFor(props.chatView)),
     statusFooterWorkspaceText(props.chatView, props.options),
   ].filter(Boolean).join(" · ");
-  const status = statusFooterStatusText(props.chatView, props.canSubmit, props.model, props.agentExperience);
+  const status = statusFooterStatusText(props.chatView, props.canSubmit, props.agentExperience);
   const right = [
     props.options.modeName,
     props.showToolDetails ? "Details on" : undefined,
@@ -76,7 +65,6 @@ export function statusFooterHeight(_width: number): number {
 export function statusFooterStatusText(
   chatView: ChatSessionView,
   canSubmit: boolean,
-  model: TeamLiveView,
   agentExperience: AgentsViewModel | undefined,
 ): string | undefined {
   const session = chatView.status === "failed"
@@ -91,11 +79,10 @@ export function statusFooterStatusText(
             ? "running"
             : canSubmit ? undefined : "waiting";
   const goal = goalStatusText(chatView);
-  const agents = agentExperience && agentExperience.activeAdHocAgents > 0
-    ? `${agentExperience.activeAdHocAgents} ad-hoc agent${agentExperience.activeAdHocAgents === 1 ? "" : "s"}`
+  const agents = agentExperience && agentExperience.activeAgents > 0
+    ? `${agentExperience.activeAgents} agent${agentExperience.activeAgents === 1 ? "" : "s"}`
     : undefined;
-  const team = teamStatusText(model);
-  const status = [session, goal, agents, team].filter(Boolean).join(" · ");
+  const status = [session, goal, agents].filter(Boolean).join(" · ");
   return status || undefined;
 }
 
@@ -109,16 +96,6 @@ function goalStatusText(chatView: ChatSessionView): string | undefined {
   if (goal.status === "paused") return "goal paused";
   if (goal.status === "budgetLimited") return `goal budget ${usage}`;
   return "goal complete";
-}
-
-function teamStatusText(model: TeamLiveView): string | undefined {
-  const counts = model.selected?.health.counts;
-  if (!counts) return undefined;
-  const parts: string[] = [];
-  if (counts.runningTasks > 0) parts.push(`${counts.runningTasks} running`);
-  if (counts.pendingApprovals > 0) parts.push(`${counts.pendingApprovals} approval`);
-  if (counts.activeTools > 0) parts.push(`${counts.activeTools} tool`);
-  return parts.length > 0 ? `team ${parts.join(" ")}` : undefined;
 }
 
 function contextText(usage: NonNullable<ChatSessionView["latestModelMetadata"]>["usage"] | undefined, contextWindowTokens: number | undefined): string | undefined {

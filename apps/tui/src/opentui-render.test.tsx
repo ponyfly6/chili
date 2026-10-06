@@ -1,34 +1,24 @@
 import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act } from "react";
-import { createRuntimeView, type ChatTranscriptItem, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, MessageId, PartId, TaskId, ToolCallId, TurnId } from "@chili/protocol";
+import { createRuntimeView, type ChatTranscriptItem } from "@chili/sdk";
+import type { ApprovalId, MessageId, PartId, ToolCallId, TurnId } from "@chili/protocol";
 import { ChatShellSurface } from "./ChatShellApp.js";
-import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatRuntimeState } from "./useChatRuntime.js";
-import type { TeamLiveSurfaceRuntime } from "./components/types.js";
 import { chiliDarkTheme } from "./theme/index.js";
-import {
-  emptyTeamLiveFixture,
-  teamLiveFixture,
-  withActions,
-  withConnection,
-  withLongText,
-  withMultipleTeams,
-} from "./test-fixtures.js";
+import { runtimeFixture, type RuntimeFixture } from "./test-fixtures.js";
 
-test("renders chat shell by default instead of the team cockpit", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), { width: 120, height: 40 });
+test("renders the chat shell", async () => {
+  const frame = await renderShellFrame(runtimeFixture(), { width: 120, height: 40 });
 
   expect(frame).toContain("Ask anything");
   expect(frame).toContain("Chili");
   expect(frame).toContain("████");
   expect(frame).not.toContain("coding agent");
-  expect(frame).not.toContain("Chili Team Live");
 });
 
 test("chat prompt exposes a native renderer cursor", async () => {
-  const app = await renderShell(teamLiveFixture(), { width: 120, height: 40 });
+  const app = await renderShell(runtimeFixture(), { width: 120, height: 40 });
 
   try {
     const cursor = app.captureSpans().cursor;
@@ -40,7 +30,7 @@ test("chat prompt exposes a native renderer cursor", async () => {
 });
 
 test("renders a restrained one-line chat footer", async () => {
-  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), { width: 120, height: 24 });
+  const frame = await renderShellFrame(runtimeFixture("streaming"), { width: 120, height: 24 });
   const footerLine = frame.split("\n").find((line) => line.includes("test-model")) ?? "";
 
   expect(footerLine).toContain("chili");
@@ -53,7 +43,7 @@ test("renders a restrained one-line chat footer", async () => {
 });
 
 test("chat footer follows the persisted session workspace", async () => {
-  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
+  const frame = await renderShellFrame(runtimeFixture("streaming"), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -74,7 +64,7 @@ test("chat footer follows the persisted session workspace", async () => {
 });
 
 test("renders remaining context without cumulative token usage", async () => {
-  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
+  const frame = await renderShellFrame(runtimeFixture("streaming"), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -103,7 +93,7 @@ test("renders remaining context without cumulative token usage", async () => {
 });
 
 test("renders compact context tokens when the model limit is unavailable", async () => {
-  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
+  const frame = await renderShellFrame(runtimeFixture("streaming"), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -130,7 +120,7 @@ test("renders compact context tokens when the model limit is unavailable", async
 });
 
 test("keeps the input visible in a short narrow chat frame", async () => {
-  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
+  const frame = await renderShellFrame(runtimeFixture("streaming"), {
     width: 64,
     height: 12,
     runtime: fakeChatRuntime({
@@ -151,36 +141,35 @@ test("keeps the input visible in a short narrow chat frame", async () => {
 });
 
 test("renders chat shell action feedback", async () => {
-  const pending = await renderShellFrame(teamLiveFixture(), {
+  const pending = await renderShellFrame(runtimeFixture(), {
     width: 120,
     height: 40,
     runtime: fakeChatRuntime({
-      actionFeedback: { key: "run_loop:team_live", type: "run_loop", status: "pending", message: "starting team loop" },
-      pendingActionKey: "run_loop:team_live",
+      chatFeedback: { status: "pending", message: "submitting prompt" },
     }),
   });
-  const success = await renderShellFrame(teamLiveFixture(), {
+  const success = await renderShellFrame(runtimeFixture(), {
     width: 120,
     height: 40,
     runtime: fakeChatRuntime({
-      actionFeedback: { key: "merge:team_live:task_live", type: "merge", status: "success", message: "merge completed" },
+      chatFeedback: { status: "success", message: "prompt accepted" },
     }),
   });
-  const error = await renderShellFrame(teamLiveFixture(), {
+  const error = await renderShellFrame(runtimeFixture(), {
     width: 120,
     height: 40,
     runtime: fakeChatRuntime({
-      actionFeedback: { key: "merge:team_live:task_live", type: "merge", status: "error", message: "merge failed" },
+      chatFeedback: { status: "error", message: "prompt failed" },
     }),
   });
 
-  expect(pending).toContain("pending: starting team loop");
-  expect(success).toContain("success: merge completed");
-  expect(error).toContain("merge failed");
+  expect(pending).toContain("pending: submitting prompt");
+  expect(success).toContain("success: prompt accepted");
+  expect(error).toContain("prompt failed");
 });
 
 test("accepted feedback is bound to the next per-session status event", async () => {
-  const staleFailure = await renderShellFrame(teamLiveFixture(), {
+  const staleFailure = await renderShellFrame(runtimeFixture(), {
     width: 120,
     height: 40,
     runtime: fakeChatRuntime({
@@ -200,7 +189,7 @@ test("accepted feedback is bound to the next per-session status event", async ()
       },
     }),
   });
-  const running = await renderShellFrame(teamLiveFixture(), {
+  const running = await renderShellFrame(runtimeFixture(), {
     width: 120,
     height: 40,
     runtime: fakeChatRuntime({
@@ -219,7 +208,7 @@ test("accepted feedback is bound to the next per-session status event", async ()
       },
     }),
   });
-  const newFailure = await renderShellFrame(teamLiveFixture(), {
+  const newFailure = await renderShellFrame(runtimeFixture(), {
     width: 120,
     height: 40,
     runtime: fakeChatRuntime({
@@ -249,7 +238,7 @@ test("accepted feedback is bound to the next per-session status event", async ()
 });
 
 test("retry feedback exposes timing without rendering the unsafe provider reason", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), {
+  const frame = await renderShellFrame(runtimeFixture(), {
     width: 120,
     height: 40,
     runtime: fakeChatRuntime({
@@ -276,7 +265,7 @@ test("retry feedback exposes timing without rendering the unsafe provider reason
 });
 
 test("renders chat transcript as a scrollable window", async () => {
-  const app = await renderShell(emptyTeamLiveFixture("streaming"), {
+  const app = await renderShell(runtimeFixture("streaming"), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -308,7 +297,7 @@ test("renders chat transcript as a scrollable window", async () => {
 });
 
 test("scrolls a long single assistant message by rendered lines", async () => {
-  const app = await renderShell(teamLiveFixture(), {
+  const app = await renderShell(runtimeFixture(), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -341,7 +330,7 @@ test("scrolls a long single assistant message by rendered lines", async () => {
 });
 
 test("renders reasoning separately from assistant text", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), {
+  const frame = await renderShellFrame(runtimeFixture(), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -373,7 +362,7 @@ test("renders reasoning separately from assistant text", async () => {
 });
 
 test("renders tool rows as compact activity without raw output blocks", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), {
+  const frame = await renderShellFrame(runtimeFixture(), {
     width: 120,
     height: 30,
     runtime: fakeChatRuntime({
@@ -401,7 +390,7 @@ test("renders tool rows as compact activity without raw output blocks", async ()
 
 test("ctrl+o toggles tool details and footer status", async () => {
   const output = Array.from({ length: 12 }, (_, index) => `line_${String(index + 1).padStart(2, "0")}`).join("\n");
-  const app = await renderShell(teamLiveFixture(), {
+  const app = await renderShell(runtimeFixture(), {
     width: 120,
     height: 36,
     runtime: fakeChatRuntime({
@@ -446,7 +435,7 @@ test("ctrl+o toggles tool details and footer status", async () => {
 
 test("ctrl+t opens transcript view with raw tool and approval details, and escape returns to chat", async () => {
   const items = rawTranscriptItems();
-  const app = await renderShell(emptyTeamLiveFixture("streaming"), {
+  const app = await renderShell(runtimeFixture("streaming"), {
     width: 120,
     height: 54,
     runtime: fakeChatRuntime({
@@ -505,7 +494,7 @@ test("ctrl+t opens transcript view with raw tool and approval details, and escap
 });
 
 test("transcript scroll offset is independent from chat scroll offset", async () => {
-  const app = await renderShell(teamLiveFixture(), {
+  const app = await renderShell(runtimeFixture(), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -554,7 +543,7 @@ test("transcript scroll offset is independent from chat scroll offset", async ()
 
 test("transcript view scrolls through long raw tool output", async () => {
   const output = Array.from({ length: 40 }, (_, index) => `raw_line_${String(index + 1).padStart(2, "0")}`).join("\n");
-  const app = await renderShell(teamLiveFixture(), {
+  const app = await renderShell(runtimeFixture(), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -598,7 +587,7 @@ test("transcript view scrolls through long raw tool output", async () => {
 });
 
 test("does not render approval dock when no approval is pending", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), {
+  const frame = await renderShellFrame(runtimeFixture(), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -617,7 +606,7 @@ test("does not render approval dock when no approval is pending", async () => {
 });
 
 test("renders approval permission patterns and risk metadata", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), {
+  const frame = await renderShellFrame(runtimeFixture(), {
     width: 110,
     height: 28,
     runtime: fakeChatRuntime({
@@ -656,7 +645,7 @@ test("renders approval permission patterns and risk metadata", async () => {
 
 test("renders unsandboxed approvals as one-time only", async () => {
   const command = "echo visible first\necho visible second\nremindctl status --include-completed";
-  const frame = await renderShellFrame(teamLiveFixture(), {
+  const frame = await renderShellFrame(runtimeFixture(), {
     width: 110,
     height: 34,
     runtime: fakeChatRuntime({
@@ -698,7 +687,7 @@ test("renders unsandboxed approvals as one-time only", async () => {
 
 test("folds long approval details without hiding the prompt", async () => {
   const longCommand = Array.from({ length: 80 }, (_, index) => `echo segment_${index}`).join(" && ");
-  const frame = await renderShellFrame(teamLiveFixture(), {
+  const frame = await renderShellFrame(runtimeFixture(), {
     width: 80,
     height: 24,
     runtime: fakeChatRuntime({
@@ -733,7 +722,7 @@ test("folds long approval details without hiding the prompt", async () => {
 });
 
 test("mouse wheel scrolls the chat transcript", async () => {
-  const app = await renderShell(teamLiveFixture(), {
+  const app = await renderShell(runtimeFixture(), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -777,126 +766,8 @@ test("mouse wheel scrolls the chat transcript", async () => {
   }
 });
 
-test("renders empty Team Live frame", async () => {
-  const frame = await renderFrame(emptyTeamLiveFixture(), { width: 80, height: 24 });
-
-  expect(frame).toContain("Chili Team Live");
-  expect(frame).toContain("No teams projected yet");
-  expect(frame).toContain("size:80x24");
-});
-
-test("renders connecting and error states", async () => {
-  const connecting = await renderFrame(emptyTeamLiveFixture("connecting"), { width: 80, height: 24 });
-  const error = await renderFrame(withConnection(teamLiveFixture(), { status: "error", error: "runtime unavailable" }), {
-    width: 120,
-    height: 40,
-    runtime: fakeRuntime({ message: "runtime unavailable" }),
-  });
-
-  expect(connecting).toContain("connection:connecting");
-  expect(error).toContain("connection:error");
-  expect(error).toContain("runtime unavailable");
-});
-
-test("renders multiple teams", async () => {
-  const frame = await renderFrame(withMultipleTeams(teamLiveFixture()), { width: 120, height: 40 });
-
-  expect(frame).toContain("live");
-  expect(frame).toContain("second");
-});
-
-test("renders active run and active tool", async () => {
-  const frame = await renderFrame(teamLiveFixture(), { width: 120, height: 40 });
-
-  expect(frame).toContain("dispatch");
-  expect(frame).toContain("fan:4");
-  expect(frame).toContain("read_file");
-});
-
-test("renders pending approval", async () => {
-  const frame = await renderFrame(teamLiveFixture(), { width: 120, height: 40 });
-
-  expect(frame).toContain("Approvals");
-  expect(frame).toContain("tool.edit");
-});
-
-test("renders pending merge", async () => {
-  const frame = await renderFrame(teamLiveFixture(), { width: 120, height: 40 });
-
-  expect(frame).toContain("merge:pending");
-  expect(frame).toContain("merge");
-});
-
-test("renders disabled action", async () => {
-  const view = teamLiveFixture();
-  const frame = await renderFrame(withActions(view, view.selected?.availableActions ?? []), { width: 120, height: 40 });
-
-  expect(frame).toContain("disabled:r");
-});
-
-test("renders overflow ranges for windowed lists", async () => {
-  const frame = await renderFrame(withOverflowRows(teamLiveFixture()), { width: 120, height: 40 });
-
-  expect(frame).toContain("Task Board 1-12/16");
-  expect(frame).toContain("Approvals 1-5/10");
-  expect(frame).toContain("Actions 1-8/10");
-});
-
-test("renders long text without pushing outside the frame", async () => {
-  const frame = await renderFrame(withLongText(teamLiveFixture()), { width: 120, height: 40 });
-
-  expect(frame).toContain("Task Board");
-  expect(lineCount(frame)).toBe(40);
-});
-
-test("supports 80x24 narrow layout", async () => {
-  const frame = await renderFrame(teamLiveFixture(), { width: 80, height: 24 });
-
-  expect(frame).toContain("size:80x24");
-  expect(lineCount(frame)).toBe(24);
-});
-
-test("supports 120x40 wide layout with detail pane", async () => {
-  const frame = await renderFrame(teamLiveFixture(), { width: 120, height: 40 });
-
-  expect(frame).toContain("size:120x40");
-  expect(frame).toContain("Detail");
-  expect(lineCount(frame)).toBe(40);
-});
-
-async function renderFrame(
-  model: TeamLiveView,
-  options: {
-    width: number;
-    height: number;
-    runtime?: TeamLiveSurfaceRuntime;
-  },
-): Promise<string> {
-  const app = await testRender(
-    <TeamLiveSurface
-      model={model}
-      runtime={options.runtime ?? fakeRuntime()}
-      selectedTeamId={model.selectedTeamId}
-      selectedTeamLocked={false}
-      onSelectTeam={() => undefined}
-      onExit={() => undefined}
-      theme={chiliDarkTheme}
-    />,
-    { width: options.width, height: options.height, exitOnCtrlC: false },
-  );
-
-  try {
-    await act(async () => {
-      await app.renderOnce();
-    });
-    return app.captureCharFrame();
-  } finally {
-    app.renderer.destroy();
-  }
-}
-
 async function renderShellFrame(
-  model: TeamLiveView,
+  model: RuntimeFixture,
   options: {
     width: number;
     height: number;
@@ -913,7 +784,7 @@ async function renderShellFrame(
 }
 
 async function renderShell(
-  model: TeamLiveView,
+  model: RuntimeFixture,
   options: {
     width: number;
     height: number;
@@ -923,11 +794,7 @@ async function renderShell(
 ) {
   const app = await testRender(
     <ChatShellSurface
-      model={model}
       runtime={options.runtime ?? fakeChatRuntime()}
-      selectedTeamId={model.selectedTeamId}
-      selectedTeamLocked={false}
-      onSelectTeam={() => undefined}
       onExit={() => undefined}
       options={{ cwd: "/repo/chili", modeName: "Build", modelName: "test-model", providerName: "test-provider" }}
     />,
@@ -949,16 +816,6 @@ function lineCount(frame: string): number {
   return frame.replace(/\n$/, "").split("\n").length;
 }
 
-function fakeRuntime(input: Partial<TeamLiveSurfaceRuntime> = {}): TeamLiveSurfaceRuntime {
-  return {
-    message: "test stream",
-    reconnect: () => undefined,
-    executeAction: (_action: TeamLiveAction) => undefined,
-    clearActionFeedback: () => undefined,
-    ...input,
-  };
-}
-
 function fakeChatRuntime(input: Partial<ChatRuntimeState> = {}): ChatRuntimeState {
   return {
     runtimeView: createRuntimeView(),
@@ -966,8 +823,6 @@ function fakeChatRuntime(input: Partial<ChatRuntimeState> = {}): ChatRuntimeStat
     connection: { status: "streaming", lastEventId: "event_live" },
     message: "test stream",
     reconnect: () => undefined,
-    executeAction: (_action: TeamLiveAction) => undefined,
-    clearActionFeedback: () => undefined,
     hydrateEvents: () => undefined,
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
@@ -982,6 +837,8 @@ function fakeChatRuntime(input: Partial<ChatRuntimeState> = {}): ChatRuntimeStat
     resumeSession: async () => true,
     renameSession: async () => undefined,
     interruptActiveSession: async () => undefined,
+    stopAgent: async () => undefined,
+    resumeAgent: async () => undefined,
     approveApproval: async () => undefined,
     rejectApproval: async () => undefined,
     ...input,
@@ -1093,50 +950,6 @@ function longAssistantMessage(lineCount: number): ChatTranscriptItem {
       },
     ],
   };
-}
-
-function withOverflowRows(view: TeamLiveView): TeamLiveView {
-  const selected = requireSelected(view);
-  const teamId = requireTeamId(view);
-  const baseTask = requireFirst(selected.tasks);
-  const baseApproval = requireFirst(selected.pendingApprovals);
-  const tasks = Array.from({ length: 16 }, (_, index) => ({
-    ...baseTask,
-    id: `task_overflow_${index + 1}` as TaskId,
-    title: `Overflow task ${index + 1}`,
-  }));
-  const pendingApprovals = Array.from({ length: 10 }, (_, index) => ({
-    ...baseApproval,
-    id: `approval_overflow_${index + 1}` as ApprovalId,
-    toolName: `approval-tool-${index + 1}`,
-  }));
-  const actions: TeamLiveAction[] = Array.from({ length: 10 }, (_, index) => ({
-    type: "run_loop",
-    teamId,
-    enabled: index % 2 === 0,
-    ...(index % 2 === 0 ? {} : { reason: "test_disabled" }),
-  }));
-
-  return {
-    ...view,
-    availableActions: actions,
-    selected: {
-      ...selected,
-      tasks,
-      pendingApprovals,
-      availableActions: actions,
-    },
-  };
-}
-
-function requireSelected(view: TeamLiveView): NonNullable<TeamLiveView["selected"]> {
-  if (!view.selected) throw new Error("fixture requires selected team");
-  return view.selected;
-}
-
-function requireTeamId(view: TeamLiveView): NonNullable<TeamLiveView["selectedTeamId"]> {
-  if (!view.selectedTeamId) throw new Error("fixture requires selected team id");
-  return view.selectedTeamId;
 }
 
 function requireFirst<T>(items: readonly T[]): T {

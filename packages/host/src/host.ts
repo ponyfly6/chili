@@ -2,42 +2,30 @@ import { mkdir, realpath } from "node:fs/promises";
 import { createHostToolExposure } from "./tool-surface.js";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import {
-  AgentRunnerSubagentRunner,
-  AgentMailboxDeliveryPump,
-  AgentTreeControlService,
-  AgentTaskControlService,
+  AgentControlService,
   DelegationPolicyGate,
   LocalSubagentConcurrencyLimiter,
-  LocalSubagentManager,
   RuntimeService,
   SingleAgentRuntime,
   SnapshotRecoveryService,
-  TeamControlService,
-  TeamExecutionRunner,
-  TeamMergeService,
-  TeamTaskDispatchService,
-  TeamTaskVerificationService,
-  TeamWorktreeService,
   buildChiliMemoryPromptFragments,
   chiliBasePromptFragment,
-  completeWorkerToolPolicy,
   createMemoryTool,
-  defaultScopedWorkerPolicy,
   type ModelRouter,
   type PromptFragment,
   type RuntimePromptTurnContext,
-  type WorkerToolPolicy,
 } from "@chili/core";
-import type { AgentPath, ChiliEvent, EventEnvelope, ExecutionIdentity, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId, TaskId, TeamId } from "@chili/protocol";
+import type { ChiliEvent, ExecutionIdentity, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId } from "@chili/protocol";
 import { compactRuntimeEvent } from "@chili/protocol";
 import { HostOwnerClaim, ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
-import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
   DeferredApprovalQueue,
   DeferredUserInputQueue,
   DELEGATION_OFF_DENIED_TOOL_NAMES,
   CODING_TOOL_GROUPS,
   FileSystemSnapshotProvider,
+  filterToolsByPolicy,
+  isToolVisible,
   InMemoryToolRegistry,
   ManagedProcessManager,
   observeProcessGuardianLifecycle,
@@ -45,10 +33,6 @@ import {
   withProcessOwner,
   PolicyApprovalBroker,
   PolicyApprovalState,
-  type AgentMessageRecord,
-  type AgentMessageToolController,
-  type SubagentController,
-  type SubagentControlController,
   ToolExecutor,
   createApplyPatchTool,
   createActivateSkillTool,
@@ -63,8 +47,9 @@ import {
   createProcessTool,
   createDelegationSetTool,
   createDelegationStatusTool,
-  createCompleteTaskTool,
   createEditTool,
+  createGitWorktreeTool,
+  createGitApplyPatchTool,
   createGitBranchTool,
   createGitCommitTool,
   createGitDiffTool,
@@ -78,24 +63,6 @@ import {
   createReadFileTool,
   createReadImageTool,
   createRequestUserInputTool,
-  createTeamCreateTool,
-  createTeamListTool,
-  createTeamMemberAddTool,
-  createTeamMemberListTool,
-  createTeamMessageListTool,
-  createTeamMessageSendTool,
-  createTeamSnapshotTool,
-  createTeamTaskAssignTool,
-  createTeamTaskClaimTool,
-  createTeamTaskCreateBatchTool,
-  createTeamTaskCreateTool,
-  createTeamTaskDispatchBatchTool,
-  createTeamTaskDispatchTool,
-  createTeamTaskListTool,
-  createTeamTaskReconcileTool,
-  createTeamRunLoopTool,
-  createTeamTaskSyncTool,
-  createTeamTaskUpdateTool,
   createToolSearchTool,
   createWriteFileTool,
   type BashRunner,
@@ -103,23 +70,6 @@ import {
   type BashRunRequest,
   type DelegationToolController,
   type GoalToolController,
-  type MailboxListToolInput,
-  type SubagentMailboxRecord,
-  type SubagentTaskRecord,
-  type TeamDispatchAgentTaskRecord,
-  type TeamMemberRecord,
-  type TeamMessageRecord,
-  type TeamRecord,
-  type TeamRunLoopRecord,
-  type TeamRunLoopToolController,
-  type TeamSnapshotRecord,
-  type TeamTaskClaimRecord,
-  type TeamTaskDispatchRecord,
-  type TeamTaskDispatchToolController,
-  type TeamTaskRecord,
-  type TeamTaskReconcileRecord,
-  type TeamTaskSyncRecord,
-  type TeamToolController,
   type ToolAccessPolicyResolver,
   type ToolAccessPolicy,
 } from "@chili/tools";
@@ -149,8 +99,8 @@ import {
   type ApprovalRulesetResolver,
 } from "./approval.js";
 import { createHostBashRunner } from "./bash-runner.js";
-import { loadHostConfig, DEFAULT_HOST_AGENT_CONFIG, type HostConfig, type HostAgentConfig } from "./config.js";
-import { createAgentExpansionController, recursiveWorkerPolicy, resolveAgentAncestry } from "./agent-expansion.js";
+import { loadHostConfig, type HostConfig, type HostAgentConfig } from "./config.js";
+import { resolveAgentAncestry } from "./agent-expansion.js";
 import { createIdFactory } from "./id.js";
 import type { HostModelName, HostReasoningLevel } from "./model.js";
 import { createHostModel, resolveHostRuntimeModelSelection } from "./model.js";
@@ -221,13 +171,7 @@ export interface ChiliHost {
   events: ObservableEventStore;
   runtime: SingleAgentRuntime;
   service: RuntimeService;
-  tasks: AgentTaskControlService;
-  agents: AgentTreeControlService;
-  mailboxPump: AgentMailboxDeliveryPump;
-  teams: TeamControlService;
-  teamDispatcher: TeamTaskDispatchService;
-  teamMerger: TeamMergeService;
-  teamRunner: TeamExecutionRunner;
+  agents: AgentControlService;
   permissions: HostPermissionProfileControl;
   commands: PromptCommandControl;
   mcp: import("@chili/protocol").RuntimeMcpControlService;
@@ -235,7 +179,7 @@ export interface ChiliHost {
   defaultModelSelection?: ModelSelection;
   defaultReasoningLevel?: HostReasoningLevel;
   defaultServiceTier?: ServiceTier;
-  waitForBackgroundTasks(): Promise<void>;
+  waitForAgents(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -315,17 +259,8 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     });
     initializationDrains.push(() => options.approvalQueue?.denyAll("Host initialization failed."));
     initializationDrains.push(() => options.userInputQueue?.denyAll("Host initialization failed."));
-    const reconcileStaleRuntimeState = async (): Promise<void> => {
+    const reconcileStaleRuntimeState = async (includePending = false): Promise<void> => {
       const now = Date.now();
-      await tasks.reconcileStaleTasks({
-        staleAfterMs: staleTurnRecoveryMs,
-        modes: ["one_shot", "resumable", "background"],
-        liveTaskIds: subagents.liveTaskIds(),
-        requireLeaseEvidence: true,
-        limit: 500,
-        summary: "Recovered after the owning runtime stopped",
-        error: "stale_agent_worker",
-      });
       await eventStore.reconcileStaleTurns({
         staleBefore: now - staleTurnRecoveryMs,
         now,
@@ -333,7 +268,8 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
         status: "failed",
         reason: "stale_turn_recovered",
       });
-      await service.recoverInputs();
+      await service.recoverInputs({ includePending });
+      await childService.recoverInputs({ includePending });
     };
     const scheduleStaleTurnRecovery = (): void => {
       if (hostClosing || staleTurnRecoveryIntervalMs === false) return;
@@ -359,7 +295,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       (staleTurnRecoveryTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
     };
     const config = await loadHostConfig(cwd, { chiliHome });
-    const childToolPolicyResolver = createWorkerToolPolicyResolver(eventStore, Boolean(options.userInputQueue), config.agents);
+    const childToolPolicyResolver = createSessionToolPolicyResolver(eventStore);
     let delegationPolicyGate: DelegationPolicyGate | undefined;
     const delegationToolPolicyResolver = createDelegationToolPolicyResolver(() => delegationPolicyGate);
     const rootToolPolicyResolver = combineToolAccessPolicyResolvers(
@@ -370,10 +306,6 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       childToolPolicyResolver,
       rootToolPolicyResolver,
     );
-    const assertDelegationEnabled = (input: { sessionId: SessionId; action: string }): Promise<void> => {
-      if (!delegationPolicyGate) throw new Error("Delegation policy gate is not initialized");
-      return delegationPolicyGate.assertEnabled(input);
-    };
     const hostModelInput: { provider?: string; model?: HostModelName; reasoningLevel?: HostReasoningLevel; serviceTier?: ServiceTier } = {};
     if (options.provider !== undefined) hostModelInput.provider = options.provider;
     if (options.model !== undefined) hostModelInput.model = options.model;
@@ -450,19 +382,9 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     });
     const processes = new ManagedProcessManager();
     initializationDrains.push(() => processes.close("runtime_closed"));
-    // A scoped worker may only receive Bash when Chili owns a concrete host
-    // sandbox. An injected runner is opaque, and non-macOS platforms currently
-    // have no equivalent sandbox implementation, so fail closed by omitting it.
-    const childBashRunner = options.bashRunner || process.platform !== "darwin"
-      ? undefined
-      : createHostBashRunner({
-          permissionProfile: () => permissions.get().profile,
-          allowHostSandboxEscape: false,
-          resolveResourceDenials,
-        });
     const childRunLimiter = new LocalSubagentConcurrencyLimiter(config.agents.maxConcurrent);
-    const registry = createToolRegistry(skillRegistryForCwd, bashRunner, processes, memoryOptions);
-    const childRegistry = createChildToolRegistry(skillRegistryForCwd, childBashRunner, memoryOptions, childRunLimiter);
+    const registry = createToolRegistry(skillRegistryForCwd, bashRunner, processes, memoryOptions, childRunLimiter);
+    const childRegistry = createToolRegistry(skillRegistryForCwd, bashRunner, processes, memoryOptions, childRunLimiter);
     if (options.userInputQueue) {
       const userInputTool = createRequestUserInputTool(
         options.userInputQueue,
@@ -504,12 +426,6 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
         store: eventStore,
         ...(context.turn ? { turn: context.turn } : {}),
       }).then((fragments) => [...fragments, agentExpansionPromptFragment(config.agents)]);
-    const subagentPromptFragments = async (context: { cwd: string }) => buildHostPromptFragments({
-      cwd: context.cwd,
-      ...(await memoryOptionsForCwd(context.cwd)),
-      memoryScopes: await allowedMemoryScopes(context.cwd),
-      skillRegistry: await skillRegistryForCwd(context.cwd),
-    });
     const snapshotProvider = new FileSystemSnapshotProvider({
       rootDir: join(stateDir, "snapshots"),
       createId,
@@ -563,36 +479,15 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
       onModelChanged: persistUserModelSelection,
       allowSubagentSessions: true,
+      stopSessionResources: (sessionId, reason) => processes.stopSession(sessionId, reason),
+      runInput: async (sessionId, signal, run) => {
+        const permit = await childRunLimiter.acquireRun(sessionId, signal);
+        try { return await permit.run(run); } finally { permit.release(); }
+      },
       ...(options.sessionClaimLeaseMs !== undefined ? { sessionClaimLeaseMs: options.sessionClaimLeaseMs } : {}),
       ...(options.sessionClaimHeartbeatMs !== undefined ? { sessionClaimHeartbeatMs: options.sessionClaimHeartbeatMs } : {}),
     });
     initializationDrains.push(() => childService.shutdown("runtime_closed"));
-    const subagents = new LocalSubagentManager({
-      store: eventStore,
-      runner: new AgentRunnerSubagentRunner({
-        runner: childRuntime,
-        runtime: childService,
-        store: eventStore,
-        maxTurns: DEV_MAX_TURNS,
-        promptFragments: subagentPromptFragments,
-        modelConfig: ({ sessionId }) => childService.getModelConfig(sessionId),
-      }),
-      createId,
-      runLimiter: childRunLimiter,
-      assertDelegationEnabled,
-    });
-    initializationDrains.push(() => subagents.shutdown("runtime_closed"));
-    const tasks = new AgentTaskControlService({
-      store: eventStore,
-      runtime: childService,
-      interruptTask: (taskId, fence) => subagents.interruptTask(taskId, fence),
-      createId,
-      runLimiter: childRunLimiter,
-      assertDelegationEnabled,
-    });
-    initializationDrains.push(() => tasks.shutdown("runtime_closed"));
-    const completeTaskController = createCompleteTaskController(tasks, subagents);
-    childRegistry.register(createCompleteTaskTool(completeTaskController));
     const toolExecutor = new ToolExecutor({
       registry,
       executionContext: (operation) => withProcessOwner(owner.token, operation),
@@ -647,49 +542,9 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     });
     const recovery = new SnapshotRecoveryService({ store: eventStore, snapshotProvider, createId, sessionOperations: service });
     initializationDrains.push(() => service.shutdown("runtime_closed"));
-    const teams = new TeamControlService({
-      store: eventStore,
-      createId,
-      sessionOperations: service,
-    });
-    const resolveTeamSession = async (sessionId: SessionId) => {
-      await service.assertSessionTurnAllowed(sessionId);
-      const session = (await eventStore.sessions()).find((candidate) => candidate.id === sessionId);
-      if (!session) throw new Error(`Session not found: ${sessionId}`);
-      return session;
-    };
-    const teamWorktrees = new TeamWorktreeService({
-      teams,
-      cwd,
-      resolveSession: resolveTeamSession,
-      sessionOperations: service,
-    });
-    const teamVerifier = new TeamTaskVerificationService({
-      teams,
-      subagents,
-      cwd,
-      resolveSession: resolveTeamSession,
-      sessionOperations: service,
-    });
     delegationPolicyGate = new DelegationPolicyGate({
       store: eventStore,
       getDelegationConfig: (sessionId) => service.getDelegationConfig(sessionId),
-    });
-    const teamMerger = new TeamMergeService({
-      teams,
-      cwd,
-      resolveSession: resolveTeamSession,
-      sessionOperations: service,
-    });
-    const teamDispatcher = new TeamTaskDispatchService({
-      teams,
-      subagents,
-      store: eventStore,
-      worktrees: teamWorktrees,
-      cwd,
-      assertDelegationEnabled,
-      resolveSession: resolveTeamSession,
-      sessionOperations: service,
     });
     for (const tool of createGoalTools(createGoalToolController(service))) {
       registry.register(tool);
@@ -697,64 +552,35 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     const delegationController = createDelegationToolController(service);
     registry.register(createDelegationStatusTool(delegationController));
     registry.register(createDelegationSetTool(delegationController));
-    await reconcileStaleRuntimeState();
-    const teamRunner = new TeamExecutionRunner({
-      teams,
-      dispatcher: teamDispatcher,
-      verifier: teamVerifier,
-      merger: teamMerger,
-      events: eventStore,
-      cwd,
-      resolveSession: resolveTeamSession,
-      createSession: async (input) => {
-        const session = await service.createSession({ cwd: input.cwd });
-        return {
-          sessionId: session.sessionId,
-          discard: () => service.archiveSession(session.sessionId),
-        };
-      },
-      assertDelegationEnabled,
-      sessionOperations: service,
-    });
-    const agents = new AgentTreeControlService({
+    await reconcileStaleRuntimeState(true);
+    const agents = new AgentControlService({
+      normalizePolicy: (policy) => ({
+        ...policy,
+        ...(policy.allowedTools ? {
+          allowedTools: filterToolsByPolicy(registry.list(), { allowedTools: policy.allowedTools }).map((tool) => tool.name),
+        } : {}),
+        ...(policy.deniedTools ? {
+          deniedTools: [...new Set([
+            ...policy.deniedTools,
+            ...registry.list().filter((tool) => !isToolVisible(tool, { deniedTools: policy.deniedTools! })).map((tool) => tool.name),
+          ])],
+        } : {}),
+      }),
       store: eventStore,
       runtime: childService,
       rootRuntime: service,
-      taskTurns: tasks,
-      runLimiter: childRunLimiter,
-      delegationPolicyGate,
+      maxChildren: config.agents.maxChildren,
+      maxDepth: config.agents.maxDepth,
       createId,
     });
-    const mailboxPump = new AgentMailboxDeliveryPump({
-      agents,
-      events: eventStore,
-    });
-    initializationDrains.push(() => mailboxPump.stop());
-    mailboxPump.start();
-    const controlController = createSubagentControlController(tasks, agents);
-    const expansionController = createAgentExpansionController({
-      subagents, store: eventStore, limits: config.agents,
-      workerPolicyForSession: (sessionId) => resolveWorkerToolPolicy(eventStore, sessionId, Boolean(options.userInputQueue), config.agents),
-    });
-    const rootMessages = createAgentMessageToolController(tasks, agents, "root");
-    const childMessages = createAgentMessageToolController(tasks, agents, "child");
-    registry.register(suspendAgentTool(createAgentSpawnTool(expansionController, controlController), childRunLimiter));
-    registry.register(createAgentListTool(controlController, rootMessages));
-    registry.register(createAgentSendTool(rootMessages));
-    registry.register(suspendAgentTool(createAgentWaitTool(controlController), childRunLimiter));
-    registry.register(createAgentStopTool(controlController));
-    registry.register(suspendAgentTool(createAgentResumeTool(controlController), childRunLimiter));
-    childRegistry.register(suspendAgentTool(createAgentSpawnTool(expansionController, controlController), childRunLimiter));
-    childRegistry.register(suspendAgentTool(createAgentWaitTool(controlController), childRunLimiter));
-    childRegistry.register(createAgentStopTool(controlController));
-    childRegistry.register(suspendAgentTool(createAgentResumeTool(controlController), childRunLimiter));
-    childRegistry.register(createAgentListTool(controlController, childMessages));
-    childRegistry.register(createAgentSendTool(childMessages));
-    registerTeamTools(registry, createTeamToolController(teams, tasks, "root"));
-    registerTeamTools(childRegistry, createTeamToolController(teams, tasks, "child"));
-    const teamDispatchController = createTeamTaskDispatchToolController(teamDispatcher, teams);
-    registerTeamDispatchTools(registry, teamDispatchController);
-    registry.register(createTeamRunLoopTool(createTeamRunLoopToolController(teamRunner, teams)));
+    for (const agentRegistry of [registry, childRegistry]) {
+      agentRegistry.register(createAgentSpawnTool(agents));
+      agentRegistry.register(createAgentListTool(agents));
+      agentRegistry.register(createAgentSendTool(agents));
+      agentRegistry.register(suspendAgentTool(createAgentWaitTool(agents), childRunLimiter));
+      agentRegistry.register(createAgentStopTool(agents));
+      agentRegistry.register(createAgentResumeTool(agents));
+    }
     mcpRuntime = await (options.mcpRuntimeFactory ?? createHostMcpRuntime)({
       cwd,
       chiliHome,
@@ -803,12 +629,9 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       // synchronously. The single cleanup actor below observes all outcomes.
       startDrain(() => service.shutdown("runtime_closed"));
       startDrain(() => childService.shutdown("runtime_closed"));
-      startDrain(() => subagents.shutdown("runtime_closed"));
-      startDrain(() => tasks.shutdown("runtime_closed"));
       startDrain(() => processes.close("runtime_closed"));
       startDrain(() => options.approvalQueue?.denyAll("Runtime closed while waiting for approval."));
       startDrain(() => options.userInputQueue?.denyAll("Runtime closed while waiting for user input."));
-      startDrain(() => mailboxPump.stop());
       startDrain(() => staleTurnRecoveryRun?.catch(() => undefined));
 
       const cleanupActor = (async (): Promise<void> => {
@@ -848,13 +671,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       events: eventStore,
       runtime,
       service,
-      tasks,
       agents,
-      mailboxPump,
-      teams,
-      teamDispatcher,
-      teamMerger,
-      teamRunner,
       permissions,
       commands,
       mcp: mcpRuntime.control,
@@ -862,7 +679,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       ...(runtimeModelSelection ? { defaultModelSelection: runtimeModelSelection } : {}),
       ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
       ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
-      waitForBackgroundTasks: () => subagents.waitForBackgroundTasks(),
+      waitForAgents: () => childService.waitForIdle(),
       close,
     };
   } catch (error) {
@@ -926,24 +743,14 @@ function registerMcpResourceTools(registry: InMemoryToolRegistry, runtime: HostM
   registry.register(createMcpResourceReadTool(runtime.resources));
 }
 
-function createWorkerToolPolicyResolver(
-  store: ObservableEventStore,
-  allowUserInput = false,
-  agentLimits: HostAgentConfig = DEFAULT_HOST_AGENT_CONFIG,
-): ToolAccessPolicyResolver {
-  return { resolve: (context) => resolveWorkerToolPolicy(store, context.sessionId, allowUserInput, agentLimits) };
-}
-
-async function resolveWorkerToolPolicy(
-  store: ObservableEventStore,
-  sessionId: SessionId,
-  allowUserInput: boolean,
-  agentLimits: HostAgentConfig,
-): Promise<WorkerToolPolicy> {
-  const policy = await findWorkerToolPolicy(store, sessionId);
-  const resolved = completeWorkerToolPolicy(policy ?? recursiveWorkerPolicy(defaultScopedWorkerPolicy(), agentLimits), sessionId);
-  if (!allowUserInput || !resolved.allowedTools || resolved.allowedTools.includes("request_user_input")) return resolved;
-  return { ...resolved, allowedTools: [...resolved.allowedTools, "request_user_input"] };
+function createSessionToolPolicyResolver(store: ObservableEventStore): ToolAccessPolicyResolver {
+  return { async resolve(context) {
+    const session = await store.session(context.sessionId);
+    if (session?.source === "subagent" && !session.agent) {
+      throw new Error("Legacy Agent sessions are read-only");
+    }
+    return session?.agent?.policy;
+  } };
 }
 
 function agentExpansionPromptFragment(limits: HostAgentConfig): PromptFragment {
@@ -959,15 +766,6 @@ function suspendAgentTool<Input>(
   limiter: LocalSubagentConcurrencyLimiter,
 ): ChiliToolDefinition<Input> {
   return { ...tool, execute: (input, context) => {
-    // Background admission returns a handle without waiting for a child. Keep
-    // the parent's slot until it actually waits, so a queued child cannot delay
-    // delivery of its own handle to the parent at max_concurrent=1.
-    if (tool.name === "agent_spawn" && isRecord(input)) {
-      const background = Array.isArray(input.tasks)
-        ? (input.completionPolicy ?? "join") !== "join"
-        : input.mode === "background";
-      if (background) return tool.execute(input, context);
-    }
     return limiter.suspend(context.sessionId, () => tool.execute(input, context));
   } };
 }
@@ -1065,45 +863,6 @@ function createDelegationToolController(service: RuntimeService): DelegationTool
   };
 }
 
-async function findWorkerToolPolicy(
-  store: ObservableEventStore,
-  sessionId: SessionId,
-): Promise<WorkerToolPolicy | undefined> {
-  let afterEventId: string | undefined;
-  let found: WorkerToolPolicy | undefined;
-
-  while (true) {
-    const query: { type: string; limit: number; afterEventId?: string } = { type: "agent.spawned", limit: 500 };
-    if (afterEventId) query.afterEventId = afterEventId;
-    const events = await store.events(query);
-    for (const event of events) {
-      const policy = workerToolPolicyFromEvent(event, sessionId);
-      if (policy) found = policy;
-    }
-    if (events.length < query.limit) return found;
-    const lastEvent = events.at(-1);
-    if (!lastEvent) return found;
-    afterEventId = lastEvent.id;
-  }
-}
-
-function workerToolPolicyFromEvent(
-  event: EventEnvelope | undefined,
-  sessionId: SessionId,
-): WorkerToolPolicy | undefined {
-  const payload = event?.payload;
-  if (!isRecord(payload)) return undefined;
-  if (payload.childSessionId !== sessionId) return undefined;
-  const policy = payload.workerPolicy;
-  if (!isRecord(policy)) return undefined;
-  return {
-    ...policy,
-    allowedTools: stringArray(policy.allowedTools),
-    writeScope: stringArray(policy.writeScope),
-    executeScope: stringArray(policy.executeScope),
-  } as WorkerToolPolicy;
-}
-
 export async function buildHostPromptFragments(input: {
   cwd: string;
   skillRegistry: SkillRegistry;
@@ -1185,7 +944,6 @@ export async function buildHostChildPromptFragments(input: {
       ...(input.projectRoot ? { projectRoot: input.projectRoot } : {}),
     })),
     chiliChildRuntimeBasePromptFragment(),
-    ...(await buildTaskFollowupPromptFragments(input.store, input.sessionId, input.cwd)),
   ];
 }
 
@@ -1199,38 +957,6 @@ function chiliChildRuntimeBasePromptFragment(): PromptFragment {
     trust: "system",
     content:
       "You are a local Chili subagent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
-  };
-}
-
-async function buildTaskFollowupPromptFragments(
-  store: ObservableEventStore,
-  sessionId: SessionId,
-  cwd: string,
-): Promise<PromptFragment[]> {
-  const tasks = await store.agentTasks({ childSessionId: sessionId, limit: 10 });
-  if (tasks.length === 0) return [];
-  if (tasks.length > 1) {
-    throw new Error(
-      `Agent task metadata invariant violated: child session ${sessionId} maps to ${tasks.length} tasks`,
-    );
-  }
-  return [taskFollowupPromptFragment(tasks[0] as AgentTaskRow, cwd)];
-}
-
-function taskFollowupPromptFragment(task: AgentTaskRow, cwd: string): PromptFragment {
-  return {
-    id: `chili.task.followup.${task.id}`,
-    layer: "developer",
-    source: "runtime",
-    priority: 30,
-    lifecycle: "turn",
-    trust: "system",
-    content: [
-      `Subagent task id: ${task.id}. Repository cwd: ${cwd}.`,
-      `Agent path: ${task.path} (logical agent identifier, not a filesystem path).`,
-      "Use repository-relative paths, or absolute paths under the repository cwd; never prefix file paths with the agent path.",
-      "This is a follow-up for an existing task; answer in the task context and call complete_task with this task id when finished.",
-    ].join(" "),
   };
 }
 
@@ -1318,9 +1044,14 @@ function createToolRegistry(
   bashRunner: BashRunner,
   processes: ManagedProcessManager,
   memoryOptions: Parameters<typeof createMemoryTool>[0],
+  runLimiter: LocalSubagentConcurrencyLimiter,
 ): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
-  registry.register(createCodeModeTool());
+  const codeMode = createCodeModeTool();
+  registry.register({ ...codeMode, async execute(input, context) {
+    try { return await codeMode.execute(input, context); }
+    finally { await runLimiter.waitForResume(context.sessionId); }
+  } });
   registry.register(createReadFileTool({ defaultMaxBytes: DEFAULT_READ_MAX_BYTES, maxBytesLimit: READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
   registry.register(createGlobTool());
@@ -1347,69 +1078,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function createChildToolRegistry(
-  skillRegistryForCwd: (cwd: string) => Promise<SkillRegistry>,
-  bashRunner: BashRunner | undefined,
-  memoryOptions: Parameters<typeof createMemoryTool>[0],
-  runLimiter: LocalSubagentConcurrencyLimiter,
-): InMemoryToolRegistry {
-  const registry = new InMemoryToolRegistry();
-  const codeMode = createCodeModeTool();
-  registry.register({ ...codeMode, async execute(input, context) {
-    try {
-      return await codeMode.execute(input, context);
-    } finally {
-      // VM cleanup is bounded. A nested agent wait may still be restoring this
-      // parent's permit; do not let the next model call escape that limit.
-      await runLimiter.waitForResume(context.sessionId);
-    }
-  } });
-  registry.register(createReadFileTool({ defaultMaxBytes: DEFAULT_READ_MAX_BYTES, maxBytesLimit: READ_MAX_BYTES_LIMIT }));
-  registry.register(createReadImageTool());
-  registry.register(createGlobTool());
-  registry.register(createGrepTool());
-  registry.register(createMemoryTool(memoryOptions));
-  registry.register(createActivateSkillTool((context) => skillRegistryForCwd(context.cwd)));
-  registry.register(createEditTool());
-  registry.register(createWriteFileTool());
-  registry.register(createApplyPatchTool());
-  if (bashRunner) {
-    registry.register(createBashTool({ runner: bashRunner, allowEscalation: false }));
-  }
-  registerGitTools(registry);
-  registry.register(createToolSearchTool(registry, { groups: CODING_TOOL_GROUPS }));
-  return registry;
-}
-
 function registerGitTools(registry: InMemoryToolRegistry): void {
   registry.register(createGitStatusTool());
   registry.register(createGitDiffTool());
   registry.register(createGitStageTool());
   registry.register(createGitCommitTool());
   registry.register(createGitBranchTool());
-}
-
-function registerTeamTools(registry: InMemoryToolRegistry, controller: TeamToolController): void {
-  registry.register(createTeamCreateTool(controller));
-  registry.register(createTeamListTool(controller));
-  registry.register(createTeamSnapshotTool(controller));
-  registry.register(createTeamMemberAddTool(controller));
-  registry.register(createTeamMemberListTool(controller));
-  registry.register(createTeamTaskCreateTool(controller));
-  registry.register(createTeamTaskCreateBatchTool(controller));
-  registry.register(createTeamTaskListTool(controller));
-  registry.register(createTeamTaskAssignTool(controller));
-  registry.register(createTeamTaskClaimTool(controller));
-  registry.register(createTeamTaskUpdateTool(controller));
-  registry.register(createTeamMessageSendTool(controller));
-  registry.register(createTeamMessageListTool(controller));
-}
-
-function registerTeamDispatchTools(registry: InMemoryToolRegistry, controller: TeamTaskDispatchToolController): void {
-  registry.register(createTeamTaskDispatchTool(controller));
-  registry.register(createTeamTaskDispatchBatchTool(controller));
-  registry.register(createTeamTaskSyncTool(controller));
-  registry.register(createTeamTaskReconcileTool(controller));
+  registry.register(createGitWorktreeTool());
+  registry.register(createGitApplyPatchTool());
 }
 
 interface MutableHostPermissionProfileControl extends HostPermissionProfileControl {
@@ -1491,923 +1167,3 @@ function createApprovalBroker(
   permissions?.register(broker);
   return broker;
 }
-
-export function createSubagentControlController(
-  tasks: AgentTaskControlService,
-  agents: AgentTreeControlService,
-): SubagentControlController {
-  return {
-    async listTasks(input, context) {
-      if (input.taskIds) {
-        const visible = (await Promise.all(input.taskIds.map((taskId) => tasks.getTask(taskId as TaskId))))
-          .filter((task) => task.parentSessionId === context.sessionId)
-          .filter((task) => !input.status || task.status === input.status)
-          .map(toSubagentTaskRecord);
-        return limitItems(visible, input.limit);
-      }
-      const query: AgentTaskQuery = {};
-      if (input.status) query.status = input.status;
-      if (input.limit !== undefined) query.limit = input.limit;
-      query.parentSessionId = context.sessionId;
-      return (await tasks.listTasks(query))
-        .filter((task) => task.parentSessionId === context.sessionId)
-        .map(toSubagentTaskRecord);
-    },
-    async waitTask(input, context) {
-      const visibleTask = await tasks.getTask(input.taskId as TaskId);
-      if (visibleTask.parentSessionId !== context.sessionId) {
-        throw new Error(`Agent task is not visible to this session: ${input.taskId}`);
-      }
-      return toSubagentTaskRecord(
-        await tasks.waitForTask({
-          taskId: input.taskId as TaskId,
-          ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
-          signal: context.signal,
-        }),
-      );
-    },
-    async waitTasks(input, context) {
-      const taskIds = input.taskIds.map((taskId) => taskId as TaskId);
-      const visibleTasks = await Promise.all(taskIds.map((taskId) => tasks.getTask(taskId)));
-      const hiddenTask = visibleTasks.find((task) => task.parentSessionId !== context.sessionId);
-      if (hiddenTask) throw new Error(`Agent task is not visible to this session: ${hiddenTask.id}`);
-      const waited = await tasks.waitForTasks({
-        taskIds,
-        waitFor: input.waitFor ?? "all",
-        ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
-        signal: context.signal,
-      });
-      return {
-        waitFor: waited.waitFor,
-        satisfied: waited.satisfied,
-        timedOut: waited.timedOut,
-        tasks: waited.tasks.map(toSubagentTaskRecord),
-      };
-    },
-    async followupTask(input, context) {
-      await requireVisibleAgentTask(tasks, input.taskId as TaskId, context.sessionId);
-      const result = await tasks.followupTask({
-        taskId: input.taskId as TaskId,
-        text: input.prompt,
-        ...(input.maxTurns !== undefined ? { maxTurns: input.maxTurns } : {}),
-        signal: context.signal,
-      });
-      return toSubagentTaskRecord(result.task);
-    },
-    async closeTask(input, context) {
-      await requireVisibleAgentTask(tasks, input.taskId as TaskId, context.sessionId);
-      return toSubagentTaskRecord(
-        await tasks.closeTask({
-          taskId: input.taskId as TaskId,
-          ...(input.status ? { status: input.status } : {}),
-          ...(input.summary ? { summary: input.summary } : {}),
-          ...(input.error ? { error: input.error } : {}),
-          ...(input.interrupt !== undefined ? { interrupt: input.interrupt } : {}),
-        }),
-      );
-    },
-    async listMailbox(input, context) {
-      const taskQuery: AgentTaskQuery = {
-        parentSessionId: context.sessionId,
-        limit: mailboxTaskLimit(input),
-      };
-      if (input.taskId) taskQuery.taskId = input.taskId as TaskId;
-      if (input.path) taskQuery.path = input.path as AgentPath;
-      const visibleTasks = (await tasks.listTasks(taskQuery))
-        .filter((task) => task.parentSessionId === context.sessionId)
-        .filter((task) => (input.taskId ? task.id === input.taskId : true))
-        .filter((task) => (input.path ? task.path === input.path : true));
-      if ((input.taskId || input.path) && visibleTasks.length === 0) return [];
-      const visibleTaskIds = new Set(visibleTasks.map((task) => task.id));
-      const visibleRecipientSessionIds = new Set<SessionId>([context.sessionId]);
-      for (const task of visibleTasks) {
-        if (task.childSessionId) visibleRecipientSessionIds.add(task.childSessionId);
-      }
-
-      const messages = await agents.mailbox({
-        status: input.status ?? "queued",
-        limit: mailboxTaskLimit(input),
-      });
-      return messages
-        .filter((message) => mailboxMessageMatchesScope(
-          message,
-          visibleTaskIds,
-          visibleRecipientSessionIds,
-        ))
-        .filter((message) => (input.taskId ? message.taskId === input.taskId : true))
-        .filter((message) => (input.path ? message.path === input.path : true))
-        .slice(0, input.limit ?? 500)
-        .map(toSubagentMailboxRecord);
-    },
-    async consumeMailbox(input, context) {
-      const message = (await agents.mailbox({ messageId: input.messageId, limit: 1 }))[0];
-      if (!message?.taskId) throw new Error(`Mailbox message is not visible to this session: ${input.messageId}`);
-      const task = await tasks.getTask(message.taskId);
-      const visibleRecipients = new Set<SessionId>([context.sessionId]);
-      if (task.childSessionId) visibleRecipients.add(task.childSessionId);
-      if (
-        task.parentSessionId !== context.sessionId ||
-        (message.recipientSessionId !== undefined && !visibleRecipients.has(message.recipientSessionId))
-      ) {
-        throw new Error(`Mailbox message is not visible to this session: ${input.messageId}`);
-      }
-      return toSubagentMailboxRecord(await agents.consumeMailbox({ messageId: input.messageId }));
-    },
-  };
-}
-
-export function createCompleteTaskController(
-  tasks: AgentTaskControlService,
-  subagents: SubagentController,
-): SubagentController {
-  return {
-    spawnTask(input, context) {
-      return subagents.spawnTask(input, context);
-    },
-    async completeTask(input, context) {
-      const taskId = input.taskId as TaskId;
-      const task = await tasks.getTask(taskId);
-      const mappings = (await tasks.listTasks({ childSessionId: context.sessionId, limit: 2 }))
-        .filter((candidate) => candidate.childSessionId === context.sessionId);
-      if (
-        task.childSessionId !== context.sessionId ||
-        mappings.length !== 1 ||
-        mappings[0]?.id !== taskId
-      ) {
-        throw new Error(`Agent task cannot be completed by this session: ${taskId}`);
-      }
-      try {
-        return await tasks.completeTask(input);
-      } catch (error) {
-        if (error instanceof Error && error.name === "AgentTaskNotRunnableError") {
-          return subagents.completeTask(input, context);
-        }
-        throw error;
-      }
-    },
-  };
-}
-
-function createAgentMessageToolController(
-  tasks: AgentTaskControlService,
-  agents: AgentTreeControlService,
-  role: "root" | "child",
-): AgentMessageToolController {
-  return {
-    async sendAgentMessage(input, context) {
-      const sender = await resolveAgentMessageSender(
-        tasks,
-        role,
-        context.sessionId,
-        input.from,
-      );
-      const message = await agents.sendMessage({
-        ...(input.messageId ? { messageId: input.messageId } : {}),
-        from: sender,
-        to: input.to,
-        content: input.content,
-        delivery: input.delivery ?? "queueOnly",
-        ...(input.taskId ? { taskId: input.taskId as TaskId } : {}),
-        ...(input.metadata ? { metadata: input.metadata } : {}),
-        sessionId: context.sessionId,
-      });
-      return toAgentMessageRecord(message);
-    },
-    async listAgentMessages(input, context) {
-      await resolveAgentMessageSender(
-        tasks,
-        role,
-        context.sessionId,
-        undefined,
-      );
-      const visibleTasks = await listAgentMessageScopeTasks(tasks, context.sessionId);
-      const visibleTaskIds = new Set(visibleTasks.map((task) => task.id));
-      const visibleSessionIds = new Set<SessionId>([context.sessionId]);
-      for (const task of visibleTasks) {
-        if (task.childSessionId) visibleSessionIds.add(task.childSessionId);
-      }
-      const messages = await agents.mailbox({
-        ...(input.status ? { status: input.status } : {}),
-        ...(input.taskId ? { taskId: input.taskId as TaskId } : {}),
-        ...(input.path ? { path: input.path as AgentPath } : {}),
-        limit: Math.max(input.limit ?? 500, 1000),
-      });
-      return messages
-        .filter((message) => {
-          const taskMatches = message.taskId === undefined ? undefined : visibleTaskIds.has(message.taskId);
-          const sessionMatches = message.recipientSessionId === undefined
-            ? undefined
-            : visibleSessionIds.has(message.recipientSessionId);
-          if (taskMatches !== undefined && sessionMatches !== undefined) {
-            return taskMatches && sessionMatches;
-          }
-          return taskMatches ?? sessionMatches ?? false;
-        })
-        .filter((message) => (input.from ? message.fromPath === input.from : true))
-        .slice(0, input.limit ?? 500)
-        .map(toAgentMessageRecord);
-    },
-  };
-}
-
-async function resolveAgentMessageSender(
-  tasks: AgentTaskControlService,
-  role: "root" | "child",
-  sessionId: SessionId,
-  requested: string | undefined,
-): Promise<AgentPath> {
-  if (role === "root") {
-    const root = "/root" as AgentPath;
-    if (requested && requested !== root) {
-      throw new Error(`Agent message sender ${requested} does not match current agent ${root}`);
-    }
-    return root;
-  }
-
-  const ownTasks = await tasks.listTasks({ childSessionId: sessionId, limit: 1000 });
-  if (ownTasks.length === 0) {
-    throw new Error(`Agent message sender is unavailable for child session ${sessionId}`);
-  }
-  if (ownTasks.length > 1) {
-    throw new Error(`Agent message sender is ambiguous for session ${sessionId}: ${ownTasks.map((task) => task.id).join(", ")}`);
-  }
-  const inferred = ownTasks[0]?.path as AgentPath;
-  if (requested && requested !== inferred) {
-    throw new Error(`Agent message sender ${requested} does not match current agent ${inferred}`);
-  }
-  return inferred;
-}
-
-async function listAgentMessageScopeTasks(
-  tasks: AgentTaskControlService,
-  sessionId: SessionId,
-): Promise<AgentTaskRow[]> {
-  const allTasks = await tasks.listTasks({ limit: 2_147_483_647 });
-  const visible = new Map<TaskId, AgentTaskRow>();
-  const endpoints: SessionId[] = [sessionId];
-  const visitedEndpoints = new Set<SessionId>();
-
-  for (const task of allTasks) {
-    if (task.childSessionId === sessionId) {
-      visible.set(task.id, task);
-    }
-  }
-
-  for (let index = 0; index < endpoints.length; index += 1) {
-    const endpoint = endpoints[index] as SessionId;
-    if (visitedEndpoints.has(endpoint)) continue;
-    visitedEndpoints.add(endpoint);
-    for (const task of allTasks) {
-      if (task.parentSessionId !== endpoint) continue;
-      visible.set(task.id, task);
-      if (task.childSessionId) {
-        endpoints.push(task.childSessionId);
-      }
-    }
-  }
-
-  return [...visible.values()];
-}
-
-async function visibleTeamsForSession(
-  teams: TeamControlService,
-  sessionId: SessionId,
-): Promise<TeamRow[]> {
-  const allTeams = await teams.listTeams();
-  const visibility = await Promise.all(allTeams.map(async (team) => {
-    if (team.sessionId === sessionId) return true;
-    return (await teams.members(team.id)).some((member) => member.childSessionId === sessionId);
-  }));
-  return allTeams.filter((_team, index) => visibility[index]);
-}
-
-async function requireVisibleTeam(
-  teams: TeamControlService,
-  teamId: TeamId,
-  sessionId: SessionId,
-): Promise<TeamRow> {
-  const team = (await visibleTeamsForSession(teams, sessionId)).find((candidate) => candidate.id === teamId);
-  if (!team) throw new Error(`Team is not visible to this session: ${teamId}`);
-  return team;
-}
-
-async function requireTeamOwnerOrLead(
-  teams: TeamControlService,
-  teamId: TeamId,
-  sessionId: SessionId,
-): Promise<TeamRow> {
-  const team = (await teams.listTeams()).find((candidate) => candidate.id === teamId);
-  if (!team) throw new Error(`Team is not visible to this session: ${teamId}`);
-  if (team.sessionId === sessionId) return team;
-  const lead = (await teams.members(teamId)).find((member) => member.path === team.leadPath);
-  if (lead?.childSessionId !== sessionId) {
-    throw new Error(`Team membership cannot be changed by this session: ${teamId}`);
-  }
-  return team;
-}
-
-async function requireUniqueDescendantAgentTask(
-  tasks: AgentTaskControlService,
-  childSessionId: SessionId,
-  path: AgentPath,
-  parentSessionId: SessionId,
-): Promise<AgentTaskRow> {
-  if (childSessionId === parentSessionId) {
-    throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
-  }
-
-  const visited = new Set<SessionId>();
-  let endpoint = childSessionId;
-  let descendant: AgentTaskRow | undefined;
-  while (endpoint !== parentSessionId) {
-    if (visited.has(endpoint)) {
-      throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
-    }
-    visited.add(endpoint);
-    const mappings = (await tasks.listTasks({ childSessionId: endpoint, limit: 2 }))
-      .filter((task) => task.childSessionId === endpoint);
-    if (mappings.length !== 1) {
-      throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
-    }
-    const task = mappings[0] as AgentTaskRow;
-    descendant ??= task;
-    if (!task.parentSessionId) {
-      throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
-    }
-    endpoint = task.parentSessionId;
-  }
-
-  if (!descendant || descendant.path !== path) {
-    throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
-  }
-  return descendant;
-}
-
-export function createTeamToolController(
-  teams: TeamControlService,
-  tasks: AgentTaskControlService,
-  role: "root" | "child",
-): TeamToolController {
-  return {
-    async createTeam(input, context) {
-      const leadPath = await resolveAgentMessageSender(tasks, role, context.sessionId, input.leadPath);
-      const createInput: Parameters<TeamControlService["createTeam"]>[0] = {
-        name: input.name,
-        leadPath,
-        sessionId: context.sessionId,
-      };
-      if (input.teamId) createInput.teamId = input.teamId as TeamId;
-      if (input.description) createInput.description = input.description;
-      if (input.leadName) createInput.leadName = input.leadName;
-      if (input.leadRole) createInput.leadRole = input.leadRole;
-      if (input.leadStatus) createInput.leadStatus = input.leadStatus;
-      if (input.leadWriteScope) createInput.leadWriteScope = input.leadWriteScope;
-      return toTeamRecord(await teams.createTeam(createInput));
-    },
-    async listTeams(input, context) {
-      const visible = await visibleTeamsForSession(teams, context.sessionId);
-      return limitItems(
-        visible.filter((team) => (input.status ? team.status === input.status : true)).map(toTeamRecord),
-        input.limit,
-      );
-    },
-    async snapshotTeam(input, context) {
-      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      return toTeamSnapshotRecord(await teams.snapshot(input.teamId as TeamId));
-    },
-    async addMember(input, context) {
-      await requireTeamOwnerOrLead(teams, input.teamId as TeamId, context.sessionId);
-      if (input.childSessionId) {
-        await requireUniqueDescendantAgentTask(
-          tasks,
-          input.childSessionId as SessionId,
-          input.path as AgentPath,
-          context.sessionId,
-        );
-      }
-      const addInput: Parameters<TeamControlService["addMember"]>[0] = {
-        teamId: input.teamId as TeamId,
-        path: input.path as AgentPath,
-        name: input.name,
-        role: input.role,
-        sessionId: context.sessionId,
-      };
-      if (input.status) addInput.status = input.status;
-      if (input.childSessionId) addInput.childSessionId = input.childSessionId as SessionId;
-      if (input.model) addInput.model = input.model;
-      if (input.toolScope) addInput.toolScope = input.toolScope;
-      if (input.writeScope) addInput.writeScope = input.writeScope;
-      return toTeamMemberRecord(await teams.addMember(addInput));
-    },
-    async listMembers(input, context) {
-      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      return limitItems(
-        (await teams.members(input.teamId as TeamId))
-          .filter((member) => (input.status ? member.status === input.status : true))
-          .map(toTeamMemberRecord),
-        input.limit,
-      );
-    },
-    async createTask(input, context) {
-      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      const createInput: Parameters<TeamControlService["createTask"]>[0] = {
-        teamId: input.teamId as TeamId,
-        title: input.title,
-        sessionId: context.sessionId,
-      };
-      if (input.taskId) createInput.taskId = input.taskId as TaskId;
-      if (input.description) createInput.description = input.description;
-      if (input.createdBy) createInput.createdBy = input.createdBy as AgentPath;
-      if (input.ownerPath) createInput.ownerPath = input.ownerPath as AgentPath;
-      if (input.dependsOn) createInput.dependsOn = input.dependsOn as TaskId[];
-      if (input.status) createInput.status = input.status;
-      if (input.metadata) createInput.metadata = input.metadata;
-      return toTeamTaskRecord(await teams.createTask(createInput));
-    },
-    async listTasks(input, context) {
-      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      return limitItems(
-        (await teams.tasks(input.teamId as TeamId))
-          .filter((task) => (input.status ? task.status === input.status : true))
-          .filter((task) => (input.ownerPath ? task.ownerPath === input.ownerPath : true))
-          .map(toTeamTaskRecord),
-        input.limit,
-      );
-    },
-    async assignTask(input, context) {
-      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      const assignInput: Parameters<TeamControlService["assignTask"]>[0] = {
-        teamId: input.teamId as TeamId,
-        taskId: input.taskId as TaskId,
-        ownerPath: input.ownerPath as AgentPath,
-        sessionId: context.sessionId,
-      };
-      if (input.assignedBy) assignInput.assignedBy = input.assignedBy as AgentPath;
-      if (input.message) assignInput.message = input.message;
-      if (input.messageDelivery) assignInput.messageDelivery = input.messageDelivery;
-      if (input.messageSummary) assignInput.messageSummary = input.messageSummary;
-      return toTeamTaskRecord(await teams.assignTask(assignInput));
-    },
-    async claimTask(input, context) {
-      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      const claimInput: Parameters<TeamControlService["claimTask"]>[0] = {
-        teamId: input.teamId as TeamId,
-        taskId: input.taskId as TaskId,
-        ownerPath: input.ownerPath as AgentPath,
-        sessionId: context.sessionId,
-      };
-      if (input.claimedBy) claimInput.claimedBy = input.claimedBy as AgentPath;
-      const claim = await teams.claimTask(claimInput);
-      const result: TeamTaskClaimRecord = { applied: claim.applied };
-      if (claim.reason) result.reason = claim.reason;
-      if (claim.task) result.task = toTeamTaskRecord(claim.task);
-      return result;
-    },
-    async updateTask(input, context) {
-      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      const updateInput: Parameters<TeamControlService["updateTask"]>[0] = {
-        teamId: input.teamId as TeamId,
-        taskId: input.taskId as TaskId,
-        sessionId: context.sessionId,
-      };
-      if (role === "child") updateInput.actorScope = "scoped_worker";
-      if (input.status) updateInput.status = input.status;
-      if (input.ownerPath) updateInput.ownerPath = input.ownerPath as AgentPath;
-      if (input.title) updateInput.title = input.title;
-      if (input.description) updateInput.description = input.description;
-      if (input.dependsOn) updateInput.dependsOn = input.dependsOn as TaskId[];
-      if (input.summary) updateInput.summary = input.summary;
-      if (input.error) updateInput.error = input.error;
-      if (input.metadata) updateInput.metadata = input.metadata;
-      return toTeamTaskRecord(await teams.updateTask(updateInput));
-    },
-    async sendMessage(input, context) {
-      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      const messageInput: Parameters<TeamControlService["sendMessage"]>[0] = {
-        teamId: input.teamId as TeamId,
-        from: input.from as AgentPath,
-        to: input.to as AgentPath | "*",
-        content: input.content,
-        sessionId: context.sessionId,
-      };
-      if (input.messageId) messageInput.messageId = input.messageId;
-      if (input.kind) messageInput.kind = input.kind;
-      if (input.delivery) messageInput.delivery = input.delivery;
-      if (input.taskId) messageInput.taskId = input.taskId as TaskId;
-      if (input.summary) messageInput.summary = input.summary;
-      if (input.metadata) messageInput.metadata = input.metadata;
-      return toTeamMessageRecord(await teams.sendMessage(messageInput));
-    },
-    async listMessages(input, context) {
-      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      return limitItems(
-        (await teams.messages(input.teamId as TeamId))
-          .filter((message) => (input.path ? message.fromPath === input.path || message.toPath === input.path || message.toPath === "*" : true))
-          .filter((message) => (input.taskId ? message.taskId === input.taskId : true))
-          .map(toTeamMessageRecord),
-        input.limit,
-      );
-    },
-  };
-}
-
-function createTeamTaskDispatchToolController(
-  dispatcher: TeamTaskDispatchService,
-  teams: TeamControlService,
-): TeamTaskDispatchToolController {
-  return {
-    async dispatchTask(input, context) {
-      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      const dispatchInput: Parameters<TeamTaskDispatchService["dispatchTask"]>[0] = {
-        teamId: input.teamId as TeamId,
-        taskId: input.taskId as TaskId,
-        sessionId: context.sessionId,
-        cwd: context.cwd,
-        signal: context.signal,
-      };
-      if (input.ownerPath) dispatchInput.ownerPath = input.ownerPath as AgentPath;
-      if (input.mode) dispatchInput.mode = input.mode;
-      if (input.prompt) dispatchInput.prompt = input.prompt;
-      if (input.sourceCallId !== undefined) dispatchInput.sourceCallId = input.sourceCallId;
-      if (input.batchId !== undefined) dispatchInput.batchId = input.batchId;
-      if (input.batchIndex !== undefined) dispatchInput.batchIndex = input.batchIndex;
-      if (input.expectedBatchSize !== undefined) dispatchInput.expectedBatchSize = input.expectedBatchSize;
-      if (input.maxConcurrency !== undefined) dispatchInput.maxConcurrency = input.maxConcurrency;
-      return toTeamTaskDispatchRecord(await dispatcher.dispatchTask(dispatchInput));
-    },
-    async syncTask(input, context) {
-      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      const syncInput: Parameters<TeamTaskDispatchService["syncTask"]>[0] = {
-        teamId: input.teamId as TeamId,
-        taskId: input.taskId as TaskId,
-        sessionId: context.sessionId,
-      };
-      return toTeamTaskSyncRecord(await dispatcher.syncTask(syncInput));
-    },
-    async reconcileTasks(input, context) {
-      if (input.teamId) {
-        await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      } else {
-        const visibleTeams = (await visibleTeamsForSession(teams, context.sessionId))
-          .filter((team) => team.status === "active");
-        const reconciled: TeamTaskReconcileRecord = {
-          scanned: 0,
-          synced: [],
-          skipped: [],
-          errors: [],
-        };
-        const limit = input.limit ?? 500;
-        for (const team of visibleTeams) {
-          if (reconciled.scanned >= limit) break;
-          const result = toTeamTaskReconcileRecord(await dispatcher.reconcileTasks({
-            teamId: team.id,
-            sessionId: context.sessionId,
-            limit: limit - reconciled.scanned,
-          }));
-          reconciled.scanned += result.scanned;
-          reconciled.synced.push(...result.synced);
-          reconciled.skipped.push(...result.skipped);
-          reconciled.errors.push(...result.errors);
-        }
-        return reconciled;
-      }
-      const reconcileInput: Parameters<TeamTaskDispatchService["reconcileTasks"]>[0] = {
-        sessionId: context.sessionId,
-      };
-      if (input.teamId) reconcileInput.teamId = input.teamId as TeamId;
-      if (input.limit !== undefined) reconcileInput.limit = input.limit;
-      return toTeamTaskReconcileRecord(await dispatcher.reconcileTasks(reconcileInput));
-    },
-  };
-}
-
-function createTeamRunLoopToolController(
-  teamRunner: TeamExecutionRunner,
-  teams: TeamControlService,
-): TeamRunLoopToolController {
-  return {
-    async runTeam(input, context) {
-      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
-      const runInput: Parameters<TeamExecutionRunner["run"]>[0] = {
-        teamId: input.teamId as TeamId,
-        sessionId: context.sessionId,
-        cwd: context.cwd,
-        once: input.once ?? true,
-        signal: context.signal,
-      };
-      if (input.mode) runInput.mode = input.mode;
-      if (input.maxCycles !== undefined) runInput.maxCycles = input.maxCycles;
-      if (input.timeoutMs !== undefined) runInput.timeoutMs = input.timeoutMs;
-      if (input.pollIntervalMs !== undefined) runInput.pollIntervalMs = input.pollIntervalMs;
-      if (input.maxConcurrentDispatches !== undefined) runInput.maxConcurrentDispatches = input.maxConcurrentDispatches;
-      if (input.maxConcurrentVerifications !== undefined) runInput.maxConcurrentVerifications = input.maxConcurrentVerifications;
-      return toTeamRunLoopRecord(await teamRunner.run(runInput));
-    },
-  };
-}
-
-function mailboxTaskLimit(input: MailboxListToolInput): number {
-  return Math.max(input.limit ?? 500, 500);
-}
-
-async function requireVisibleAgentTask(
-  tasks: AgentTaskControlService,
-  taskId: TaskId,
-  sessionId: SessionId,
-): Promise<AgentTaskRow> {
-  const task = await tasks.getTask(taskId);
-  if (task.parentSessionId !== sessionId) {
-    throw new Error(`Agent task is not visible to this session: ${taskId}`);
-  }
-  return task;
-}
-
-function mailboxMessageMatchesScope(
-  message: AgentMailboxRow,
-  visibleTaskIds: ReadonlySet<TaskId>,
-  visibleRecipientSessionIds: ReadonlySet<SessionId>,
-): boolean {
-  const taskMatches = message.taskId === undefined
-    ? undefined
-    : visibleTaskIds.has(message.taskId);
-  const recipientMatches = message.recipientSessionId === undefined
-    ? undefined
-    : visibleRecipientSessionIds.has(message.recipientSessionId);
-  if (taskMatches !== undefined && recipientMatches !== undefined) {
-    return taskMatches && recipientMatches;
-  }
-  return taskMatches ?? recipientMatches ?? false;
-}
-
-function toSubagentTaskRecord(task: AgentTaskRow): SubagentTaskRecord {
-  return {
-    taskId: task.id,
-    path: task.path,
-    taskName: task.taskName,
-    status: task.status,
-    ...(task.mode ? { mode: task.mode } : {}),
-    generation: task.generation,
-    ...(task.currentRunId ? { currentRunId: task.currentRunId } : {}),
-    ...(task.childSessionId ? { childSessionId: task.childSessionId } : {}),
-    ...(task.summary ? { summary: task.summary } : {}),
-    ...(task.error ? { error: task.error } : {}),
-    createdAt: task.createdAt,
-    updatedAt: task.updatedAt,
-    ...(task.completedAt ? { completedAt: task.completedAt } : {}),
-  };
-}
-
-function toSubagentMailboxRecord(message: AgentMailboxRow): SubagentMailboxRecord {
-  return {
-    messageId: message.id,
-    path: message.path,
-    fromPath: message.fromPath,
-    status: message.status,
-    triggerTurn: message.triggerTurn,
-    ...(message.taskId ? { taskId: message.taskId } : {}),
-    ...(message.recipientSessionId ? { recipientSessionId: message.recipientSessionId } : {}),
-    ...(message.message ? { message: message.message } : {}),
-    createdAt: message.createdAt,
-    ...(message.consumedAt ? { consumedAt: message.consumedAt } : {}),
-  };
-}
-
-function toAgentMessageRecord(message: AgentMailboxRow): AgentMessageRecord {
-  const content = message.message && "content" in message.message ? message.message.content : undefined;
-  const metadata = message.message?.metadata;
-  return {
-    messageId: message.id,
-    fromPath: message.fromPath,
-    toPath: message.path,
-    delivery: message.triggerTurn ? "triggerTurn" : "queueOnly",
-    status: message.status,
-    ...(message.taskId ? { taskId: message.taskId } : {}),
-    ...(message.recipientSessionId ? { recipientSessionId: message.recipientSessionId } : {}),
-    ...(content ? { content } : {}),
-    ...(metadata ? { metadata } : {}),
-    createdAt: message.createdAt,
-    ...(message.consumedAt ? { consumedAt: message.consumedAt } : {}),
-  };
-}
-
-function toTeamRecord(team: TeamRow): TeamRecord {
-  return {
-    teamId: team.id,
-    name: team.name,
-    leadPath: team.leadPath,
-    status: team.status,
-    ...(team.sessionId ? { sessionId: team.sessionId } : {}),
-    ...(team.description ? { description: team.description } : {}),
-    createdAt: team.createdAt,
-    updatedAt: team.updatedAt,
-  };
-}
-
-function toTeamSnapshotRecord(snapshot: Awaited<ReturnType<TeamControlService["snapshot"]>>): TeamSnapshotRecord {
-  return {
-    team: toTeamRecord(snapshot.team),
-    members: snapshot.members.map((member) => {
-      const record = {
-        ...toTeamMemberRecord(member),
-        taskIds: member.taskIds,
-        deliveryIds: member.deliveryIds,
-      };
-      return member.currentTask ? { ...record, currentTask: toTeamTaskRecord(member.currentTask) } : record;
-    }),
-    tasks: snapshot.tasks.map((task) => {
-      const record = {
-        ...toTeamTaskRecord(task),
-        blockedBy: task.blockedBy,
-        blocks: task.blocks,
-        ready: task.ready,
-        messageIds: task.messageIds,
-      };
-      return {
-        ...record,
-        ...(task.owner ? { owner: toTeamMemberRecord(task.owner) } : {}),
-        ...(task.dispatch !== undefined ? { dispatch: task.dispatch } : {}),
-      };
-    }),
-    messages: snapshot.messages.map((message) => ({
-      ...toTeamMessageRecord(message),
-      deliveries: message.deliveries.map(toTeamMessageDeliveryRecord),
-    })),
-    messageDeliveries: snapshot.messageDeliveries.map(toTeamMessageDeliveryRecord),
-    stats: snapshot.stats,
-    generatedAt: snapshot.generatedAt,
-  };
-}
-
-function toTeamMemberRecord(member: TeamMemberRow): TeamMemberRecord {
-  return {
-    teamId: member.teamId,
-    path: member.path,
-    name: member.name,
-    role: member.role,
-    status: member.status,
-    ...(member.childSessionId ? { childSessionId: member.childSessionId } : {}),
-    ...(member.model ? { model: member.model } : {}),
-    ...(member.toolScope ? { toolScope: member.toolScope } : {}),
-    ...(member.writeScope ? { writeScope: member.writeScope } : {}),
-    ...(member.currentTaskId ? { currentTaskId: member.currentTaskId } : {}),
-    createdAt: member.createdAt,
-    updatedAt: member.updatedAt,
-    ...(member.closedAt ? { closedAt: member.closedAt } : {}),
-  };
-}
-
-function toTeamTaskRecord(task: TeamTaskRow): TeamTaskRecord {
-  return {
-    taskId: task.id,
-    teamId: task.teamId,
-    title: task.title,
-    status: task.status,
-    ...(task.sessionId ? { sessionId: task.sessionId } : {}),
-    ...(task.description ? { description: task.description } : {}),
-    ...(task.ownerPath ? { ownerPath: task.ownerPath } : {}),
-    ...(task.createdBy ? { createdBy: task.createdBy } : {}),
-    dependsOn: task.dependsOn,
-    ...(task.summary ? { summary: task.summary } : {}),
-    ...(task.error ? { error: task.error } : {}),
-    ...(task.metadata ? { metadata: task.metadata } : {}),
-    createdAt: task.createdAt,
-    updatedAt: task.updatedAt,
-    ...(task.completedAt ? { completedAt: task.completedAt } : {}),
-  };
-}
-
-function toTeamTaskDispatchRecord(
-  result: Awaited<ReturnType<TeamTaskDispatchService["dispatchTask"]>>,
-): TeamTaskDispatchRecord {
-  return {
-    status: result.status,
-    teamTask: toTeamTaskRecord(result.teamTask),
-    ...(result.agentTask ? { agentTask: toTeamDispatchAgentTaskRecord(result.agentTask) } : {}),
-    ...(result.reason ? { reason: result.reason } : {}),
-  };
-}
-
-function toTeamTaskSyncRecord(result: Awaited<ReturnType<TeamTaskDispatchService["syncTask"]>>): TeamTaskSyncRecord {
-  return {
-    applied: result.applied,
-    teamTask: toTeamTaskRecord(result.teamTask),
-    ...(result.agentTask ? { agentTask: toTeamDispatchAgentTaskRecord(result.agentTask) } : {}),
-    ...(result.reason ? { reason: result.reason } : {}),
-  };
-}
-
-function toTeamTaskReconcileRecord(
-  result: Awaited<ReturnType<TeamTaskDispatchService["reconcileTasks"]>>,
-): TeamTaskReconcileRecord {
-  return {
-    scanned: result.scanned,
-    synced: result.synced.map(toTeamTaskSyncRecord),
-    skipped: result.skipped.map(toTeamTaskSyncRecord),
-    errors: result.errors.map((error) => ({
-      teamId: error.teamId,
-      taskId: error.taskId,
-      error: error.error,
-    })),
-  };
-}
-
-function toTeamRunLoopRecord(result: Awaited<ReturnType<TeamExecutionRunner["run"]>>): TeamRunLoopRecord {
-  return {
-    teamId: result.teamId,
-    cycles: result.cycles,
-    stopReason: result.stopReason,
-    startedAt: result.startedAt,
-    endedAt: result.endedAt,
-    maxConcurrentDispatches: result.maxConcurrentDispatches,
-    maxConcurrentVerifications: result.maxConcurrentVerifications,
-    dispatched: result.dispatched,
-    completed: result.completed,
-    accepted: result.accepted,
-    reopened: result.reopened,
-    merged: result.merged,
-    mergeFailed: result.mergeFailed,
-    mergeConflicted: result.mergeConflicted,
-    mergeSkipped: result.mergeSkipped,
-    failed: result.failed,
-    blocked: result.blocked,
-    skipped: result.skipped,
-    stillRunning: result.stillRunning,
-    errors: result.errors,
-  };
-}
-
-function toTeamDispatchAgentTaskRecord(task: TeamDispatchAgentTaskLike): TeamDispatchAgentTaskRecord {
-  const record: TeamDispatchAgentTaskRecord = {
-    taskId: (task.taskId ?? task.id) as TaskId,
-    status: task.status,
-  };
-  if (task.path) record.path = task.path;
-  const runId = task.runId ?? task.currentRunId;
-  if (runId) record.runId = runId;
-  if (task.childSessionId) record.childSessionId = task.childSessionId;
-  if (task.summary) record.summary = task.summary;
-  const error = task.error;
-  if (error) record.error = error instanceof Error ? error.message : error;
-  return record;
-}
-
-function toTeamMessageRecord(message: TeamMessageRow): TeamMessageRecord {
-  return {
-    messageId: message.id,
-    teamId: message.teamId,
-    fromPath: message.fromPath,
-    toPath: message.toPath,
-    content: message.content,
-    kind: message.kind,
-    ...(message.delivery ? { delivery: message.delivery } : {}),
-    ...(message.deliveryStatus ? { deliveryStatus: message.deliveryStatus } : {}),
-    ...(message.deliveryError ? { deliveryError: message.deliveryError } : {}),
-    ...(message.deliveryUpdatedAt ? { deliveryUpdatedAt: message.deliveryUpdatedAt } : {}),
-    ...(message.deliveredAt ? { deliveredAt: message.deliveredAt } : {}),
-    ...(message.taskId ? { taskId: message.taskId } : {}),
-    ...(message.summary ? { summary: message.summary } : {}),
-    ...(message.metadata ? { metadata: message.metadata } : {}),
-    createdAt: message.createdAt,
-  };
-}
-
-function toTeamMessageDeliveryRecord(
-  delivery: Awaited<ReturnType<TeamControlService["snapshot"]>>["messageDeliveries"][number],
-): TeamSnapshotRecord["messageDeliveries"][number] {
-  return {
-    mailboxMessageId: delivery.mailboxMessageId,
-    teamId: delivery.teamId,
-    teamMessageId: delivery.teamMessageId,
-    path: delivery.path,
-    status: delivery.status,
-    triggerTurn: delivery.triggerTurn,
-    ...(delivery.childSessionId ? { childSessionId: delivery.childSessionId } : {}),
-    ...(delivery.error ? { error: delivery.error } : {}),
-    queuedAt: delivery.queuedAt,
-    updatedAt: delivery.updatedAt,
-    ...(delivery.deliveredAt ? { deliveredAt: delivery.deliveredAt } : {}),
-  };
-}
-
-function limitItems<T>(items: T[], limit: number | undefined): T[] {
-  return limit === undefined ? items : items.slice(0, limit);
-}
-
-type TeamDispatchAgentTaskLike = (
-  | {
-      taskId: TaskId;
-      id?: TaskId;
-    }
-  | {
-      taskId?: TaskId;
-      id: TaskId;
-    }
-) & {
-  path?: AgentPath;
-  runId?: string;
-  currentRunId?: string;
-  childSessionId?: SessionId;
-  status: string;
-  summary?: string;
-  error?: string | Error;
-};

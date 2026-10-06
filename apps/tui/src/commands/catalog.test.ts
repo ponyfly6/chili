@@ -5,7 +5,6 @@ import { createTuiCommandRegistry } from "./catalog.js";
 import type { TuiCommandContext } from "./types.js";
 
 const context = {
-  model: {},
   busy: false,
   modelCandidates: [
     { provider: "openai-codex", model: "gpt-5.5", displayName: "GPT-5.5" },
@@ -147,7 +146,7 @@ test("TUI destructive app exit is explicit and confirmed", async () => {
 test("busy context disables unsafe commands before execution", () => {
   const registry = createTuiCommandRegistry();
 
-  expect(resolveCommand(registry, { ...context, busy: true }, "/team run")).toMatchObject({
+  expect(resolveCommand(registry, { ...context, busy: true }, "/session new")).toMatchObject({
     status: "disabled",
     reason: "Wait for the active turn to finish.",
   });
@@ -200,4 +199,22 @@ test("runtime prompt catalog is imported as an ID-based TUI proxy", async () => 
     commandId: "prompt.project.review",
     args: "src/index.ts",
   });
+});
+
+
+test("TUI exposes one agent list and stop/resume controls", async () => {
+  const registry = createTuiCommandRegistry();
+  expect(resolveCommand(registry, context, "/team").status).toBe("unknown");
+  for (const command of ["/agents", "/agents list"]) {
+    const match = resolveCommand(registry, context, command);
+    expect(match.status).toBe("matched");
+    if (match.status !== "matched" || !match.command.run) throw new Error("Missing agent list command");
+    expect(await match.command.run(context, match.args)).toEqual({ type: "open_view", view: "agents" });
+  }
+  for (const action of ["stop", "resume"] as const) {
+    const match = resolveCommand(registry, context, `/agents ${action} session_child`);
+    expect(match.status).toBe("matched");
+    if (match.status !== "matched" || !match.command.run) throw new Error("Missing agent control command");
+    expect(await match.command.run(context, match.args)).toEqual({ type: "agent_action", action, agentId: "session_child" });
+  }
 });

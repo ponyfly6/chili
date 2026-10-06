@@ -149,7 +149,7 @@ describe("real desktop remote adapter boundary", () => {
       .then(() => null, (error: unknown) => error);
     const sending = fixture.service.invoke({ type: "session.send", sessionId: "root", text: "allowed local", mode: "queue" });
     membership.resolve(kind === "missing" ? [] : [{ ...summary("root"),
-      ...(kind === "child" ? { source: "subagent" as const } : {}),
+      ...(kind === "child" ? { agent: { parentSessionId: "parent" as never, name: "child", path: "/root/child" as never, policy: {} } } : {}),
       ...(kind === "foreign" ? { cwd: "/other" } : {}),
       ...(kind === "archived" ? { status: "archived" as const } : {}),
     }]);
@@ -185,7 +185,7 @@ describe("real desktop remote adapter boundary", () => {
     const fixture = harness({ listSessions: async () => [
       summary("root"),
       legacy,
-      { ...summary("child"), source: "subagent" },
+      { ...summary("child"), agent: { parentSessionId: "root" as never, name: "child", path: "/root/child" as never, policy: {} } },
       { ...summary("other"), cwd: "/other/private" },
       { ...summary("nested"), cwd: "/repo/nested" },
     ] });
@@ -202,7 +202,7 @@ describe("real desktop remote adapter boundary", () => {
   test("checks every target operation independently and refuses child, foreign, missing and archived mutation targets", async () => {
     let targetReads = 0;
     const fixture = harness({
-      listSessions: async () => [summary("root"), { ...summary("child"), source: "subagent" },
+      listSessions: async () => [summary("root"), { ...summary("child"), agent: { parentSessionId: "root" as never, name: "child", path: "/root/child" as never, policy: {} } },
         { ...summary("foreign"), cwd: "/other" }, { ...summary("archived"), status: "archived" }],
       sessionEvents: async () => { targetReads += 1; return []; },
     });
@@ -366,8 +366,7 @@ describe("real desktop remote adapter boundary", () => {
         reads += 1;
         return { events: await gate.promise, pendingApprovals: [], truncated: false, bytes: 2, pinnedEventIds: [] };
       },
-      agentTree: async () => { throw new Error("must not fetch agent tree"); },
-      listTasks: async () => { throw new Error("must not fetch child tasks"); },
+      listAgents: async () => { throw new Error("must not fetch child Agents"); },
     });
     const reading = invoke(fixture.adapter, { operation: "session.snapshot", payload: { sessionId: "root" } });
     await until(() => reads === 1);

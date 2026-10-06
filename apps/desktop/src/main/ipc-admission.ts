@@ -34,7 +34,7 @@ export class DesktopIpcAdmission {
   }
 
   admit(request: DesktopRequest): () => void {
-    const critical = request.type === "session.stop";
+    const critical = request.type === "session.stop" || request.type === "agent.stop";
     const bytes = Buffer.byteLength(JSON.stringify(request), "utf8");
     if (critical) {
       if (this.criticalItems >= this.criticalMaxItems || this.criticalBytes + bytes > this.criticalMaxBytes) {

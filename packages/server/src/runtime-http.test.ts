@@ -4,8 +4,6 @@ import { join } from "node:path";
 import { expect, test } from "bun:test";
 import { normalizePersistedError, PERSISTED_ERROR_LIMITS } from "@chili/protocol";
 import {
-  AgentTaskControlService,
-  LocalSubagentConcurrencyLimiter,
   RuntimeSessionAlreadyExistsError,
   RuntimeSessionCreationConflictError,
   RuntimeSessionInactiveError,
@@ -13,24 +11,15 @@ import {
   RuntimeForeignOwnerError,
   RuntimeSessionNotFoundError,
   RuntimeSubagentSessionAccessError,
-  TeamControlService,
-  type AgentTreeSnapshot,
-  type AgentTaskPromptRuntime,
   type RuntimeSessionOperation,
   type SubmitPromptInput,
 } from "@chili/core";
 import type {
   ApprovalRow,
-  AgentMailboxQuery,
-  AgentRunQuery,
-  AgentTaskRow,
-  AgentMailboxRow,
-  AgentRunRow,
   EventPublisher,
   EventQuery,
   EventStore,
   SessionRow,
-  TeamTaskRow,
 } from "@chili/store";
 import { ObservableEventStore, SqliteEventStore, UnknownEventCursorError } from "@chili/store";
 import { HttpRuntimeClient, type RuntimeSessionEventWindow } from "@chili/sdk";
@@ -58,8 +47,6 @@ import type {
   RuntimeSessionRef,
   ServiceTier,
   SessionId,
-  TaskId,
-  TeamId,
   SessionGoal,
   SessionGoalStatus,
   TimestampMs,
@@ -68,17 +55,10 @@ import type {
   UserInputAnswers,
   UserInputId,
 } from "@chili/protocol";
-import { projectRuntimeAgents, type RuntimeAgentsSnapshot } from "./agent-projection.js";
 import type {
-  RuntimeAgentTreeService,
   RuntimeHttpService,
   RuntimeMcpControlService,
   RuntimeMcpScopeInput,
-  RuntimeTaskControlService,
-  RuntimeTeamService,
-  RuntimeTeamDispatcherService,
-  RuntimeTeamExecutionRunnerService,
-  RuntimeTeamMergeService,
 } from "./runtime-http.js";
 import type { PromptCommandControl, PromptCommandRunResult } from "./commands.js";
 import { PromptCommandNotFoundError, PromptCommandUsageError } from "./commands.js";
@@ -988,7 +968,7 @@ test("applies the central credential taxonomy idempotently to Error and HttpErro
   expect(await unicode.json()).toEqual({ error: { message: "会话暂不可用" } });
 });
 
-test("normalizes hostile service, goal, task, and recovery errors at the HTTP boundary", async () => {
+test("normalizes hostile service and goal errors at the HTTP boundary", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
   const service = new FakeRuntimeService(store);
@@ -1001,19 +981,9 @@ test("normalizes hostile service, goal, task, and recovery errors at the HTTP bo
     return error;
   };
   service.getGoal = async () => { throw hostileError("GoalNotFoundError"); };
-  const tasks = {
-    getTask: async () => { throw hostileError("AgentTaskNotFoundError"); },
-    reconcileStaleTasks: async () => { throw hostileError("AgentTaskControlServiceClosedError"); },
-  } as unknown as RuntimeTaskControlService;
-  const handler = createRuntimeHttpHandler({ service, store, tasks });
+  const handler = createRuntimeHttpHandler({ service, store });
   const requests = [
     handler(new Request(`http://chili.test/sessions/${sessionId}/goal`)),
-    handler(new Request("http://chili.test/tasks/task_hostile")),
-    handler(new Request("http://chili.test/tasks/reconcile_stale", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{}",
-    })),
   ];
   for (const response of await Promise.all(requests)) {
     const body = await response.text();
@@ -1827,1314 +1797,6 @@ test("rejects unknown SSE cursors but keeps a known tip cursor live without tran
   }
 });
 
-test("serves subagent runs and tasks through an event replay projection", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const handler = createRuntimeHttpHandler({ service, store });
-  const session = await service.createSession({ cwd: "/repo" });
-  const rootRunId = "agentrun_http_root" as AgentRunId;
-  const childRunId = "agentrun_http_child" as AgentRunId;
-  const rootPath = "/root" as AgentPath;
-  const childPath = "/root/reviewer" as AgentPath;
-  const teamId = "team_http" as TeamId;
-  const taskId = "task_http" as TaskId;
-  const localTaskId = "task_local_http" as TaskId;
-  const localRunId = "agentrun_local_http" as AgentRunId;
-  const localPath = "/root/local_reader" as AgentPath;
-
-  await store.appendMany([
-    {
-      id: "event_agent_root",
-      type: "agent.spawned",
-      time: 2 as TimestampMs,
-      sessionId: session.sessionId,
-      payload: { runId: rootRunId, path: rootPath, taskName: "lead" },
-    },
-    {
-      id: "event_agent_child",
-      type: "agent.spawned",
-      time: 3 as TimestampMs,
-      sessionId: session.sessionId,
-      payload: { runId: childRunId, path: childPath, parentPath: rootPath, taskName: "review" },
-    },
-    {
-      id: "event_task_created",
-      type: "team.task_created",
-      time: 4 as TimestampMs,
-      sessionId: session.sessionId,
-      payload: { teamId, taskId, ownerPath: childPath },
-    },
-    {
-      id: "event_mailbox",
-      type: "agent.message_queued",
-      time: 5 as TimestampMs,
-      sessionId: session.sessionId,
-      payload: {
-        path: childPath,
-        from: rootPath,
-        triggerTurn: true,
-        recipientSessionId: "session_mailbox_projection" as SessionId,
-      },
-    },
-    {
-      id: "event_task_done",
-      type: "team.task_updated",
-      time: 6 as TimestampMs,
-      sessionId: session.sessionId,
-      payload: { teamId, taskId, status: "completed" },
-    },
-    {
-      id: "event_local_task",
-      type: "agent.task_created",
-      time: 7 as TimestampMs,
-      sessionId: session.sessionId,
-      payload: {
-        taskId: localTaskId,
-        path: localPath,
-        parentPath: rootPath,
-        parentSessionId: session.sessionId,
-        childSessionId: "session_child_http" as SessionId,
-        taskName: "local reader",
-        cwd: "/repo",
-        prompt: "read",
-      },
-    },
-    {
-      id: "event_local_task_completed",
-      type: "agent.task_completed",
-      time: 8 as TimestampMs,
-      sessionId: session.sessionId,
-      payload: {
-        taskId: localTaskId,
-        path: localPath,
-        status: "completed",
-        generation: 1,
-        summary: "done",
-      },
-    },
-    {
-      id: "event_local_agent",
-      type: "agent.spawned",
-      time: 9 as TimestampMs,
-      sessionId: session.sessionId,
-      payload: {
-        runId: localRunId,
-        taskId: localTaskId,
-        path: localPath,
-        parentPath: rootPath,
-        parentSessionId: session.sessionId,
-        childSessionId: "session_child_http" as SessionId,
-        taskName: "local reader",
-        generation: 2,
-      },
-    },
-  ]);
-
-  const response = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/agents`));
-  expect(response.status).toBe(200);
-  const body = (await response.json()) as RuntimeAgentsSnapshot;
-
-  expect(body.agents.map((agent) => agent.id)).toEqual([rootRunId, childRunId, localRunId]);
-  expect(body.agents[0]?.childRunIds).toEqual([childRunId, localRunId]);
-  expect(body.agents[1]?.mailboxMessageIds).toEqual(["event_mailbox"]);
-  expect(body.tasks[0]?.status).toBe("completed");
-  const localTask = body.tasks.find((task) => task.id === localTaskId);
-  expect(localTask?.status).toBe("running");
-  expect(localTask?.completedAt).toBeUndefined();
-  expect(body.mailbox[0]?.triggerTurn).toBe(true);
-  expect(body.mailbox[0]?.recipientSessionId).toBe("session_mailbox_projection" as SessionId);
-});
-
-test("paginates the full event history for global and session agent projections", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const handler = createRuntimeHttpHandler({ service, store, maxBacklogEvents: 2 });
-  const session = await service.createSession({ cwd: "/repo" });
-  const sessionId = session.sessionId;
-  const childSessionId = "session_paged_child" as SessionId;
-  const taskId = "task_paged_projection" as TaskId;
-  const runId = "agentrun_paged_projection" as AgentRunId;
-  const path = "/root/paged" as AgentPath;
-
-  await store.appendMany([
-    ...Array.from({ length: 5 }, (_, index): ChiliEvent => ({
-      id: `event_paged_filler_${index}`,
-      type: "session.renamed",
-      time: (index + 2) as TimestampMs,
-      sessionId,
-      payload: { sessionId, title: `filler ${index}` },
-    })),
-    {
-      id: "event_paged_task",
-      type: "agent.task_created",
-      time: 7 as TimestampMs,
-      sessionId,
-      payload: {
-        taskId,
-        path,
-        parentPath: "/root" as AgentPath,
-        parentSessionId: sessionId,
-        childSessionId,
-        taskName: "paged projection",
-        cwd: "/repo",
-        prompt: "finish after the first event page",
-      },
-    },
-    {
-      id: "event_paged_spawned",
-      type: "agent.spawned",
-      time: 8 as TimestampMs,
-      sessionId,
-      payload: {
-        runId,
-        taskId,
-        path,
-        parentPath: "/root" as AgentPath,
-        parentSessionId: sessionId,
-        childSessionId,
-        taskName: "paged projection",
-        generation: 1,
-      },
-    },
-    {
-      id: "event_paged_task_completed",
-      type: "agent.task_completed",
-      time: 9 as TimestampMs,
-      sessionId,
-      payload: { taskId, path, status: "completed", generation: 1, summary: "done" },
-    },
-    {
-      id: "event_paged_completed",
-      type: "agent.completed",
-      time: 10 as TimestampMs,
-      sessionId,
-      payload: { runId, taskId, path, status: "completed", generation: 1, summary: "done" },
-    },
-    {
-      id: "event_paged_mailbox",
-      type: "agent.message_queued",
-      time: 11 as TimestampMs,
-      sessionId,
-      payload: {
-        taskId,
-        path,
-        from: "/root" as AgentPath,
-        triggerTurn: true,
-        recipientSessionId: childSessionId,
-      },
-    },
-  ]);
-
-  for (const url of [
-    "http://chili.test/agents",
-    `http://chili.test/sessions/${sessionId}/agents`,
-  ]) {
-    const response = await handler(new Request(url));
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as RuntimeAgentsSnapshot;
-    expect(body.agents).toMatchObject([{ id: runId, status: "completed", completedAt: 10 }]);
-    expect(body.tasks).toMatchObject([{ id: taskId, status: "completed", completedAt: 9 }]);
-    expect(body.mailbox).toMatchObject([{
-      id: "event_paged_mailbox",
-      recipientSessionId: childSessionId,
-      status: "queued",
-    }]);
-  }
-});
-
-test("serves task control routes", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const tasks = new FakeTaskControlService();
-  const handler = createRuntimeHttpHandler({ service, store, tasks });
-
-  const listResponse = await handler(new Request("http://chili.test/tasks?status=running"));
-  expect(listResponse.status).toBe(200);
-  expect(await listResponse.json()).toMatchObject([{ id: "task_http", status: "running" }]);
-  expect(tasks.lastListStatus).toBe("running");
-
-  const incompleteListResponse = await handler(new Request("http://chili.test/tasks?status=incomplete"));
-  expect(incompleteListResponse.status).toBe(200);
-  expect(tasks.lastListStatus).toBe("incomplete");
-
-  const taskResponse = await handler(new Request("http://chili.test/tasks/task_http"));
-  expect(taskResponse.status).toBe(200);
-  expect(await taskResponse.json()).toMatchObject({ id: "task_http", status: "running" });
-
-  const followupResponse = await handler(
-    new Request("http://chili.test/tasks/task_http/followup", {
-      method: "POST",
-      body: JSON.stringify({ text: "continue", maxTurns: 2 }),
-      headers: { "content-type": "application/json" },
-    }),
-  );
-  expect(followupResponse.status).toBe(200);
-  expect(await followupResponse.json()).toMatchObject({
-    task: { id: "task_http", status: "completed", summary: "done" },
-    result: { status: "completed", finishReason: "stop" },
-  });
-  expect(tasks.lastFollowupText).toBe("continue");
-  expect(tasks.lastFollowupSignal).toBeInstanceOf(AbortSignal);
-
-  const legacyFollowupResponse = await handler(
-    new Request("http://chili.test/tasks/task_http/followup", {
-      method: "POST",
-      body: JSON.stringify({ text: "continue", system: ["old"] }),
-      headers: { "content-type": "application/json" },
-    }),
-  );
-  expect(legacyFollowupResponse.status).toBe(400);
-  expect(await legacyFollowupResponse.json()).toMatchObject({
-    error: { message: "system is no longer supported in runtime prompt requests" },
-  });
-
-  const waitResponse = await handler(
-    new Request("http://chili.test/tasks/task_http/wait", {
-      method: "POST",
-      body: JSON.stringify({ timeoutMs: 10 }),
-      headers: { "content-type": "application/json" },
-    }),
-  );
-  expect(waitResponse.status).toBe(200);
-  expect(await waitResponse.json()).toMatchObject({ id: "task_http" });
-  expect(tasks.lastWaitSignal).toBeInstanceOf(AbortSignal);
-
-  const closeResponse = await handler(
-    new Request("http://chili.test/tasks/task_http/close", {
-      method: "POST",
-      body: JSON.stringify({ status: "cancelled", summary: "stopped" }),
-      headers: { "content-type": "application/json" },
-    }),
-  );
-  expect(closeResponse.status).toBe(200);
-  expect(await closeResponse.json()).toMatchObject({ id: "task_http", status: "cancelled", summary: "stopped" });
-
-  const incompleteCloseResponse = await handler(
-    new Request("http://chili.test/tasks/task_http/close", {
-      method: "POST",
-      body: JSON.stringify({ status: "incomplete", summary: "planning_only" }),
-      headers: { "content-type": "application/json" },
-    }),
-  );
-  expect(incompleteCloseResponse.status).toBe(200);
-  expect(await incompleteCloseResponse.json()).toMatchObject({
-    id: "task_http",
-    status: "incomplete",
-    summary: "planning_only",
-  });
-
-  const reconcileResponse = await handler(
-    new Request("http://chili.test/tasks/reconcile_stale", {
-      method: "POST",
-      body: JSON.stringify({
-        parentSessionId: "  session_task_owner  ",
-        staleAfterMs: 0,
-        modes: ["background"],
-        limit: 25,
-      }),
-      headers: { "content-type": "application/json" },
-    }),
-  );
-  expect(reconcileResponse.status).toBe(200);
-  expect(await reconcileResponse.json()).toMatchObject({
-    scanned: 1,
-    closed: [{ id: "task_http", status: "cancelled" }],
-  });
-  expect(tasks.lastReconcile).toMatchObject({
-    parentSessionId: "session_task_owner",
-    staleAfterMs: 0,
-    modes: ["background"],
-    limit: 25,
-    requireLeaseEvidence: true,
-  });
-});
-
-test("task follow-up HTTP requests propagate client abort to the task controller", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const tasks = new AbortableFollowupTaskControlService();
-  const handler = createRuntimeHttpHandler({ service, store, tasks });
-  const controller = new AbortController();
-
-  const responsePromise = handler(new Request("http://chili.test/tasks/task_http/followup", {
-    method: "POST",
-    body: JSON.stringify({ text: "wait for capacity" }),
-    headers: { "content-type": "application/json" },
-    signal: controller.signal,
-  }));
-  await tasks.started.promise;
-
-  controller.abort();
-
-  const response = await responsePromise;
-  expect(response.status).toBe(499);
-  expect(tasks.lastFollowupSignal?.aborted).toBe(true);
-  expect(await response.json()).toMatchObject({ error: { message: "Task follow-up aborted" } });
-});
-
-test("task close HTTP requests cancel a capacity-queued follow-up without changing the terminal task", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-http-close-queued-followup-"));
-  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const taskId = "task_http_queued" as TaskId;
-  const limiter = new LocalSubagentConcurrencyLimiter(1);
-  const releaseBlocker = await limiter.acquire();
-  const taskRuntime: AgentTaskPromptRuntime = {
-    async submitPrompt(): Promise<never> {
-      throw new Error("queued follow-up must not reach the runtime");
-    },
-  };
-
-  try {
-    await seedCompletedHttpTask(baseStore, taskId);
-    const tasks = new AgentTaskControlService({ store, runtime: taskRuntime, runLimiter: limiter });
-    const handler = createRuntimeHttpHandler({ service, store, tasks });
-    const followupResponsePromise = handler(new Request(`http://chili.test/tasks/${taskId}/followup`, {
-      method: "POST",
-      body: JSON.stringify({ text: "wait for capacity" }),
-      headers: { "content-type": "application/json" },
-    }));
-    await waitUntil(() => limiter.snapshot().queuedRuns === 1);
-
-    const closeResponse = await handler(new Request(`http://chili.test/tasks/${taskId}/close`, {
-      method: "POST",
-      body: JSON.stringify({ status: "cancelled" }),
-      headers: { "content-type": "application/json" },
-    }));
-    const followupResponse = await followupResponsePromise;
-
-    expect(closeResponse.status).toBe(200);
-    expect(await closeResponse.json()).toMatchObject({ id: taskId, status: "completed", summary: "initial answer" });
-    expect(followupResponse.status).toBe(499);
-    expect(await baseStore.events({ type: "agent.spawned", limit: 100 })).toHaveLength(1);
-    expect(await baseStore.agentTask(taskId)).toMatchObject({ status: "completed", generation: 1 });
-  } finally {
-    releaseBlocker();
-    baseStore.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("projects incomplete agent tasks and runs as terminal", () => {
-  const sessionId = "session_incomplete_projection" as SessionId;
-  const taskId = "task_incomplete_projection" as TaskId;
-  const runId = "agent_incomplete_projection" as AgentRunId;
-  const path = "/root/task_incomplete_projection" as AgentPath;
-  const events: ChiliEvent[] = [
-    {
-      id: "event_incomplete_created",
-      type: "agent.task_created",
-      time: 1 as TimestampMs,
-      sessionId,
-      payload: {
-        taskId,
-        path,
-        parentPath: "/root" as AgentPath,
-        parentSessionId: sessionId,
-        childSessionId: "session_incomplete_child" as SessionId,
-        taskName: "Inspect repository",
-        cwd: "/repo",
-        prompt: "Inspect repository",
-      },
-    },
-    {
-      id: "event_incomplete_spawned",
-      type: "agent.spawned",
-      time: 2 as TimestampMs,
-      sessionId,
-      payload: { runId, taskId, path, taskName: "Inspect repository", generation: 1 },
-    },
-    {
-      id: "event_incomplete_task_done",
-      type: "agent.task_completed",
-      time: 3 as TimestampMs,
-      sessionId,
-      payload: { taskId, runId, path, status: "incomplete", generation: 1, error: "planning_only" },
-    },
-    {
-      id: "event_incomplete_agent_done",
-      type: "agent.completed",
-      time: 4 as TimestampMs,
-      sessionId,
-      payload: { runId, taskId, path, status: "incomplete", generation: 1, error: "planning_only" },
-    },
-  ];
-
-  const snapshot = projectRuntimeAgents(events, sessionId);
-  expect(snapshot.tasks).toMatchObject([{ id: taskId, status: "incomplete", completedAt: 3 }]);
-  expect(snapshot.agents).toMatchObject([{ id: runId, status: "incomplete", completedAt: 4 }]);
-});
-
-test("upcasts a legacy mailbox child session in the runtime agent projection", () => {
-  const recipientSessionId = "session_legacy_http_recipient" as SessionId;
-  const snapshot = projectRuntimeAgents([{
-    id: "event_legacy_http_mailbox",
-    type: "agent.message_queued",
-    time: 1 as TimestampMs,
-    sessionId: "session_legacy_http_sender" as SessionId,
-    payload: {
-      path: "/root/legacy" as AgentPath,
-      from: "/root" as AgentPath,
-      triggerTurn: true,
-      childSessionId: recipientSessionId,
-    },
-  } as unknown as ChiliEvent]);
-
-  expect(snapshot.mailbox[0]?.recipientSessionId).toBe(recipientSessionId);
-  expect(Object.prototype.hasOwnProperty.call(snapshot.mailbox[0], "childSessionId")).toBe(false);
-});
-
-test("serves agent tree and mailbox control routes", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const agents = new FakeAgentTreeService();
-  const handler = createRuntimeHttpHandler({ service, store, agents });
-
-  const treeResponse = await handler(new Request("http://chili.test/agents/tree?rootPath=/root&includeConsumedMailbox=true"));
-  expect(treeResponse.status).toBe(200);
-  expect(await treeResponse.json()).toMatchObject({
-    rootPath: "/root",
-    nodes: [{ path: "/root", children: [{ path: "/root/task_http" }] }],
-  });
-
-  const runsResponse = await handler(new Request("http://chili.test/agent_runs?path=/root/task_http&status=incomplete"));
-  expect(runsResponse.status).toBe(200);
-  expect(await runsResponse.json()).toMatchObject([{ id: "agent_http_child", path: "/root/task_http" }]);
-  expect(agents.runQueries.at(-1)).toMatchObject({ path: "/root/task_http", status: "incomplete" });
-
-  const mailboxResponse = await handler(new Request("http://chili.test/mailbox?status=queued"));
-  expect(mailboxResponse.status).toBe(200);
-  expect(await mailboxResponse.json()).toMatchObject([{ id: "event_mailbox", status: "queued" }]);
-  expect(agents.mailboxQueries.at(-1)).toMatchObject({ status: "queued" });
-
-  const taskMailboxResponse = await handler(new Request(
-    "http://chili.test/mailbox?taskId=task_http&recipientSessionId=session_mailbox_recipient&status=queued",
-  ));
-  expect(taskMailboxResponse.status).toBe(200);
-  expect(await taskMailboxResponse.json()).toMatchObject([{
-    id: "event_mailbox",
-    status: "queued",
-    recipientSessionId: "session_mailbox_recipient",
-  }]);
-  expect(agents.mailboxQueries.at(-1)).toMatchObject({
-    taskId: "task_http",
-    recipientSessionId: "session_mailbox_recipient",
-    status: "queued",
-  });
-
-  const legacyMailboxResponse = await handler(new Request(
-    "http://chili.test/mailbox?childSessionId=session_mailbox_recipient",
-  ));
-  expect(legacyMailboxResponse.status).toBe(400);
-  expect(await legacyMailboxResponse.json()).toEqual({
-    error: { message: "Query parameter \"childSessionId\" is not supported" },
-  });
-
-  const unknownMailboxResponse = await handler(new Request(
-    "http://chili.test/mailbox?legacyScope=obsolete",
-  ));
-  expect(unknownMailboxResponse.status).toBe(400);
-  expect(await unknownMailboxResponse.json()).toEqual({
-    error: { message: "Query parameter \"legacyScope\" is not supported" },
-  });
-
-  const consumeResponse = await handler(
-    new Request("http://chili.test/mailbox/event_mailbox/consume", {
-      method: "POST",
-      body: JSON.stringify({}),
-      headers: { "content-type": "application/json" },
-    }),
-  );
-  expect(consumeResponse.status).toBe(200);
-  expect(await consumeResponse.json()).toMatchObject({ id: "event_mailbox", status: "consumed" });
-  expect(agents.consumedIds).toEqual(["event_mailbox"]);
-});
-
-test("serves team control routes", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-http-team-"));
-  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const teams = new TeamControlService({
-    store,
-    createId: createSequentialId(),
-    now: () => 10 as TimestampMs,
-  });
-  const teamDispatcher = new FakeTeamDispatcherService();
-  const teamMerger = new FakeTeamMergeService();
-  const teamRunner = new FakeTeamExecutionRunnerService();
-  const handler = createRuntimeHttpHandler({ service, store, teams, teamDispatcher, teamMerger, teamRunner });
-  const ownerSession = await service.createSession({ cwd: "/repo" });
-  const reviewerSessionId = "session_reviewer" as SessionId;
-
-  try {
-    const createTeamResponse = await handler(
-      new Request("http://chili.test/teams", {
-        method: "POST",
-        body: JSON.stringify({
-          sessionId: ownerSession.sessionId,
-          name: "alpha",
-          leadPath: "/root",
-          description: "team api",
-        }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(createTeamResponse.status).toBe(201);
-    const team = (await createTeamResponse.json()) as { id: TeamId };
-    expect(team).toMatchObject({ id: "team_1", name: "alpha", leadPath: "/root" });
-
-    const duplicateTeamResponse = await handler(
-      new Request("http://chili.test/teams", {
-        method: "POST",
-        body: JSON.stringify({
-          teamId: team.id,
-          sessionId: ownerSession.sessionId,
-          name: "must not overwrite alpha",
-          leadPath: "/root/replacement",
-        }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(duplicateTeamResponse.status).toBe(409);
-    expect((await teams.listTeams()).find((candidate) => candidate.id === team.id)).toMatchObject({
-      name: "alpha",
-      leadPath: "/root",
-    });
-
-    await store.append({
-      id: "event_http_reviewer_ownership",
-      type: "agent.task_created",
-      time: 9 as TimestampMs,
-      sessionId: ownerSession.sessionId,
-      payload: {
-        taskId: "task_http_reviewer_ownership" as TaskId,
-        path: "/root/reviewer" as AgentPath,
-        parentPath: "/root" as AgentPath,
-        parentSessionId: ownerSession.sessionId,
-        childSessionId: reviewerSessionId,
-        taskName: "reviewer ownership",
-        cwd: "/repo",
-        prompt: "own reviewer session",
-      },
-    });
-
-    const addMemberResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/members`, {
-        method: "POST",
-        body: JSON.stringify({
-          path: "/root/reviewer",
-          name: "reviewer",
-          role: "reviewer",
-          childSessionId: reviewerSessionId,
-          toolScope: ["read"],
-        }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(addMemberResponse.status).toBe(201);
-    expect(await addMemberResponse.json()).toMatchObject({ path: "/root/reviewer", role: "reviewer" });
-
-    const invalidMemberSessionResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/members`, {
-        method: "POST",
-        body: JSON.stringify({
-          path: "/root/impostor",
-          name: "impostor",
-          role: "reviewer",
-          childSessionId: ownerSession.sessionId,
-        }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(invalidMemberSessionResponse.status).toBe(409);
-    expect(await invalidMemberSessionResponse.json()).toMatchObject({
-      error: { message: expect.stringContaining("is not owned by /root/impostor") },
-    });
-    expect((await teams.members(team.id)).some((member) => member.path === "/root/impostor")).toBe(false);
-
-    const createTaskResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/tasks`, {
-        method: "POST",
-        body: JSON.stringify({
-          taskId: "task_http_explicit",
-          title: "Review HTTP team API",
-          createdBy: "/root",
-          metadata: { source: "original" },
-        }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(createTaskResponse.status).toBe(201);
-    const task = (await createTaskResponse.json()) as { id: TaskId };
-    expect(task.id).toBe("task_http_explicit" as TaskId);
-
-    const duplicateTaskResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/tasks`, {
-        method: "POST",
-        body: JSON.stringify({
-          taskId: task.id,
-          title: "must not replace the HTTP task",
-          status: "failed",
-          metadata: { source: "duplicate" },
-        }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(duplicateTaskResponse.status).toBe(409);
-    expect(await duplicateTaskResponse.json()).toMatchObject({
-      error: { message: `Team task already exists: ${task.id} in ${team.id}` },
-    });
-    expect(await teams.tasks(team.id)).toMatchObject([{
-      id: task.id,
-      teamId: team.id,
-      title: "Review HTTP team API",
-      status: "pending",
-      metadata: { source: "original" },
-    }]);
-
-    const assignResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/assign`, {
-        method: "POST",
-        body: JSON.stringify({
-          ownerPath: "/root/reviewer",
-          assignedBy: "/root",
-          message: "please review",
-          messageDelivery: "triggerTurn",
-        }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(assignResponse.status).toBe(200);
-    expect(await assignResponse.json()).toMatchObject({ id: task.id, ownerPath: "/root/reviewer" });
-
-    const claimResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/claim`, {
-        method: "POST",
-        body: JSON.stringify({ ownerPath: "/root/reviewer", claimedBy: "/root/reviewer" }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(claimResponse.status).toBe(200);
-    expect(await claimResponse.json()).toMatchObject({ applied: true, task: { id: task.id, status: "in_progress" } });
-
-    const dispatchResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/dispatch`, {
-        method: "POST",
-        body: JSON.stringify({ mode: "background", sessionId: ownerSession.sessionId }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(dispatchResponse.status).toBe(200);
-    const runningTeamTask = teamTaskRow({
-      teamId: team.id,
-      taskId: task.id,
-      status: "in_progress",
-      metadata: teamDispatchMetadata("running"),
-    });
-    const runningAgentTask = localSubagentTaskRow({ status: "running" });
-    expect(await dispatchResponse.json()).toEqual({
-      status: "running",
-      teamTask: runningTeamTask,
-      team_task: runningTeamTask,
-      agentTask: runningAgentTask,
-      agent_task: runningAgentTask,
-    });
-    expect(teamDispatcher.dispatchInputs).toMatchObject([
-      { teamId: team.id, taskId: task.id, mode: "background", sessionId: ownerSession.sessionId },
-    ]);
-    expect(teamDispatcher.dispatchInputs[0]?.signal).toBeInstanceOf(AbortSignal);
-
-    teamDispatcher.nextDispatchResult = {
-      status: "skipped",
-      reason: "missing_owner",
-      teamTask: teamTaskRow({ teamId: team.id, taskId: task.id, status: "pending" }),
-    };
-    const skippedDispatchResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/dispatch`, {
-        method: "POST",
-        body: JSON.stringify({ sessionId: ownerSession.sessionId }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(skippedDispatchResponse.status).toBe(200);
-    const skippedTeamTask = teamTaskRow({ teamId: team.id, taskId: task.id, status: "pending" });
-    expect(await skippedDispatchResponse.json()).toEqual({
-      status: "skipped",
-      teamTask: skippedTeamTask,
-      team_task: skippedTeamTask,
-      reason: "missing_owner",
-    });
-
-    for (const body of [
-      { sessionId: "   " },
-      { sessionId: 42 },
-      { sessionId: ownerSession.sessionId, cwd: 42 },
-      { sessionId: ownerSession.sessionId, cwd: "   " },
-      { sessionId: ownerSession.sessionId, cwd: "bad\0cwd" },
-    ]) {
-      const invalidDispatchResponse = await handler(
-        new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/dispatch`, {
-          method: "POST",
-          body: JSON.stringify(body),
-          headers: { "content-type": "application/json" },
-        }),
-      );
-      expect(invalidDispatchResponse.status).toBe(400);
-    }
-    expect(teamDispatcher.dispatchInputs).toHaveLength(2);
-
-    const syncResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/sync`, {
-        method: "POST",
-        body: JSON.stringify({ sessionId: ownerSession.sessionId }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(syncResponse.status).toBe(200);
-    expect(await syncResponse.json()).toEqual({
-      applied: true,
-      teamTask: teamTaskRow({
-        teamId: team.id,
-        taskId: task.id,
-        status: "completed",
-        metadata: teamDispatchMetadata("completed", 102),
-      }),
-      agentTask: taskRow({ status: "completed", summary: "done" }),
-    });
-    expect(teamDispatcher.syncInputs).toMatchObject([{ teamId: team.id, taskId: task.id, sessionId: ownerSession.sessionId }]);
-
-    const teamReconcileResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/reconcile_dispatches`, {
-        method: "POST",
-        body: JSON.stringify({ sessionId: ownerSession.sessionId, limit: 5 }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(teamReconcileResponse.status).toBe(200);
-    expect(await teamReconcileResponse.json()).toEqual(reconcileResultJson(team.id));
-    expect(teamDispatcher.reconcileInputs.at(-1)).toMatchObject({ teamId: team.id, sessionId: ownerSession.sessionId, limit: 5 });
-
-    const globalReconcileResponse = await handler(
-      new Request("http://chili.test/teams/reconcile_dispatches", {
-        method: "POST",
-        body: JSON.stringify({ limit: 10 }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(globalReconcileResponse.status).toBe(200);
-    expect(await globalReconcileResponse.json()).toEqual(reconcileResultJson("team_http" as TeamId));
-    expect(teamDispatcher.reconcileInputs.at(-1)).toMatchObject({ limit: 10 });
-
-    const mergeResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/merge`, {
-        method: "POST",
-        body: JSON.stringify({ sessionId: ownerSession.sessionId, taskId: task.id, cwd: "/repo" }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(mergeResponse.status).toBe(200);
-    expect(await mergeResponse.json()).toEqual(teamMergeResultJson(team.id, task.id));
-    expect(teamMerger.mergeInputs).toMatchObject([
-      { teamId: team.id, taskId: task.id, sessionId: ownerSession.sessionId, cwd: "/repo" },
-    ]);
-
-    const runLoopResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/run_loop`, {
-        method: "POST",
-        body: JSON.stringify({
-          sessionId: ownerSession.sessionId,
-          cwd: "/repo",
-          mode: "background",
-          once: true,
-          maxCycles: 2,
-          timeoutMs: 1000,
-          pollIntervalMs: 10,
-        }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(runLoopResponse.status).toBe(200);
-    expect(await runLoopResponse.json()).toEqual(teamRunLoopResultJson(team.id));
-    expect(teamRunner.runInputs).toMatchObject([
-      {
-        teamId: team.id,
-        sessionId: ownerSession.sessionId,
-        cwd: "/repo",
-        mode: "background",
-        once: true,
-        maxCycles: 2,
-        timeoutMs: 1000,
-        pollIntervalMs: 10,
-      },
-    ]);
-
-    const updateResponse = await handler(
-      new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/update`, {
-        method: "POST",
-        body: JSON.stringify({ status: "completed", summary: "done" }),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    expect(updateResponse.status).toBe(200);
-    expect(await updateResponse.json()).toMatchObject({ id: task.id, status: "completed", summary: "done" });
-
-    const tasksResponse = await handler(new Request(`http://chili.test/teams/${team.id}/tasks`));
-    expect(tasksResponse.status).toBe(200);
-    expect(await tasksResponse.json()).toMatchObject([{ id: task.id, status: "completed" }]);
-
-    const messagesResponse = await handler(new Request(`http://chili.test/teams/${team.id}/messages`));
-    expect(messagesResponse.status).toBe(200);
-    expect(await messagesResponse.json()).toMatchObject([
-      { kind: "task_assignment", delivery: "triggerTurn", deliveryStatus: "queued", content: "please review" },
-    ]);
-    const snapshotResponse = await handler(new Request(`http://chili.test/teams/${team.id}/snapshot`));
-    expect(snapshotResponse.status).toBe(200);
-    const snapshot = (await snapshotResponse.json()) as {
-      stats: {
-        memberCount: number;
-        taskCount: number;
-        messageCount: number;
-        deliveryCount: number;
-      };
-      members: Array<{ path: string; taskIds: string[]; deliveryIds: string[] }>;
-      tasks: Array<{ id: string; owner?: { path: string }; messageIds: string[] }>;
-      messages: Array<{ deliveries: Array<{ path: string; status: string }> }>;
-    };
-    expect(snapshot.stats).toMatchObject({
-      memberCount: 2,
-      taskCount: 1,
-      messageCount: 1,
-      deliveryCount: 1,
-    });
-    expect(snapshot.members.find((member) => member.path === "/root/reviewer")).toMatchObject({
-      taskIds: [task.id],
-    });
-    expect(snapshot.members.find((member) => member.path === "/root/reviewer")?.deliveryIds).toHaveLength(1);
-    expect(snapshot.tasks[0]).toMatchObject({
-      id: task.id,
-      owner: { path: "/root/reviewer" },
-    });
-    expect(snapshot.tasks[0]?.messageIds).toHaveLength(1);
-    expect(snapshot.messages[0]).toMatchObject({
-      deliveries: [{ path: "/root/reviewer", status: "queued" }],
-    });
-    expect(await store.agentMailbox({ path: "/root/reviewer" as AgentPath, status: "queued" })).toMatchObject([
-      {
-        path: "/root/reviewer",
-        fromPath: "/root",
-        triggerTurn: true,
-        recipientSessionId: "session_reviewer",
-        taskId: task.id,
-      },
-    ]);
-
-    await store.append({
-      id: "event_http_reviewer_session",
-      type: "session.created",
-      time: 11 as TimestampMs,
-      sessionId: reviewerSessionId,
-      payload: { sessionId: reviewerSessionId, cwd: "/repo" },
-    });
-    const descendantMessageResponse = await handler(new Request(`http://chili.test/teams/${team.id}/messages`, {
-      method: "POST",
-      body: JSON.stringify({
-        sessionId: reviewerSessionId,
-        from: "/root/reviewer",
-        to: "/root",
-        content: "review complete",
-      }),
-      headers: { "content-type": "application/json" },
-    }));
-    expect(descendantMessageResponse.status).toBe(201);
-    expect(await descendantMessageResponse.json()).toMatchObject({
-      fromPath: "/root/reviewer",
-      toPath: "/root",
-      content: "review complete",
-    });
-    expect(service.sessionOperationIds).toEqual(Array<SessionId>(10).fill(ownerSession.sessionId));
-    expect(await store.events({ type: "team.message_sent", limit: 100 })).toContainEqual(
-      expect.objectContaining({
-        sessionId: reviewerSessionId,
-        payload: expect.objectContaining({ content: "review complete" }),
-      }),
-    );
-  } finally {
-    baseStore.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("normalizes hostile local subagent task errors at the HTTP boundary", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-http-hostile-subagent-error-"));
-  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const teams = new TeamControlService({
-    store,
-    createId: createSequentialId(),
-    now: () => 20 as TimestampMs,
-  });
-  const teamDispatcher = new FakeTeamDispatcherService();
-  try {
-    const ownerSession = await service.createSession({
-      sessionId: "session_http_hostile_subagent_error" as SessionId,
-      cwd: "/repo",
-    });
-    const team = await teams.createTeam({
-      sessionId: ownerSession.sessionId,
-      name: "hostile-subagent-error",
-      leadPath: "/root" as AgentPath,
-    });
-    const hostileMessage = "secret=LOCAL_SUBAGENT_SECRET\n" + "\u0000".repeat(5 * 1024 * 1024);
-    const hostileError = Object.create(null) as Error;
-    Object.defineProperties(hostileError, {
-      message: { enumerable: true, get: () => hostileMessage },
-      name: { enumerable: true, get: () => "RemoteSubagentError" },
-      stack: { enumerable: true, get: () => { throw new Error("stack accessor must not run"); } },
-    });
-    const normalized = normalizePersistedError(hostileError);
-    teamDispatcher.nextDispatchResult = {
-      status: "failed",
-      teamTask: teamTaskRow({
-        teamId: team.id,
-        taskId: "task_http_hostile_subagent_error" as TaskId,
-        status: "failed",
-      }),
-      agentTask: {
-        ...localSubagentTaskRow({ status: "failed" }),
-        error: hostileError,
-      },
-    };
-    const handler = createRuntimeHttpHandler({ service, store, teams, teamDispatcher });
-
-    const response = await handler(new Request(
-      `http://chili.test/teams/${team.id}/tasks/task_http_hostile_subagent_error/dispatch`,
-      {
-        method: "POST",
-        body: JSON.stringify({ sessionId: ownerSession.sessionId }),
-        headers: { "content-type": "application/json" },
-      },
-    ));
-    const responseText = await response.text();
-    const body = JSON.parse(responseText) as {
-      agentTask: { error: string };
-      agent_task: { error: string };
-    };
-
-    expect(response.status).toBe(200);
-    expect(body.agentTask.error).toBe(normalized.message);
-    expect(body.agent_task.error).toBe(normalized.message);
-    expect(Buffer.byteLength(body.agentTask.error, "utf8")).toBeLessThanOrEqual(PERSISTED_ERROR_LIMITS.messageBytes);
-    expect(Buffer.byteLength(responseText, "utf8")).toBeLessThanOrEqual(40_000);
-    expect(responseText).toContain("[REDACTED]");
-    expect(responseText).toContain("error message truncated from");
-    expect(responseText).not.toContain("LOCAL_SUBAGENT_SECRET");
-  } finally {
-    baseStore.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("team HTTP CRUD mutations acquire the owner session operation and stay side-effect free when busy", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-http-team-operation-fence-"));
-  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const teams = new TeamControlService({
-    store,
-    createId: createSequentialId(),
-    now: () => 30 as TimestampMs,
-  });
-  const handler = createRuntimeHttpHandler({ service, store, teams });
-  const owner = await service.createSession({
-    sessionId: "session_http_team_operation_owner" as SessionId,
-    cwd: "/repo",
-  });
-
-  try {
-    const team = await teams.createTeam({
-      sessionId: owner.sessionId,
-      name: "operation fence",
-      leadPath: "/root" as AgentPath,
-    });
-    const task = await teams.createTask({
-      teamId: team.id,
-      sessionId: owner.sessionId,
-      title: "must remain pending",
-    });
-    const before = await store.events({ limit: 1_000 });
-    service.busySessionOperations.add(owner.sessionId);
-
-    const cases = [
-      {
-        url: "http://chili.test/teams",
-        body: { sessionId: owner.sessionId, name: "must not exist", leadPath: "/root" },
-      },
-      {
-        url: `http://chili.test/teams/${team.id}/members`,
-        body: { path: "/root/blocked", name: "blocked", role: "worker" },
-      },
-      {
-        url: `http://chili.test/teams/${team.id}/tasks`,
-        body: { title: "must not exist" },
-      },
-      {
-        url: `http://chili.test/teams/${team.id}/tasks/${task.id}/assign`,
-        body: { ownerPath: "/root" },
-      },
-      {
-        url: `http://chili.test/teams/${team.id}/tasks/${task.id}/claim`,
-        body: { ownerPath: "/root" },
-      },
-      {
-        url: `http://chili.test/teams/${team.id}/tasks/${task.id}/update`,
-        body: { status: "completed", summary: "must not persist" },
-      },
-      {
-        url: `http://chili.test/teams/${team.id}/messages`,
-        body: { from: "/root", to: "/root", content: "must not persist" },
-      },
-    ];
-    for (const testCase of cases) {
-      const response = await handler(new Request(testCase.url, {
-        method: "POST",
-        body: JSON.stringify(testCase.body),
-        headers: { "content-type": "application/json" },
-      }));
-      expect(response.status).toBe(409);
-      expect(await response.json()).toMatchObject({
-        error: { message: expect.stringContaining("already running") },
-      });
-    }
-
-    expect(service.sessionOperationIds).toEqual(Array<SessionId>(cases.length).fill(owner.sessionId));
-    expect(await store.events({ limit: 1_000 })).toEqual(before);
-    expect((await teams.listTeams()).some((candidate) => candidate.name === "must not exist")).toBe(false);
-    expect(await teams.tasks(team.id)).toMatchObject([{ id: task.id, status: "pending" }]);
-  } finally {
-    baseStore.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("team run, merge, dispatch, sync, and reconcile reject invalid owner authority before service calls", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-http-team-authority-"));
-  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const teams = new TeamControlService({
-    store,
-    createId: createSequentialId(),
-    now: () => 20 as TimestampMs,
-  });
-  const teamRunner = new FakeTeamExecutionRunnerService();
-  const teamMerger = new FakeTeamMergeService();
-  const teamDispatcher = new FakeTeamDispatcherService();
-  const handler = createRuntimeHttpHandler({ service, store, teams, teamRunner, teamMerger, teamDispatcher });
-  const sessionA = "session_http_team_authority_a" as SessionId;
-  const sessionB = "session_http_team_authority_b" as SessionId;
-  const sessionMissing = "session_http_team_authority_missing" as SessionId;
-  const sessionArchived = "session_http_team_authority_archived" as SessionId;
-  const sessionSubagent = "session_http_team_authority_subagent" as SessionId;
-
-  try {
-    for (const [index, sessionId, cwd] of [
-      [1, sessionA, "/repo/a"],
-      [2, sessionB, "/repo/b"],
-      [3, sessionArchived, "/repo/archived"],
-      [4, sessionSubagent, "/repo/subagent"],
-    ] as const) {
-      await store.append({
-        id: `event_http_team_authority_session_${index}`,
-        type: "session.created",
-        time: index as TimestampMs,
-        sessionId,
-        payload: { sessionId, cwd },
-      });
-    }
-    const teamA = await teams.createTeam({ sessionId: sessionA, name: "A", leadPath: "/root" as AgentPath });
-    const teamMissing = await teams.createTeam({ sessionId: sessionMissing, name: "missing", leadPath: "/root" as AgentPath });
-    const teamArchived = await teams.createTeam({ sessionId: sessionArchived, name: "archived", leadPath: "/root" as AgentPath });
-    const teamSubagent = await teams.createTeam({ sessionId: sessionSubagent, name: "subagent", leadPath: "/root" as AgentPath });
-    await store.append({
-      id: "event_http_team_authority_archived",
-      type: "session.archived",
-      time: 10 as TimestampMs,
-      sessionId: sessionArchived,
-      payload: { sessionId: sessionArchived },
-    });
-    service.blockedSubagentSessions.add(sessionSubagent);
-
-    const beforeRejectedMutations = await store.events({ limit: 1_000 });
-    for (const request of [
-      { suffix: "members", body: { sessionId: sessionB, path: "/root/blocked", name: "blocked", role: "worker" } },
-      { suffix: "tasks", body: { sessionId: sessionB, title: "blocked" } },
-      { suffix: "tasks/task_authority/assign", body: { sessionId: sessionB, ownerPath: "/root" } },
-      { suffix: "tasks/task_authority/claim", body: { sessionId: sessionB, ownerPath: "/root" } },
-      { suffix: "tasks/task_authority/update", body: { sessionId: sessionB, status: "completed" } },
-    ]) {
-      const response = await handler(new Request(`http://chili.test/teams/${teamA.id}/${request.suffix}`, {
-        method: "POST",
-        body: JSON.stringify(request.body),
-        headers: { "content-type": "application/json" },
-      }));
-      expect(response.status).toBe(409);
-    }
-    const archivedActorMessage = await handler(new Request(`http://chili.test/teams/${teamA.id}/messages`, {
-      method: "POST",
-      body: JSON.stringify({
-        sessionId: sessionArchived,
-        from: "/root",
-        to: "/root",
-        content: "blocked",
-      }),
-      headers: { "content-type": "application/json" },
-    }));
-    expect(archivedActorMessage.status).toBe(409);
-    expect(await store.events({ limit: 1_000 })).toEqual(beforeRejectedMutations);
-
-    const cases = [
-      { teamId: teamA.id, body: { sessionId: sessionB, cwd: "/repo/a" }, status: 409 },
-      { teamId: teamA.id, body: { sessionId: sessionA, cwd: "/repo/b" }, status: 409 },
-      { teamId: teamMissing.id, body: {}, status: 404 },
-      { teamId: teamArchived.id, body: {}, status: 409 },
-      { teamId: teamSubagent.id, body: {}, status: 409 },
-    ];
-    for (const route of ["run_loop", "merge"] as const) {
-      for (const testCase of cases) {
-        const response = await handler(new Request(`http://chili.test/teams/${testCase.teamId}/${route}`, {
-          method: "POST",
-          body: JSON.stringify(testCase.body),
-          headers: { "content-type": "application/json" },
-        }));
-        expect(response.status).toBe(testCase.status);
-      }
-    }
-
-    const mutationCases = [
-      { teamId: teamA.id, body: { sessionId: sessionB }, status: 409 },
-      { teamId: teamMissing.id, body: {}, status: 404 },
-      { teamId: teamArchived.id, body: {}, status: 409 },
-      { teamId: teamSubagent.id, body: {}, status: 409 },
-    ];
-    for (const testCase of mutationCases) {
-      for (const suffix of ["tasks/task_authority/dispatch", "tasks/task_authority/sync", "reconcile_dispatches"] as const) {
-        const response = await handler(new Request(`http://chili.test/teams/${testCase.teamId}/${suffix}`, {
-          method: "POST",
-          body: JSON.stringify(testCase.body),
-          headers: { "content-type": "application/json" },
-        }));
-        expect(response.status).toBe(testCase.status);
-      }
-    }
-    const globalReconcile = await handler(new Request("http://chili.test/teams/reconcile_dispatches", {
-      method: "POST",
-      body: JSON.stringify({}),
-      headers: { "content-type": "application/json" },
-    }));
-    expect([404, 409]).toContain(globalReconcile.status);
-
-    expect(teamRunner.runInputs).toEqual([]);
-    expect(teamMerger.mergeInputs).toEqual([]);
-    expect(teamDispatcher.dispatchInputs).toEqual([]);
-    expect(teamDispatcher.syncInputs).toEqual([]);
-    expect(teamDispatcher.reconcileInputs).toEqual([]);
-  } finally {
-    baseStore.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("maps an archived team run-loop boundary to an HTTP conflict", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const teamId = "team_http_archived" as TeamId;
-  const teams = {
-    async listTeams() {
-      return [{
-        id: teamId,
-        name: "archived",
-        leadPath: "/root" as AgentPath,
-        status: "archived" as const,
-        createdAt: 1,
-        updatedAt: 2,
-      }];
-    },
-  } as unknown as RuntimeTeamService;
-  const teamRunner = new FakeTeamExecutionRunnerService();
-  const handler = createRuntimeHttpHandler({ service, store, teams, teamRunner });
-
-  const response = await handler(new Request(`http://chili.test/teams/${teamId}/run_loop`, {
-    method: "POST",
-    body: JSON.stringify({ once: true }),
-    headers: { "content-type": "application/json" },
-  }));
-
-  expect(response.status).toBe(409);
-  expect(await response.json()).toEqual({
-    error: { message: `Cannot operate on archived team ${teamId}` },
-  });
-  expect(teamRunner.runInputs).toEqual([]);
-});
-
-test("maps scoped worker team-task mutation denials to HTTP 403", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-http-team-worker-denial-"));
-  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const teams = new TeamControlService({
-    store,
-    createId: createSequentialId(),
-    now: () => 30 as TimestampMs,
-  });
-
-  try {
-    const owner = await service.createSession({ cwd: "/repo" });
-    const team = await teams.createTeam({
-      sessionId: owner.sessionId,
-      name: "worker-denial",
-      leadPath: "/root" as AgentPath,
-    });
-    const task = await teams.createTask({
-      teamId: team.id,
-      sessionId: owner.sessionId,
-      title: "protected task",
-    });
-    teams.updateTask = async () => {
-      const error = new Error(
-        `Scoped worker cannot update team task ${task.id} in ${team.id}: field is runtime-owned: ownerPath`,
-      );
-      error.name = "TeamTaskWorkerMutationError";
-      throw error;
-    };
-    const handler = createRuntimeHttpHandler({ service, store, teams });
-
-    const response = await handler(new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/update`, {
-      method: "POST",
-      body: JSON.stringify({ ownerPath: "/root/other" }),
-      headers: { "content-type": "application/json" },
-    }));
-
-    expect(response.status).toBe(403);
-    expect(await response.json()).toEqual({
-      error: {
-        message: `Scoped worker cannot update team task ${task.id} in ${team.id}: field is runtime-owned: ownerPath`,
-      },
-    });
-  } finally {
-    baseStore.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
 test("resolves approvals through the runtime HTTP handler", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -3675,7 +2337,7 @@ test("rejects direct HTTP prompts, commands, controls, and lifecycle mutations f
     const response = await handler(request);
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({
-      error: { message: expect.stringContaining("Use agent_resume for the owning task") },
+      error: { message: expect.stringContaining("Use agent_resume for this Agent") },
     });
   }
   expect(service.lastPrompt).toBeUndefined();
@@ -3765,7 +2427,7 @@ test("rejects a known pending child over HTTP before its session row exists", as
     const response = await handler(request);
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({
-      error: { message: expect.stringContaining("Use agent_resume for the owning task") },
+      error: { message: expect.stringContaining("Use agent_resume for this Agent") },
     });
   }
   expect(service.lastPrompt).toBeUndefined();
@@ -4128,46 +2790,6 @@ test("returns conflict when approval is not pending in the runtime queue", async
       message: "Approval is not pending in this runtime. It may have been handled already or orphaned by a server restart.",
     },
   });
-});
-
-test("passes request cancellation through team run loop HTTP route", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-http-team-abort-"));
-  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  try {
-    const session = await service.createSession({ cwd: "/repo" });
-    const teams = new TeamControlService({
-      store,
-      createId: createSequentialId(),
-      now: () => 10 as TimestampMs,
-    });
-    const team = await teams.createTeam({
-      sessionId: session.sessionId,
-      name: "abort",
-      leadPath: "/root" as AgentPath,
-    });
-    const controller = new AbortController();
-    const teamRunner = new AbortObservingTeamExecutionRunnerService(() => controller.abort());
-    const handler = createRuntimeHttpHandler({ service, store, teams, teamRunner });
-
-    const response = await handler(
-      new Request(`http://chili.test/teams/${team.id}/run_loop`, {
-        method: "POST",
-        body: JSON.stringify({ once: true }),
-        headers: { "content-type": "application/json" },
-        signal: controller.signal,
-      }),
-    );
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ teamId: team.id, stopReason: "aborted" });
-    expect(teamRunner.seenSignal).toBeInstanceOf(AbortSignal);
-    expect(teamRunner.signalAbortedAfterAbort).toBe(true);
-  } finally {
-    baseStore.close();
-    await rm(dir, { recursive: true, force: true });
-  }
 });
 
 test("serves model control routes and prompt model overrides", async () => {
@@ -4901,346 +3523,6 @@ class FakeMcpControlService implements RuntimeMcpControlService {
   }
 }
 
-class FakeTaskControlService implements RuntimeTaskControlService {
-  lastListStatus: string | undefined;
-  lastFollowupText: string | undefined;
-  lastFollowupSignal: AbortSignal | undefined;
-  lastWaitSignal: AbortSignal | undefined;
-  lastReconcile: unknown;
-
-  async listTasks(query: { status?: string } = {}): Promise<AgentTaskRow[]> {
-    this.lastListStatus = query.status;
-    return [taskRow({ status: "running" })];
-  }
-
-  async getTask(): Promise<AgentTaskRow> {
-    return taskRow({ status: "running" });
-  }
-
-  async followupTask(
-    input: Parameters<RuntimeTaskControlService["followupTask"]>[0],
-  ): Promise<Awaited<ReturnType<RuntimeTaskControlService["followupTask"]>>> {
-    this.lastFollowupText = input.text;
-    this.lastFollowupSignal = input.signal;
-    return {
-      task: taskRow({ status: "completed", summary: "done" }),
-      result: {
-        status: "completed",
-        turns: [],
-        finishReason: "stop",
-      },
-    };
-  }
-
-  async waitForTask(input: Parameters<RuntimeTaskControlService["waitForTask"]>[0]): Promise<AgentTaskRow> {
-    this.lastWaitSignal = input.signal;
-    return taskRow({ status: "completed", summary: "done" });
-  }
-
-  async closeTask(input: { status?: "completed" | "incomplete" | "failed" | "cancelled"; summary?: string }): Promise<AgentTaskRow> {
-    const rowInput: { status: AgentTaskRow["status"]; summary?: string } = { status: input.status ?? "cancelled" };
-    if (input.summary) rowInput.summary = input.summary;
-    return taskRow(rowInput);
-  }
-
-  async reconcileStaleTasks(input = {}): Promise<{ scanned: number; closed: AgentTaskRow[] }> {
-    this.lastReconcile = input;
-    return { scanned: 1, closed: [taskRow({ status: "cancelled" })] };
-  }
-}
-
-class AbortableFollowupTaskControlService extends FakeTaskControlService {
-  readonly started = deferred<void>();
-
-  override async followupTask(
-    input: Parameters<RuntimeTaskControlService["followupTask"]>[0],
-  ): Promise<Awaited<ReturnType<RuntimeTaskControlService["followupTask"]>>> {
-    this.lastFollowupText = input.text;
-    this.lastFollowupSignal = input.signal;
-    this.started.resolve();
-    if (input.signal?.aborted) throw abortError("Task follow-up aborted");
-    return new Promise((_, reject) => {
-      input.signal?.addEventListener(
-        "abort",
-        () => reject(abortError("Task follow-up aborted")),
-        { once: true },
-      );
-    });
-  }
-}
-
-class FakeAgentTreeService implements RuntimeAgentTreeService {
-  consumedIds: string[] = [];
-  runQueries: AgentRunQuery[] = [];
-  mailboxQueries: AgentMailboxQuery[] = [];
-
-  async snapshot(): Promise<AgentTreeSnapshot> {
-    const root = agentRunRow({ id: "agent_http_root", path: "/root", taskName: "lead" });
-    const child = agentRunRow({ id: "agent_http_child", path: "/root/task_http", parentPath: "/root", taskName: "review" });
-    const mailbox = mailboxRow({ status: "queued" });
-    return {
-      rootPath: "/root" as AgentPath,
-      agents: [root, child],
-      tasks: [taskRow({ status: "running" })],
-      mailbox: [mailbox],
-      nodes: [
-        {
-          path: "/root" as AgentPath,
-          taskName: "lead",
-          status: "running",
-          runIds: [root.id],
-          runs: [root],
-          tasks: [],
-          mailbox: [],
-          createdAt: 1,
-          updatedAt: 1,
-          children: [
-            {
-              path: "/root/task_http" as AgentPath,
-              parentPath: "/root" as AgentPath,
-              taskName: "review",
-              status: "running",
-              runIds: [child.id],
-              runs: [child],
-              tasks: [taskRow({ status: "running" })],
-              mailbox: [mailbox],
-              children: [],
-              createdAt: 2,
-              updatedAt: 2,
-            },
-          ],
-        },
-      ],
-    };
-  }
-
-  async agentRuns(query: AgentRunQuery = {}): Promise<AgentRunRow[]> {
-    this.runQueries.push(query);
-    return [agentRunRow({ id: "agent_http_child", path: "/root/task_http", parentPath: "/root", taskName: "review" })];
-  }
-
-  async mailbox(query: AgentMailboxQuery = {}): Promise<AgentMailboxRow[]> {
-    this.mailboxQueries.push(query);
-    return [mailboxRow({ status: "queued" })];
-  }
-
-  async consumeMailbox(input: { messageId: string }): Promise<AgentMailboxRow> {
-    this.consumedIds.push(input.messageId);
-    return mailboxRow({ status: "consumed" });
-  }
-}
-
-class FakeTeamDispatcherService implements RuntimeTeamDispatcherService {
-  dispatchInputs: Array<Parameters<RuntimeTeamDispatcherService["dispatchTask"]>[0]> = [];
-  syncInputs: Array<Parameters<RuntimeTeamDispatcherService["syncTask"]>[0]> = [];
-  reconcileInputs: Array<NonNullable<Parameters<RuntimeTeamDispatcherService["reconcileTasks"]>[0]>> = [];
-  nextDispatchResult: Awaited<ReturnType<RuntimeTeamDispatcherService["dispatchTask"]>> | undefined;
-
-  async dispatchTask(
-    input: Parameters<RuntimeTeamDispatcherService["dispatchTask"]>[0],
-  ): Promise<Awaited<ReturnType<RuntimeTeamDispatcherService["dispatchTask"]>>> {
-    this.dispatchInputs.push(input);
-    if (this.nextDispatchResult) {
-      const result = this.nextDispatchResult;
-      this.nextDispatchResult = undefined;
-      return result;
-    }
-    return {
-      status: "running",
-      teamTask: teamTaskRow({
-        teamId: input.teamId,
-        taskId: input.taskId,
-        status: "in_progress",
-        metadata: teamDispatchMetadata("running"),
-      }),
-      agentTask: localSubagentTaskRow({ status: "running" }),
-    };
-  }
-
-  async syncTask(
-    input: Parameters<RuntimeTeamDispatcherService["syncTask"]>[0],
-  ): Promise<Awaited<ReturnType<RuntimeTeamDispatcherService["syncTask"]>>> {
-    this.syncInputs.push(input);
-    return {
-      applied: true,
-      teamTask: teamTaskRow({
-        teamId: input.teamId,
-        taskId: input.taskId,
-        status: "completed",
-        metadata: teamDispatchMetadata("completed", 102),
-      }),
-      agentTask: taskRow({ status: "completed", summary: "done" }),
-    };
-  }
-
-  async reconcileTasks(
-    input: NonNullable<Parameters<RuntimeTeamDispatcherService["reconcileTasks"]>[0]> = {},
-  ): Promise<Awaited<ReturnType<RuntimeTeamDispatcherService["reconcileTasks"]>>> {
-    this.reconcileInputs.push(input);
-    return reconcileResultJson(input.teamId ?? ("team_http" as TeamId));
-  }
-}
-
-class FakeTeamExecutionRunnerService implements RuntimeTeamExecutionRunnerService {
-  runInputs: Array<Parameters<RuntimeTeamExecutionRunnerService["run"]>[0]> = [];
-
-  async run(input: Parameters<RuntimeTeamExecutionRunnerService["run"]>[0]): Promise<Awaited<ReturnType<RuntimeTeamExecutionRunnerService["run"]>>> {
-    this.runInputs.push(input);
-    return teamRunLoopResultJson(input.teamId);
-  }
-}
-
-class FakeTeamMergeService implements RuntimeTeamMergeService {
-  mergeInputs: Array<Parameters<RuntimeTeamMergeService["mergeTeamTasks"]>[0]> = [];
-
-  async mergeTeamTasks(
-    input: Parameters<RuntimeTeamMergeService["mergeTeamTasks"]>[0],
-  ): Promise<Awaited<ReturnType<RuntimeTeamMergeService["mergeTeamTasks"]>>> {
-    this.mergeInputs.push(input);
-    return teamMergeResultJson(input.teamId, input.taskId ?? ("task_http" as TaskId));
-  }
-}
-
-class AbortObservingTeamExecutionRunnerService implements RuntimeTeamExecutionRunnerService {
-  seenSignal: AbortSignal | undefined;
-  signalAbortedAfterAbort = false;
-
-  constructor(private readonly abortRequest: () => void) {}
-
-  async run(input: Parameters<RuntimeTeamExecutionRunnerService["run"]>[0]): Promise<Awaited<ReturnType<RuntimeTeamExecutionRunnerService["run"]>>> {
-    this.seenSignal = input.signal;
-    this.abortRequest();
-    this.signalAbortedAfterAbort = input.signal?.aborted ?? false;
-    return {
-      ...teamRunLoopResultJson(input.teamId),
-      stopReason: this.signalAbortedAfterAbort ? "aborted" : "once",
-    };
-  }
-}
-
-function reconcileResultJson(teamId: TeamId): Awaited<ReturnType<RuntimeTeamDispatcherService["reconcileTasks"]>> {
-  return {
-    scanned: 2,
-    synced: [
-      {
-        applied: true,
-        teamTask: teamTaskRow({
-          teamId,
-          taskId: "task_http" as TaskId,
-          status: "completed",
-          metadata: teamDispatchMetadata("completed", 102),
-        }),
-        agentTask: taskRow({ status: "completed", summary: "done" }),
-      },
-    ],
-    skipped: [
-      {
-        applied: false,
-        reason: "agent_running",
-        teamTask: teamTaskRow({
-          teamId,
-          taskId: "task_skip_http" as TaskId,
-          status: "in_progress",
-          metadata: teamDispatchMetadata("running"),
-        }),
-        agentTask: taskRow({ status: "running" }),
-      },
-    ],
-    errors: [],
-  };
-}
-
-function teamRunLoopResultJson(teamId: TeamId): Awaited<ReturnType<RuntimeTeamExecutionRunnerService["run"]>> {
-  return {
-    teamId,
-    cycles: 1,
-    stopReason: "once",
-    startedAt: 100,
-    endedAt: 110,
-    maxConcurrentDispatches: 4,
-    maxConcurrentVerifications: 2,
-    dispatched: [
-      {
-        teamId,
-        taskId: "task_http" as TaskId,
-        ownerPath: "/root/reviewer" as AgentPath,
-        agentTaskId: "task_agent_http" as TaskId,
-        status: "running",
-      },
-    ],
-    completed: [],
-    accepted: [],
-    reopened: [],
-    merged: [],
-    mergeFailed: [],
-    mergeConflicted: [],
-    mergeSkipped: [],
-    failed: [],
-    blocked: [],
-    skipped: [],
-    stillRunning: [
-      {
-        teamId,
-        taskId: "task_http" as TaskId,
-        ownerPath: "/root/reviewer" as AgentPath,
-        agentTaskId: "task_agent_http" as TaskId,
-        title: "HTTP team task",
-      },
-    ],
-    errors: [],
-  };
-}
-
-function teamMergeResultJson(teamId: TeamId, taskId: TaskId): Awaited<ReturnType<RuntimeTeamMergeService["mergeTeamTasks"]>> {
-  return {
-    scanned: 1,
-    applied: [
-      {
-        status: "applied",
-        teamTask: teamTaskRow({ teamId, taskId, status: "completed" }),
-        diffSummary: { filesChanged: 1, paths: ["packages/core/src/team.ts"], truncatedPaths: false, diffBytes: 120 },
-      },
-    ],
-    failed: [],
-    conflicted: [],
-    skipped: [],
-    errors: [],
-  };
-}
-
-function teamDispatchMetadata(agentStatus: "running" | "completed", syncedAt?: number): Record<string, unknown> {
-  return {
-    chiliTeamDispatch: {
-      agentTaskId: "task_agent_http",
-      agentPath: "/root/reviewer/task_agent_http",
-      runId: "agent_http_dispatch",
-      childSessionId: "session_child_dispatch",
-      mode: "background",
-      dispatchedAt: 101,
-      agentStatus,
-      ...(syncedAt === undefined ? {} : { syncedAt }),
-    },
-  };
-}
-
-function localSubagentTaskRow(input: { status: "running" | "completed" | "incomplete" | "failed" | "cancelled" }): {
-  taskId: TaskId;
-  runId: AgentRunId;
-  path: AgentPath;
-  parentPath: AgentPath;
-  childSessionId: SessionId;
-  status: "running" | "completed" | "incomplete" | "failed" | "cancelled";
-} {
-  return {
-    taskId: "task_agent_http" as TaskId,
-    runId: "agent_http_dispatch" as AgentRunId,
-    path: "/root/reviewer/task_agent_http" as AgentPath,
-    parentPath: "/root/reviewer" as AgentPath,
-    childSessionId: "session_child_dispatch" as SessionId,
-    status: input.status,
-  };
-}
-
 function mcpServer() {
   return {
     name: "github",
@@ -5255,68 +3537,6 @@ function mcpServer() {
       provider: "github",
     },
   };
-}
-
-function teamTaskRow(input: {
-  teamId: TeamId;
-  taskId: TaskId;
-  status: TeamTaskRow["status"];
-  metadata?: Record<string, unknown>;
-}): TeamTaskRow {
-  const row: TeamTaskRow = {
-    id: input.taskId,
-    teamId: input.teamId,
-    title: "HTTP team task",
-    status: input.status,
-    ownerPath: "/root/reviewer" as AgentPath,
-    dependsOn: [],
-    createdAt: 1,
-    updatedAt: 2,
-  };
-  if (input.metadata) row.metadata = input.metadata;
-  return row;
-}
-
-function taskRow(input: { status: AgentTaskRow["status"]; summary?: string }): AgentTaskRow {
-  const row: AgentTaskRow = {
-    id: "task_http" as TaskId,
-    path: "/root/task_http" as AgentPath,
-    taskName: "review",
-    status: input.status,
-    generation: 0,
-    childSessionId: "session_child" as SessionId,
-    createdAt: 1,
-    updatedAt: 2,
-  };
-  if (input.summary) row.summary = input.summary;
-  return row;
-}
-
-function agentRunRow(input: { id: string; path: string; parentPath?: string; taskName: string }): AgentRunRow {
-  const row: AgentRunRow = {
-    id: input.id as AgentRunId,
-    path: input.path as AgentPath,
-    taskName: input.taskName,
-    status: "running",
-    createdAt: 1,
-  };
-  if (input.parentPath) row.parentPath = input.parentPath as AgentPath;
-  return row;
-}
-
-function mailboxRow(input: { status: AgentMailboxRow["status"] }): AgentMailboxRow {
-  const row: AgentMailboxRow = {
-    id: "event_mailbox",
-    path: "/root/task_http" as AgentPath,
-    fromPath: "/root" as AgentPath,
-    triggerTurn: true,
-    status: input.status,
-    taskId: "task_http" as TaskId,
-    recipientSessionId: "session_mailbox_recipient" as SessionId,
-    createdAt: 3,
-  };
-  if (input.status === "consumed") row.consumedAt = 4;
-  return row;
 }
 
 function createSequentialId(): (prefix: string) => string {
@@ -5414,64 +3634,6 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs 
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   throw new Error("Timed out waiting for condition");
-}
-
-async function seedCompletedHttpTask(store: SqliteEventStore, taskId: TaskId): Promise<void> {
-  const sessionId = "session_http_parent" as SessionId;
-  const childSessionId = "session_http_child" as SessionId;
-  const path = `/root/${taskId}` as AgentPath;
-  const runId = `agent_initial_${taskId}` as AgentRunId;
-  await store.appendMany([
-    {
-      id: `event_created_${taskId}`,
-      type: "agent.task_created",
-      time: 1 as TimestampMs,
-      sessionId,
-      payload: {
-        taskId,
-        path,
-        parentPath: "/root" as AgentPath,
-        parentSessionId: sessionId,
-        childSessionId,
-        taskName: "queued worker",
-        cwd: "/repo",
-        prompt: "initial work",
-        mode: "resumable",
-      },
-    },
-    {
-      id: `event_spawned_${taskId}`,
-      type: "agent.spawned",
-      time: 2 as TimestampMs,
-      sessionId,
-      payload: {
-        runId,
-        taskId,
-        path,
-        parentPath: "/root" as AgentPath,
-        parentSessionId: sessionId,
-        childSessionId,
-        taskName: "queued worker",
-        cwd: "/repo",
-        mode: "resumable",
-        generation: 1,
-      },
-    },
-    {
-      id: `event_completed_${taskId}`,
-      type: "agent.completed",
-      time: 3 as TimestampMs,
-      sessionId,
-      payload: {
-        runId,
-        taskId,
-        path,
-        status: "completed",
-        generation: 1,
-        summary: "initial answer",
-      },
-    },
-  ]);
 }
 
 function abortError(message: string): Error {
@@ -5572,3 +3734,142 @@ class DelayedEmitEventStore extends MemoryEventStore implements EventPublisher {
     for (const listener of this.listeners) listener(event);
   }
 }
+
+test("unified Agent routes bind the persisted caller and wait for the requested input", async () => {
+  const base = new MemoryEventStore();
+  const store = new ObservableEventStore(base);
+  const service = new FakeRuntimeService(store);
+  const sessionId = "session_agent_root" as SessionId;
+  await service.createSession({ sessionId });
+  const calls: Array<{ caller: SessionId; operation: string; input: unknown }> = [];
+  const receipt = { agentId: "child/one", inputId: "input_1" };
+  const settled = agentInputReceipt("child/one");
+  const agents = {
+    forSession(caller: SessionId) {
+      const record = (operation: string, input: unknown) => { calls.push({ caller, operation, input }); };
+      return {
+        async listAgents(input: {}) { record("list", input); return [{ agentId: "child/one", name: "reviewer", path: "/root/reviewer", state: "idle" as const }]; },
+        async spawnAgent(input: { name: string; prompt: string; cwd?: string }) { record("spawn", input); return receipt; },
+        async sendAgent(input: { agentId: string; text: string; mode?: "queue" | "steer" }) { record("send", input); return receipt; },
+        async waitAgent(input: { agentId: string; inputId: string; timeoutMs?: number }) { record("wait", input); return { input: settled, timedOut: false }; },
+        async stopAgent(input: { agentId: string }) { record("stop", input); return { agentId: input.agentId }; },
+        async resumeAgent(input: { agentId: string }) { record("resume", input); return { agentId: input.agentId }; },
+      };
+    },
+  };
+  const handler = createRuntimeHttpHandler({ service, store, agents });
+  const client = new HttpRuntimeClient({ baseUrl: "http://chili.test", fetch: ((input, init) => handler(new Request(input, init))) as typeof fetch });
+  expect(await client.listAgents({ sessionId })).toEqual([{ agentId: "child/one", name: "reviewer", path: "/root/reviewer", state: "idle" }]);
+  expect(await client.spawnAgent({ sessionId, name: "reviewer", prompt: "inspect changes" })).toEqual(receipt);
+  expect(await client.sendAgent({ sessionId, agentId: receipt.agentId, text: "review again", mode: "steer" })).toEqual(receipt);
+  expect(await client.waitAgent({ sessionId, agentId: receipt.agentId, inputId: receipt.inputId, timeoutMs: 0 })).toEqual({ input: settled, timedOut: false });
+  expect(await client.stopAgent({ sessionId, agentId: receipt.agentId })).toEqual({ agentId: receipt.agentId });
+  expect(await client.resumeAgent({ sessionId, agentId: receipt.agentId })).toEqual({ agentId: receipt.agentId });
+  expect(calls).toEqual([
+    { caller: sessionId, operation: "list", input: {} },
+    { caller: sessionId, operation: "spawn", input: { name: "reviewer", prompt: "inspect changes" } },
+    { caller: sessionId, operation: "send", input: { agentId: "child/one", text: "review again", mode: "steer" } },
+    { caller: sessionId, operation: "wait", input: { agentId: "child/one", inputId: "input_1", timeoutMs: 0 } },
+    { caller: sessionId, operation: "stop", input: { agentId: "child/one" } },
+    { caller: sessionId, operation: "resume", input: { agentId: "child/one" } },
+  ]);
+});
+
+test("Agent HTTP control rejects child and archived callers before invoking the controller", async () => {
+  const base = new MemoryEventStore();
+  const store = new ObservableEventStore(base);
+  const service = new FakeRuntimeService(store);
+  let called = false;
+  const agents = { forSession() { called = true; throw new Error("must not bind"); } };
+  const sessionId = "session_agent_invalid" as SessionId;
+  await service.createSession({ sessionId });
+  const row = base.sessionRows.get(sessionId)!;
+  const handler = createRuntimeHttpHandler({ service, store, agents });
+  const child = { parentSessionId: "session_parent" as SessionId, name: "worker", path: "/root/worker" as AgentPath, policy: {} };
+  for (const invalid of [{ ...row, agent: child }, { ...row, source: "subagent" as const }, { ...row, status: "archived" as const }]) {
+    base.sessionRows.set(sessionId, invalid);
+    for (const [method, suffix] of [["GET", ""], ["POST", ""], ["POST", "/another/send"], ["POST", "/another/wait"], ["POST", "/another/stop"], ["POST", "/another/resume"]] as const) {
+      const response = await handler(new Request(`http://chili.test/sessions/${sessionId}/agents${suffix}`, { method }));
+      expect(response.status).toBe(403);
+    }
+  }
+  expect(called).toBe(false);
+});
+
+test("retired Team, Task, mailbox and global Agent routes are not executable", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+  for (const path of ["/teams", "/teams/team_one/tasks", "/teams/team_one/run_loop", "/tasks", "/tasks/task_one/followup", "/tasks/reconcile_stale", "/agents", "/agents/tree", "/agent_runs", "/mailbox"]) {
+    for (const method of ["GET", "POST"]) {
+      expect((await handler(new Request(`http://chili.test${path}`, { method }))).status).toBe(404);
+    }
+  }
+});
+
+test("Agent HTTP rejects caller overrides and malformed controls before mutation", async () => {
+  const base = new MemoryEventStore();
+  const store = new ObservableEventStore(base);
+  const service = new FakeRuntimeService(store);
+  const sessionId = "session_agent_body" as SessionId;
+  await service.createSession({ sessionId });
+  let invoked = false;
+  const method = async () => { invoked = true; return { agentId: "child", inputId: "input" }; };
+  const handler = createRuntimeHttpHandler({ service, store, agents: { forSession: () => ({
+    spawnAgent: method, sendAgent: method, stopAgent: method, resumeAgent: method,
+    listAgents: async () => [], waitAgent: async () => { invoked = true; return { input: agentInputReceipt("child"), timedOut: false }; },
+  }) } });
+  const cases = [
+    { suffix: "", body: { name: "worker", prompt: "work", sessionId: "different_root" } },
+    { suffix: "/child/send", body: { text: "hello", mode: "triggerTurn" } },
+    { suffix: "/child/wait", body: { timeoutMs: 0 } },
+    { suffix: "/child/wait", body: { inputId: "input", timeoutMs: -1 } },
+    { suffix: "/child/stop", body: { agentId: "another_child" } },
+    { suffix: "/child/resume", body: { prompt: "restart something else" } },
+  ];
+  for (const { suffix, body } of cases) {
+    const response = await handler(new Request(`http://chili.test/sessions/${sessionId}/agents${suffix}`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    }));
+    expect(response.status).toBe(400);
+  }
+  expect(invoked).toBe(false);
+});
+
+function agentInputReceipt(agentId: string): import("@chili/protocol").RuntimeSessionInput {
+  return { inputId: "input_1", submissionId: "submission_1", sessionId: agentId as SessionId, mode: "queue", state: "settled", outcome: "completed", revision: 1, sequence: 1, text: "review again", acceptedAt: 1, updatedAt: 2 };
+}
+
+test("disconnecting an Agent wait cancels only its waiter", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const service = new FakeRuntimeService(store);
+  const sessionId = "session_agent_wait_abort" as SessionId;
+  await service.createSession({ sessionId });
+  const started = deferred<void>();
+  let stopped = false;
+  const mutation = async () => ({ agentId: "child", inputId: "input" });
+  const handler = createRuntimeHttpHandler({ service, store, agents: {
+    forSession(_caller: SessionId, options: { signal?: AbortSignal } = {}) {
+      return {
+        listAgents: async () => [], spawnAgent: mutation, sendAgent: mutation, resumeAgent: mutation,
+        stopAgent: async () => { stopped = true; return { agentId: "child" }; },
+        waitAgent: () => {
+          started.resolve();
+          return new Promise<import("@chili/protocol").RuntimeAgentWaitResult>((_resolve, reject) => {
+            const abort = () => reject(abortError("Wait cancelled"));
+            if (options.signal?.aborted) abort();
+            else options.signal?.addEventListener("abort", abort, { once: true });
+          });
+        },
+      };
+    },
+  } });
+  const abort = new AbortController();
+  const response = handler(new Request(`http://chili.test/sessions/${sessionId}/agents/child/wait`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ inputId: "input" }), signal: abort.signal,
+  }));
+  await started.promise;
+  abort.abort();
+  expect((await response).status).toBe(499);
+  expect(stopped).toBe(false);
+});

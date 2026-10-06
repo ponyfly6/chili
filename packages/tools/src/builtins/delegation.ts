@@ -6,28 +6,9 @@ import {
 } from "@chili/protocol";
 import type { ChiliToolDefinition, ChiliToolExecutionContext, ValidationResult } from "../types.js";
 
-/**
- * Tools that can create, resume, or orchestrate delegated work. Inspection,
- * settlement, reconciliation, completion, and delegation-control tools remain
- * available while policy is off.
- */
+/** Delegation off blocks new work while preserving observation and stop controls. */
 export const DELEGATION_OFF_DENIED_TOOL_NAMES = [
-  "agent_spawn",
-  "agent_resume",
-  "agent_send",
-  "task",
-  "task_batch",
-  "task_followup",
-  "team_create",
-  "team_member_add",
-  "team_task_create",
-  "team_task_create_batch",
-  "team_task_assign",
-  "team_task_dispatch",
-  "team_task_dispatch_batch",
-  "team_run_loop",
-  "agent_message_send",
-  "team_message_send",
+  "agent_spawn", "agent_send", "agent_resume",
 ] as const;
 
 export interface DelegationToolController {
@@ -48,7 +29,7 @@ export function createDelegationStatusTool(
   return {
     name: "delegation_status",
     description:
-      "Read this session's effective delegation policy and its source. This reports policy only; use task or team status tools to inspect live agents.",
+      "Read this session's effective delegation policy and its source. This reports policy only; use agent_list to inspect agents.",
     resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
@@ -73,7 +54,7 @@ export function createDelegationSetTool(
     description: [
       "Set this session's ongoing delegation policy.",
       "Map requests such as '开启代理', '默认用代理', '以后主动委派', or '自动并行' to proactive; map requests to stop/disable agents to off; use explicit when delegation should happen only when the user asks for it.",
-      "Do not change policy merely because the user asks to open several subagents for the current task (for example '本次开多个 sub'); under explicit policy, spawn those tasks directly and leave policy unchanged.",
+      "Do not change policy merely because the user asks to create several agents for the current task; under explicit policy, create those agents directly and leave policy unchanged.",
     ].join(" "),
     resourcePolicy: "internal",
     risk: "write",

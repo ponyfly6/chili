@@ -7,7 +7,6 @@ import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import { DelegationPolicyGate } from "./delegation.js";
 import type { AgentRunner } from "./runner.js";
 import { RuntimeService } from "./runtime-service.js";
-import { LocalSubagentManager } from "./subagent.js";
 
 test("delegation policy reads the durable latest value across runtime instances and event pages", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-delegation-runtime-"));
@@ -20,7 +19,7 @@ test("delegation policy reads the durable latest value across runtime instances 
 
   try {
     await firstStore.append(sessionCreatedEvent("event_shared_delegation_session", sessionId));
-    expect((await first.getDelegationConfig(sessionId)).policy).toBe("explicit");
+    expect((await first.getDelegationConfig(sessionId)).policy).toBe("proactive");
 
     await second.setDelegationPolicy({ sessionId, policy: "off" });
     expect(await first.getDelegationConfig(sessionId)).toMatchObject({
@@ -49,127 +48,6 @@ test("delegation policy reads the durable latest value across runtime instances 
   } finally {
     firstStore.close();
     secondStore.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("a task cancelled during the post-permit delegation check never spawns a ghost run", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-delegation-cancel-race-"));
-  const store = new SqliteEventStore(join(dir, "events.sqlite"));
-  let gateCalls = 0;
-  let releasePostPermitGate: (() => void) | undefined;
-  const postPermitGate = new Promise<void>((resolve) => {
-    releasePostPermitGate = resolve;
-  });
-  let runnerCalls = 0;
-  const manager = new LocalSubagentManager({
-    store,
-    assertDelegationEnabled: async () => {
-      gateCalls += 1;
-      if (gateCalls === 2) await postPermitGate;
-    },
-    runner: {
-      async run() {
-        runnerCalls += 1;
-        return { status: "completed", summary: "must not run" };
-      },
-    },
-  });
-
-  try {
-    const task = await manager.spawnTask({
-      parentSessionId: "session_cancel_race" as SessionId,
-      cwd: "/repo",
-      taskName: "cancel during delegation gate",
-      prompt: "must not run",
-      mode: "background",
-    });
-    await waitUntil(() => gateCalls === 2);
-
-    expect(await manager.interruptTask(task.taskId)).toBe(true);
-    releasePostPermitGate?.();
-    await manager.waitForBackgroundTasks();
-
-    expect(runnerCalls).toBe(0);
-    expect(await store.events({ type: "agent.spawned", limit: 10 })).toEqual([]);
-    expect(await store.agentTask(task.taskId)).toMatchObject({
-      id: task.taskId,
-      status: "cancelled",
-    });
-    expect((await store.agentTask(task.taskId))?.currentRunId).toBeUndefined();
-  } finally {
-    releasePostPermitGate?.();
-    await manager.waitForBackgroundTasks();
-    store.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("a durable off written by another runtime after spawn prevents the local runner call", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-delegation-post-spawn-"));
-  const path = join(dir, "events.sqlite");
-  const managerStoreBase = new SqliteEventStore(path);
-  const managerStore = new ObservableEventStore(managerStoreBase);
-  const policyWriterStore = new SqliteEventStore(path);
-  const policyReader = runtimeService(managerStoreBase);
-  const policyWriter = runtimeService(policyWriterStore);
-  const parentSessionId = "session_post_spawn_policy" as SessionId;
-  const gate = new DelegationPolicyGate({
-    store: managerStore,
-    getDelegationConfig: (sessionId) => policyReader.getDelegationConfig(sessionId),
-  });
-  let policyWrite: Promise<unknown> | undefined;
-  let gateChecks = 0;
-  let runnerCalls = 0;
-  managerStore.subscribe((event) => {
-    if (event.type === "agent.spawned") {
-      policyWrite = policyWriter.setDelegationPolicy({
-        sessionId: parentSessionId,
-        policy: "off",
-      });
-    }
-  });
-  const manager = new LocalSubagentManager({
-    store: managerStore,
-    assertDelegationEnabled: async (input) => {
-      gateChecks += 1;
-      if (policyWrite) await policyWrite;
-      await gate.assertEnabled(input);
-    },
-    runner: {
-      async run() {
-        runnerCalls += 1;
-        return { status: "completed", summary: "must not run" };
-      },
-    },
-  });
-
-  try {
-    await managerStore.append(sessionCreatedEvent("event_post_spawn_policy_session", parentSessionId));
-    const task = await manager.spawnTask({
-      parentSessionId,
-      cwd: "/repo",
-      taskName: "post-spawn policy fence",
-      prompt: "must not run",
-      mode: "background",
-    });
-    await manager.waitForBackgroundTasks();
-
-    expect(gateChecks).toBe(3);
-    expect(runnerCalls).toBe(0);
-    expect((await policyReader.getDelegationConfig(parentSessionId)).policy).toBe("off");
-    expect(await managerStore.events({ type: "agent.spawned", limit: 10 })).toHaveLength(1);
-    expect(await managerStore.agentTask(task.taskId)).toMatchObject({
-      id: task.taskId,
-      status: "failed",
-      error: expect.stringContaining("Delegation policy is off"),
-    });
-    expect(await managerStore.events({ type: "agent.completed", limit: 10 })).toHaveLength(1);
-  } finally {
-    await policyWrite;
-    await manager.waitForBackgroundTasks();
-    managerStoreBase.close();
-    policyWriterStore.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

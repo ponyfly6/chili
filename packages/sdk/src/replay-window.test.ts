@@ -1,11 +1,50 @@
 import { expect, test } from "bun:test";
 import type { ChiliEvent } from "@chili/protocol";
-import { reduceRuntimeEvents } from "./projection.js";
+import { reduceRuntimeEvents, runtimeSessionAgents } from "./projection.js";
 import {
   jsonEventArrayUtf8Bytes,
   ReplayableRuntimeEventWindowAccumulator,
   retainReplayableRuntimeEvents,
+  runtimeEventProvides,
+  runtimeEventRequires,
 } from "./replay-window.js";
+
+test("retains the session Agent identity with its queue state", () => {
+  const created = event("session.created", {
+    sessionId: "session_1", cwd: "/repo",
+    agent: { parentSessionId: "session_root", name: "worker", path: "/root/worker", policy: { allowedTools: ["read"] } },
+  }, 1);
+  const paused = event("session.input_queue_changed", {
+    sessionId: "session_1", paused: true, revision: 3, pendingCount: 0, interruptedCount: 1, items: [],
+  }, 20);
+  const result = retainReplayableRuntimeEvents([
+    created,
+    ...Array.from({ length: 10 }, (_, index) => event("session.status_changed", { sessionId: "session_1", status: "running" }, index + 2)),
+    paused,
+  ], { maxEvents: 2, maxBytes: 10_000 });
+  expect(result.events).toEqual([created, paused]);
+  expect(result.missingDependencies).toEqual([]);
+  expect(runtimeSessionAgents(reduceRuntimeEvents(result.events))[0]).toMatchObject({
+    agentId: "session_1", parentSessionId: "session_root", name: "worker", state: "paused",
+  });
+});
+
+test("historical Team and AgentTask events have no live replay dependencies", () => {
+  const history = [
+    event("team.task_updated", { teamId: "old_team", taskId: "old_task", status: "completed" }, 1),
+    event("agent.task_completed", { taskId: "old_agent_task", status: "completed" }, 2),
+    event("agent.completed", { runId: "old_run", path: "/root/old", status: "completed" }, 3),
+  ];
+  for (const item of history) {
+    expect(runtimeEventProvides(item)).toEqual([]);
+    expect(runtimeEventRequires(item)).toEqual([]);
+  }
+  const result = retainReplayableRuntimeEvents(history, { maxEvents: 10, maxBytes: 10_000 });
+  expect(result.events).toEqual(history);
+  expect(result.missingDependencies).toEqual([]);
+  expect(runtimeSessionAgents(reduceRuntimeEvents(result.events))).toEqual([]);
+  expect(reduceRuntimeEvents(result.events).lastEventId).toBe(history.at(-1)!.id);
+});
 
 test("keeps message anchors and a visible newest delta inside an exact JSON-array budget", () => {
   const created = event("message.created", { messageId: "message_1", role: "assistant", turnId: "turn_1" }, 2);

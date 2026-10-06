@@ -4,8 +4,9 @@ The Host starts root coding sessions with these fourteen tools when available:
 `read`, `glob`, `grep`, `edit`, `write`, `apply_patch`, `bash`, `process`,
 `git_status`, `git_diff`, `code_mode`, `tool_search`, `activate_skill`, and
 `request_user_input`. Headless Hosts without an input queue omit the last tool.
-Worker sessions additionally advertise their completion and messaging controls,
-subject to worker policy. Registered tools remain implemented independently.
+Agent controls are exposed according to durable Agent state and the caller's
+permissions. All Agents receive code mode by default. Registered tools remain
+implemented independently.
 Embedders using `SingleAgentRuntime` directly opt in with `toolExposure`; without
 that configuration their supplied catalog stays exposed, including when they do
 not install a discovery tool.
@@ -15,7 +16,7 @@ There are three views of one registry:
 - The authorized catalog is filtered by the current session/worker policy. Tool
   discovery and code mode use this catalog, not the list of model definitions.
 - The model surface contains eager tools, tools explicitly loaded in the session,
-  and control tools required by durable Goal, Agent, and Team state.
+  and control tools required by durable Goal and Agent state.
 - The script catalog contains authorized tools that opt in with `codeMode: true`.
   Orchestrators and direct-only tools remain excluded.
 
@@ -41,16 +42,21 @@ name/description directory. Use `tool_search` to obtain complete parameter schem
 All actual calls still go through the existing Executor, current authorization,
 catalog validation, effect scheduler and event recording.
 
-Searching an Agent, Goal or Team tool loads its related control group. The Host
+Searching an Agent or Goal tool loads its related control group. The Host
 also reconstructs required groups from persisted domain projections for sessions
-created before discovery existed or work created through the API. Completed
-agents retain inspection/resume controls. These groups are filtered again by the
-current policy; they cannot enable disabled delegation or grant worker access.
+created before discovery existed or work created through the API. Existing
+Agents retain controls for later inputs, inspection and resume. These groups are
+filtered again by current policy. Delegation-off policy hides and rejects spawn,
+send and resume. List, wait and stop remain available for existing Agents.
 
-The ad-hoc Agent group contains six canonical tools: `agent_spawn`, `agent_list`,
+The Agent group contains six canonical tools: `agent_spawn`, `agent_list`,
 `agent_send`, `agent_wait`, `agent_stop`, and `agent_resume`. They can also be called
-through code mode without direct loading. See [Agent tools](AGENT_TOOLS.md) for
-the merged single/batch interface and lifecycle semantics. Domain services,
-permission defaults and Memory write semantics remain unchanged. Loaded definitions are retained for the
-session; there is no usage-based eviction yet. Evaluate definition size, search
-round trips and tool/argument errors before changing the default surface.
+through code mode without direct loading. Creation and sending return input
+receipts; waiting follows a specific receipt. Use `Promise.all` over individual
+spawn calls for parallel work. See [Agent tools](AGENT_TOOLS.md) for the contracts,
+pause and resume behavior, and permission boundaries. Git tools provide workspace
+isolation and change integration independently of Agent controls.
+
+Loaded definitions are retained for the session; there is no usage-based eviction
+yet. Evaluate definition size, search round trips and tool/argument errors before
+changing the default surface.

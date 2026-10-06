@@ -153,7 +153,8 @@ export class ToolExecutor {
           release = await input.dispatchScope!.acquire(prepared.isConcurrencySafe, input.signal);
         }
         await this.assertPreparedCurrent(prepared, input);
-        const executionPolicy = await this.authorizeWorkerPolicy(tool, validated, input, spec);
+        const workerAuthorization = await this.authorizeWorkerPolicy(tool, validated, input, spec);
+        const { executionPolicy, callerToolPolicy } = workerAuthorization;
 
         const authorization = await this.requestLifecycleApproval(tool, input, callId, spec);
         const approval = authorization.decision;
@@ -165,7 +166,7 @@ export class ToolExecutor {
         }
 
         const assertCurrentAuthorization = () => this.assertExecutionAuthorized(
-          prepared, input, callId, authorization.authority, executionPolicy,
+          prepared, input, callId, authorization.authority, workerAuthorization,
         );
         await this.createSnapshotIfNeeded(tool, input, callId, validated, spec, assertCurrentAuthorization);
         throwIfAborted(input.signal);
@@ -191,7 +192,7 @@ export class ToolExecutor {
           }
         };
         const context = this.context(tool, validated, input, callId, outputArtifactId, registerPersistedOutput,
-          executionPolicy, assertCurrentAuthorization);
+          executionPolicy, assertCurrentAuthorization, callerToolPolicy);
         // No lifecycle event or policy preparation may await after this final check.
         await context.assertCurrentAuthorization?.();
         const rawResult = await tool.execute(validated, context);
@@ -331,7 +332,7 @@ export class ToolExecutor {
   private async authorizeWorkerPolicy<Input>(
     tool: ChiliToolDefinition<Input>, validatedInput: Input, input: ExecuteToolInput,
     spec: false | ExecutableApprovalSpec,
-  ): Promise<ToolAccessPolicy | undefined> {
+  ): Promise<{ executionPolicy?: ToolAccessPolicy; callerToolPolicy?: ToolAccessPolicy }> {
     const policies = await this.policies(input);
     for (const policy of policies) {
       await authorizeToolByPolicy({
@@ -340,20 +341,37 @@ export class ToolExecutor {
         policy, isReadOnly: (definition, value) => this.resolvePredicate(definition.isReadOnly, value),
       });
     }
-    // Backend scopes and the worker decision must describe the same observation.
-    return executionPolicyFor(input.cwd, policies);
+    // Backend scopes and delegated authority must describe the same observation.
+    const executionPolicy = await executionPolicyFor(input.cwd, policies);
+    if (policies.length === 0) return {};
+    const callerToolPolicy: ToolAccessPolicy = { ...executionPolicy };
+    if (policies.some((policy) => policy.allowedTools !== undefined)) {
+      const registered = this.options.registry.listForContext
+        ? await this.options.registry.listForContext(toolRegistryContext(input))
+        : this.options.registry.list();
+      // Materializing canonical names preserves wildcard and alias semantics
+      // without granting a child capabilities absent from the caller's catalog.
+      callerToolPolicy.allowedTools = policies.reduce(
+        (tools, policy) => filterToolsByPolicy(tools, policy), registered,
+      ).map((candidate) => candidate.name).sort();
+    }
+    const deniedTools = [...new Set(policies.flatMap((policy) => policy.deniedTools ?? [])
+      .map((name) => name.trim().toLowerCase()))].sort();
+    if (deniedTools.length > 0) callerToolPolicy.deniedTools = deniedTools;
+    return { ...(executionPolicy ? { executionPolicy } : {}), callerToolPolicy };
   }
 
   private async assertExecutionAuthorized(
     prepared: PreparedToolCall, input: ExecuteToolInput, callId: ToolCallId,
-    authority: ApprovalPreflightDecision | undefined, executionPolicy: ToolAccessPolicy | undefined,
+    authority: ApprovalPreflightDecision | undefined,
+    workerAuthorization: { executionPolicy?: ToolAccessPolicy; callerToolPolicy?: ToolAccessPolicy },
   ): Promise<void> {
     throwIfAborted(input.signal);
     await this.assertPreparedCurrent(prepared, input);
     const { tool, spec } = this.preparedCalls.get(prepared)!;
     const current = await this.authorizeWorkerPolicy(tool, prepared.validatedInput, input, spec);
-    if (JSON.stringify(current) !== JSON.stringify(executionPolicy)) {
-      throw new ToolDeniedError(tool.name, "Execution resource scope changed; prepare a new operation and backend isolation profile.");
+    if (JSON.stringify(current) !== JSON.stringify(workerAuthorization)) {
+      throw new ToolDeniedError(tool.name, "Execution resource scope changed or caller tool policy changed; prepare a new operation and backend isolation profile.");
     }
     if (spec === false && tool.resourcePolicy !== undefined) {
       throwIfAborted(input.signal);
@@ -615,6 +633,7 @@ export class ToolExecutor {
     registerPersistedOutput: (output: PersistedToolOutputRegistration) => Promise<void>,
     executionPolicy?: ToolAccessPolicy,
     assertCurrentAuthorization?: () => Promise<void>,
+    callerToolPolicy?: ToolAccessPolicy,
   ): ChiliToolExecutionContext {
     let outputSequence = 0;
     let streamedOutputBytes = 0;
@@ -638,6 +657,7 @@ export class ToolExecutor {
       cwd: input.cwd,
       fileReads: this.fileReads.forSession(input.sessionId),
       ...(executionPolicy ? { executionPolicy } : {}),
+      ...(callerToolPolicy ? { callerToolPolicy: structuredClone(callerToolPolicy) } : {}),
       ...(assertCurrentAuthorization ? { assertCurrentAuthorization } : {}),
       currentResourceDenials: () => this.options.approvals.resourceDenials?.(resourceRequest) ?? Promise.resolve(undefined),
       assertFileResourceAccess: async (paths, access) => {

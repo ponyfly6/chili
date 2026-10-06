@@ -2,23 +2,17 @@
 import { createCliRenderer, type CliRendererConfig } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { HttpRuntimeClient } from "@chili/sdk";
-import type { SessionId, TeamId } from "@chili/protocol";
+import type { SessionId } from "@chili/protocol";
 import { basename, resolve } from "node:path";
 import { ChatShellApp, type ChatShellExitInfo, type ChatShellOptions } from "./ChatShellApp.js";
-import { TeamLiveApp } from "./TeamLiveApp.js";
 import { detectSystemTheme } from "./theme/index.js";
-export { teamLiveStreamInput, type TeamLiveStreamScopeInput } from "./useTeamLiveRuntime.js";
+export { runtimeStreamInput } from "./useRuntimeEvents.js";
 
-export interface TuiOptions extends ChatShellOptions {
-  teamLive: boolean;
-}
+export type TuiOptions = ChatShellOptions;
 
 export function parseArgs(argv: readonly string[]): TuiOptions | "help" {
   const options: TuiOptions = {
     baseUrl: process.env.CHILI_RUNTIME_URL ?? "http://127.0.0.1:4777",
-    runLoop: false,
-    once: false,
-    teamLive: false,
   };
 
   for (let index = 0; index < argv.length; index++) {
@@ -28,14 +22,8 @@ export function parseArgs(argv: readonly string[]): TuiOptions | "help" {
       options.baseUrl = requireValue(argv, ++index, arg);
       continue;
     }
-    if (arg === "--team") {
-      options.teamId = requireValue(argv, ++index, arg) as TeamId;
-      continue;
-    }
-    if (arg === "--team-live") {
-      options.teamLive = true;
-      continue;
-    }
+
+
     if (arg === "--session" || arg === "--resume") {
       options.sessionId = requireValue(argv, ++index, arg) as SessionId;
       continue;
@@ -48,26 +36,11 @@ export function parseArgs(argv: readonly string[]): TuiOptions | "help" {
       options.themeId = requireValue(argv, ++index, arg);
       continue;
     }
-    if (arg === "--run-loop") {
-      options.runLoop = true;
-      continue;
-    }
-    if (arg === "--once") {
-      options.once = true;
-      continue;
-    }
-    if (arg === "--max-cycles") {
-      options.maxCycles = numberValue(requireValue(argv, ++index, arg), arg);
-      continue;
-    }
-    if (arg === "--timeout-ms") {
-      options.timeoutMs = numberValue(requireValue(argv, ++index, arg), arg);
-      continue;
-    }
-    if (arg === "--poll-interval-ms") {
-      options.pollIntervalMs = numberValue(requireValue(argv, ++index, arg), arg);
-      continue;
-    }
+
+
+
+
+
     throw new Error(`Unknown argument: ${arg}`);
   }
 
@@ -92,19 +65,13 @@ function rendererConfig(): CliRendererConfig {
 
 function usage(): string {
   return [
-    "Usage: chili-tui --url <runtime-url> [--team <team-id>] [--resume <session-id>]",
+    "Usage: chili-tui --url <runtime-url> [--resume <session-id>]",
     "",
     "Options:",
     "  --resume <session-id> Resume a chat session. Alias for --session.",
     "  --session <session-id> Select a chat session.",
-    "  --team-live           Open the team cockpit directly.",
-    "  --run-loop             Trigger SDK runTeamLoop for --team.",
-    "  --once                 Pass once=true to runTeamLoop.",
-    "  --cwd <path>           CWD passed to runTeamLoop.",
+    "  --cwd <path>           Working directory for this chat.",
     "  --theme <theme-id>     Initial TUI theme.",
-    "  --max-cycles <n>       Max cycles passed to runTeamLoop.",
-    "  --timeout-ms <n>       Timeout passed to runTeamLoop.",
-    "  --poll-interval-ms <n> Poll interval passed to runTeamLoop.",
   ].join("\n");
 }
 
@@ -129,12 +96,6 @@ function requireValue(argv: readonly string[], index: number, flag: string): str
   const value = argv[index];
   if (!value) throw new Error(`${flag} requires a value`);
   return value;
-}
-
-function numberValue(value: string, flag: string): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${flag} requires a non-negative number`);
-  return Math.trunc(parsed);
 }
 
 function toError(error: unknown): Error {
@@ -176,9 +137,7 @@ async function main(): Promise<void> {
       resolve();
     };
 
-    root.render(options.teamLive
-      ? <TeamLiveApp client={client} options={options} onExit={close} />
-      : <ChatShellApp client={client} options={options} onExit={close} />);
+    root.render(<ChatShellApp client={client} options={options} onExit={close} />);
     renderer.start();
   });
 

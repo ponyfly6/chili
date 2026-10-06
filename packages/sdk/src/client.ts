@@ -3,11 +3,7 @@ import type {
   RuntimeInputMode,
   RuntimeInputQueue,
   RuntimeSessionInput,
-  AgentPath,
-  AgentRunId,
-  AgentMailboxStatus,
-  AgentTaskMode,
-  AgentTaskStatus,
+  SessionAgentMetadata,
   Message,
   MessageImageContent,
   PendingUserInputRequest as ProtocolPendingUserInputRequest,
@@ -42,13 +38,6 @@ import type {
   ReasoningLevel,
   ServiceTier,
   SessionId,
-  TaskId,
-  TeamId,
-  TeamMemberStatus,
-  TeamMessageDelivery,
-  TeamMessageDeliveryStatus,
-  TeamMessageKind,
-  TeamTaskStatus,
   SessionGoal,
   SessionGoalStatus,
   UserInputAnswers as ProtocolUserInputAnswers,
@@ -58,6 +47,7 @@ import type {
 import {
   normalizePersistedError,
   parseRuntimeInputQueue,
+  parseSessionAgentMetadata,
   parseRuntimeSessionInput,
   parseChiliEvent,
   parseChiliEventArray,
@@ -92,7 +82,8 @@ import {
   parseRuntimeStringArray,
   type RuntimeParser,
 } from "@chili/protocol";
-import type { RuntimeAgentsSnapshot } from "./projection.js";
+import type { RuntimeAgentRecord, RuntimeAgentSubmission, RuntimeAgentWaitResult, RuntimeAgentControlRequest } from "@chili/protocol";
+export type { RuntimeAgentRecord, RuntimeAgentSubmission, RuntimeAgentWaitResult } from "@chili/protocol";
 
 export interface RuntimeClient {
   createSession(input?: CreateSessionRequest): Promise<RuntimeSessionRef>;
@@ -146,34 +137,12 @@ export interface RuntimeClient {
   /** Dependency-complete bounded replay window with explicit truncation metadata. */
   sessionEventWindow?(input: SessionEventsRequest): Promise<RuntimeSessionEventWindow>;
   renameSession(input: RenameSessionRequest): Promise<RuntimeSessionSummary>;
-  listAgents(input?: ListAgentsRequest): Promise<RuntimeAgentsSnapshot>;
-  agentTree(input?: AgentTreeRequest): Promise<RuntimeAgentTreeSnapshot>;
-  listAgentRuns(input?: ListAgentRunsRequest): Promise<RuntimeAgentRunRecord[]>;
-  mailbox(input?: ListMailboxRequest): Promise<RuntimeAgentMailboxRecord[]>;
-  consumeMailbox(messageId: string): Promise<RuntimeAgentMailboxRecord>;
-  listTeams(): Promise<RuntimeTeamRecord[]>;
-  createTeam(input: CreateTeamRequest): Promise<RuntimeTeamRecord>;
-  teamSnapshot(teamId: TeamId): Promise<RuntimeTeamSnapshot>;
-  listTeamMembers(teamId: TeamId): Promise<RuntimeTeamMemberRecord[]>;
-  addTeamMember(input: AddTeamMemberRequest): Promise<RuntimeTeamMemberRecord>;
-  listTeamTasks(teamId: TeamId): Promise<RuntimeTeamTaskRecord[]>;
-  createTeamTask(input: CreateTeamTaskRequest): Promise<RuntimeTeamTaskRecord>;
-  assignTeamTask(input: AssignTeamTaskRequest): Promise<RuntimeTeamTaskRecord>;
-  claimTeamTask(input: ClaimTeamTaskRequest): Promise<RuntimeTeamTaskClaimResult>;
-  dispatchTeamTask(input: DispatchTeamTaskRequest): Promise<RuntimeTeamTaskDispatchResult>;
-  syncTeamTask(input: SyncTeamTaskRequest): Promise<RuntimeTeamTaskSyncResult>;
-  reconcileTeamTasks(input?: ReconcileTeamTasksRequest): Promise<RuntimeTeamTaskReconcileResult>;
-  mergeTeamTasks(input: MergeTeamTasksRequest): Promise<RuntimeTeamMergeResult>;
-  runTeamLoop(input: RunTeamLoopRequest): Promise<RuntimeTeamExecutionRunSummary>;
-  updateTeamTask(input: UpdateTeamTaskRequest): Promise<RuntimeTeamTaskRecord>;
-  listTeamMessages(teamId: TeamId): Promise<RuntimeTeamMessageRecord[]>;
-  sendTeamMessage(input: SendTeamMessageRequest): Promise<RuntimeTeamMessageRecord>;
-  listTasks(input?: ListTasksRequest): Promise<RuntimeAgentTaskRecord[]>;
-  task(taskId: TaskId): Promise<RuntimeAgentTaskRecord>;
-  followupTask(input: FollowupTaskRequest): Promise<RuntimeTaskFollowupResult>;
-  waitTask(input: WaitTaskRequest): Promise<RuntimeAgentTaskRecord>;
-  closeTask(input: CloseTaskRequest): Promise<RuntimeAgentTaskRecord>;
-  reconcileStaleTasks(input?: ReconcileStaleTasksRequest): Promise<RuntimeTaskReconcileStaleResult>;
+  listAgents(input: ListAgentsRequest): Promise<RuntimeAgentRecord[]>;
+  spawnAgent(input: SpawnAgentRequest): Promise<RuntimeAgentSubmission>;
+  sendAgent(input: SendAgentRequest): Promise<RuntimeAgentSubmission>;
+  waitAgent(input: WaitAgentRequest): Promise<RuntimeAgentWaitResult>;
+  stopAgent(input: TargetAgentRequest): Promise<{ agentId: string }>;
+  resumeAgent(input: TargetAgentRequest): Promise<{ agentId: string; inputId?: string }>;
   messages(sessionId: SessionId): Promise<Message[]>;
   streamEvents(input?: StreamEventsRequest): AsyncIterable<ChiliEvent>;
 }
@@ -402,6 +371,7 @@ export interface RuntimeSessionSummary {
   title?: string;
   preview?: string;
   source?: "interactive" | "subagent";
+  agent?: SessionAgentMetadata;
   status: "active" | "archived";
   createdAt: number;
   updatedAt: number;
@@ -454,590 +424,26 @@ export interface RenameSessionRequest {
   signal?: AbortSignal;
 }
 
-export interface ListAgentsRequest {
-  sessionId?: SessionId;
-}
+export interface ListAgentsRequest extends RuntimeAgentControlRequest {}
 
-export interface AgentTreeRequest {
-  rootPath?: AgentPath;
-  sessionId?: SessionId;
-  includeConsumedMailbox?: boolean;
-  limit?: number;
-}
-
-export interface RuntimeAgentTreeSnapshot {
-  rootPath?: AgentPath;
-  nodes: RuntimeAgentTreeNode[];
-  agents: RuntimeAgentRunRecord[];
-  tasks: RuntimeAgentTaskRecord[];
-  mailbox: RuntimeAgentMailboxRecord[];
-}
-
-export interface RuntimeAgentTreeNode {
-  path: AgentPath;
-  parentPath?: AgentPath;
-  taskName: string;
-  status: RuntimeAgentRunRecord["status"] | AgentTaskStatus | AgentMailboxStatus | "empty";
-  runIds: AgentRunId[];
-  runs: RuntimeAgentRunRecord[];
-  tasks: RuntimeAgentTaskRecord[];
-  mailbox: RuntimeAgentMailboxRecord[];
-  children: RuntimeAgentTreeNode[];
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface ListAgentRunsRequest {
-  path?: AgentPath;
-  sessionId?: SessionId;
-  childSessionId?: SessionId;
-  status?: RuntimeAgentRunRecord["status"];
-  limit?: number;
-}
-
-export interface RuntimeAgentRunRecord {
-  id: AgentRunId;
-  sessionId?: SessionId;
-  taskId?: TaskId;
-  path: AgentPath;
-  parentPath?: AgentPath;
-  parentSessionId?: SessionId;
-  childSessionId?: SessionId;
-  taskName: string;
-  cwd?: string;
-  mode?: AgentTaskMode;
-  status: "running" | "completed" | "incomplete" | "failed" | "cancelled";
-  createdAt: number;
-  completedAt?: number;
-}
-
-export interface ListMailboxRequest {
-  messageId?: string;
-  taskId?: TaskId;
-  path?: AgentPath;
-  recipientSessionId?: SessionId;
-  status?: AgentMailboxStatus;
-  limit?: number;
-}
-
-export interface RuntimeAgentMailboxRecord {
-  id: string;
-  path: AgentPath;
-  fromPath: AgentPath;
-  triggerTurn: boolean;
-  status: AgentMailboxStatus;
-  taskId?: TaskId;
-  recipientSessionId?: SessionId;
-  message?: unknown;
-  createdAt: number;
-  consumedAt?: number;
-}
-
-export interface RuntimeTeamRecord {
-  id: TeamId;
-  sessionId?: SessionId;
+export interface SpawnAgentRequest extends RuntimeAgentControlRequest {
   name: string;
-  leadPath: AgentPath;
-  status: "active" | "archived";
-  description?: string;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface RuntimeTeamMemberRecord {
-  teamId: TeamId;
-  path: AgentPath;
-  name: string;
-  role: string;
-  status: TeamMemberStatus;
-  childSessionId?: SessionId;
-  model?: string;
-  toolScope?: string[];
-  writeScope?: string[];
-  currentTaskId?: TaskId;
-  createdAt: number;
-  updatedAt: number;
-  closedAt?: number;
-}
-
-export interface RuntimeTeamTaskRecord {
-  id: TaskId;
-  teamId: TeamId;
-  sessionId?: SessionId;
-  title: string;
-  description?: string;
-  status: TeamTaskStatus;
-  ownerPath?: AgentPath;
-  createdBy?: AgentPath;
-  dependsOn: TaskId[];
-  summary?: string;
-  error?: string;
-  metadata?: Record<string, unknown>;
-  createdAt: number;
-  updatedAt: number;
-  completedAt?: number;
-}
-
-export interface RuntimeTeamMessageRecord {
-  id: string;
-  teamId: TeamId;
-  fromPath: AgentPath;
-  toPath: AgentPath | "*";
-  content: string;
-  kind: TeamMessageKind;
-  delivery?: TeamMessageDelivery;
-  deliveryStatus?: TeamMessageDeliveryStatus;
-  deliveryError?: string;
-  deliveryUpdatedAt?: number;
-  deliveredAt?: number;
-  taskId?: TaskId;
-  summary?: string;
-  metadata?: Record<string, unknown>;
-  createdAt: number;
-}
-
-export interface RuntimeTeamMessageDeliveryRecord {
-  mailboxMessageId: string;
-  teamId: TeamId;
-  teamMessageId: string;
-  path: AgentPath;
-  status: TeamMessageDeliveryStatus;
-  triggerTurn: boolean;
-  childSessionId?: SessionId;
-  error?: string;
-  queuedAt: number;
-  updatedAt: number;
-  deliveredAt?: number;
-}
-
-export interface RuntimeTeamSnapshot {
-  team: RuntimeTeamRecord;
-  members: RuntimeTeamSnapshotMember[];
-  tasks: RuntimeTeamSnapshotTask[];
-  messages: RuntimeTeamSnapshotMessage[];
-  messageDeliveries: RuntimeTeamMessageDeliveryRecord[];
-  stats: RuntimeTeamSnapshotStats;
-  generatedAt: number;
-}
-
-export interface RuntimeTeamSnapshotMember extends RuntimeTeamMemberRecord {
-  taskIds: TaskId[];
-  deliveryIds: string[];
-  currentTask?: RuntimeTeamTaskRecord;
-}
-
-export interface RuntimeTeamSnapshotTask extends RuntimeTeamTaskRecord {
-  blockedBy: TaskId[];
-  blocks: TaskId[];
-  ready: boolean;
-  messageIds: string[];
-  owner?: RuntimeTeamMemberRecord;
-  dispatch?: unknown;
-}
-
-export interface RuntimeTeamSnapshotMessage extends RuntimeTeamMessageRecord {
-  deliveries: RuntimeTeamMessageDeliveryRecord[];
-}
-
-export interface RuntimeTeamSnapshotStats {
-  memberCount: number;
-  taskCount: number;
-  messageCount: number;
-  deliveryCount: number;
-  membersByStatus: Record<TeamMemberStatus, number>;
-  tasksByStatus: Record<TeamTaskStatus, number>;
-  messagesByDeliveryStatus: Record<string, number>;
-  deliveriesByStatus: Record<string, number>;
-  readyTaskIds: TaskId[];
-  blockedTaskIds: TaskId[];
-}
-
-export interface TeamRequestContext {
-  sessionId?: SessionId;
-}
-
-export interface CreateTeamRequest extends TeamRequestContext {
-  teamId?: TeamId;
-  name: string;
-  leadPath: AgentPath;
-  description?: string;
-  leadName?: string;
-  leadRole?: string;
-  leadStatus?: TeamMemberStatus;
-  leadWriteScope?: string[];
-}
-
-export interface AddTeamMemberRequest extends TeamRequestContext {
-  teamId: TeamId;
-  path: AgentPath;
-  name: string;
-  role: string;
-  status?: TeamMemberStatus;
-  childSessionId?: SessionId;
-  model?: string;
-  toolScope?: string[];
-  writeScope?: string[];
-}
-
-export interface CreateTeamTaskRequest extends TeamRequestContext {
-  teamId: TeamId;
-  taskId?: TaskId;
-  title: string;
-  description?: string;
-  createdBy?: AgentPath;
-  ownerPath?: AgentPath;
-  dependsOn?: TaskId[];
-  status?: TeamTaskStatus;
-  metadata?: Record<string, unknown>;
-}
-
-export interface AssignTeamTaskRequest extends TeamRequestContext {
-  teamId: TeamId;
-  taskId: TaskId;
-  ownerPath: AgentPath;
-  assignedBy?: AgentPath;
-  message?: string;
-  messageDelivery?: TeamMessageDelivery;
-  messageSummary?: string;
-}
-
-export interface ClaimTeamTaskRequest extends TeamRequestContext {
-  teamId: TeamId;
-  taskId: TaskId;
-  ownerPath: AgentPath;
-  claimedBy?: AgentPath;
-}
-
-export interface RuntimeTeamTaskClaimResult {
-  applied: boolean;
-  task?: RuntimeTeamTaskRecord;
-  events: ChiliEvent[];
-  reason?: "not_found" | "already_claimed" | "already_resolved" | "blocked";
-}
-
-export interface RuntimeLocalSubagentTaskRecord {
-  taskId: TaskId;
-  runId: AgentRunId;
-  path: AgentPath;
-  parentPath: AgentPath;
-  childSessionId: SessionId;
-  status: AgentTaskStatus;
-  summary?: string;
-  error?: string;
-}
-
-export interface RuntimeTeamTaskDispatchResult {
-  status: "running" | "completed" | "incomplete" | "failed" | "cancelled" | "skipped";
-  teamTask: RuntimeTeamTaskRecord;
-  team_task: RuntimeTeamTaskRecord;
-  agentTask?: RuntimeLocalSubagentTaskRecord;
-  agent_task?: RuntimeLocalSubagentTaskRecord;
-  reason?:
-    | RuntimeTeamTaskClaimResult["reason"]
-    | "missing_owner"
-    | "missing_session"
-    | "missing_member"
-    | "member_unavailable"
-    | "scope_mismatch"
-    | "write_conflict";
-}
-
-export interface RuntimeTeamTaskSyncResult {
-  applied: boolean;
-  teamTask: RuntimeTeamTaskRecord;
-  agentTask?: RuntimeAgentTaskRecord;
-  reason?: "not_dispatched" | "agent_task_not_found" | "agent_running" | "team_already_final";
-}
-
-export interface RuntimeTeamTaskReconcileError {
-  teamId: TeamId;
-  taskId: TaskId;
-  error: string;
-}
-
-export interface RuntimeTeamTaskReconcileResult {
-  scanned: number;
-  synced: RuntimeTeamTaskSyncResult[];
-  skipped: RuntimeTeamTaskSyncResult[];
-  errors: RuntimeTeamTaskReconcileError[];
-}
-
-export interface DispatchTeamTaskRequest extends TeamRequestContext {
-  teamId: TeamId;
-  taskId: TaskId;
-  ownerPath?: AgentPath;
+  prompt: string;
   cwd?: string;
-  mode?: AgentTaskMode;
-  prompt?: string;
 }
 
-export interface SyncTeamTaskRequest extends TeamRequestContext {
-  teamId: TeamId;
-  taskId: TaskId;
+export interface TargetAgentRequest extends RuntimeAgentControlRequest {
+  agentId: string;
 }
 
-export interface ReconcileTeamTasksRequest extends TeamRequestContext {
-  teamId?: TeamId;
-  limit?: number;
-}
-
-export interface MergeTeamTasksRequest extends TeamRequestContext {
-  teamId: TeamId;
-  taskId?: TaskId;
-  cwd?: string;
-  signal?: AbortSignal;
-}
-
-export interface RunTeamLoopRequest extends TeamRequestContext {
-  teamId: TeamId;
-  cwd?: string;
-  mode?: AgentTaskMode;
-  once?: boolean;
-  maxCycles?: number;
-  timeoutMs?: number;
-  pollIntervalMs?: number;
-  signal?: AbortSignal;
-}
-
-export type RuntimeTeamExecutionStopReason = "drained" | "once" | "max_cycles" | "timeout" | "aborted" | "team_inactive";
-
-export type RuntimeTeamExecutionSkipReason =
-  | "dependency_incomplete"
-  | "missing_owner"
-  | "missing_session"
-  | "missing_member"
-  | "member_unavailable"
-  | "scope_mismatch"
-  | "write_conflict"
-  | "blocked"
-  | "already_claimed"
-  | "already_resolved"
-  | "not_dispatched"
-  | "agent_task_not_found"
-  | "team_already_final";
-
-export interface RuntimeTeamExecutionDispatchedTask {
-  teamId: TeamId;
-  taskId: TaskId;
-  ownerPath?: AgentPath;
-  agentTaskId?: TaskId;
-  status: RuntimeTeamTaskDispatchResult["status"];
-}
-
-export interface RuntimeTeamExecutionFinalTask {
-  teamId: TeamId;
-  taskId: TaskId;
-  ownerPath?: AgentPath;
-  status: Extract<TeamTaskStatus, "completed" | "failed" | "cancelled">;
-  summary?: string;
-  error?: string;
-  agentTaskId?: TaskId;
-}
-
-export interface RuntimeTeamExecutionVerificationTask {
-  teamId: TeamId;
-  taskId: TaskId;
-  ownerPath?: AgentPath;
-  status: "passed" | "failed";
-  feedback?: string;
-  verifierTaskId?: TaskId;
-}
-
-export interface RuntimeTeamMergeDiffSummary {
-  filesChanged: number;
-  paths: string[];
-  truncatedPaths: boolean;
-  diffBytes: number;
-}
-
-export interface RuntimeTeamMergeTask {
-  teamId: TeamId;
-  taskId: TaskId;
-  ownerPath?: AgentPath;
-  status: "applied" | "failed" | "conflicted";
-  diffSummary?: RuntimeTeamMergeDiffSummary | unknown;
-  error?: string;
-  conflicts?: string[];
-}
-
-export type RuntimeTeamMergeSkippedReason = "not_passed" | "missing_merge_metadata" | "not_pending" | "missing_worktree";
-
-export interface RuntimeTeamMergeSkippedTask {
-  teamId: TeamId;
-  taskId: TaskId;
-  ownerPath?: AgentPath;
-  reason: RuntimeTeamMergeSkippedReason;
-  error?: string;
-}
-
-export interface RuntimeTeamExecutionSkippedTask {
-  teamId: TeamId;
-  taskId: TaskId;
-  ownerPath?: AgentPath;
-  reason: RuntimeTeamExecutionSkipReason;
-  blockedBy?: TaskId[];
-}
-
-export interface RuntimeTeamExecutionRunningTask {
-  teamId: TeamId;
-  taskId: TaskId;
-  ownerPath?: AgentPath;
-  title: string;
-  agentTaskId?: TaskId;
-}
-
-export interface RuntimeTeamExecutionError {
-  teamId: TeamId;
-  taskId?: TaskId;
-  error: string;
-}
-
-export interface RuntimeTeamExecutionRunSummary {
-  teamId: TeamId;
-  cycles: number;
-  stopReason: RuntimeTeamExecutionStopReason;
-  startedAt: number;
-  endedAt: number;
-  maxConcurrentDispatches?: number;
-  maxConcurrentVerifications?: number;
-  dispatched: RuntimeTeamExecutionDispatchedTask[];
-  completed: RuntimeTeamExecutionFinalTask[];
-  accepted: RuntimeTeamExecutionFinalTask[];
-  reopened: RuntimeTeamExecutionVerificationTask[];
-  merged: RuntimeTeamMergeTask[];
-  mergeFailed: RuntimeTeamMergeTask[];
-  mergeConflicted: RuntimeTeamMergeTask[];
-  mergeSkipped: RuntimeTeamMergeSkippedTask[];
-  failed: RuntimeTeamExecutionFinalTask[];
-  blocked: RuntimeTeamExecutionSkippedTask[];
-  skipped: RuntimeTeamExecutionSkippedTask[];
-  stillRunning: RuntimeTeamExecutionRunningTask[];
-  errors: RuntimeTeamExecutionError[];
-}
-
-export interface RuntimeTeamMergeTaskResult {
-  status: "applied" | "failed" | "conflicted";
-  teamTask: RuntimeTeamTaskRecord;
-  diffSummary?: RuntimeTeamMergeDiffSummary;
-  error?: string;
-  conflicts?: string[];
-}
-
-export interface RuntimeTeamMergeTaskSkipped {
-  status: "skipped";
-  teamTask: RuntimeTeamTaskRecord;
-  reason: RuntimeTeamMergeSkippedReason;
-  error?: string;
-}
-
-export interface RuntimeTeamMergeError {
-  teamId: TeamId;
-  taskId: TaskId;
-  error: string;
-}
-
-export interface RuntimeTeamMergeResult {
-  scanned: number;
-  applied: RuntimeTeamMergeTaskResult[];
-  failed: RuntimeTeamMergeTaskResult[];
-  conflicted: RuntimeTeamMergeTaskResult[];
-  skipped: RuntimeTeamMergeTaskSkipped[];
-  errors: RuntimeTeamMergeError[];
-}
-
-export interface UpdateTeamTaskRequest extends TeamRequestContext {
-  teamId: TeamId;
-  taskId: TaskId;
-  status?: TeamTaskStatus;
-  ownerPath?: AgentPath;
-  title?: string;
-  description?: string;
-  dependsOn?: TaskId[];
-  summary?: string;
-  error?: string;
-  metadata?: Record<string, unknown>;
-}
-
-export interface SendTeamMessageRequest extends TeamRequestContext {
-  teamId: TeamId;
-  messageId?: string;
-  from: AgentPath;
-  to: AgentPath | "*";
-  content: string;
-  kind?: TeamMessageKind;
-  delivery?: TeamMessageDelivery;
-  taskId?: TaskId;
-  summary?: string;
-  metadata?: Record<string, unknown>;
-}
-
-export interface ListTasksRequest {
-  status?: AgentTaskStatus;
-  parentSessionId?: SessionId;
-  childSessionId?: SessionId;
-  limit?: number;
-}
-
-export interface RuntimeAgentTaskRecord {
-  id: TaskId;
-  path: AgentPath;
-  status: AgentTaskStatus;
-  taskName: string;
-  generation: number;
-  parentPath?: AgentPath;
-  parentSessionId?: SessionId;
-  childSessionId?: SessionId;
-  cwd?: string;
-  prompt?: string;
-  mode?: AgentTaskMode;
-  currentRunId?: AgentRunId;
-  summary?: string;
-  error?: string;
-  completion?: Record<string, unknown>;
-  leaseOwner?: string;
-  leaseExpiresAt?: number;
-  leaseHeartbeatAt?: number;
-  createdAt: number;
-  updatedAt: number;
-  completedAt?: number;
-}
-
-export interface FollowupTaskRequest {
-  taskId: TaskId;
+export interface SendAgentRequest extends TargetAgentRequest {
   text: string;
-  maxTurns?: number;
+  mode?: "queue" | "steer";
 }
 
-export interface RuntimeTaskFollowupResult {
-  task: RuntimeAgentTaskRecord;
-  result: RuntimePromptResult;
-}
-
-export interface WaitTaskRequest {
-  taskId: TaskId;
+export interface WaitAgentRequest extends TargetAgentRequest {
+  inputId: string;
   timeoutMs?: number;
-}
-
-export interface CloseTaskRequest {
-  taskId: TaskId;
-  status?: Extract<AgentTaskStatus, "completed" | "incomplete" | "failed" | "cancelled">;
-  summary?: string;
-  error?: string;
-  interrupt?: boolean;
-}
-
-export interface ReconcileStaleTasksRequest {
-  parentSessionId?: SessionId;
-  staleAfterMs?: number;
-  modes?: AgentTaskMode[];
-  limit?: number;
-  summary?: string;
-  error?: string;
-}
-
-export interface RuntimeTaskReconcileStaleResult {
-  scanned: number;
-  closed: RuntimeAgentTaskRecord[];
 }
 
 export interface StreamEventsRequest {
@@ -1381,161 +787,31 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.post(`sessions/${encodeURIComponent(input.sessionId)}/rename`, { title: input.title }, input.signal, parseRuntimeSessionSummary);
   }
 
-  listAgents(input: ListAgentsRequest = {}): Promise<RuntimeAgentsSnapshot> {
-    if (input.sessionId) return this.get(`sessions/${encodeURIComponent(input.sessionId)}/agents`, undefined, parseRuntimeAgentsSnapshot);
-    return this.get("agents", undefined, parseRuntimeAgentsSnapshot);
+  listAgents(input: ListAgentsRequest): Promise<RuntimeAgentRecord[]> {
+    return this.get(agentControlPath(input.sessionId), input.signal, (value, path) => parseRuntimeArray(value, parseAgentRecord, path));
   }
 
-  agentTree(input: AgentTreeRequest = {}): Promise<RuntimeAgentTreeSnapshot> {
-    const params = new URLSearchParams();
-    if (input.rootPath) params.set("rootPath", input.rootPath);
-    if (input.sessionId) params.set("sessionId", input.sessionId);
-    if (input.includeConsumedMailbox !== undefined) {
-      params.set("includeConsumedMailbox", String(input.includeConsumedMailbox));
-    }
-    if (input.limit !== undefined) params.set("limit", String(input.limit));
-    const query = params.toString();
-    return this.get(`agents/tree${query ? `?${query}` : ""}`, undefined, parseAgentTreeSnapshot);
+  spawnAgent(input: SpawnAgentRequest): Promise<RuntimeAgentSubmission> {
+    const { sessionId, signal, ...body } = input;
+    return this.post(agentControlPath(sessionId), body, signal, parseAgentSubmission);
   }
 
-  listAgentRuns(input: ListAgentRunsRequest = {}): Promise<RuntimeAgentRunRecord[]> {
-    const params = new URLSearchParams();
-    if (input.path) params.set("path", input.path);
-    if (input.sessionId) params.set("sessionId", input.sessionId);
-    if (input.childSessionId) params.set("childSessionId", input.childSessionId);
-    if (input.status) params.set("status", input.status);
-    if (input.limit !== undefined) params.set("limit", String(input.limit));
-    const query = params.toString();
-    return this.get(`agent_runs${query ? `?${query}` : ""}`, undefined, parseAgentRunArray);
+  sendAgent(input: SendAgentRequest): Promise<RuntimeAgentSubmission> {
+    const { sessionId, agentId, signal, ...body } = input;
+    return this.post(agentControlPath(sessionId, agentId, "send"), body, signal, parseAgentSubmission);
   }
 
-  mailbox(input: ListMailboxRequest = {}): Promise<RuntimeAgentMailboxRecord[]> {
-    const params = new URLSearchParams();
-    if (input.messageId) params.set("messageId", input.messageId);
-    if (input.taskId) params.set("taskId", input.taskId);
-    if (input.path) params.set("path", input.path);
-    if (input.recipientSessionId) params.set("recipientSessionId", input.recipientSessionId);
-    if (input.status) params.set("status", input.status);
-    if (input.limit !== undefined) params.set("limit", String(input.limit));
-    const query = params.toString();
-    return this.get(`mailbox${query ? `?${query}` : ""}`, undefined, parseAgentMailboxArray);
+  waitAgent(input: WaitAgentRequest): Promise<RuntimeAgentWaitResult> {
+    const { sessionId, agentId, signal, ...body } = input;
+    return this.post(agentControlPath(sessionId, agentId, "wait"), body, signal, parseAgentWaitResult);
   }
 
-  consumeMailbox(messageId: string): Promise<RuntimeAgentMailboxRecord> {
-    return this.post(`mailbox/${encodeURIComponent(messageId)}/consume`, {}, undefined, parseAgentMailboxRecord);
+  stopAgent(input: TargetAgentRequest): Promise<{ agentId: string }> {
+    return this.post(agentControlPath(input.sessionId, input.agentId, "stop"), {}, input.signal, parseAgentTarget);
   }
 
-  listTeams(): Promise<RuntimeTeamRecord[]> {
-    return this.get("teams", undefined, parseTeamRecordArray);
-  }
-
-  createTeam(input: CreateTeamRequest): Promise<RuntimeTeamRecord> {
-    return this.post("teams", input, undefined, parseTeamRecord);
-  }
-
-  teamSnapshot(teamId: TeamId): Promise<RuntimeTeamSnapshot> {
-    return this.get(`teams/${encodeURIComponent(teamId)}/snapshot`, undefined, parseTeamSnapshot);
-  }
-
-  listTeamMembers(teamId: TeamId): Promise<RuntimeTeamMemberRecord[]> {
-    return this.get(`teams/${encodeURIComponent(teamId)}/members`, undefined, parseTeamMemberArray);
-  }
-
-  addTeamMember(input: AddTeamMemberRequest): Promise<RuntimeTeamMemberRecord> {
-    return this.post(`teams/${encodeURIComponent(input.teamId)}/members`, input, undefined, parseTeamMemberRecord);
-  }
-
-  listTeamTasks(teamId: TeamId): Promise<RuntimeTeamTaskRecord[]> {
-    return this.get(`teams/${encodeURIComponent(teamId)}/tasks`, undefined, parseTeamTaskArray);
-  }
-
-  createTeamTask(input: CreateTeamTaskRequest): Promise<RuntimeTeamTaskRecord> {
-    return this.post(`teams/${encodeURIComponent(input.teamId)}/tasks`, input, undefined, parseTeamTaskRecord);
-  }
-
-  assignTeamTask(input: AssignTeamTaskRequest): Promise<RuntimeTeamTaskRecord> {
-    return this.post(`teams/${encodeURIComponent(input.teamId)}/tasks/${encodeURIComponent(input.taskId)}/assign`, input, undefined, parseTeamTaskRecord);
-  }
-
-  claimTeamTask(input: ClaimTeamTaskRequest): Promise<RuntimeTeamTaskClaimResult> {
-    return this.post(`teams/${encodeURIComponent(input.teamId)}/tasks/${encodeURIComponent(input.taskId)}/claim`, input, undefined, parseTeamTaskClaimResult);
-  }
-
-  dispatchTeamTask(input: DispatchTeamTaskRequest): Promise<RuntimeTeamTaskDispatchResult> {
-    return this.post(`teams/${encodeURIComponent(input.teamId)}/tasks/${encodeURIComponent(input.taskId)}/dispatch`, input, undefined, parseTeamTaskDispatchResult);
-  }
-
-  syncTeamTask(input: SyncTeamTaskRequest): Promise<RuntimeTeamTaskSyncResult> {
-    return this.post(`teams/${encodeURIComponent(input.teamId)}/tasks/${encodeURIComponent(input.taskId)}/sync`, input, undefined, parseTeamTaskSyncResult);
-  }
-
-  reconcileTeamTasks(input: ReconcileTeamTasksRequest = {}): Promise<RuntimeTeamTaskReconcileResult> {
-    const path = input.teamId
-      ? `teams/${encodeURIComponent(input.teamId)}/reconcile_dispatches`
-      : "teams/reconcile_dispatches";
-    return this.post(path, input, undefined, parseTeamTaskReconcileResult);
-  }
-
-  mergeTeamTasks(input: MergeTeamTasksRequest): Promise<RuntimeTeamMergeResult> {
-    const { signal, ...body } = input;
-    return this.post(`teams/${encodeURIComponent(input.teamId)}/merge`, body, signal, parseTeamMergeResult);
-  }
-
-  runTeamLoop(input: RunTeamLoopRequest): Promise<RuntimeTeamExecutionRunSummary> {
-    const { signal, ...body } = input;
-    return this.post(`teams/${encodeURIComponent(input.teamId)}/run_loop`, body, signal, parseTeamExecutionRunSummary);
-  }
-
-  updateTeamTask(input: UpdateTeamTaskRequest): Promise<RuntimeTeamTaskRecord> {
-    return this.post(`teams/${encodeURIComponent(input.teamId)}/tasks/${encodeURIComponent(input.taskId)}/update`, input, undefined, parseTeamTaskRecord);
-  }
-
-  listTeamMessages(teamId: TeamId): Promise<RuntimeTeamMessageRecord[]> {
-    return this.get(`teams/${encodeURIComponent(teamId)}/messages`, undefined, parseTeamMessageArray);
-  }
-
-  sendTeamMessage(input: SendTeamMessageRequest): Promise<RuntimeTeamMessageRecord> {
-    return this.post(`teams/${encodeURIComponent(input.teamId)}/messages`, input, undefined, parseTeamMessageRecord);
-  }
-
-  listTasks(input: ListTasksRequest = {}): Promise<RuntimeAgentTaskRecord[]> {
-    const params = new URLSearchParams();
-    if (input.status) params.set("status", input.status);
-    if (input.parentSessionId) params.set("parentSessionId", input.parentSessionId);
-    if (input.childSessionId) params.set("childSessionId", input.childSessionId);
-    if (input.limit !== undefined) params.set("limit", String(input.limit));
-    const query = params.toString();
-    return this.get(`tasks${query ? `?${query}` : ""}`, undefined, parseAgentTaskArray);
-  }
-
-  task(taskId: TaskId): Promise<RuntimeAgentTaskRecord> {
-    return this.get(`tasks/${encodeURIComponent(taskId)}`, undefined, parseAgentTaskRecord);
-  }
-
-  followupTask(input: FollowupTaskRequest): Promise<RuntimeTaskFollowupResult> {
-    return this.post(`tasks/${encodeURIComponent(input.taskId)}/followup`, {
-      text: input.text,
-      maxTurns: input.maxTurns,
-    }, undefined, parseTaskFollowupResult);
-  }
-
-  waitTask(input: WaitTaskRequest): Promise<RuntimeAgentTaskRecord> {
-    return this.post(`tasks/${encodeURIComponent(input.taskId)}/wait`, {
-      timeoutMs: input.timeoutMs,
-    }, undefined, parseAgentTaskRecord);
-  }
-
-  closeTask(input: CloseTaskRequest): Promise<RuntimeAgentTaskRecord> {
-    return this.post(`tasks/${encodeURIComponent(input.taskId)}/close`, {
-      status: input.status,
-      summary: input.summary,
-      error: input.error,
-      interrupt: input.interrupt,
-    }, undefined, parseAgentTaskRecord);
-  }
-
-  reconcileStaleTasks(input: ReconcileStaleTasksRequest = {}): Promise<RuntimeTaskReconcileStaleResult> {
-    return this.post("tasks/reconcile_stale", input, undefined, parseTaskReconcileStaleResult);
+  resumeAgent(input: TargetAgentRequest): Promise<{ agentId: string; inputId?: string }> {
+    return this.post(agentControlPath(input.sessionId, input.agentId, "resume"), {}, input.signal, parseAgentResumeResult);
   }
 
   messages(sessionId: SessionId): Promise<Message[]> {
@@ -1778,6 +1054,7 @@ function parseRuntimeSessionSummary(value: unknown, path = "session"): RuntimeSe
   optionalString(record.title, `${path}.title`);
   optionalString(record.preview, `${path}.preview`);
   if (record.source !== undefined) parseRuntimeEnum(record.source, ["interactive", "subagent"] as const, `${path}.source`);
+  if (record.agent !== undefined) parseSessionAgentMetadata(record.agent, `${path}.agent`);
   return record as unknown as RuntimeSessionSummary;
 }
 
@@ -1800,456 +1077,47 @@ function parseSessionEventWindow(value: unknown, path = "response"): RuntimeSess
   return record as unknown as RuntimeSessionEventWindow;
 }
 
-function parseRuntimeAgentsSnapshot(value: unknown, path = "response"): RuntimeAgentsSnapshot {
+function agentControlPath(sessionId: SessionId, agentId?: string, action?: string): string {
+  const root = parseRuntimeIdentifier(sessionId, "sessionId");
+  const base = `sessions/${encodeURIComponent(root)}/agents`;
+  return agentId === undefined ? base : `${base}/${encodeURIComponent(parseRuntimeIdentifier(agentId, "agentId"))}/${action}`;
+}
+
+function parseAgentRecord(value: unknown, path = "agent"): RuntimeAgentRecord {
   const record = parseRuntimeRecord(value, path);
-  parseRuntimeArray(record.agents, (item, itemPath) => {
-    const agent = parseRuntimeRecord(item, itemPath);
-    parseRuntimeIdentifier(agent.id, `${itemPath}.id`);
-    parseAgentPath(agent.path, `${itemPath}.path`);
-    parseRuntimeString(agent.taskName, `${itemPath}.taskName`);
-    parseRuntimeEnum(agent.status, ["running", "completed", "incomplete", "failed", "cancelled"] as const, `${itemPath}.status`);
-    parseRuntimeNonNegativeInteger(agent.generation, `${itemPath}.generation`);
-    return agent;
-  }, `${path}.agents`);
-  parseRuntimeArray(record.tasks, (item, itemPath) => {
-    const task = parseRuntimeRecord(item, itemPath);
-    parseRuntimeIdentifier(task.id, `${itemPath}.id`);
-    parseRuntimeEnum(task.status, [
-      "pending",
-      "running",
-      "completed",
-      "incomplete",
-      "failed",
-      "cancelled",
-      "in_progress",
-      "blocked",
-    ] as const, `${itemPath}.status`);
-    return task;
-  }, `${path}.tasks`);
-  parseRuntimeArray(record.mailbox, (item, itemPath) => {
-    const message = parseRuntimeRecord(item, itemPath);
-    parseRuntimeIdentifier(message.id, `${itemPath}.id`);
-    parseRuntimeEnum(message.status, ["queued", "delivering", "consumed", "discarded"] as const, `${itemPath}.status`);
-    return message;
-  }, `${path}.mailbox`);
-  optionalIdentifier(record.lastEventId, `${path}.lastEventId`);
-  return record as unknown as RuntimeAgentsSnapshot;
-}
-
-function parseAgentTreeSnapshot(value: unknown, path = "response"): RuntimeAgentTreeSnapshot {
-  const record = parseRuntimeRecord(value, path);
-  if (record.rootPath !== undefined) parseAgentPath(record.rootPath, `${path}.rootPath`);
-  parseRuntimeArray(record.nodes, parseAgentTreeNode, `${path}.nodes`);
-  parseRuntimeArray(record.agents, parseAgentRunRecord, `${path}.agents`);
-  parseRuntimeArray(record.tasks, parseAgentTaskRecord, `${path}.tasks`);
-  parseRuntimeArray(record.mailbox, parseAgentMailboxRecord, `${path}.mailbox`);
-  return record as unknown as RuntimeAgentTreeSnapshot;
-}
-
-function parseAgentTreeNode(value: unknown, path = "node"): RuntimeAgentTreeNode {
-  const record = parseRuntimeRecord(value, path);
-  parseAgentPath(record.path, `${path}.path`);
-  // Synthesized ancestors and mailbox-only nodes have no associated task.
-  parseRuntimeString(record.taskName, `${path}.taskName`, { allowEmpty: true });
-  parseRuntimeEnum(record.status, [
-    "empty",
-    "pending",
-    "running",
-    "completed",
-    "incomplete",
-    "failed",
-    "cancelled",
-    "queued",
-    "delivering",
-    "consumed",
-    "discarded",
-  ] as const, `${path}.status`);
-  parseRuntimeArray(record.runs, parseAgentRunRecord, `${path}.runs`);
-  parseRuntimeArray(record.tasks, parseAgentTaskRecord, `${path}.tasks`);
-  parseRuntimeArray(record.mailbox, parseAgentMailboxRecord, `${path}.mailbox`);
-  parseRuntimeArray(record.children, parseAgentTreeNode, `${path}.children`);
-  return record as unknown as RuntimeAgentTreeNode;
-}
-
-function parseAgentRunRecord(value: unknown, path = "run"): RuntimeAgentRunRecord {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeIdentifier(record.id, `${path}.id`);
-  parseAgentPath(record.path, `${path}.path`);
-  parseRuntimeString(record.taskName, `${path}.taskName`);
-  parseRuntimeEnum(record.status, ["running", "completed", "incomplete", "failed", "cancelled"] as const, `${path}.status`);
-  parseRuntimeNonNegativeInteger(record.createdAt, `${path}.createdAt`);
-  optionalNonNegativeInteger(record.completedAt, `${path}.completedAt`);
-  return record as unknown as RuntimeAgentRunRecord;
-}
-
-function parseAgentRunArray(value: unknown, path = "response"): RuntimeAgentRunRecord[] {
-  return parseRuntimeArray(value, parseAgentRunRecord, path);
-}
-
-function parseAgentMailboxRecord(value: unknown, path = "mailbox"): RuntimeAgentMailboxRecord {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeIdentifier(record.id, `${path}.id`);
-  parseAgentPath(record.path, `${path}.path`);
-  parseAgentPath(record.fromPath, `${path}.fromPath`);
-  parseRuntimeBoolean(record.triggerTurn, `${path}.triggerTurn`);
-  parseRuntimeEnum(record.status, ["queued", "delivering", "consumed", "discarded"] as const, `${path}.status`);
-  parseRuntimeNonNegativeInteger(record.createdAt, `${path}.createdAt`);
-  optionalNonNegativeInteger(record.consumedAt, `${path}.consumedAt`);
-  return record as unknown as RuntimeAgentMailboxRecord;
-}
-
-function parseAgentMailboxArray(value: unknown, path = "response"): RuntimeAgentMailboxRecord[] {
-  return parseRuntimeArray(value, parseAgentMailboxRecord, path);
-}
-
-function parseTeamRecord(value: unknown, path = "team"): RuntimeTeamRecord {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeIdentifier(record.id, `${path}.id`);
-  optionalIdentifier(record.sessionId, `${path}.sessionId`);
+  parseRuntimeIdentifier(record.agentId, `${path}.agentId`);
   parseRuntimeString(record.name, `${path}.name`);
-  parseAgentPath(record.leadPath, `${path}.leadPath`);
-  parseRuntimeEnum(record.status, ["active", "archived"] as const, `${path}.status`);
-  optionalString(record.description, `${path}.description`);
-  parseRuntimeNonNegativeInteger(record.createdAt, `${path}.createdAt`);
-  parseRuntimeNonNegativeInteger(record.updatedAt, `${path}.updatedAt`);
-  return record as unknown as RuntimeTeamRecord;
+  parseRuntimeString(record.path, `${path}.path`);
+  optionalIdentifier(record.parentAgentId, `${path}.parentAgentId`);
+  parseRuntimeEnum(record.state, ["idle", "running", "paused"] as const, `${path}.state`);
+  return record as unknown as RuntimeAgentRecord;
 }
 
-function parseTeamRecordArray(value: unknown, path = "response"): RuntimeTeamRecord[] {
-  return parseRuntimeArray(value, parseTeamRecord, path);
-}
-
-function parseTeamMemberRecord(value: unknown, path = "member"): RuntimeTeamMemberRecord {
+function parseAgentTarget(value: unknown, path = "response"): { agentId: string } {
   const record = parseRuntimeRecord(value, path);
-  parseRuntimeIdentifier(record.teamId, `${path}.teamId`);
-  parseAgentPath(record.path, `${path}.path`);
-  parseRuntimeString(record.name, `${path}.name`);
-  parseRuntimeString(record.role, `${path}.role`);
-  parseRuntimeEnum(record.status, ["idle", "running", "waiting", "blocked", "closed"] as const, `${path}.status`);
-  optionalIdentifier(record.childSessionId, `${path}.childSessionId`);
-  optionalString(record.model, `${path}.model`);
-  if (record.toolScope !== undefined) parseRuntimeStringArray(record.toolScope, `${path}.toolScope`);
-  if (record.writeScope !== undefined) parseRuntimeStringArray(record.writeScope, `${path}.writeScope`);
-  optionalIdentifier(record.currentTaskId, `${path}.currentTaskId`);
-  parseRuntimeNonNegativeInteger(record.createdAt, `${path}.createdAt`);
-  parseRuntimeNonNegativeInteger(record.updatedAt, `${path}.updatedAt`);
-  optionalNonNegativeInteger(record.closedAt, `${path}.closedAt`);
-  return record as unknown as RuntimeTeamMemberRecord;
+  parseRuntimeIdentifier(record.agentId, `${path}.agentId`);
+  return record as unknown as { agentId: string };
 }
 
-function parseTeamMemberArray(value: unknown, path = "response"): RuntimeTeamMemberRecord[] {
-  return parseRuntimeArray(value, parseTeamMemberRecord, path);
-}
-
-function parseTeamTaskRecord(value: unknown, path = "task"): RuntimeTeamTaskRecord {
+function parseAgentSubmission(value: unknown, path = "response"): RuntimeAgentSubmission {
   const record = parseRuntimeRecord(value, path);
-  parseRuntimeIdentifier(record.id, `${path}.id`);
-  parseRuntimeIdentifier(record.teamId, `${path}.teamId`);
-  optionalIdentifier(record.sessionId, `${path}.sessionId`);
-  parseRuntimeString(record.title, `${path}.title`);
-  optionalString(record.description, `${path}.description`);
-  parseRuntimeEnum(record.status, ["pending", "in_progress", "blocked", "completed", "failed", "cancelled"] as const, `${path}.status`);
-  if (record.ownerPath !== undefined) parseAgentPath(record.ownerPath, `${path}.ownerPath`);
-  if (record.createdBy !== undefined) parseAgentPath(record.createdBy, `${path}.createdBy`);
-  parseRuntimeArray(record.dependsOn, (item, itemPath) => parseRuntimeIdentifier(item, itemPath), `${path}.dependsOn`);
-  optionalString(record.summary, `${path}.summary`);
-  optionalString(record.error, `${path}.error`);
-  if (record.metadata !== undefined) parseRuntimeRecord(record.metadata, `${path}.metadata`);
-  parseRuntimeNonNegativeInteger(record.createdAt, `${path}.createdAt`);
-  parseRuntimeNonNegativeInteger(record.updatedAt, `${path}.updatedAt`);
-  optionalNonNegativeInteger(record.completedAt, `${path}.completedAt`);
-  return record as unknown as RuntimeTeamTaskRecord;
+  parseAgentTarget(record, path);
+  parseRuntimeIdentifier(record.inputId, `${path}.inputId`);
+  return record as unknown as RuntimeAgentSubmission;
 }
 
-function parseTeamTaskArray(value: unknown, path = "response"): RuntimeTeamTaskRecord[] {
-  return parseRuntimeArray(value, parseTeamTaskRecord, path);
-}
-
-function parseTeamMessageRecord(value: unknown, path = "message"): RuntimeTeamMessageRecord {
+function parseAgentResumeResult(value: unknown, path = "response"): { agentId: string; inputId?: string } {
   const record = parseRuntimeRecord(value, path);
-  parseRuntimeIdentifier(record.id, `${path}.id`);
-  parseRuntimeIdentifier(record.teamId, `${path}.teamId`);
-  parseAgentPath(record.fromPath, `${path}.fromPath`);
-  if (record.toPath !== "*") parseAgentPath(record.toPath, `${path}.toPath`);
-  parseRuntimeString(record.content, `${path}.content`);
-  parseRuntimeEnum(record.kind, ["text", "task_assignment", "system"] as const, `${path}.kind`);
-  if (record.delivery !== undefined) {
-    parseRuntimeEnum(record.delivery, ["queueOnly", "triggerTurn"] as const, `${path}.delivery`);
-  }
-  if (record.deliveryStatus !== undefined) {
-    parseRuntimeEnum(
-      record.deliveryStatus,
-      ["queued", "delivering", "delivered", "failed"] as const,
-      `${path}.deliveryStatus`,
-    );
-  }
-  optionalString(record.deliveryError, `${path}.deliveryError`);
-  optionalNonNegativeInteger(record.deliveryUpdatedAt, `${path}.deliveryUpdatedAt`);
-  optionalNonNegativeInteger(record.deliveredAt, `${path}.deliveredAt`);
-  optionalIdentifier(record.taskId, `${path}.taskId`);
-  optionalString(record.summary, `${path}.summary`);
-  if (record.metadata !== undefined) parseRuntimeRecord(record.metadata, `${path}.metadata`);
-  parseRuntimeNonNegativeInteger(record.createdAt, `${path}.createdAt`);
-  return record as unknown as RuntimeTeamMessageRecord;
+  parseAgentTarget(record, path);
+  optionalIdentifier(record.inputId, `${path}.inputId`);
+  return record as unknown as { agentId: string; inputId?: string };
 }
 
-function parseTeamMessageArray(value: unknown, path = "response"): RuntimeTeamMessageRecord[] {
-  return parseRuntimeArray(value, parseTeamMessageRecord, path);
-}
-
-function parseTeamSnapshot(value: unknown, path = "response"): RuntimeTeamSnapshot {
+function parseAgentWaitResult(value: unknown, path = "response"): RuntimeAgentWaitResult {
   const record = parseRuntimeRecord(value, path);
-  parseTeamRecord(record.team, `${path}.team`);
-  parseRuntimeArray(record.members, parseTeamSnapshotMember, `${path}.members`);
-  parseRuntimeArray(record.tasks, parseTeamSnapshotTask, `${path}.tasks`);
-  parseRuntimeArray(record.messages, parseTeamSnapshotMessage, `${path}.messages`);
-  parseRuntimeArray(record.messageDeliveries, parseTeamMessageDeliveryRecord, `${path}.messageDeliveries`);
-  parseTeamSnapshotStats(record.stats, `${path}.stats`);
-  parseRuntimeNonNegativeInteger(record.generatedAt, `${path}.generatedAt`);
-  return record as unknown as RuntimeTeamSnapshot;
-}
-
-function parseTeamSnapshotMember(value: unknown, path: string): RuntimeTeamSnapshotMember {
-  const record = parseRuntimeRecord(value, path);
-  parseTeamMemberRecord(record, path);
-  parseRuntimeArray(
-    record.taskIds,
-    (item, itemPath) => parseRuntimeIdentifier(item, itemPath),
-    `${path}.taskIds`,
-  );
-  parseRuntimeArray(
-    record.deliveryIds,
-    (item, itemPath) => parseRuntimeIdentifier(item, itemPath),
-    `${path}.deliveryIds`,
-  );
-  if (record.currentTask !== undefined) parseTeamTaskRecord(record.currentTask, `${path}.currentTask`);
-  return record as unknown as RuntimeTeamSnapshotMember;
-}
-
-function parseTeamSnapshotTask(value: unknown, path: string): RuntimeTeamSnapshotTask {
-  const record = parseRuntimeRecord(value, path);
-  parseTeamTaskRecord(record, path);
-  for (const field of ["blockedBy", "blocks", "messageIds"] as const) {
-    parseRuntimeArray(
-      record[field],
-      (item, itemPath) => parseRuntimeIdentifier(item, itemPath),
-      `${path}.${field}`,
-    );
-  }
-  parseRuntimeBoolean(record.ready, `${path}.ready`);
-  if (record.owner !== undefined) parseTeamMemberRecord(record.owner, `${path}.owner`);
-  return record as unknown as RuntimeTeamSnapshotTask;
-}
-
-function parseTeamSnapshotMessage(value: unknown, path: string): RuntimeTeamSnapshotMessage {
-  const record = parseRuntimeRecord(value, path);
-  parseTeamMessageRecord(record, path);
-  parseRuntimeArray(record.deliveries, parseTeamMessageDeliveryRecord, `${path}.deliveries`);
-  return record as unknown as RuntimeTeamSnapshotMessage;
-}
-
-function parseTeamMessageDeliveryRecord(value: unknown, path: string): RuntimeTeamMessageDeliveryRecord {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeIdentifier(record.mailboxMessageId, `${path}.mailboxMessageId`);
-  parseRuntimeIdentifier(record.teamId, `${path}.teamId`);
-  parseRuntimeIdentifier(record.teamMessageId, `${path}.teamMessageId`);
-  parseAgentPath(record.path, `${path}.path`);
-  parseRuntimeEnum(record.status, ["queued", "delivering", "delivered", "failed"] as const, `${path}.status`);
-  parseRuntimeBoolean(record.triggerTurn, `${path}.triggerTurn`);
-  optionalIdentifier(record.childSessionId, `${path}.childSessionId`);
-  optionalString(record.error, `${path}.error`);
-  parseRuntimeNonNegativeInteger(record.queuedAt, `${path}.queuedAt`);
-  parseRuntimeNonNegativeInteger(record.updatedAt, `${path}.updatedAt`);
-  optionalNonNegativeInteger(record.deliveredAt, `${path}.deliveredAt`);
-  return record as unknown as RuntimeTeamMessageDeliveryRecord;
-}
-
-function parseTeamSnapshotStats(value: unknown, path: string): RuntimeTeamSnapshotStats {
-  const record = parseRuntimeRecord(value, path);
-  for (const field of ["memberCount", "taskCount", "messageCount", "deliveryCount"] as const) {
-    parseRuntimeNonNegativeInteger(record[field], `${path}.${field}`);
-  }
-
-  const membersByStatus = parseRuntimeRecord(record.membersByStatus, `${path}.membersByStatus`);
-  for (const status of ["idle", "running", "waiting", "blocked", "closed"] as const) {
-    parseRuntimeNonNegativeInteger(membersByStatus[status], `${path}.membersByStatus.${status}`);
-  }
-  parseNonNegativeCountRecord(membersByStatus, `${path}.membersByStatus`);
-
-  const tasksByStatus = parseRuntimeRecord(record.tasksByStatus, `${path}.tasksByStatus`);
-  for (const status of ["pending", "in_progress", "blocked", "completed", "failed", "cancelled"] as const) {
-    parseRuntimeNonNegativeInteger(tasksByStatus[status], `${path}.tasksByStatus.${status}`);
-  }
-  parseNonNegativeCountRecord(tasksByStatus, `${path}.tasksByStatus`);
-
-  parseNonNegativeCountRecord(record.messagesByDeliveryStatus, `${path}.messagesByDeliveryStatus`);
-  parseNonNegativeCountRecord(record.deliveriesByStatus, `${path}.deliveriesByStatus`);
-  parseRuntimeArray(
-    record.readyTaskIds,
-    (item, itemPath) => parseRuntimeIdentifier(item, itemPath),
-    `${path}.readyTaskIds`,
-  );
-  parseRuntimeArray(
-    record.blockedTaskIds,
-    (item, itemPath) => parseRuntimeIdentifier(item, itemPath),
-    `${path}.blockedTaskIds`,
-  );
-  return record as unknown as RuntimeTeamSnapshotStats;
-}
-
-function parseNonNegativeCountRecord(value: unknown, path: string): Record<string, unknown> {
-  const record = parseRuntimeRecord(value, path);
-  for (const [index, count] of Object.values(record).entries()) {
-    parseRuntimeNonNegativeInteger(count, `${path}[${index}]`);
-  }
-  return record;
-}
-
-function parseTeamTaskClaimResult(value: unknown, path = "response"): RuntimeTeamTaskClaimResult {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeBoolean(record.applied, `${path}.applied`);
-  if (record.task !== undefined) parseTeamTaskRecord(record.task, `${path}.task`);
-  parseChiliEventArray(record.events, `${path}.events`);
-  if (record.reason !== undefined) {
-    parseRuntimeEnum(record.reason, ["not_found", "already_claimed", "already_resolved", "blocked"] as const, `${path}.reason`);
-  }
-  return record as unknown as RuntimeTeamTaskClaimResult;
-}
-
-function parseTeamTaskDispatchResult(value: unknown, path = "response"): RuntimeTeamTaskDispatchResult {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeEnum(record.status, ["running", "completed", "incomplete", "failed", "cancelled", "skipped"] as const, `${path}.status`);
-  parseTeamTaskRecord(record.teamTask, `${path}.teamTask`);
-  parseTeamTaskRecord(record.team_task, `${path}.team_task`);
-  if (record.agentTask !== undefined) parseLocalSubagentTask(record.agentTask, `${path}.agentTask`);
-  if (record.agent_task !== undefined) parseLocalSubagentTask(record.agent_task, `${path}.agent_task`);
-  optionalString(record.reason, `${path}.reason`);
-  return record as unknown as RuntimeTeamTaskDispatchResult;
-}
-
-function parseLocalSubagentTask(value: unknown, path: string): RuntimeLocalSubagentTaskRecord {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeIdentifier(record.taskId, `${path}.taskId`);
-  parseRuntimeIdentifier(record.runId, `${path}.runId`);
-  parseAgentPath(record.path, `${path}.path`);
-  parseRuntimeEnum(record.status, ["pending", "running", "completed", "incomplete", "failed", "cancelled"] as const, `${path}.status`);
-  return record as unknown as RuntimeLocalSubagentTaskRecord;
-}
-
-function parseTeamTaskSyncResult(value: unknown, path = "response"): RuntimeTeamTaskSyncResult {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeBoolean(record.applied, `${path}.applied`);
-  parseTeamTaskRecord(record.teamTask, `${path}.teamTask`);
-  if (record.agentTask !== undefined) parseAgentTaskRecord(record.agentTask, `${path}.agentTask`);
-  optionalString(record.reason, `${path}.reason`);
-  return record as unknown as RuntimeTeamTaskSyncResult;
-}
-
-function parseTeamTaskReconcileResult(value: unknown, path = "response"): RuntimeTeamTaskReconcileResult {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeNonNegativeInteger(record.scanned, `${path}.scanned`);
-  parseRuntimeArray(record.synced, parseTeamTaskSyncResult, `${path}.synced`);
-  parseRuntimeArray(record.skipped, parseTeamTaskSyncResult, `${path}.skipped`);
-  parseRuntimeArray(record.errors, (item, itemPath) => {
-    const error = parseRuntimeRecord(item, itemPath);
-    parseRuntimeIdentifier(error.teamId, `${itemPath}.teamId`);
-    parseRuntimeIdentifier(error.taskId, `${itemPath}.taskId`);
-    parseRuntimeString(error.error, `${itemPath}.error`);
-    return error;
-  }, `${path}.errors`);
-  return record as unknown as RuntimeTeamTaskReconcileResult;
-}
-
-function parseTeamMergeResult(value: unknown, path = "response"): RuntimeTeamMergeResult {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeNonNegativeInteger(record.scanned, `${path}.scanned`);
-  for (const key of ["applied", "failed", "conflicted"] as const) {
-    parseRuntimeArray(record[key], (item, itemPath) => {
-      const result = parseRuntimeRecord(item, itemPath);
-      parseRuntimeEnum(result.status, ["applied", "failed", "conflicted"] as const, `${itemPath}.status`);
-      parseTeamTaskRecord(result.teamTask, `${itemPath}.teamTask`);
-      return result;
-    }, `${path}.${key}`);
-  }
-  parseRuntimeArray(record.skipped, (item, itemPath) => {
-    const result = parseRuntimeRecord(item, itemPath);
-    if (result.status !== "skipped") throw new TypeError(`${itemPath}.status must be skipped`);
-    parseTeamTaskRecord(result.teamTask, `${itemPath}.teamTask`);
-    parseRuntimeString(result.reason, `${itemPath}.reason`);
-    return result;
-  }, `${path}.skipped`);
-  parseRuntimeArray(record.errors, (item, itemPath) => parseRuntimeRecord(item, itemPath), `${path}.errors`);
-  return record as unknown as RuntimeTeamMergeResult;
-}
-
-function parseTeamExecutionRunSummary(value: unknown, path = "response"): RuntimeTeamExecutionRunSummary {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeIdentifier(record.teamId, `${path}.teamId`);
-  parseRuntimeNonNegativeInteger(record.cycles, `${path}.cycles`);
-  parseRuntimeEnum(record.stopReason, ["drained", "once", "max_cycles", "timeout", "aborted", "team_inactive"] as const, `${path}.stopReason`);
-  parseRuntimeNonNegativeInteger(record.startedAt, `${path}.startedAt`);
-  parseRuntimeNonNegativeInteger(record.endedAt, `${path}.endedAt`);
-  for (const key of [
-    "dispatched",
-    "completed",
-    "accepted",
-    "reopened",
-    "merged",
-    "mergeFailed",
-    "mergeConflicted",
-    "mergeSkipped",
-    "failed",
-    "blocked",
-    "skipped",
-    "stillRunning",
-    "errors",
-  ] as const) {
-    parseRuntimeArray(record[key], (item, itemPath) => {
-      const entry = parseRuntimeRecord(item, itemPath);
-      parseRuntimeIdentifier(entry.teamId, `${itemPath}.teamId`);
-      if (entry.taskId !== undefined) parseRuntimeIdentifier(entry.taskId, `${itemPath}.taskId`);
-      if (entry.status !== undefined) parseRuntimeString(entry.status, `${itemPath}.status`);
-      if (entry.reason !== undefined) parseRuntimeString(entry.reason, `${itemPath}.reason`);
-      return entry;
-    }, `${path}.${key}`);
-  }
-  return record as unknown as RuntimeTeamExecutionRunSummary;
-}
-
-function parseAgentTaskRecord(value: unknown, path = "task"): RuntimeAgentTaskRecord {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeIdentifier(record.id, `${path}.id`);
-  parseAgentPath(record.path, `${path}.path`);
-  parseRuntimeEnum(record.status, ["pending", "running", "completed", "incomplete", "failed", "cancelled"] as const, `${path}.status`);
-  parseRuntimeString(record.taskName, `${path}.taskName`);
-  parseRuntimeNonNegativeInteger(record.generation, `${path}.generation`);
-  parseRuntimeNonNegativeInteger(record.createdAt, `${path}.createdAt`);
-  parseRuntimeNonNegativeInteger(record.updatedAt, `${path}.updatedAt`);
-  return record as unknown as RuntimeAgentTaskRecord;
-}
-
-function parseAgentTaskArray(value: unknown, path = "response"): RuntimeAgentTaskRecord[] {
-  return parseRuntimeArray(value, parseAgentTaskRecord, path);
-}
-
-function parseTaskFollowupResult(value: unknown, path = "response"): RuntimeTaskFollowupResult {
-  const record = parseRuntimeRecord(value, path);
-  parseAgentTaskRecord(record.task, `${path}.task`);
-  parseRuntimePromptResult(record.result, `${path}.result`);
-  return record as unknown as RuntimeTaskFollowupResult;
-}
-
-function parseTaskReconcileStaleResult(value: unknown, path = "response"): RuntimeTaskReconcileStaleResult {
-  const record = parseRuntimeRecord(value, path);
-  parseRuntimeNonNegativeInteger(record.scanned, `${path}.scanned`);
-  parseRuntimeArray(record.closed, parseAgentTaskRecord, `${path}.closed`);
-  return record as unknown as RuntimeTaskReconcileStaleResult;
-}
-
-function parseAgentPath(value: unknown, path: string): AgentPath {
-  const agentPath = parseRuntimeIdentifier(value, path);
-  if (!agentPath.startsWith("/")) throw new TypeError(`${path} must be an absolute agent path`);
-  return agentPath as AgentPath;
+  parseRuntimeSessionInput(record.input, `${path}.input`);
+  parseRuntimeBoolean(record.timedOut, `${path}.timedOut`);
+  return record as unknown as RuntimeAgentWaitResult;
 }
 
 function optionalIdentifier(value: unknown, path: string): void {

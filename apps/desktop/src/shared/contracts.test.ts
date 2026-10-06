@@ -317,58 +317,79 @@ describe("desktop IPC contracts", () => {
       event: { payload: { input: { userId: 42 } } },
     });
 
-    const task = {
-      id: "task_1",
-      path: "/root/task",
-      status: "completed",
-      taskName: "task",
-      generation: 0,
-      completion: { userId: 42, provider: { responseId: 7 } },
-      createdAt: 1,
-      updatedAt: 2,
-    };
     const request = parseDesktopRequest({ type: "session.snapshot", sessionId: "session_1" });
     expect(parseDesktopResponse(request, {
       sessionId: "session_1",
       events: [opaqueEvent],
-      agentTree: {
-        nodes: [],
-        agents: [],
-        tasks: [task],
-        mailbox: [{ id: "mail_1", path: "/root", to: "*", content: "ok", metadata: { userId: 42 } }],
-      },
-      tasks: [task],
+      agents: [{ agentId: "session_child", name: "research", path: "/root/research", parentAgentId: "session_1", state: "idle" }],
       pendingApprovals: [],
       pendingInputs: [],
     })).toMatchObject({
       sessionId: "session_1",
-      tasks: [{ completion: { userId: 42 } }],
+      events: [{ payload: { input: { userId: 42 } } }],
+      agents: [{ agentId: "session_child" }],
     });
   });
 
-  test("still rejects malicious known IDs in snapshot structures", () => {
+  test("validates the unified Agent snapshot and rejects old active task shapes", () => {
     const request = parseDesktopRequest({ type: "session.snapshot", sessionId: "session_1" });
-    expect(() => parseDesktopResponse(request, {
-      sessionId: "session_1",
-      events: [],
-      agentTree: {
-        nodes: [],
-        agents: [],
-        tasks: [],
-        mailbox: [{
-          id: "mail_1",
-          path: "/root",
-          fromPath: "/root/source",
-          triggerTurn: false,
-          status: "queued",
-          recipientSessionId: "__proto__",
-          createdAt: 1,
-        }],
-      },
-      tasks: [],
-      pendingApprovals: [],
-      pendingInputs: [],
-    })).toThrow("prototype property name");
+    const agent = { agentId: "session_child", name: "research", path: "/root/research", parentAgentId: "session_1", state: "running" };
+    const snapshot = { sessionId: "session_1", events: [], agents: [agent], pendingApprovals: [], pendingInputs: [] };
+    expect(parseDesktopResponse(request, snapshot)).toMatchObject({ agents: [agent] });
+    for (const field of ["agentId", "parentAgentId"]) {
+      expect(() => parseDesktopResponse(request, { ...snapshot, agents: [{ ...agent, [field]: "__proto__" }] })).toThrow("prototype property name");
+    }
+    expect(() => parseDesktopResponse(request, { ...snapshot, agents: [{ ...agent, state: "completed" }] })).toThrow("agent.state");
+    expect(() => parseDesktopResponse(request, { ...snapshot, agents: [{ ...agent, taskId: "task_legacy" }] })).toThrow("Unexpected request field");
+    expect(() => parseDesktopResponse(request, { ...snapshot, agents: Array(2_001).fill(agent) })).toThrow("snapshot agents");
+    expect(() => parseDesktopResponse(request, { ...snapshot, agents: undefined })).toThrow();
+    expect(() => parseDesktopResponse(request, { ...snapshot, tasks: [] })).toThrow("Unexpected request field");
+    expect(() => parseDesktopResponse(request, { ...snapshot, agentTree: { nodes: [] } })).toThrow("Unexpected request field");
+  });
+
+  test("Agent IPC preserves caller scope, input budgets, and exact response identity", () => {
+    const request = { type: "agent.send" as const, sessionId: "session_1", agentId: "session_child", text: "Continue the inspection" };
+    expect(parseDesktopRequest(request)).toEqual(request);
+    expect(parseDesktopRequest({ ...request, mode: "steer", projectId: "project_1" })).toMatchObject({ mode: "steer", projectId: "project_1" });
+    expect(() => parseDesktopRequest({ ...request, mode: "start" })).toThrow("mode");
+    expect(() => parseDesktopRequest({ ...request, text: "x".repeat(200_001) })).toThrow("200000");
+    expect(() => parseDesktopRequest({ ...request, policy: { allowedTools: ["bash"] } })).toThrow("Unexpected request field");
+    for (const field of ["sessionId", "agentId"]) {
+      expect(() => parseDesktopRequest({ ...request, [field]: "constructor" })).toThrow("prototype property name");
+    }
+    const parsed = parseDesktopRequest(request);
+    expect(parseDesktopResponse(parsed, { agentId: "session_child", inputId: "input_1" })).toEqual({ agentId: "session_child", inputId: "input_1" });
+    expect(() => parseDesktopResponse(parsed, { agentId: "session_other", inputId: "input_1" })).toThrow("different agentId");
+    expect(() => parseDesktopResponse(parsed, { agentId: "session_child" })).toThrow("inputId");
+    expect(() => parseDesktopResponse(parsed, { agentId: "session_child", inputId: "__proto__" })).toThrow("prototype property name");
+    for (const type of ["agent.stop", "agent.resume"] as const) {
+      const control = parseDesktopRequest({ type, sessionId: "session_1", agentId: "session_child" });
+      expect(parseDesktopResponse(control, { agentId: "session_child" })).toEqual({ agentId: "session_child" });
+    }
+    const stop = parseDesktopRequest({ type: "agent.stop", sessionId: "session_1", agentId: "session_child" });
+    expect(() => parseDesktopResponse(stop, { agentId: "session_child", inputId: "input_1" })).toThrow("Unexpected request field");
+    const resume = parseDesktopRequest({ type: "agent.resume", sessionId: "session_1", agentId: "session_child" });
+    expect(parseDesktopResponse(resume, { agentId: "session_child", inputId: "input_resumed" })).toMatchObject({ inputId: "input_resumed" });
+  });
+
+  test("new Session identity and durable input references receive protocol and map-key validation", () => {
+    const agent = { parentSessionId: "session_parent", name: "child", path: "/root/child", policy: { writeScope: [] } };
+    const created = runtimeEnvelope("session.created", { sessionId: "session_1", cwd: "/repo", agent }, "created_agent");
+    expect(parseDesktopEvent({ type: "runtime.event", event: created })).toMatchObject({ event: { payload: { agent } } });
+    expect(() => parseDesktopEvent({ type: "runtime.event", event: { ...created, payload: { ...created.payload, agent: { ...agent, parentSessionId: "__proto__" } } } })).toThrow("prototype property name");
+    expect(() => parseDesktopEvent({ type: "runtime.event", event: { ...created, payload: { ...created.payload, agent: { ...agent, policy: { allowSubagentSessions: true } } } } })).toThrow();
+    const receipt = { inputId: "input_1", submissionId: "submission_1", sessionId: "session_1", mode: "queue", state: "settled", revision: 3, sequence: 1, text: "inspect", acceptedAt: 1, updatedAt: 2, outcome: "completed", resultMessageId: "message_result" };
+    const queue = { sessionId: "session_1", paused: false, revision: 3, pendingCount: 0, interruptedCount: 0, items: [receipt] };
+    const queueEvent = runtimeEnvelope("session.input_queue_changed", queue, "queue_event");
+    expect(parseDesktopEvent({ type: "runtime.event", event: queueEvent })).toMatchObject({ event: { payload: queue } });
+    expect(() => parseDesktopEvent({ type: "runtime.event", event: { ...queueEvent, payload: { ...queue, items: [{ ...receipt, resultMessageId: "constructor" }] } } })).toThrow("prototype property name");
+    expect(() => parseDesktopEvent({ type: "runtime.event", event: { ...queueEvent, payload: { ...queue, items: [{ ...receipt, sessionId: "session_other" }] } } })).toThrow();
+  });
+
+  test("historical Team events remain readable without the old live task snapshot", () => {
+    const historical = runtimeEnvelope("team.task_updated", { teamId: "team_old", taskId: "task_old", status: "completed" }, "historical_team");
+    const request = parseDesktopRequest({ type: "session.snapshot", sessionId: "session_1" });
+    expect(parseDesktopResponse(request, { sessionId: "session_1", events: [historical], agents: [], pendingApprovals: [], pendingInputs: [] })).toMatchObject({ events: [historical], agents: [] });
   });
 
   test("validates authoritative pending approvals without requiring event anchors", () => {
@@ -376,8 +397,7 @@ describe("desktop IPC contracts", () => {
     const snapshot = {
       sessionId: "session_1",
       events: [],
-      agentTree: { nodes: [], agents: [], tasks: [], mailbox: [] },
-      tasks: [],
+      agents: [],
       pendingApprovals: [{
         id: "approval_1",
         sessionId: "session_1",
@@ -444,16 +464,14 @@ describe("desktop IPC contracts", () => {
     expect(() => presentSession({
       sessionId: "session_1",
       events,
-      agentTree: { nodes: [], agents: [], tasks: [], mailbox: [] },
-      tasks: [],
+      agents: [],
       pendingApprovals: [],
       pendingInputs: [],
     })).not.toThrow();
     expect(presentSession({
       sessionId: "session_1",
       events,
-      agentTree: { nodes: [], agents: [], tasks: [], mailbox: [] },
-      tasks: [],
+      agents: [],
       pendingApprovals: [],
       pendingInputs: [],
     }).runtime.messages.message_1?.parts).toHaveLength(9);

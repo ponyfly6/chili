@@ -20,7 +20,6 @@ import {
   type ToolRenderBodyKind,
   type ToolRenderMode,
 } from "./tool-renderers.js";
-import type { InlineAgentBatchDisplay } from "./AgentBatchCells.js";
 import { publicSyntheticAssistantText } from "./public-error.js";
 
 export type ChatDisplayItem =
@@ -36,7 +35,6 @@ export type ChatDisplayItem =
   | { kind: "reasoning"; id: string; text: string; collapsed: true; active?: boolean; time?: number }
   | { kind: "tool_activity"; id: string; activity: ToolActivityDisplay; time?: number }
   | { kind: "tool_group"; id: string; label: string; tone: ToolActivityTone; metadata: ToolGroupMetadata; activities: ToolActivityDisplay[]; time?: number }
-  | { kind: "agent_batch"; id: string; batch: InlineAgentBatchDisplay; time?: number }
   | { kind: "approval"; id: string; approval: ChatApprovalRow; time?: number }
   | { kind: "summary"; id: string; text: string; time?: number };
 
@@ -89,7 +87,6 @@ interface BuildOptions {
   activeToolCount?: number;
   groupExplorationTools?: boolean;
   cwd?: string;
-  agentBatches?: readonly InlineAgentBatchDisplay[];
 }
 
 interface ToolCallPartInfo {
@@ -103,8 +100,6 @@ export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], opti
   const streamingMessageId = streamingAssistantMessageId(items, options);
   const toolRowsById = new Set<string>();
   const toolCallParts = new Map<string, ToolCallPartInfo>();
-  const agentBatchesByCallId = new Map((options.agentBatches ?? []).flatMap((batch) => batch.callId ? [[batch.callId, batch] as const] : []));
-  const renderedAgentBatchIds = new Set<string>();
 
   for (const item of items) {
     if (item.kind === "tool") {
@@ -128,12 +123,6 @@ export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], opti
       continue;
     }
     if (item.kind === "tool") {
-      const agentBatch = agentBatchesByCallId.get(item.id);
-      if (agentBatch && isAgentSpawnToolName(item.toolName)) {
-        output.push({ kind: "agent_batch", id: `agent-batch:${agentBatch.id}`, batch: agentBatch, time: agentBatch.createdAt });
-        renderedAgentBatchIds.add(agentBatch.id);
-        continue;
-      }
       output.push({
         kind: "tool_activity",
         id: `tool:${item.id}`,
@@ -143,14 +132,6 @@ export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], opti
       continue;
     }
     output.push({ kind: "approval", id: `approval:${item.id}`, approval: item, time: item.resolvedAt ?? item.createdAt });
-  }
-
-  for (const batch of options.agentBatches ?? []) {
-    if (renderedAgentBatchIds.has(batch.id)) continue;
-    const sourceCallStillVisible = batch.callId ? toolCallParts.has(batch.callId) : false;
-    const lifecycleActive = batch.counts.active > 0 || batch.status === "pending" || batch.status === "running";
-    if (batch.kind !== "team" && !sourceCallStillVisible && !lifecycleActive) continue;
-    output.push({ kind: "agent_batch", id: `agent-batch:${batch.id}`, batch, time: batch.createdAt });
   }
 
   output.sort((left, right) => displayItemTime(left) - displayItemTime(right));
@@ -218,16 +199,7 @@ function groupNestedTools(items: readonly ChatDisplayItem[]): ChatDisplayItem[] 
   return output;
 }
 
-function isAgentSpawnToolName(toolName: string): boolean {
-  const name = toolName.toLowerCase().replace(/^tool\./, "");
-  return name === "task"
-    || name === "agent"
-    || name === "agent_spawn"
-    || name === "task_batch"
-    || name === "agent_batch"
-    || name === "spawn_tasks"
-    || name === "spawn_agents";
-}
+
 
 function displayItemTime(item: ChatDisplayItem): number {
   return typeof item.time === "number" && Number.isFinite(item.time) ? item.time : Number.MAX_SAFE_INTEGER;

@@ -27,7 +27,7 @@ export function workToolCategory(name: string): WorkCategory {
   if (/^(write|write_file|edit|replace|apply_patch)$/.test(value)) return "edit";
   if (/^(bash|run_shell_command|exec_command|write_stdin)$/.test(value)) return "command";
   if (/^(web_search|search_query|web_fetch|fetch_url)$/.test(value)) return "web";
-  if (/^(agent_|team_|spawn_|wait_agent|send_message|task_)/.test(value)) return "delegate";
+  if (/^agent_/.test(value)) return "delegate";
   return "other";
 }
 

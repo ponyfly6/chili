@@ -203,56 +203,20 @@ const gitRenderer: ToolRenderer = {
   },
 };
 
-const taskRenderer: ToolRenderer = {
-  name: "task",
-  match: (toolName) => {
-    const name = normalizeToolName(toolName);
-    return name === "task" || name === "agent" || name === "complete_task" || name.startsWith("task_") || name.startsWith("agent_");
-  },
-  mode: (input) => (isAgentBatchSpawn(input) || normalizeToolName(input.toolName) === "task_wait_batch" || normalizeToolName(input.toolName) === "agent_wait") && !input.showToolDetails ? "inline" : defaultToolMode(input),
-  summary: (input) => {
-    const name = normalizeToolName(input.toolName);
-    if (isAgentBatchSpawn(input)) return taskBatchSummary(input.output);
-    if (name === "task_wait_batch" || name === "agent_wait") return taskWaitBatchSummary(input.output);
-    return defaultSummary(input);
-  },
+const agentRenderer: ToolRenderer = {
+  name: "agent",
+  match: (toolName) => matchesTool(toolName, ["agent_spawn", "agent_send", "agent_wait", "agent_stop", "agent_resume", "agent_list"]),
+  mode: (input) => input.showToolDetails || isFailedDisplayStatus(input.displayStatus) ? defaultToolMode(input) : "inline",
+  summary: (input) => middleElideText(agentSummary(input) ?? "", MAX_COMPACT_LABEL_TARGET_LENGTH),
   label: (input) => {
     const name = normalizeToolName(input.toolName);
-    if (isAgentBatchSpawn(input)) return taskBatchLabel(input);
-    if (name === "task" || name === "agent" || name === "agent_spawn") return labelWithTarget(statusVerb(input.displayStatus, "Started ad-hoc agent", "Starting ad-hoc agent"), stringFromInput(input.input, "description") ?? input.inputSummary.detail);
-    if (name === "complete_task") return labelWithTarget(statusVerb(input.displayStatus, "Completed task", "Completing task"), taskIdTarget(input));
-    if (name === "agent_list" && stringFromInput(input.input, "view") === "messages") return labelWithTarget(statusVerb(input.displayStatus, "Listed agent messages", "Listing agent messages"), stringFromInput(input.input, "status", "path", "from"));
-    if (name === "task_list" || name === "agent_list") return labelWithTarget(statusVerb(input.displayStatus, "Listed ad-hoc agents", "Listing ad-hoc agents"), stringFromInput(input.input, "status") ?? input.inputSummary.detail);
-    if (name === "task_wait" || (name === "agent_wait" && stringFromInput(input.input, "taskId", "task_id"))) return labelWithTarget(statusVerb(input.displayStatus, "Waited for ad-hoc agent", "Waiting for ad-hoc agent"), taskIdTarget(input));
-    if (name === "task_wait_batch" || name === "agent_wait") return labelWithTarget(statusVerb(input.displayStatus, "Waited for", "Waiting for"), taskWaitBatchTarget(input.input));
-    if (name === "task_followup") return labelWithTarget(statusVerb(input.displayStatus, "Sent agent follow-up", "Sending agent follow-up"), taskIdTarget(input));
-    if (name === "agent_resume") return labelWithTarget(statusVerb(input.displayStatus, "Resumed ad-hoc agent", "Resuming ad-hoc agent"), taskIdTarget(input));
-    if (name === "task_close") return labelWithTarget(statusVerb(input.displayStatus, "Closed ad-hoc agent", "Closing ad-hoc agent"), taskIdTarget(input));
-    if (name === "agent_stop") return labelWithTarget(statusVerb(input.displayStatus, "Stopped ad-hoc agent", "Stopping ad-hoc agent"), taskIdTarget(input));
-    if (name === "agent_message_send" || name === "agent_send") return labelWithTarget(statusVerb(input.displayStatus, "Sent agent message to", "Sending agent message to"), stringFromInput(input.input, "to", "target"));
-    if (name === "agent_message_list") return labelWithTarget(statusVerb(input.displayStatus, "Listed agent messages", "Listing agent messages"), stringFromInput(input.input, "status", "path", "from"));
-    return labelWithTarget(statusVerb(input.displayStatus, `Ran ${input.inputSummary.title}`, `Running ${input.inputSummary.title}`), taskIdTarget(input) ?? input.inputSummary.detail);
-  },
-};
-
-const teamRenderer: ToolRenderer = {
-  name: "team",
-  match: (toolName) => normalizeToolName(toolName).startsWith("team_"),
-  mode: (input) => normalizeToolName(input.toolName) === "team_run_loop" && !input.showToolDetails ? "inline" : defaultToolMode(input),
-  summary: (input) => normalizeToolName(input.toolName) === "team_run_loop" ? teamRunLoopSummary(input.output) : defaultSummary(input),
-  label: (input) => {
-    const name = normalizeToolName(input.toolName);
-    const target = teamTarget(input);
-    if (name === "team_create") return labelWithTarget(statusVerb(input.displayStatus, "Created persistent team", "Creating persistent team"), stringFromInput(input.input, "name") ?? target);
-    if (name === "team_list") return statusVerb(input.displayStatus, "Listed persistent teams", "Listing persistent teams");
-    if (name === "team_snapshot") return labelWithTarget(statusVerb(input.displayStatus, "Read persistent team snapshot", "Reading persistent team snapshot"), target);
-    if (name === "team_run_loop") return labelWithTarget(statusVerb(input.displayStatus, "Ran persistent team loop", "Running persistent team loop"), target);
-    if (name.startsWith("team_task_")) return labelWithTarget(statusVerb(input.displayStatus, teamTaskPastVerb(name), teamTaskActiveVerb(name)), stringFromInput(input.input, "title") ?? target);
-    if (name.startsWith("team_message_")) return labelWithTarget(statusVerb(input.displayStatus, teamMessagePastVerb(name), teamMessageActiveVerb(name)), target);
-    if (name === "team_member_add") return labelWithTarget(statusVerb(input.displayStatus, "Added persistent team member", "Adding persistent team member"), stringFromInput(input.input, "name", "path") ?? target);
-    if (name === "team_member_list") return labelWithTarget(statusVerb(input.displayStatus, "Listed persistent team members", "Listing persistent team members"), target);
-    if (name.startsWith("team_member_")) return labelWithTarget(statusVerb(input.displayStatus, "Updated persistent team member", "Updating persistent team member"), stringFromInput(input.input, "path", "name") ?? target);
-    return labelWithTarget(statusVerb(input.displayStatus, `Ran ${input.inputSummary.title}`, `Running ${input.inputSummary.title}`), target ?? input.inputSummary.detail);
+    const agentId = stringFromInput(input.input, "agentId");
+    if (name === "agent_spawn") return labelWithTarget(statusVerb(input.displayStatus, "Started agent", "Starting agent"), stringFromInput(input.input, "name"));
+    if (name === "agent_send") return labelWithTarget(statusVerb(input.displayStatus, "Sent input to agent", "Sending input to agent"), agentId);
+    if (name === "agent_wait") return labelWithTarget(statusVerb(input.displayStatus, "Waited for input", "Waiting for input"), agentWaitTarget(input.input));
+    if (name === "agent_stop") return labelWithTarget(statusVerb(input.displayStatus, "Stopped agent", "Stopping agent"), agentId);
+    if (name === "agent_resume") return labelWithTarget(statusVerb(input.displayStatus, "Resumed agent", "Resuming agent"), agentId);
+    return statusVerb(input.displayStatus, "Listed agents", "Listing agents");
   },
 };
 
@@ -279,8 +243,7 @@ const defaultToolRenderers: readonly ToolRenderer[] = [
   writeRenderer,
   applyPatchRenderer,
   gitRenderer,
-  taskRenderer,
-  teamRenderer,
+  agentRenderer,
 ];
 
 export const defaultToolRendererRegistry = new ToolRendererRegistry();
@@ -646,246 +609,34 @@ function pathListTarget(input: ToolRenderInput): string | undefined {
   return input.inputSummary.scope ?? input.inputSummary.path;
 }
 
-function taskIdTarget(input: ToolRenderInput): string | undefined {
-  return stringFromInput(input.input, "taskId", "task_id") ?? input.inputSummary.detail ?? input.inputSummary.scope;
+function agentWaitTarget(input: unknown): string | undefined {
+  const inputId = stringFromInput(input, "inputId");
+  const agentId = stringFromInput(input, "agentId");
+  return inputId && agentId ? `${inputId} · agent ${agentId}` : inputId ?? agentId;
 }
 
-function isAgentBatchSpawn(input: ToolRenderInput): boolean {
-  const name = normalizeToolName(input.toolName);
-  return name === "task_batch" || (name === "agent_spawn" && Array.isArray(recordValue(input.input)?.tasks));
-}
-
-function taskBatchTarget(input: unknown): string {
-  const record = recordValue(input);
-  const tasks = record?.tasks;
-  const count = Array.isArray(tasks) ? tasks.length : undefined;
-  return count === undefined ? "ad-hoc agents" : `${count} ${plural(count, "ad-hoc agent", "ad-hoc agents")}`;
-}
-
-function taskBatchLabel(input: ToolRenderInput): string {
+function agentSummary(input: ToolRenderInput): string | undefined {
   const output = parseJsonObject(input.output);
-  const spawn = output ? taskBatchSpawnState(output) : undefined;
-  if (input.displayStatus === "succeeded" && spawn?.spawnFailureCount) {
-    if (spawn.spawnedCount === 0) {
-      const target = `${spawn.expected} ${plural(spawn.expected, "ad-hoc agent", "ad-hoc agents")}`;
-      return `Failed to spawn ${target}`;
-    }
-    if (spawn.spawnedCount !== undefined) {
-      const target = `${spawn.spawnedCount} of ${spawn.expected} ad-hoc agents`;
-      return `Started ${target} (${spawn.spawnFailureCount} failed to spawn)`;
-    }
+  if (!output) return undefined;
+  const name = normalizeToolName(input.toolName);
+  if (name === "agent_wait") {
+    const receipt = recordValue(output.input);
+    const state = receipt ? firstString(receipt, ["outcome", "state"]) : undefined;
+    return [state, output.timedOut === true ? "wait timed out" : undefined].filter(Boolean).join(" · ") || undefined;
   }
-  return labelWithTarget(statusVerb(input.displayStatus, "Started", "Starting"), taskBatchTarget(input.input));
-}
-
-function taskWaitBatchTarget(input: unknown): string {
-  const record = recordValue(input);
-  const taskIds = record?.taskIds ?? record?.task_ids;
-  const count = Array.isArray(taskIds) ? taskIds.length : undefined;
-  const waitFor = firstString(record ?? {}, ["waitFor", "wait_for"]) ?? "all";
-  const agents = count === undefined ? "ad-hoc agents" : `${count} ${plural(count, "ad-hoc agent", "ad-hoc agents")}`;
-  return `${agents} (${waitFor})`;
-}
-
-function taskBatchSummary(output: string | undefined): string | undefined {
-  const record = parseJsonObject(output);
-  if (!record) return undefined;
-  const tasks = arrayField(record, ["tasks"]);
-  const parts: string[] = [];
-  const spawn = taskBatchSpawnState(record);
-  const count = spawn.spawnedCount ?? spawn.expected;
-  if (count > 0 || spawn.spawnFailureCount > 0) parts.push(`agents=${count}`);
-  if (spawn.spawnFailureCount > 0 || count !== spawn.expected) parts.push(`planned=${spawn.expected}`);
-  if (spawn.spawnFailureCount > 0) parts.push(`spawn_failed=${spawn.spawnFailureCount}`);
-  const policy = firstString(record, ["completionPolicy", "completion_policy"]);
-  if (policy) parts.push(`policy=${policy}`);
-  const fanout = firstNumber(record, ["maxConcurrency", "max_concurrency"]);
-  if (fanout !== undefined) parts.push(`fanout=${fanout}`);
-  if (record.joined === true) parts.push("joined=true");
-  appendBooleanPart(parts, "timed_out", firstBoolean(record, ["timedOut", "timed_out"]));
-  appendTaskStatusCounts(parts, tasks);
-  return parts.length > 0 ? parts.join(", ") : undefined;
-}
-
-function taskBatchSpawnState(record: Record<string, unknown>): {
-  expected: number;
-  spawnedCount?: number;
-  spawnFailureCount: number;
-} {
-  const tasks = arrayField(record, ["tasks"]);
-  const failures = arrayField(record, ["spawnFailures", "spawn_failures"]);
-  const spawnFailureCount = firstNumber(record, ["spawnFailureCount", "spawn_failure_count"])
-    ?? failures.length;
-  const declaredExpected = firstNumber(record, ["expectedBatchSize", "expected_batch_size", "count"]);
-  const declaredSpawned = firstNumber(record, ["spawnedCount", "spawned_count"]);
-  const expected = Math.max(declaredExpected ?? 0, declaredSpawned ?? 0, tasks.length + spawnFailureCount);
-  const spawnedCount = declaredSpawned ?? (spawnFailureCount > 0 ? tasks.length : undefined);
-  return {
-    expected,
-    ...(spawnedCount === undefined ? {} : { spawnedCount }),
-    spawnFailureCount,
-  };
-}
-
-function taskWaitBatchSummary(output: string | undefined): string | undefined {
-  const record = parseJsonObject(output);
-  if (!record) return undefined;
-  const tasks = arrayField(record, ["tasks"]);
-  const parts: string[] = [];
-  const waitFor = firstString(record, ["waitFor", "wait_for"]);
-  if (waitFor) parts.push(`wait=${waitFor}`);
-  const count = firstNumber(record, ["count"]) ?? tasks.length;
-  if (count > 0) parts.push(`agents=${count}`);
-  appendBooleanPart(parts, "timed_out", firstBoolean(record, ["timedOut", "timed_out"]));
-  appendTaskStatusCounts(parts, tasks);
-  return parts.length > 0 ? parts.join(", ") : undefined;
-}
-
-function appendTaskStatusCounts(parts: string[], tasks: readonly Record<string, unknown>[]): void {
-  const statusCounts = new Map<string, number>();
-  for (const task of tasks) {
-    const status = recordString(task, "status");
-    if (status) statusCounts.set(status, (statusCounts.get(status) ?? 0) + 1);
+  if (name === "agent_list") {
+    if (!Array.isArray(output.agents)) return undefined;
+    const agents = output.agents.map(recordValue).filter((agent) => agent !== undefined);
+    const counts = ["running", "paused", "idle"].map((state) => {
+      const count = agents.filter((agent) => agent.state === state).length;
+      return count > 0 ? `${count} ${state}` : undefined;
+    }).filter(Boolean);
+    return [`${agents.length} ${plural(agents.length, "agent", "agents")}`, ...counts].join(" · ");
   }
-  for (const status of ["pending", "running", "completed", "incomplete", "failed", "cancelled"] as const) {
-    appendCountPart(parts, status, statusCounts.get(status));
-  }
-}
-
-function teamTarget(input: ToolRenderInput): string | undefined {
-  return stringFromInput(input.input, "taskId", "task_id", "teamId", "team_id", "messageId", "message_id")
-    ?? input.inputSummary.detail
-    ?? input.inputSummary.scope;
-}
-
-function teamTaskPastVerb(toolName: string): string {
-  if (toolName.endsWith("_create_batch")) return "Created persistent team tasks";
-  if (toolName.endsWith("_dispatch_batch")) return "Dispatched persistent team tasks";
-  if (toolName.endsWith("_create")) return "Created persistent team task";
-  if (toolName.endsWith("_list")) return "Listed persistent team tasks";
-  if (toolName.endsWith("_assign")) return "Assigned persistent team task";
-  if (toolName.endsWith("_claim")) return "Claimed persistent team task";
-  if (toolName.endsWith("_update")) return "Updated persistent team task";
-  if (toolName.endsWith("_dispatch")) return "Dispatched persistent team task";
-  if (toolName.endsWith("_sync")) return "Synced persistent team task";
-  if (toolName.endsWith("_reconcile")) return "Reconciled persistent team tasks";
-  return "Updated persistent team task";
-}
-
-function teamTaskActiveVerb(toolName: string): string {
-  if (toolName.endsWith("_create_batch")) return "Creating persistent team tasks";
-  if (toolName.endsWith("_dispatch_batch")) return "Dispatching persistent team tasks";
-  return teamTaskPastVerb(toolName).replace(/ed\b/, "ing");
-}
-
-function teamRunLoopSummary(output: string | undefined): string | undefined {
-  const record = parseJsonObject(output);
-  if (!record) return undefined;
-  const parts: string[] = [];
-  const stopReason = firstString(record, ["stopReason", "stop_reason"]);
-  if (stopReason) parts.push(`stop=${stopReason}`);
-  const bottleneck = firstString(record, ["bottleneck"]) ?? teamRunLoopBottleneck(record, stopReason);
-  if (bottleneck) parts.push(`bottleneck=${bottleneck}`);
-  const fanout = firstNumber(record, ["maxConcurrentDispatches", "max_concurrent_dispatches"]);
-  if (fanout !== undefined) parts.push(`fanout=${fanout}`);
-  const verifierFanout = firstNumber(record, ["maxConcurrentVerifications", "max_concurrent_verifications"]);
-  if (verifierFanout !== undefined) parts.push(`verify=${verifierFanout}`);
-  appendCountPart(parts, "dispatched", countArrayField(record, ["dispatched"]));
-  appendCountPart(parts, "completed", countArrayField(record, ["completed", "accepted", "merged"]));
-  appendCountPart(parts, "running", countArrayField(record, ["stillRunning", "still_running"]));
-  appendCountPart(parts, "blocked", countArrayField(record, ["blocked"]));
-  appendCountPart(parts, "errors", countArrayField(record, ["errors"]));
-  return parts.length > 0 ? parts.join(", ") : undefined;
-}
-
-function teamRunLoopBottleneck(record: Record<string, unknown>, stopReason: string | undefined): string | undefined {
-  const errors = countArrayField(record, ["errors"]) ?? 0;
-  if (errors > 0) return "errors";
-  const mergeConflicted = countArrayField(record, ["mergeConflicted", "merge_conflicted"]) ?? 0;
-  if (mergeConflicted > 0) return "merge-conflict";
-  const mergeFailed = countArrayField(record, ["mergeFailed", "merge_failed"]) ?? 0;
-  if (mergeFailed > 0) return "merge-failed";
-  const reopened = countArrayField(record, ["reopened"]) ?? 0;
-  if (reopened > 0) return "verify-failed";
-  const blocked = arrayField(record, ["blocked"]);
-  if (blocked.some((item) => recordString(item, "reason") !== "dependency_incomplete")) return "blocked";
-  const fanout = firstNumber(record, ["maxConcurrentDispatches", "max_concurrent_dispatches"]);
-  const running = countArrayField(record, ["stillRunning", "still_running"]) ?? 0;
-  if (fanout !== undefined && fanout > 0 && running >= fanout) return "fanout-full";
-  if (running > 0) return "workers-running";
-  if (blocked.length > 0) return "waiting-dependencies";
-  const completed = countArrayField(record, ["completed"]) ?? 0;
-  const accepted = countArrayField(record, ["accepted"]) ?? 0;
-  const merged = countArrayField(record, ["merged"]) ?? 0;
-  if (completed > 0 && accepted === 0 && merged === 0) return "verify-pending";
-  if (stopReason === "timeout") return "timeout";
-  if (stopReason === "max_cycles") return "max-cycles";
-  if (stopReason === "drained") return "drained";
-  if (stopReason === "once") return "one-cycle";
-  return stopReason;
-}
-
-function appendCountPart(parts: string[], label: string, count: number | undefined): void {
-  if (count === undefined || count === 0) return;
-  parts.push(`${label}=${count}`);
-}
-
-function appendBooleanPart(parts: string[], label: string, value: boolean | undefined): void {
-  if (value !== undefined) parts.push(`${label}=${String(value)}`);
-}
-
-function arrayField(record: Record<string, unknown>, keys: readonly string[]): Record<string, unknown>[] {
-  for (const key of keys) {
-    const value = record[key];
-    if (!Array.isArray(value)) continue;
-    return value.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null && !Array.isArray(item));
-  }
-  return [];
-}
-
-function recordString(record: Record<string, unknown>, key: string): string | undefined {
-  const value = record[key];
-  return typeof value === "string" ? value : undefined;
-}
-
-function countArrayField(record: Record<string, unknown>, keys: readonly string[]): number | undefined {
-  let found = false;
-  let count = 0;
-  for (const key of keys) {
-    const value = record[key];
-    if (!Array.isArray(value)) continue;
-    found = true;
-    count += value.length;
-  }
-  return found ? count : undefined;
-}
-
-function firstNumber(record: Record<string, unknown>, keys: readonly string[]): number | undefined {
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-  }
-  return undefined;
-}
-
-function firstBoolean(record: Record<string, unknown>, keys: readonly string[]): boolean | undefined {
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === "boolean") return value;
-  }
-  return undefined;
-}
-
-function teamMessagePastVerb(toolName: string): string {
-  if (toolName.endsWith("_send")) return "Sent persistent team message";
-  if (toolName.endsWith("_list")) return "Listed persistent team messages";
-  return "Handled persistent team message";
-}
-
-function teamMessageActiveVerb(toolName: string): string {
-  if (toolName.endsWith("_send")) return "Sending persistent team message";
-  if (toolName.endsWith("_list")) return "Listing persistent team messages";
-  return "Handling persistent team message";
+  const inputId = firstString(output, ["inputId"]);
+  const agentId = firstString(output, ["agentId"]);
+  return [name === "agent_spawn" && agentId ? `agent ${agentId}` : undefined, inputId ? `input ${inputId}` : undefined]
+    .filter(Boolean).join(" · ") || undefined;
 }
 
 function matchesTool(toolName: string, names: readonly string[]): boolean {

@@ -54,9 +54,9 @@ test("admission commits before execution and retry never duplicates history", as
   expect((await store.messages(sessionId)).filter((message) => message.role === "user")).toHaveLength(1);
 });
 
-test("Stop persists pause before abort, preserves pending work, and explicit Resume dispatches once", async () => {
+test("Stop preserves pending work and Resume continues the original input before queued work", async () => {
   const { service, store, turns } = await fixture(async (input, index) => index === 1 ? waitForAbort(input) : completed(input));
-  service.submitPromptAsync({ sessionId, text: "first", submissionId: "first" });
+  const first = service.submitPromptAsync({ sessionId, text: "first", submissionId: "first" });
   await until(() => turns.length === 1);
   service.submitPromptAsync({ sessionId, text: "next", submissionId: "next", mode: "queue" });
   await service.interrupt(sessionId);
@@ -68,7 +68,14 @@ test("Stop persists pause before abort, preserves pending work, and explicit Res
   expect(turns).toHaveLength(1);
   await service.resumeInputs(sessionId);
   await until(() => service.getInput(sessionId, "next")?.outcome === "completed");
-  expect(turns).toHaveLength(2);
+  expect(turns).toHaveLength(3);
+  expect(turns.map((turn) => turn.turnId)).toEqual([
+    first.input!.turnId,
+    service.getInput(sessionId, "first")!.turnId,
+    service.getInput(sessionId, "next")!.turnId,
+  ]);
+  expect(turns[1]!.turnId).not.toBe(turns[0]!.turnId);
+  expect(service.getInput(sessionId, "first")).toMatchObject({ inputId: first.input!.inputId, outcome: "completed" });
   expect((await store.messages(sessionId)).filter((message) => message.role === "user")).toHaveLength(2);
 });
 
@@ -135,9 +142,10 @@ test("repeated recovery preserves original request and tool policy without repla
     expect(turns.at(-1)?.toolPolicy).toEqual(original.toolPolicy);
     expect(turns.at(-1)?.contextualUser?.join("\n")).toContain(original.text);
     expect(turns.at(-1)?.contextualUser?.join("\n")).toContain("Never blindly replay");
+    expect(service.getInput(sessionId, "original")).toMatchObject({ inputId: "crashed", outcome: "failed" });
+    expect(service.getInput(sessionId, "resume_crashed")).toBeUndefined();
+    expect((await store.messages(sessionId)).filter((message) => message.id === "msg_input_crashed")).toHaveLength(1);
   }
-  expect((await store.messages(sessionId)).filter((message) => message.id === "msg_input_crashed")).toHaveLength(0);
-  expect(service.getInput(sessionId, "original")?.outcome).toBe("interrupted");
 });
 
 test("an explicit Goal resume clears Stop and lets queued input precede Goal work", async () => {

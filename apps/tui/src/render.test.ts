@@ -2,33 +2,28 @@ import { expect, test } from "bun:test";
 import { readdir, readFile } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import type { SessionId } from "@chili/protocol";
-import { formatResumeCommand, formatTerminalTitle, parseArgs, terminalTitleSequence, teamLiveStreamInput } from "./index.js";
+import { formatResumeCommand, formatTerminalTitle, parseArgs, terminalTitleSequence, runtimeStreamInput } from "./index.js";
 import { detectSystemTheme, generateSystemTheme, initialTuiThemeId, resolveTuiTheme } from "./theme/index.js";
 
-test("parses runtime flags and keeps Team Live stream unscoped for child-session events", () => {
+test("parses runtime flags and keeps the runtime stream unscoped for child-session events", () => {
   const controller = new AbortController();
 
   expect(parseArgs([])).toMatchObject({
     baseUrl: "http://127.0.0.1:4777",
-    runLoop: false,
-    once: false,
-    teamLive: false,
   });
-  expect(parseArgs(["--url", "http://runtime.test", "--team", "team_live", "--team-live", "--run-loop", "--once", "--theme", "chili-light", "--max-cycles", "2"])).toMatchObject({
+  expect(parseArgs(["--url", "http://runtime.test", "--theme", "chili-light"])).toMatchObject({
     baseUrl: "http://runtime.test",
-    teamId: "team_live",
-    teamLive: true,
-    runLoop: true,
-    once: true,
     themeId: "chili-light",
-    maxCycles: 2,
   });
+  for (const flag of ["--team", "--team-live", "--run-loop", "--once", "--max-cycles"]) {
+    expect(() => parseArgs([flag])).toThrow(`Unknown argument: ${flag}`);
+  }
   expect(parseArgs(["--resume", "session_resume"])).toMatchObject({
     sessionId: "session_resume",
   });
   expect(() => parseArgs(["--thread", "thread_resume"])).toThrow("Unknown argument: --thread");
 
-  const streamInput = teamLiveStreamInput(
+  const streamInput = runtimeStreamInput(
     { sessionId: "session_live" as SessionId },
     controller.signal,
     "event_live",
@@ -37,7 +32,7 @@ test("parses runtime flags and keeps Team Live stream unscoped for child-session
   expect(streamInput.afterEventId).toBe("event_live");
   expect(streamInput.sessionId).toBeUndefined();
 
-  const scopedStreamInput = teamLiveStreamInput(
+  const scopedStreamInput = runtimeStreamInput(
     { sessionId: "session_resume" as SessionId, streamScope: "session" },
     controller.signal,
   );

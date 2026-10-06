@@ -13,8 +13,6 @@ import type {
   RuntimeMcpToolsResponse,
   RuntimeModelConfig,
   SessionId,
-  TaskId,
-  TeamId,
   TimestampMs,
 } from "@chili/protocol";
 import type { ChatSessionView, HttpRuntimeClient, RuntimeSessionSummary } from "@chili/sdk";
@@ -24,7 +22,7 @@ import {
   type ChatRuntimeFeedback,
   type ChatRuntimeState,
 } from "./useChatRuntime.js";
-import type { TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
+import type { RuntimeTuiOptions } from "./useRuntimeEvents.js";
 
 const sessionId = "session_feedback_gate" as SessionId;
 const accepted: ChatRuntimeFeedback = {
@@ -88,12 +86,10 @@ test("a late model-config response from the previous session cannot overwrite th
       summary: { total: 0, running: 0, disabled: 0, authRequired: 0, errored: 0 },
     }),
   } as unknown as HttpRuntimeClient;
-  const options: TeamLiveTuiOptions = {
+  const options: RuntimeTuiOptions = {
     baseUrl: "http://chili.test",
     cwd: "/workspace",
     sessionId: sessionA,
-    runLoop: false,
-    once: false,
   };
   let runtime: ChatRuntimeState | undefined;
   let app!: Awaited<ReturnType<typeof testRender>>;
@@ -135,33 +131,30 @@ test("a late model-config response from the previous session cannot overwrite th
   }
 });
 
-test("team run-loop and merge use the resumed session authority instead of startup options", async () => {
-  const sessionA = "session_team_resume_a" as SessionId;
-  const sessionB = "session_team_resume_b" as SessionId;
-  const teamId = "team_resume_authority" as TeamId;
-  const taskId = "task_resume_authority" as TaskId;
+test("agent controls use the resumed session authority instead of startup options", async () => {
+  const sessionA = "session_agent_resume_a" as SessionId;
+  const sessionB = "session_agent_resume_b" as SessionId;
+  const agentId = "session_child";
   const sessions = [
     sessionSummary(sessionA, "/workspace/a"),
     sessionSummary(sessionB, "/workspace/b"),
   ];
-  const runRequests: Array<Record<string, unknown>> = [];
-  const mergeRequests: Array<Record<string, unknown>> = [];
+  const stopRequests: Array<Record<string, unknown>> = [];
+  const resumeRequests: Array<Record<string, unknown>> = [];
   const client = chatRuntimeClient(sessions, {
-    runTeamLoop: async (request: Record<string, unknown>) => {
-      runRequests.push(request);
+    stopAgent: async (request: Record<string, unknown>) => {
+      stopRequests.push(request);
       return {};
     },
-    mergeTeamTasks: async (request: Record<string, unknown>) => {
-      mergeRequests.push(request);
+    resumeAgent: async (request: Record<string, unknown>) => {
+      resumeRequests.push(request);
       return {};
     },
   });
-  const options: TeamLiveTuiOptions = {
+  const options: RuntimeTuiOptions = {
     baseUrl: "http://chili.test",
     cwd: "/workspace/startup",
     sessionId: sessionA,
-    runLoop: false,
-    once: false,
   };
   let runtime: ChatRuntimeState | undefined;
   let app!: Awaited<ReturnType<typeof testRender>>;
@@ -184,14 +177,14 @@ test("team run-loop and merge use the resumed session authority instead of start
     await waitForRuntime(app, () => runtime?.activeSessionId === sessionB && runtime.chatView.cwd === "/workspace/b");
 
     await act(async () => {
-      runtime!.executeAction({ type: "run_loop", teamId, enabled: true });
-      runtime!.executeAction({ type: "merge", teamId, taskId, enabled: true });
+      await runtime!.stopAgent(agentId);
+      await runtime!.resumeAgent(agentId);
       await Bun.sleep(5);
       await app.renderOnce();
     });
 
-    expect(runRequests[0]).toMatchObject({ teamId, sessionId: sessionB, cwd: "/workspace/b" });
-    expect(mergeRequests[0]).toMatchObject({ teamId, taskId, sessionId: sessionB, cwd: "/workspace/b" });
+    expect(stopRequests[0]).toMatchObject({ agentId, sessionId: sessionB });
+    expect(resumeRequests[0]).toMatchObject({ agentId, sessionId: sessionB });
   } finally {
     act(() => app.renderer.destroy());
   }
@@ -209,12 +202,10 @@ test("resume aborts an in-flight submit and ignores its late acceptance", async 
       return submit.promise;
     },
   });
-  const options: TeamLiveTuiOptions = {
+  const options: RuntimeTuiOptions = {
     baseUrl: "http://chili.test",
     cwd: "/workspace",
     sessionId: sessionA,
-    runLoop: false,
-    once: false,
   };
   let runtime: ChatRuntimeState | undefined;
   let app!: Awaited<ReturnType<typeof testRender>>;
@@ -287,12 +278,10 @@ test("resume aborts model, reasoning, and service-tier mutations and ignores lat
       return tierUpdate.promise;
     },
   });
-  const options: TeamLiveTuiOptions = {
+  const options: RuntimeTuiOptions = {
     baseUrl: "http://chili.test",
     cwd: "/workspace",
     sessionId: sessionA,
-    runLoop: false,
-    once: false,
   };
   let runtime: ChatRuntimeState | undefined;
   let app!: Awaited<ReturnType<typeof testRender>>;
@@ -381,12 +370,10 @@ test("MCP status follows the selected session and ignores a late prior-workspace
       return mcpStatusResponse();
     },
   } as unknown as HttpRuntimeClient;
-  const options: TeamLiveTuiOptions = {
+  const options: RuntimeTuiOptions = {
     baseUrl: "http://chili.test",
     cwd: "/workspace",
     sessionId: sessionA,
-    runLoop: false,
-    once: false,
   };
   let runtime: ChatRuntimeState | undefined;
   let app!: Awaited<ReturnType<typeof testRender>>;
@@ -467,12 +454,10 @@ test("all late MCP operations return undefined and cannot refresh the next sessi
     authMcpServer: async () => auth.promise,
     logoutMcpServer: async () => logout.promise,
   } as unknown as HttpRuntimeClient;
-  const options: TeamLiveTuiOptions = {
+  const options: RuntimeTuiOptions = {
     baseUrl: "http://chili.test",
     cwd: "/workspace",
     sessionId: sessionA,
-    runLoop: false,
-    once: false,
   };
   let runtime: ChatRuntimeState | undefined;
   let app!: Awaited<ReturnType<typeof testRender>>;
@@ -557,11 +542,9 @@ test("renaming an empty chat creates its session before saving the title", async
       };
     },
   });
-  const options: TeamLiveTuiOptions = {
+  const options: RuntimeTuiOptions = {
     baseUrl: "http://chili.test",
     cwd: "/workspace",
-    runLoop: false,
-    once: false,
   };
   let runtime: ChatRuntimeState | undefined;
   let app!: Awaited<ReturnType<typeof testRender>>;
@@ -626,12 +609,10 @@ test("a failed command-catalog load for the resumed session cannot retain a late
       summary: { total: 0, running: 0, disabled: 0, authRequired: 0, errored: 0 },
     }),
   } as unknown as HttpRuntimeClient;
-  const options: TeamLiveTuiOptions = {
+  const options: RuntimeTuiOptions = {
     baseUrl: "http://chili.test",
     cwd: "/workspace",
     sessionId: sessionA,
-    runLoop: false,
-    once: false,
   };
   let runtime: ChatRuntimeState | undefined;
   let app!: Awaited<ReturnType<typeof testRender>>;
@@ -675,7 +656,7 @@ test("a failed command-catalog load for the resumed session cannot retain a late
 
 function ChatRuntimeProbe(props: {
   client: HttpRuntimeClient;
-  options: TeamLiveTuiOptions;
+  options: RuntimeTuiOptions;
   onRuntime: (runtime: ChatRuntimeState) => void;
 }) {
   const runtime = useChatRuntime({ client: props.client, options: props.options });

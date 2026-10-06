@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { RuntimeService } from "@chili/core";
-import type { SessionId, TaskId } from "@chili/protocol";
-import type { EventStore, SubagentProjectionStore, TeamProjectionStore } from "@chili/store";
+import type { SessionId } from "@chili/protocol";
+import type { EventStore } from "@chili/store";
 import { resolveSession } from "./session.js";
 
 test("CLI resume accepts only an existing active interactive session without creating events", async () => {
@@ -34,28 +34,18 @@ test("CLI resume accepts only an existing active interactive session without cre
           createdAt: 1,
           updatedAt: 1,
         },
+        {
+          id: childSessionId,
+          cwd: "/repo",
+          source: "subagent" as const,
+          status: "active" as const,
+          createdAt: 1,
+          updatedAt: 1,
+        },
       ];
     },
-    async agentTasks(query: { childSessionId?: SessionId }) {
-      return query.childSessionId === childSessionId
-        ? [{
-            id: "task_resume_child" as TaskId,
-            childSessionId,
-          }]
-        : [];
-    },
-    async agentRuns() {
-      return [];
-    },
-    async teamMembers() {
-      return [];
-    },
-    async teams() {
-      return [];
-    },
   } as unknown as Pick<EventStore, "sessions">
-    & Pick<SubagentProjectionStore, "agentTasks" | "agentRuns">
-    & Pick<TeamProjectionStore, "teamMembers" | "teams">;
+;
   const input = { service, store, cwd: "/repo" };
 
   await expect(resolveSession({
@@ -65,7 +55,7 @@ test("CLI resume accepts only an existing active interactive session without cre
   await expect(resolveSession({
     ...input,
     resume: childSessionId,
-  })).rejects.toThrow("belongs to a subagent");
+  })).rejects.toThrow("belongs to an agent");
   await expect(resolveSession({
     ...input,
     resume: archivedSessionId,

@@ -50,6 +50,9 @@ export interface ControlTransport {
   reloadMcp(sessionId?: string): Promise<DesktopResponseMap["mcp.reload"]>;
   send(sessionId: string, text: string, mode: SendMode): Promise<DesktopResponseMap["session.send"]>;
   stop(sessionId: string): Promise<DesktopResponseMap["session.stop"]>;
+  sendAgent(sessionId: string, agentId: string, text: string, mode?: SendMode): Promise<DesktopResponseMap["agent.send"]>;
+  stopAgent(sessionId: string, agentId: string): Promise<DesktopResponseMap["agent.stop"]>;
+  resumeAgent(sessionId: string, agentId: string): Promise<DesktopResponseMap["agent.resume"]>;
   resolveApproval(
     approvalId: string,
     decision: "allow_once" | "allow_session" | "allow_always" | "deny",

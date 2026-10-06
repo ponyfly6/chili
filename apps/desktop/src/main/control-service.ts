@@ -2,11 +2,7 @@ import { normalizeSessionTitle, type ChiliEvent, type RuntimeInputQueue, type Se
 import { resolve } from "node:path";
 import { reduceRuntimeEvents, ReplayableRuntimeEventWindowAccumulator, RuntimeHttpError } from "@chili/sdk";
 import type {
-  RuntimeAgentMailboxRecord,
-  RuntimeAgentRunRecord,
-  RuntimeAgentTaskRecord,
-  RuntimeAgentTreeNode,
-  RuntimeAgentTreeSnapshot,
+  RuntimeAgentRecord,
   RuntimeClient,
   RuntimePendingApprovalRequest,
   RuntimeSessionSummary,
@@ -190,7 +186,7 @@ export class DesktopControlService {
   /**
    * Every remote operation resolves membership using the original workspace lease.
    * Sends and stops use the local window's service actors and the runtime queue.
-   * Snapshot reads never enter those actors or fetch subagent session contents.
+   * Snapshot reads never enter those actors or fetch child Agent session contents.
    */
   async invokeRemoteControl<Request extends DesktopRemoteControlRequest>(
     request: Request,
@@ -230,7 +226,7 @@ export class DesktopControlService {
     const sessions = await boundedControlRead(lease, (signal) => lease.client.listSessions({ signal }));
     this.assertRemoteControlScope(scope);
     this.assertClientLease(lease);
-    return sessions.filter((session) => session.source !== "subagent" && resolve(session.cwd) === resolve(scope.workspace));
+    return sessions.filter((session) => !isChildAgentSession(session) && resolve(session.cwd) === resolve(scope.workspace));
   }
 
   private async invokeRemoteMutation(
@@ -395,7 +391,7 @@ export class DesktopControlService {
     this.hydratedGeneration = sidecarGeneration;
     void boundedControlRead(lease, (signal) => lease.client.listSessions({ signal })).then(async (sessions) => {
       for (const session of sessions) {
-        if (session.source === "subagent" || session.status !== "active") continue;
+        if (isChildAgentSession(session) || session.status !== "active") continue;
         const queue = await boundedControlRead(lease, (signal) => lease.client.inputQueue({ sessionId: session.id, signal }));
         this.assertClientLease(lease);
         this.observeInputQueue(queue);
@@ -432,8 +428,7 @@ export class DesktopControlService {
       return {
         sessionId: request.sessionId,
         events: [],
-        agentTree: { nodes: [], agents: [], tasks: [], mailbox: [] },
-        tasks: [],
+        agents: [],
         pendingApprovals: [],
         pendingInputs: [],
         truncated: true,
@@ -465,7 +460,7 @@ export class DesktopControlService {
       this.assertClientLease(lease);
       const query = request.query?.trim().toLowerCase();
       return sessions.filter((session) => {
-        if (session.source === "subagent") return false;
+        if (isChildAgentSession(session)) return false;
         if (request.status && request.status !== "all" && session.status !== request.status) return false;
         if (!query) return true;
         return [String(session.id), session.title, session.preview, session.cwd]
@@ -484,6 +479,20 @@ export class DesktopControlService {
     if (request.type === "session.snapshot") {
       return this.sessionSnapshot(request.sessionId as SessionId, this.captureClientLease());
     }
+    if (request.type === "agent.send" || request.type === "agent.stop" || request.type === "agent.resume") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.agentId, async () => {
+        this.assertClientLease(lease);
+        const target = { sessionId: request.sessionId as SessionId, agentId: request.agentId, signal: lease.signal };
+        const result = request.type === "agent.send"
+          ? await lease.client.sendAgent({ ...target, text: request.text, ...(request.mode === undefined ? {} : { mode: request.mode }) })
+          : request.type === "agent.stop"
+            ? await lease.client.stopAgent(target)
+            : await lease.client.resumeAgent(target);
+        this.assertClientLease(lease);
+        return result;
+      });
+    }
     if (request.type === "session.resume") {
       const lease = this.captureClientLease();
       return this.withSessionActor(request.sessionId, async () => {
@@ -491,7 +500,7 @@ export class DesktopControlService {
         this.assertClientLease(lease);
         const session = sessions.find((candidate) => String(candidate.id) === request.sessionId);
         if (!session) throw new Error(`Saved task not found: ${request.sessionId}`);
-        if (session.source === "subagent") throw new Error("Subagent tasks cannot be resumed directly");
+        if (isChildAgentSession(session)) throw new Error("Use Agent controls to resume a child Agent");
         if (session.status !== "active") throw new Error("Archived tasks cannot be resumed");
         const sessionId = request.sessionId as SessionId;
         const goal = await lease.client.getGoal({ sessionId, signal: lease.signal });
@@ -917,8 +926,7 @@ export class DesktopControlService {
   private async sessionSnapshot(sessionId: SessionId, lease: ClientLease): Promise<{
     sessionId: string;
     events: ChiliEvent[];
-    agentTree: RuntimeAgentTreeSnapshot;
-    tasks: RuntimeAgentTaskRecord[];
+    agents: RuntimeAgentRecord[];
     pendingApprovals: RuntimePendingApprovalRequest[];
     pendingInputs: SessionControlSnapshot["inputs"];
     truncated?: boolean;
@@ -933,8 +941,7 @@ export class DesktopControlService {
     const sessionOrder = new Map<string, number>([[sessionId, 0]]);
     let nextSessionOrder = 1;
     const limiter = createAsyncLimiter(SNAPSHOT_FETCH_CONCURRENCY);
-    const retainedAgentTrees: RuntimeAgentTreeSnapshot[] = [];
-    const tasks = new BoundedUniqueRows<RuntimeAgentTaskRecord>(SNAPSHOT_TASK_LIMIT, SNAPSHOT_TASK_BYTES);
+    const agents = new BoundedUniqueRows<RuntimeAgentRecord>(SNAPSHOT_AGENT_LIMIT, SNAPSHOT_AGENT_BYTES);
     const inputs = new BoundedUniqueRows<SessionControlSnapshot["inputs"][number]>(
       SNAPSHOT_INPUT_LIMIT,
       SNAPSHOT_INPUT_BYTES,
@@ -944,8 +951,6 @@ export class DesktopControlService {
       SNAPSHOT_APPROVAL_BYTES,
     );
     const warnings = new Set<string>();
-    let agentTreeRows = 0;
-    let agentTreeBytes = 0;
     const events = new ReplayableRuntimeEventWindowAccumulator({
       maxEvents: SNAPSHOT_EVENT_LIMIT,
       maxBytes: SNAPSHOT_EVENT_BYTES,
@@ -955,7 +960,7 @@ export class DesktopControlService {
     while (pendingSessionIds.length > 0) {
       const batch = pendingSessionIds.splice(0, SNAPSHOT_SESSION_BATCH);
       const snapshots = await Promise.all(batch.map(async (candidate): Promise<SessionControlSnapshot> => {
-        const [eventWindow, agentTree, sessionTasks, pendingInputs] = await Promise.all([
+        const [eventWindow, sessionAgents, pendingInputs] = await Promise.all([
           limiter(async () => {
             if (lease.client.sessionEventWindow) {
               return lease.client.sessionEventWindow({
@@ -986,12 +991,17 @@ export class DesktopControlService {
               approvalsTruncated: approvalWindow.truncated,
             };
           }),
-          limiter(() => lease.client.agentTree({
-            sessionId: candidate,
-            includeConsumedMailbox: false,
-            limit: 2_000,
-          })),
-          limiter(() => lease.client.listTasks({ parentSessionId: candidate, limit: 2_000 })),
+          candidate === sessionId ? limiter(async () => {
+            try {
+              // The root's authorized listing already includes the entire hierarchy.
+              return await lease.client.listAgents({ sessionId, signal: lease.signal });
+            } catch (error) {
+              if (!(error instanceof RuntimeHttpError) || error.status !== 403) throw error;
+              // Archived roots retain readable history, but have no active Agent controls.
+              warnings.add("Agent controls are unavailable for this session");
+              return [];
+            }
+          }) : Promise.resolve([]),
           limiter(() => lease.client.listUserInputs({ sessionId: candidate, signal: lease.signal })),
         ]);
         return {
@@ -1001,8 +1011,7 @@ export class DesktopControlService {
           eventsTruncated: eventWindow.truncated,
           pendingApprovals: eventWindow.pendingApprovals,
           approvalsTruncated: "approvalsTruncated" in eventWindow && eventWindow.approvalsTruncated === true,
-          agentTree,
-          tasks: sessionTasks,
+          agents: sessionAgents,
           inputs: pendingInputs,
         };
       }));
@@ -1028,19 +1037,7 @@ export class DesktopControlService {
           pinnedEventIds: snapshot.eventPinnedIds,
         });
         if (snapshot.eventsTruncated) warnings.add("timeline events exceeded their desktop snapshot budget");
-        const treeRows = agentTreeRowCount(snapshot.agentTree);
-        const treeBytes = jsonByteLength(snapshot.agentTree);
-        if (
-          treeRows > SNAPSHOT_AGENT_TREE_ROWS - agentTreeRows
-          || treeBytes > SNAPSHOT_AGENT_TREE_BYTES - agentTreeBytes
-        ) {
-          warnings.add("agent tree exceeded its desktop snapshot budget");
-        } else {
-          retainedAgentTrees.push(snapshot.agentTree);
-          agentTreeRows += treeRows;
-          agentTreeBytes += treeBytes;
-        }
-        if (tasks.add(snapshot.tasks)) warnings.add("task rows exceeded their desktop snapshot budget");
+        if (agents.add(snapshot.agents)) warnings.add("Agent rows exceeded their desktop snapshot budget");
         if (approvals.add(snapshot.pendingApprovals)) {
           warnings.add("pending approvals exceeded their desktop snapshot budget");
         }
@@ -1061,8 +1058,7 @@ export class DesktopControlService {
       sessionId: String(sessionId),
       events: retainedEvents.events,
       inputQueue,
-      agentTree: mergeAgentTrees(retainedAgentTrees),
-      tasks: tasks.values(),
+      agents: agents.values(),
       pendingApprovals: approvals.values()
         .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id)),
       pendingInputs: inputs.values()
@@ -1346,14 +1342,17 @@ const SNAPSHOT_FETCH_CONCURRENCY = 6;
 const SNAPSHOT_SESSION_BATCH = 6;
 const SNAPSHOT_EVENT_LIMIT = 20_000;
 const SNAPSHOT_EVENT_BYTES = 4_000_000;
-const SNAPSHOT_AGENT_TREE_ROWS = 5_000;
-const SNAPSHOT_AGENT_TREE_BYTES = 2_000_000;
-const SNAPSHOT_TASK_LIMIT = 2_000;
-const SNAPSHOT_TASK_BYTES = 1_000_000;
+const SNAPSHOT_AGENT_LIMIT = 2_000;
+const SNAPSHOT_AGENT_BYTES = 2_000_000;
 const SNAPSHOT_APPROVAL_LIMIT = 2_000;
 const SNAPSHOT_APPROVAL_BYTES = 1_000_000;
 const SNAPSHOT_INPUT_LIMIT = 2_000;
 const SNAPSHOT_INPUT_BYTES = 1_000_000;
+
+/** Historical source labels only prevent old child sessions entering root controls. */
+function isChildAgentSession(session: RuntimeSessionSummary): boolean {
+  return session.agent !== undefined || session.source === "subagent";
+}
 
 interface SessionControlSnapshot {
   sessionId: SessionId;
@@ -1362,23 +1361,15 @@ interface SessionControlSnapshot {
   eventsTruncated: boolean;
   pendingApprovals: RuntimePendingApprovalRequest[];
   approvalsTruncated: boolean;
-  agentTree: RuntimeAgentTreeSnapshot;
-  tasks: RuntimeAgentTaskRecord[];
+  agents: RuntimeAgentRecord[];
   inputs: Awaited<ReturnType<import("@chili/sdk").RuntimeClient["listUserInputs"]>>;
 }
 
 function descendantSessionIds(snapshot: SessionControlSnapshot): Set<string> {
-  const sessionIds = new Set<string>();
-  for (const agent of snapshot.agentTree.agents) {
-    if (agent.childSessionId && agent.childSessionId !== snapshot.sessionId) sessionIds.add(agent.childSessionId);
-  }
-  for (const task of [...snapshot.agentTree.tasks, ...snapshot.tasks]) {
-    if (task.childSessionId && task.childSessionId !== snapshot.sessionId) sessionIds.add(task.childSessionId);
-  }
-  return sessionIds;
+  return new Set(snapshot.agents.map((agent) => agent.agentId).filter((agentId) => agentId !== snapshot.sessionId));
 }
 
-class BoundedUniqueRows<T extends { id: string }> {
+class BoundedUniqueRows<T extends { id: string } | { agentId: string }> {
   private readonly rows = new Map<string, { value: T; bytes: number }>();
   private bytes = 2;
 
@@ -1391,14 +1382,15 @@ class BoundedUniqueRows<T extends { id: string }> {
     let truncated = false;
     for (const value of values) {
       const rowBytes = jsonByteLength(value);
-      const existing = this.rows.get(value.id);
+      const id = "agentId" in value ? value.agentId : value.id;
+      const existing = this.rows.get(id);
       const separatorBytes = !existing && this.rows.size > 0 ? 1 : 0;
       const nextBytes = this.bytes - (existing?.bytes ?? 0) + rowBytes + separatorBytes;
       if ((!existing && this.rows.size >= this.maxRows) || nextBytes > this.maxBytes) {
         truncated = true;
         continue;
       }
-      this.rows.set(value.id, { value, bytes: rowBytes });
+      this.rows.set(id, { value, bytes: rowBytes });
       this.bytes = nextBytes;
     }
     return truncated;
@@ -1407,18 +1399,6 @@ class BoundedUniqueRows<T extends { id: string }> {
   values(): T[] {
     return [...this.rows.values()].map((row) => row.value);
   }
-}
-
-function agentTreeRowCount(tree: RuntimeAgentTreeSnapshot): number {
-  let nodes = 0;
-  const pending = [...tree.nodes];
-  while (pending.length > 0) {
-    const node = pending.pop();
-    if (!node) continue;
-    nodes += 1;
-    pending.push(...node.children);
-  }
-  return nodes + tree.agents.length + tree.tasks.length + tree.mailbox.length;
 }
 
 function jsonByteLength(value: unknown): number {
@@ -1454,61 +1434,4 @@ function createAsyncLimiter(maxConcurrency: number): AsyncLimiter {
     });
     advance();
   });
-}
-
-function mergeAgentTrees(snapshots: RuntimeAgentTreeSnapshot[]): RuntimeAgentTreeSnapshot {
-  const agents = uniqueById(snapshots.flatMap((snapshot) => snapshot.agents));
-  const tasks = uniqueById(snapshots.flatMap((snapshot) => snapshot.tasks));
-  const mailbox = uniqueById(snapshots.flatMap((snapshot) => snapshot.mailbox));
-  const nodeVersions = new Map<string, RuntimeAgentTreeNode[]>();
-  for (const snapshot of snapshots) {
-    visitAgentTreeNodes(snapshot.nodes, (node) => {
-      const versions = nodeVersions.get(node.path) ?? [];
-      versions.push(node);
-      nodeVersions.set(node.path, versions);
-    });
-  }
-
-  const nodes = new Map<string, RuntimeAgentTreeNode>();
-  for (const [path, versions] of nodeVersions) {
-    const newest = [...versions].sort((left, right) => right.updatedAt - left.updatedAt)[0];
-    if (!newest) continue;
-    const nodeAgents = agents.filter((agent) => agent.path === path);
-    nodes.set(path, {
-      path: newest.path,
-      ...(newest.parentPath ? { parentPath: newest.parentPath } : {}),
-      taskName: newest.taskName,
-      status: newest.status,
-      runIds: nodeAgents.map((agent) => agent.id),
-      runs: nodeAgents,
-      tasks: tasks.filter((task) => task.path === path),
-      mailbox: mailbox.filter((message) => message.path === path),
-      children: [],
-      createdAt: Math.min(...versions.map((node) => node.createdAt)),
-      updatedAt: Math.max(...versions.map((node) => node.updatedAt)),
-    });
-  }
-  const roots: RuntimeAgentTreeNode[] = [];
-  for (const node of nodes.values()) {
-    const parent = node.parentPath ? nodes.get(node.parentPath) : undefined;
-    if (parent) parent.children.push(node);
-    else roots.push(node);
-  }
-  const sortNodes = (items: RuntimeAgentTreeNode[]): RuntimeAgentTreeNode[] => {
-    items.sort((left, right) => left.createdAt - right.createdAt || left.path.localeCompare(right.path));
-    for (const item of items) sortNodes(item.children);
-    return items;
-  };
-  return { nodes: sortNodes(roots), agents, tasks, mailbox };
-}
-
-function visitAgentTreeNodes(nodes: RuntimeAgentTreeNode[], visit: (node: RuntimeAgentTreeNode) => void): void {
-  for (const node of nodes) {
-    visit(node);
-    visitAgentTreeNodes(node.children, visit);
-  }
-}
-
-function uniqueById<T extends RuntimeAgentRunRecord | RuntimeAgentTaskRecord | RuntimeAgentMailboxRecord>(items: T[]): T[] {
-  return [...new Map(items.map((item) => [item.id, item])).values()];
 }

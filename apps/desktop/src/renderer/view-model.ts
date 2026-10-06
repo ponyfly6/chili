@@ -582,11 +582,12 @@ export function visibleToolLiveOutput(
 export function runtimeEventRelated(snapshot: RuntimeSnapshot, event: ChiliEvent): boolean {
   if (!event.sessionId) return false;
   if (event.sessionId === snapshot.sessionId) return true;
-  for (const agent of snapshot.agentTree.agents) {
-    if (agent.sessionId === event.sessionId || agent.childSessionId === event.sessionId) return true;
+  if (event.type === "session.created" && event.payload.agent) {
+    const parentId = event.payload.agent.parentSessionId;
+    if (parentId === snapshot.sessionId || snapshot.agents.some((agent) => agent.agentId === parentId)) return true;
   }
-  for (const task of [...snapshot.agentTree.tasks, ...snapshot.tasks]) {
-    if (task.childSessionId === event.sessionId) return true;
+  for (const agent of snapshot.agents) {
+    if (agent.agentId === event.sessionId) return true;
   }
   return false;
 }
@@ -771,8 +772,6 @@ function cloneProjectionSession(next: ChiliRuntimeView, source: ChiliRuntimeView
     messageIds: [...session.messageIds],
     toolCallIds: [...session.toolCallIds],
     approvalIds: [...session.approvalIds],
-    agentRunIds: [...session.agentRunIds],
-    taskIds: [...session.taskIds],
   };
 }
 

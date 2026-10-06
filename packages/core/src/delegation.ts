@@ -5,12 +5,9 @@ import type {
   RuntimeDelegationConfig,
   SessionId,
 } from "@chili/protocol";
-import type { EventStore, SubagentProjectionStore, TeamProjectionStore } from "@chili/store";
+import type { EventStore } from "@chili/store";
 
 const MAX_DELEGATION_PARENT_DEPTH = 64;
-const DELEGATION_PARENT_QUERY_LIMIT = 2;
-const DELEGATION_RUN_QUERY_LIMIT = 10_001;
-const DELEGATION_TEAM_MEMBERSHIP_LIMIT = 10_000;
 
 export interface ResolveDelegationConfigInput {
   sessionId: SessionId;
@@ -20,9 +17,7 @@ export interface ResolveDelegationConfigInput {
 }
 
 export interface DelegationPolicyGateOptions {
-  store: SubagentProjectionStore
-    & Partial<TeamProjectionStore>
-    & Partial<Pick<EventStore, "sessions">>;
+  store: Pick<EventStore, "sessions">;
   getDelegationConfig(sessionId: SessionId): Promise<RuntimeDelegationConfig>;
 }
 
@@ -119,83 +114,7 @@ export class DelegationPolicyGate {
   }
 
   private async parentSessionId(sessionId: SessionId): Promise<SessionId | undefined> {
-    const [queriedTasks, queriedRuns] = await Promise.all([
-      this.options.store.agentTasks({
-        childSessionId: sessionId,
-        limit: DELEGATION_PARENT_QUERY_LIMIT,
-      }),
-      this.options.store.agentRuns?.({
-        childSessionId: sessionId,
-        limit: DELEGATION_RUN_QUERY_LIMIT,
-      }) ?? [],
-    ]);
-    const tasks = queriedTasks.filter((candidate) => candidate.childSessionId === sessionId);
-    if (tasks.length > 1) {
-      throw new Error(`Ambiguous delegation ancestry for agent task session ${sessionId}`);
-    }
-    const taskParentSessionId = tasks[0]?.parentSessionId;
-    if (taskParentSessionId === sessionId) {
-      throw new Error(`Cyclic delegation ancestry for agent task session ${sessionId}`);
-    }
-
-    const runs = queriedRuns.filter((candidate) => candidate.childSessionId === sessionId);
-    if (runs.length >= DELEGATION_RUN_QUERY_LIMIT) {
-      throw new Error(`Delegation agent run ancestry exceeds ${DELEGATION_RUN_QUERY_LIMIT - 1} rows for ${sessionId}`);
-    }
-    const runParentSessionIds = [...new Set(runs.flatMap((run) => (
-      run.parentSessionId ? [run.parentSessionId] : []
-    )))];
-    if (runParentSessionIds.includes(sessionId)) {
-      throw new Error(`Cyclic delegation ancestry for agent run session ${sessionId}`);
-    }
-    if (runParentSessionIds.length > 1) {
-      throw new Error(`Ambiguous delegation ancestry for agent run session ${sessionId}`);
-    }
-
-    const teamMembers = this.options.store.teamMembers;
-    const teams = this.options.store.teams;
-    let teamParentSessionIds: SessionId[] = [];
-    if (teamMembers && teams) {
-      const matchingMembers = (await teamMembers.call(this.options.store, {
-        childSessionId: sessionId,
-        limit: DELEGATION_TEAM_MEMBERSHIP_LIMIT,
-      })).filter((candidate) => candidate.childSessionId === sessionId);
-      if (matchingMembers.length >= DELEGATION_TEAM_MEMBERSHIP_LIMIT) {
-        throw new Error(`Delegation team ancestry exceeds ${DELEGATION_TEAM_MEMBERSHIP_LIMIT - 1} memberships for ${sessionId}`);
-      }
-      const memberships = await Promise.all(matchingMembers.map(async (member) => ({
-        member,
-        team: (await teams.call(this.options.store, { teamId: member.teamId, limit: 1 }))[0],
-      })));
-      const parents: SessionId[] = [];
-      for (const { member, team } of memberships) {
-        if (!team) {
-          throw new Error(`Delegation team not found: ${member.teamId} (child ${sessionId})`);
-        }
-        if (member.path === team.leadPath) continue;
-        if (!team.sessionId) {
-          throw new Error(`Delegation team session not found: ${team.id} (child ${sessionId})`);
-        }
-        if (team.sessionId === sessionId) {
-          throw new Error(`Cyclic delegation ancestry for team member session ${sessionId}`);
-        }
-        parents.push(team.sessionId);
-      }
-      teamParentSessionIds = [...new Set(parents)];
-    }
-    if (teamParentSessionIds.length > 1) {
-      throw new Error(`Ambiguous delegation ancestry for team member session ${sessionId}`);
-    }
-
-    const parentSessionIds = [...new Set([
-      ...(taskParentSessionId ? [taskParentSessionId] : []),
-      ...runParentSessionIds,
-      ...teamParentSessionIds,
-    ])];
-    if (parentSessionIds.length > 1) {
-      throw new Error(`Conflicting delegation ancestry for session ${sessionId}`);
-    }
-    return parentSessionIds[0];
+    return (await this.options.store.sessions()).find((session) => session.id === sessionId)?.agent?.parentSessionId;
   }
 }
 
@@ -207,7 +126,7 @@ export function resolveDelegationConfig(input: ResolveDelegationConfigInput): Ru
   if (input.defaultPolicy) {
     return delegationConfig(input.sessionId, input.defaultPolicy, "default");
   }
-  return delegationConfig(input.sessionId, "explicit", "default");
+  return delegationConfig(input.sessionId, "proactive", "default");
 }
 
 function delegationConfig(

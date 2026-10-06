@@ -48,7 +48,7 @@ test("delegation_set validates policy and documents one-turn versus ongoing inte
   expect(setTool.alwaysLoad).toBe(true);
   expect(setTool.description).toContain("开启代理");
   expect(setTool.description).toContain("以后主动委派");
-  expect(setTool.description).toContain("本次开多个 sub");
+  expect(setTool.description).toContain("several agents for the current task");
   expect(setTool.description).toContain("leave policy unchanged");
 
   const invalid = await createExecutor(controller).execute(toolInput("delegation_set", { policy: "sometimes" }));

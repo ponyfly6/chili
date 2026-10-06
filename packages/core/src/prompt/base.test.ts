@@ -41,23 +41,19 @@ test("delegationPolicyPromptFragment keeps explicit delegation bounded and integ
   });
   const content = delegationPolicyPromptFragment("explicit").content;
   expect(content).toContain("only when the user explicitly asks");
-  expect(content).toContain("completionPolicy=supervised");
-  expect(content).toContain("agent_spawn with tasks");
-  expect(content).toContain("agent_wait(waitFor=any)");
-  expect(content).toContain("agent_wait(waitFor=all)");
+  expect(content).toContain("inputId");
+  expect(content).not.toContain("completionPolicy");
+  expect(content).not.toContain("team_");
   expect(content).toContain("agent_resume");
   expect(content).toContain("agent_send");
   expect(content).toContain("agent_list");
   expect(content).toContain("agent_stop");
   expect(content).not.toContain("task_batch");
   expect(content).not.toContain("task_followup");
-  expect(content).toContain("verify material claims");
-  expect(content).toContain("substantive integrated result");
-  expect(content).toContain("team_run_loop");
 });
 
 test("delegationPolicyPromptFragment distinguishes off and proactive policies", () => {
-  expect(delegationPolicyPromptFragment("off").content).toContain("Do not spawn");
+  expect(delegationPolicyPromptFragment("off").content).toContain("Do not create Agents");
   expect(delegationPolicyPromptFragment("off").content).toContain("already running");
   expect(delegationPolicyPromptFragment("proactive").content).toContain("Proactively delegate");
 });

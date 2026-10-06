@@ -238,7 +238,7 @@ export class DesktopProjectManager {
   private updateTasks(id: string, sessions: RuntimeSessionSummary[]): void {
     const entry = this.entries.get(id);
     if (!entry || this.closing) return;
-    const tasks = sessions.filter((session) => session.source !== "subagent")
+    const tasks = sessions.filter((session) => !session.agent && session.source !== "subagent")
       .sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 8)
       .map((session) => ({ id: String(session.id), title: (session.title || session.preview || "Untitled task").slice(0, 160),
         status: session.status, updatedAt: session.updatedAt }));

@@ -11,19 +11,16 @@ import type {
   MessageId,
   PartId,
   SessionId,
-  TaskId,
-  TeamId,
   TimestampMs,
   ToolCallId,
 } from "@chili/protocol";
 import {
-  useTeamLiveRuntime,
-  type TeamLiveActionAuthority,
-  type TeamLiveRuntimeState,
-  type TeamLiveTuiOptions,
-} from "./useTeamLiveRuntime.js";
+  useRuntimeEvents,
+  type RuntimeEventsState,
+  type RuntimeTuiOptions,
+} from "./useRuntimeEvents.js";
 
-test("Team Live clears a rejected cursor and projection before reconnecting", async () => {
+test("Runtime stream clears a rejected cursor and projection before reconnecting", async () => {
   const requests: StreamEventsRequest[] = [];
   const sharedEventId = "event_replayed_after_resync";
   const oldEvent = sessionCreatedEvent(sharedEventId, "session_old", 1);
@@ -43,16 +40,14 @@ test("Team Live clears a rejected cursor and projection before reconnecting", as
       await waitForAbort(input.signal);
     },
   } as unknown as HttpRuntimeClient;
-  const options: TeamLiveTuiOptions = {
+  const options: RuntimeTuiOptions = {
     baseUrl: "http://chili.test",
-    runLoop: false,
-    once: false,
   };
-  let runtime: TeamLiveRuntimeState | undefined;
+  let runtime: RuntimeEventsState | undefined;
   let app!: Awaited<ReturnType<typeof testRender>>;
   await act(async () => {
     app = await testRender(
-      <TeamLiveRuntimeProbe client={client} options={options} onRuntime={(value) => { runtime = value; }} />,
+      <RuntimeEventsProbe client={client} options={options} onRuntime={(value) => { runtime = value; }} />,
       { width: 80, height: 4, exitOnCtrlC: false },
     );
   });
@@ -81,7 +76,7 @@ test("Team Live clears a rejected cursor and projection before reconnecting", as
   }
 });
 
-test("Team Live applies durable events once across the stream and hydration", async () => {
+test("Runtime stream applies durable events once across the stream and hydration", async () => {
   const events = transcriptDeltaEvents();
   const client = {
     streamEvents: async function* (input: StreamEventsRequest = {}) {
@@ -89,16 +84,14 @@ test("Team Live applies durable events once across the stream and hydration", as
       await waitForAbort(input.signal);
     },
   } as unknown as HttpRuntimeClient;
-  const options: TeamLiveTuiOptions = {
+  const options: RuntimeTuiOptions = {
     baseUrl: "http://chili.test",
-    runLoop: false,
-    once: false,
   };
-  let runtime: TeamLiveRuntimeState | undefined;
+  let runtime: RuntimeEventsState | undefined;
   let app!: Awaited<ReturnType<typeof testRender>>;
   await act(async () => {
     app = await testRender(
-      <TeamLiveRuntimeProbe client={client} options={options} onRuntime={(value) => { runtime = value; }} />,
+      <RuntimeEventsProbe client={client} options={options} onRuntime={(value) => { runtime = value; }} />,
       { width: 120, height: 4, exitOnCtrlC: false },
     );
   });
@@ -118,7 +111,7 @@ test("Team Live applies durable events once across the stream and hydration", as
   }
 });
 
-test("Team Live continues applying transient events that reuse an event id", async () => {
+test("Runtime stream continues applying transient events that reuse an event id", async () => {
   const event = toolOutputDeltaEvent("event_transient_output", "toolcall_transient", "chunk");
   const client = {
     streamEvents: async function* (input: StreamEventsRequest = {}) {
@@ -126,16 +119,14 @@ test("Team Live continues applying transient events that reuse an event id", asy
       await waitForAbort(input.signal);
     },
   } as unknown as HttpRuntimeClient;
-  const options: TeamLiveTuiOptions = {
+  const options: RuntimeTuiOptions = {
     baseUrl: "http://chili.test",
-    runLoop: false,
-    once: false,
   };
-  let runtime: TeamLiveRuntimeState | undefined;
+  let runtime: RuntimeEventsState | undefined;
   let app!: Awaited<ReturnType<typeof testRender>>;
   await act(async () => {
     app = await testRender(
-      <TeamLiveRuntimeProbe client={client} options={options} onRuntime={(value) => { runtime = value; }} />,
+      <RuntimeEventsProbe client={client} options={options} onRuntime={(value) => { runtime = value; }} />,
       { width: 120, height: 4, exitOnCtrlC: false },
     );
   });
@@ -152,78 +143,14 @@ test("Team Live continues applying transient events that reuse an event id", asy
   }
 });
 
-test("Team Live resolves run-loop and merge authority when each action executes", async () => {
-  const sessionA = "session_team_action_a" as SessionId;
-  const sessionB = "session_team_action_b" as SessionId;
-  const teamId = "team_dynamic_authority" as TeamId;
-  const taskId = "task_dynamic_authority" as TaskId;
-  let authority: TeamLiveActionAuthority = { sessionId: sessionA, cwd: "/workspace/a" };
-  const runRequests: Array<Record<string, unknown>> = [];
-  const mergeRequests: Array<Record<string, unknown>> = [];
-  const client = {
-    streamEvents: async function* (input: StreamEventsRequest = {}) {
-      await waitForAbort(input.signal);
-    },
-    runTeamLoop: async (request: Record<string, unknown>) => {
-      runRequests.push(request);
-      return {};
-    },
-    mergeTeamTasks: async (request: Record<string, unknown>) => {
-      mergeRequests.push(request);
-      return {};
-    },
-  } as unknown as HttpRuntimeClient;
-  const options: TeamLiveTuiOptions = {
-    baseUrl: "http://chili.test",
-    sessionId: sessionA,
-    cwd: "/workspace/a",
-    runLoop: false,
-    once: false,
-  };
-  let runtime: TeamLiveRuntimeState | undefined;
-  let app!: Awaited<ReturnType<typeof testRender>>;
-  await act(async () => {
-    app = await testRender(
-      <TeamLiveRuntimeProbe
-        client={client}
-        options={options}
-        resolveActionAuthority={() => authority}
-        onRuntime={(value) => { runtime = value; }}
-      />,
-      { width: 120, height: 4, exitOnCtrlC: false },
-    );
-  });
-
-  try {
-    authority = { sessionId: sessionB, cwd: "/workspace/b" };
-    await act(async () => {
-      runtime!.executeAction({ type: "run_loop", teamId, enabled: true });
-      runtime!.executeAction({ type: "merge", teamId, taskId, enabled: true });
-      await Bun.sleep(5);
-      await app.renderOnce();
-    });
-
-    expect(runRequests).toHaveLength(1);
-    expect(runRequests[0]).toMatchObject({ teamId, sessionId: sessionB, cwd: "/workspace/b" });
-    expect(mergeRequests).toHaveLength(1);
-    expect(mergeRequests[0]).toMatchObject({ teamId, taskId, sessionId: sessionB, cwd: "/workspace/b" });
-    expect(runRequests[0]).not.toMatchObject({ sessionId: sessionA, cwd: "/workspace/a" });
-    expect(mergeRequests[0]).not.toMatchObject({ sessionId: sessionA, cwd: "/workspace/a" });
-  } finally {
-    act(() => app.renderer.destroy());
-  }
-});
-
-function TeamLiveRuntimeProbe(props: {
+function RuntimeEventsProbe(props: {
   client: HttpRuntimeClient;
-  options: TeamLiveTuiOptions;
-  resolveActionAuthority?: () => TeamLiveActionAuthority;
-  onRuntime: (runtime: TeamLiveRuntimeState) => void;
+  options: RuntimeTuiOptions;
+  onRuntime: (runtime: RuntimeEventsState) => void;
 }) {
-  const runtime = useTeamLiveRuntime({
+  const runtime = useRuntimeEvents({
     client: props.client,
     options: props.options,
-    ...(props.resolveActionAuthority ? { resolveActionAuthority: props.resolveActionAuthority } : {}),
   });
   props.onRuntime(runtime);
   const text = Object.values(runtime.runtimeView.messages)

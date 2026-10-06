@@ -2,7 +2,7 @@ import { useCallback, useDeferredValue, useEffect, useMemo, useReducer, useRef, 
 import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent, ScrollBoxRenderable, Selection } from "@opentui/core";
 import { collectCommandNodes, completeCommandsSync, resolveCommand, type ResolveCommandResult } from "@chili/commands";
-import { runtimeDelegationStatus, type ChatSessionView, type ChatTranscriptItem, type HttpRuntimeClient, type RuntimeSessionSummary, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
+import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, RuntimeSessionSummary } from "@chili/sdk";
 import { normalizeSessionTitle, SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import type {
   ApprovalId,
@@ -22,7 +22,6 @@ import type {
   RuntimeSkillMention,
   ServiceTier,
   SessionId,
-  TeamId,
 } from "@chili/protocol";
 import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@chili/providers";
 import { discoverSkills, updateSkillDisabledSetting, type SkillSettingsScope, type SkillSummary } from "@chili/skills";
@@ -32,10 +31,9 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { cleanClipboardText, systemClipboard, type ClipboardAccess, type ClipboardImage } from "./clipboard.js";
-import { TeamLiveSurface } from "./TeamLiveApp.js";
-import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
+import type { RuntimeTuiOptions, RuntimeConnectionState } from "./useRuntimeEvents.js";
 import { acceptedFeedbackMatchesStatus, useChatRuntime, type ChatApprovalGrantScope, type ChatRuntimeState } from "./useChatRuntime.js";
-import { findAction, shorten } from "./components/helpers.js";
+import { shorten } from "./components/helpers.js";
 import {
   DEFAULT_REASONING_LEVEL,
   REASONING_LEVELS,
@@ -61,8 +59,6 @@ import { charDisplayWidth } from "./chat/markdown.js";
 import { zedPathWithPosition, type FileLinkTarget } from "./chat/file-links.js";
 import { MessageList } from "./chat/MessageList.js";
 import { commandListHeight } from "./chat/CommandList.js";
-import { inlineAgentBatchesForSession } from "./chat/inline-agent-batches.js";
-import type { InlineAgentBatchDisplay } from "./chat/AgentBatchCells.js";
 import { TranscriptLine } from "./chat/lines.js";
 import {
   McpManager,
@@ -96,7 +92,7 @@ import {
   type TuiThemeOption,
 } from "./theme/index.js";
 
-type ShellView = "chat" | "team" | "help" | "agents" | "status" | "mcp" | "transcript";
+type ShellView = "chat" | "help" | "agents" | "status" | "mcp" | "transcript";
 type AppendLocalItem = (level: "info" | "error", text: string, options?: { persistent?: boolean | undefined; bare?: boolean | undefined }) => void;
 type LocalShellItem = Extract<LocalTranscriptItem, { kind: "shell" }>;
 type AppendShellItem = (item: Omit<LocalShellItem, "id" | "kind" | "createdAt">) => string;
@@ -167,7 +163,7 @@ interface SkillSummariesState {
   reload: () => Promise<void>;
 }
 
-export interface ChatShellOptions extends TeamLiveTuiOptions {
+export interface ChatShellOptions extends RuntimeTuiOptions {
   modelName?: string;
   providerName?: string;
   modeName?: string;
@@ -224,40 +220,12 @@ export function ChatShellApp(props: {
     [shellOptions],
   );
   const runtime = useChatRuntime({ client: props.client, options: chatOptions });
-  const currentSessionId = runtime.activeSessionId ?? runtime.chatView.sessionId;
-  const allTeams = teamLiveModel(runtime.runtimeView, {
-    connection: runtime.connection,
-    sessionId: currentSessionId,
-    limit: 48,
-  });
-  const [selectedTeamId, setSelectedTeamId] = useState<TeamId | undefined>(shellOptions.teamId ?? allTeams.selectedTeamId);
-  const resolvedSelectedTeamId = validSelectedTeamId(allTeams, shellOptions.teamId ?? selectedTeamId);
-  const model = teamLiveModel(runtime.runtimeView, {
-    connection: runtime.connection,
-    selectedTeamId: resolvedSelectedTeamId,
-    sessionId: currentSessionId,
-    limit: 64,
-  });
   const skillSummaries = useSkillSummaries(runtime.chatView.cwd ?? shellOptions.cwd ?? process.cwd());
-
-  useEffect(() => {
-    if (shellOptions.teamId) {
-      setSelectedTeamId(shellOptions.teamId);
-      return;
-    }
-    if (!selectedTeamId || !allTeams.teams.some((team) => team.id === selectedTeamId)) {
-      setSelectedTeamId(allTeams.selectedTeamId ?? allTeams.teams[0]?.id);
-    }
-  }, [allTeams.selectedTeamId, allTeams.teams, shellOptions.teamId, selectedTeamId]);
 
   return (
     <ChatShellSurface
-      model={model}
       runtime={runtime}
       options={shellOptions}
-      selectedTeamId={resolvedSelectedTeamId}
-      selectedTeamLocked={Boolean(shellOptions.teamId)}
-      onSelectTeam={setSelectedTeamId}
       onExit={props.onExit}
       skills={skillSummaries.skills}
       allSkills={skillSummaries.allSkills}
@@ -267,12 +235,8 @@ export function ChatShellApp(props: {
 }
 
 export function ChatShellSurface(props: {
-  model: TeamLiveView;
   runtime: ChatRuntimeState;
   options?: Partial<ChatShellOptions>;
-  selectedTeamId?: TeamId | undefined;
-  selectedTeamLocked?: boolean;
-  onSelectTeam?: (teamId: TeamId) => void;
   onExit?: (info?: ChatShellExitInfo) => void;
   commands?: readonly TuiCommand[];
   clipboard?: ClipboardAccess | undefined;
@@ -486,39 +450,19 @@ export function ChatShellSurface(props: {
     ...(serviceTierConfigurable && serviceTier ? { serviceTier } : {}),
     cwd,
   };
-  const delegationStatus = runtimeDelegationStatus(props.runtime.runtimeView, {
-    ...(props.runtime.activeSessionId ? { sessionId: props.runtime.activeSessionId } : {}),
-    ...(props.selectedTeamId ? { teamId: props.selectedTeamId } : {}),
-    ...(props.runtime.delegationConfig ? { delegationConfig: props.runtime.delegationConfig } : {}),
-  });
   const capabilityCandidate = capabilitySelection
     ? modelCandidates.find((item) => sameModelSelection(capabilitySelection, modelDescriptorSelection(item)))
     : undefined;
   const capabilitySupported = modelToolCallSupport(capabilityCandidate);
+  const currentSessionId = props.runtime.activeSessionId ?? props.runtime.chatView.sessionId;
   const agentExperience = agentsViewModel({
     runtimeView: props.runtime.runtimeView,
-    status: delegationStatus,
+    ...(props.runtime.delegationConfig ? { delegationConfig: props.runtime.delegationConfig } : {}),
     parentExecution: props.runtime.chatView.status,
-    ...(props.runtime.activeSessionId ? { sessionId: props.runtime.activeSessionId } : {}),
+    ...(currentSessionId ? { sessionId: currentSessionId } : {}),
     ...(capabilitySupported === undefined ? {} : { capabilitySupported }),
   });
-  const currentSessionId = props.runtime.activeSessionId ?? props.runtime.chatView.sessionId;
-  const inlineAgentBatches = useMemo(() => inlineAgentBatchesForSession({
-    runtimeView: props.runtime.runtimeView,
-    teamView: props.model,
-    ...(currentSessionId ? { sessionId: currentSessionId } : {}),
-    limit: 20,
-  }), [
-    currentSessionId,
-    props.model,
-    props.runtime.revision,
-    props.runtime.runtimeView,
-  ]);
-  useEffect(() => {
-    if (inlineAgentBatches.length > 0) setSessionLayoutEntered(true);
-  }, [inlineAgentBatches.length]);
   const statusPage = statusPageModel({
-    model: props.model,
     runtime: props.runtime,
     options: statusOptions,
     agentExperience,
@@ -531,7 +475,6 @@ export function ChatShellSurface(props: {
     [props.commands, props.runtime.commandList],
   );
   const commandContext = useMemo<TuiCommandContext>(() => ({
-    model: props.model,
     busy: isInterruptInFlight(props.runtime.chatView.status),
     cwd,
     ...(modelSelection ? { modelSelection } : {}),
@@ -544,7 +487,7 @@ export function ChatShellSurface(props: {
     allSkills: props.allSkills ?? props.skills ?? [],
     mcpServers: props.runtime.mcpStatus?.servers ?? [],
     commandDiagnostics: props.runtime.commandList?.diagnostics ?? [],
-  }), [availableReasoningLevels, cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.runtime.chatView.status, props.runtime.commandList?.diagnostics, props.runtime.mcpStatus?.servers, props.skills, reasoningConfigurable, reasoningLevel, serviceTier, serviceTierConfigurable]);
+  }), [availableReasoningLevels, cwd, modelCandidates, modelSelection, props.allSkills, props.runtime.chatView.status, props.runtime.commandList?.diagnostics, props.runtime.mcpStatus?.servers, props.skills, reasoningConfigurable, reasoningLevel, serviceTier, serviceTierConfigurable]);
   const skillTrigger = activeSkillMentionTrigger(prompt);
   const skillCompletionItems = skillTrigger && !prompt.startsWith("/") && !shellInputActive
     ? skillCompletions(props.skills ?? [], skillTrigger.query)
@@ -1029,12 +972,12 @@ export function ChatShellSurface(props: {
       },
     };
     history.resetNavigation();
-    void runCommandInput(completion.value, commands, commandContext, props.model, props.runtime, trackedCommandActions)
+    void runCommandInput(completion.value, commands, commandContext, props.runtime, trackedCommandActions)
       .then(() => {
         if (!promptUpdated) setPrompt((current) => current === promptAtSelection ? "" : current);
       });
     return true;
-  }, [commandActions, commandCompletionItems, commandCompletionOpen, commandContext, commands, history, prompt, props.model, props.runtime, selectedCompletionIndex, setPrompt]);
+  }, [commandActions, commandCompletionItems, commandCompletionOpen, commandContext, commands, history, prompt, props.runtime, selectedCompletionIndex, setPrompt]);
   const runSelectedSkillCompletion = useCallback(() => {
     if (!skillCompletionOpen || !skillTrigger) return false;
     const completion = skillCompletionItems[selectedCompletionIndex] ?? skillCompletionItems[0];
@@ -1062,7 +1005,6 @@ export function ChatShellSurface(props: {
       expandedPrompt,
       commands,
       commandContext,
-      props.model,
       props.runtime,
       commandActions,
       history.record,
@@ -1072,7 +1014,7 @@ export function ChatShellSurface(props: {
       clearPromptAttachments,
       (state) => trackInterruptedPromptCandidate(interruptedPromptCandidateRef, candidate, state),
     );
-  }, [clearPromptAttachments, commandActions, commandContext, commands, expandedPrompt, history.record, pastedImages, prompt, promptParts, props.model, props.runtime, props.skills, skillMentionBindings]);
+  }, [clearPromptAttachments, commandActions, commandContext, commands, expandedPrompt, history.record, pastedImages, prompt, promptParts, props.runtime, props.skills, skillMentionBindings]);
   useEffect(() => {
     setCompletionIndex(0);
   }, [prompt]);
@@ -1448,7 +1390,7 @@ export function ChatShellSurface(props: {
         if (commandConfirmation.selectedIndex === 1 || key.name === "y") {
           const result = commandConfirmation.result;
           setCommandConfirmation(undefined);
-          void applyCommandResult(result, commandContext, props.model, props.runtime, commandActions);
+          void applyCommandResult(result, commandContext, props.runtime, commandActions);
         } else {
           setCommandConfirmation(undefined);
         }
@@ -1532,10 +1474,6 @@ export function ChatShellSurface(props: {
     }
     if (key.ctrl && key.name === "t" && !key.shift) {
       setView((current) => current === "transcript" ? "chat" : "transcript");
-      return;
-    }
-    if (view === "team") {
-      if (isEscape(key)) setView("chat");
       return;
     }
     if (view === "mcp") {
@@ -1652,7 +1590,7 @@ export function ChatShellSurface(props: {
           setPrompt(`${selected.value} `);
           return;
         }
-        void runCommandInput(selected.value, commands, commandContext, props.model, props.runtime, commandActions);
+        void runCommandInput(selected.value, commands, commandContext, props.runtime, commandActions);
         return;
       }
       if (isBackspace(key)) {
@@ -1857,24 +1795,8 @@ export function ChatShellSurface(props: {
     );
   }
 
-  if (view === "team") {
-    return (
-      <TeamLiveSurface
-        model={props.model}
-        runtime={props.runtime}
-        selectedTeamId={props.selectedTeamId}
-        selectedTeamLocked={props.selectedTeamLocked}
-        onSelectTeam={props.onSelectTeam}
-        onBack={() => setView("chat")}
-        onExit={props.onExit}
-        theme={theme}
-      />
-    );
-  }
-
   const home = !sessionLayoutEntered
     && props.runtime.chatView.items.length === 0
-    && inlineAgentBatches.length === 0
     && localItems.length === 0
     && props.runtime.chatView.pendingApprovals.length === 0
     && view === "chat";
@@ -1906,7 +1828,6 @@ export function ChatShellSurface(props: {
           paletteTitle={`Command Palette · ${paletteQuery || "type to search"}`}
           paletteItems={paletteItems}
           paletteIndex={paletteIndex}
-          model={props.model}
           agentExperience={agentExperience}
           options={shellOptions}
           runtime={props.runtime}
@@ -1970,9 +1891,7 @@ export function ChatShellSurface(props: {
           paletteTitle={`Command Palette · ${paletteQuery || "type to search"}`}
           paletteItems={paletteItems}
           paletteIndex={paletteIndex}
-          model={props.model}
           agentExperience={agentExperience}
-          agentBatches={inlineAgentBatches}
           options={shellOptions}
           runtime={props.runtime}
           mcpManager={mcpManager}
@@ -2021,7 +1940,6 @@ function HomeScreen(props: {
   paletteTitle: string;
   paletteItems: readonly TuiCommandSuggestion[];
   paletteIndex: number;
-  model: TeamLiveView;
   agentExperience: AgentsViewModel;
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
@@ -2106,7 +2024,7 @@ function HomeScreen(props: {
         />
       </box>
       <box flexGrow={3} />
-      <StatusFooter options={props.options} model={props.model} agentExperience={props.agentExperience} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
+      <StatusFooter options={props.options} agentExperience={props.agentExperience} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
     </box>
   );
 }
@@ -2114,7 +2032,7 @@ function HomeScreen(props: {
 function SessionScreen(props: {
   width: number;
   height: number;
-  view: Exclude<ShellView, "team">;
+  view: ShellView;
   prompt: string;
   promptInputResetKey: number;
   focused: boolean;
@@ -2137,9 +2055,7 @@ function SessionScreen(props: {
   paletteTitle: string;
   paletteItems: readonly TuiCommandSuggestion[];
   paletteIndex: number;
-  model: TeamLiveView;
   agentExperience: AgentsViewModel;
-  agentBatches: readonly InlineAgentBatchDisplay[];
   runtime: ChatRuntimeState;
   mcpManager: McpManagerState;
   statusPage: StatusPageModel;
@@ -2244,7 +2160,6 @@ function SessionScreen(props: {
             theme={props.theme}
             showToolDetails={props.showToolDetails}
             hideThinking={props.hideThinking}
-            agentBatches={props.agentBatches}
           />
         )}
       </box>
@@ -2289,7 +2204,7 @@ function SessionScreen(props: {
           maxCommandItems={maxCommandItems}
         />
       </box>
-      <StatusFooter options={props.options} model={props.model} agentExperience={props.agentExperience} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
+      <StatusFooter options={props.options} agentExperience={props.agentExperience} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
     </box>
   );
 }
@@ -3104,7 +3019,6 @@ interface StatusPageModel {
 }
 
 interface StatusPageInput {
-  model: TeamLiveView;
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
   agentExperience: AgentsViewModel;
@@ -3174,7 +3088,7 @@ function statusPageModel(input: StatusPageInput): StatusPageModel {
   const rows: StatusPageRow[] = [
     { key: "status:title", text: "Status", tone: "heading" },
     { key: "status:spacer", text: "", tone: "spacer" },
-    { key: "status:event-stream", text: `event stream: ${eventStreamStatus(input.model.connection.status)}`, tone: "text" },
+    { key: "status:event-stream", text: `event stream: ${eventStreamStatus(input.runtime.connection.status)}`, tone: "text" },
     { key: "status:execution", text: `parent execution: ${input.agentExperience.parentExecution}`, tone: executionStatus === "failed" || executionStatus === "cancelled" ? "error" : "text" },
   ];
   const reason = singleLineStatusValue(input.runtime.chatView.statusReason);
@@ -3184,8 +3098,7 @@ function statusPageModel(input: StatusPageInput): StatusPageModel {
   rows.push(
     { key: "status:agent-capability", text: `agent capability: ${input.agentExperience.capability}`, tone: input.agentExperience.capability.startsWith("unavailable") ? "error" : "text" },
     { key: "status:delegation", text: `delegation: ${input.agentExperience.delegation}`, tone: "text" },
-    { key: "status:ad-hoc-agents", text: `ad-hoc agents: ${input.agentExperience.adHocSummary}`, tone: "text" },
-    { key: "status:persistent-team", text: `persistent teams: ${input.agentExperience.persistentTeamSummary}`, tone: "text" },
+    { key: "status:agents", text: `agents: ${input.agentExperience.summary}`, tone: "text" },
     { key: "status:session", text: `session: ${input.runtime.activeSessionId ?? "none"}`, tone: "text" },
     { key: "status:mode", text: `mode: ${input.options.modeName}`, tone: "text" },
     { key: "status:model", text: `model: ${modelLabel}`, tone: "text" },
@@ -3234,7 +3147,7 @@ function safeConnectionLabel(value: string | undefined): string | undefined {
   return sanitized.slice(0, 80);
 }
 
-function eventStreamStatus(status: TeamLiveView["connection"]["status"]): string {
+function eventStreamStatus(status: RuntimeConnectionState["status"]): string {
   return status === "streaming" ? "connected" : status;
 }
 
@@ -3259,7 +3172,6 @@ async function submitPrompt(
   expandedPrompt: string,
   commands: readonly TuiCommand[],
   ctx: TuiCommandContext,
-  model: TeamLiveView,
   runtime: ChatRuntimeState,
   actions: CommandActions,
   onAccepted?: (text: string) => void,
@@ -3290,7 +3202,7 @@ async function submitPrompt(
     if (commandMatch.status === "matched") {
       actions.setPrompt("");
       clearPromptAttachments?.();
-      await runResolvedCommand(commandMatch, ctx, model, runtime, actions);
+      await runResolvedCommand(commandMatch, ctx, runtime, actions);
       return;
     }
     if (commandMatch.status !== "not_command") {
@@ -3375,7 +3287,6 @@ async function runCommandInput(
   input: string,
   commands: readonly TuiCommand[],
   ctx: TuiCommandContext,
-  model: TeamLiveView,
   runtime: ChatRuntimeState,
   actions: CommandActions,
 ): Promise<void> {
@@ -3384,13 +3295,12 @@ async function runCommandInput(
     actions.appendLocalItem("error", commandResolutionMessage(match));
     return;
   }
-  await runResolvedCommand(match, ctx, model, runtime, actions);
+  await runResolvedCommand(match, ctx, runtime, actions);
 }
 
 async function runResolvedCommand(
   match: Extract<ResolveCommandResult<TuiCommandContext, TuiCommandResult>, { status: "matched" }>,
   ctx: TuiCommandContext,
-  model: TeamLiveView,
   runtime: ChatRuntimeState,
   actions: CommandActions,
 ): Promise<void> {
@@ -3419,13 +3329,12 @@ async function runResolvedCommand(
       if (actions.isSessionUiEpochCurrent(uiEpoch)) actions.requestConfirmation(title, result);
     },
   };
-  await applyCommandResult(result, ctx, model, runtime, scopedActions);
+  await applyCommandResult(result, ctx, runtime, scopedActions);
 }
 
 async function applyCommandResult(
   result: TuiCommandResult,
   ctx: TuiCommandContext,
-  model: TeamLiveView,
   runtime: ChatRuntimeState,
   actions: CommandActions,
 ): Promise<void> {
@@ -3563,9 +3472,15 @@ async function applyCommandResult(
     await performMcpAction(result, runtime, actions.appendLocalItem);
     return;
   }
-  if (result.type === "sdk_action") {
-    const action = actionForCommandResult(result, model);
-    if (action) runtime.executeAction(action);
+  if (result.type === "agent_action") {
+    try {
+      if (result.action === "stop") await runtime.stopAgent(result.agentId);
+      else await runtime.resumeAgent(result.agentId);
+      actions.appendLocalItem("info", `Agent ${result.agentId} ${result.action === "stop" ? "stopped" : "resumed"}.`);
+    } catch (error) {
+      actions.appendLocalItem("error", errorMessage(error));
+    }
+    return;
   }
 }
 
@@ -3977,19 +3892,6 @@ function formatAuthTime(value: number): string {
   return new Date(value).toLocaleString();
 }
 
-function actionForCommandResult(result: Extract<TuiCommandResult, { type: "sdk_action" }>, model: TeamLiveView): TeamLiveAction | undefined {
-  const actions = model.selected?.availableActions ?? model.availableActions;
-  if (result.action === "team_run") {
-    return findAction(actions, "run_loop") ?? { type: "run_loop", ...(model.selectedTeamId ? { teamId: model.selectedTeamId } : {}), enabled: false, reason: "no_team" };
-  }
-  if (result.action === "team_merge") {
-    return findAction(actions, "merge") ?? { type: "merge", ...(model.selectedTeamId ? { teamId: model.selectedTeamId } : {}), enabled: false, reason: "no_pending_merge" };
-  }
-  if (result.action === "approve") return findAction(actions, "approve");
-  if (result.action === "reject") return findAction(actions, "reject");
-  return undefined;
-}
-
 function handleModelPickerKey(
   key: KeyEvent,
   picker: ModelPickerNavigation,
@@ -4207,7 +4109,6 @@ function currentFeedback(runtime: ChatRuntimeState): { status: string; message: 
     }
     return { status: "pending", message: "session running" };
   }
-  if (runtime.actionFeedback) return runtime.actionFeedback;
   return undefined;
 }
 
@@ -4624,10 +4525,6 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function validSelectedTeamId(model: TeamLiveView, selectedTeamId: TeamId | undefined): TeamId | undefined {
-  if (selectedTeamId && model.teams.some((team) => team.id === selectedTeamId)) return selectedTeamId;
-  return model.selectedTeamId ?? model.teams[0]?.id;
-}
 
 function themeOptionIndex(options: readonly TuiThemeOption[], themeId: string): number {
   const index = options.findIndex((option) => option.id === themeId);

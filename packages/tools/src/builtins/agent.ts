@@ -1,315 +1,147 @@
-import type { AgentMessageListToolInput, AgentMessageSendToolInput, AgentMessageToolController } from "../agent-message.js";
-import type {
-  SubagentController,
-  SubagentControlController,
-  TaskBatchToolInput,
-  TaskCloseToolInput,
-  TaskFollowupToolInput,
-  TaskListToolInput,
-  TaskToolInput,
-  TaskWaitBatchToolInput,
-} from "../subagent.js";
+import type { ToolResult } from "@chili/protocol";
+import type { AgentListToolInput, AgentSendToolInput, AgentSpawnToolInput, AgentTargetToolInput, AgentToolController, AgentWaitToolInput } from "../agent.js";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
-import { createAgentMessageListTool, createAgentMessageSendTool } from "./agent-message.js";
-import {
-  createTaskBatchTool,
-  createTaskCloseTool,
-  createTaskFollowupTool,
-  createTaskListTool,
-  createTaskTool,
-  createTaskWaitBatchTool,
-  type SubagentToolResult,
-} from "./task.js";
 
-export type AgentSpawnToolInput = TaskToolInput | TaskBatchToolInput;
-export type AgentListToolInput =
-  | (TaskListToolInput & { view: "agents" })
-  | (AgentMessageListToolInput & { view: "messages" });
-export type AgentStopToolInput = Pick<TaskCloseToolInput, "taskId" | "summary">;
-
-const taskStatusSchema = { type: "string", enum: ["pending", "running", "completed", "incomplete", "failed", "cancelled"] };
-const messageStatusSchema = { type: "string", enum: ["queued", "delivering", "consumed", "discarded"] };
-const taskIdSchema = { type: "string", minLength: 1 };
-const taskIdsSchema = { type: "array", minItems: 1, maxItems: 64, items: taskIdSchema };
-const timeoutSchema = { type: "integer", minimum: 1 };
-const taskRecordSchema = {
-  type: "object",
-  required: ["task_id", "status"],
-  properties: {
-    task_id: taskIdSchema,
-    taskId: taskIdSchema,
-    status: taskStatusSchema,
-    summary: { type: "string" },
-    path: { type: "string" },
-    mode: { type: "string" },
-  },
+const identifier = { type: "string", minLength: 1 };
+const receiptSchema = {
+  type: "object", required: ["agentId", "inputId"], additionalProperties: false,
+  properties: { agentId: identifier, inputId: identifier },
 };
-const taskSetSchema = {
-  type: "object",
-  required: ["tasks", "count"],
-  properties: {
-    tasks: { type: "array", items: taskRecordSchema },
-    count: { type: "integer" },
-    batchId: taskIdSchema,
-    satisfied: { type: "boolean" },
-    timedOut: { type: "boolean" },
-    pending_task_ids: { type: "array", items: taskIdSchema },
-    next_action: { type: "string" },
-  },
-};
-const messageRecordSchema = {
-  type: "object",
-  required: ["message_id", "from_path", "to_path", "delivery", "status"],
-  properties: {
-    message_id: { type: "string" },
-    messageId: { type: "string" },
-    from_path: { type: "string" },
-    to_path: { type: "string" },
-    delivery: { type: "string", enum: ["queueOnly", "triggerTurn"] },
-    status: messageStatusSchema,
-    content: { type: "string" },
-    task_id: taskIdSchema,
-  },
+const targetSchema = {
+  type: "object", required: ["agentId"], additionalProperties: false,
+  properties: { agentId: identifier },
 };
 
-/** Canonical model-facing tools share the existing lifecycle and message controllers. */
-export function createAgentSpawnTool(
-  controller: SubagentController,
-  lifecycle?: SubagentControlController,
-): ChiliToolDefinition<AgentSpawnToolInput, SubagentToolResult> {
-  const single = createTaskTool(controller);
-  const batch = createTaskBatchTool(controller, lifecycle);
+export function createAgentSpawnTool(controller: AgentToolController): ChiliToolDefinition<AgentSpawnToolInput> {
   return {
     name: "agent_spawn",
-    description:
-      "Create one agent with description/prompt, or parallel agents with tasks. Single mode defaults to one_shot (inline); use resumable (inline with history) or background (immediate handle) for later agent_resume. Batch tasks run in background and default to completionPolicy=join, waiting inline. supervised returns handles for an agent_wait/agent_resume review loop; notify wakes the parent on completion; detached never wakes. Read and integrate required results before finishing the original request.",
-    resourcePolicy: "internal",
-    risk: "execute",
-    codeMode: true,
+    description: "Create one agent and enqueue its first input. Returns agentId and inputId immediately; use agent_wait for that input's result. Use separate calls, optionally Promise.all in code_mode, to create several agents. Agents retain their identity and history after each input completes.",
+    resourcePolicy: "internal", risk: "write", codeMode: true, isConcurrencySafe: true,
     inputSchema: {
-      type: "object",
-      properties: {
-        description: { type: "string", minLength: 1 },
-        prompt: { type: "string", minLength: 1 },
-        mode: { type: "string", enum: ["one_shot", "resumable", "background"] },
-        tasks: {
-          type: "array", minItems: 1, maxItems: 64,
-          items: {
-            type: "object", required: ["description", "prompt"],
-            properties: {
-              description: { type: "string", minLength: 1 },
-              prompt: { type: "string", minLength: 1 },
-              mode: { type: "string", enum: ["background"] },
-            },
-          },
-        },
-        completionPolicy: { type: "string", enum: ["join", "notify", "detached", "supervised"], description: "supervised is only supported with tasks." },
-        maxConcurrency: { type: "integer", minimum: 1, maximum: 32, description: "Batch only. Defaults to 3; runtime limits also apply." },
-        timeoutMs: { ...timeoutSchema, description: "Batch join timeout. Returns partial results on timeout." },
-        batchId: { ...taskIdSchema, description: "Batch only. Optional stable batch identifier." },
-      },
-      oneOf: [
-        { required: ["description", "prompt"], not: { anyOf: ["tasks", "maxConcurrency", "timeoutMs", "batchId"].map((key) => ({ required: [key] })) } },
-        { required: ["tasks"], not: { anyOf: ["description", "prompt", "mode"].map((key) => ({ required: [key] })) } },
-      ],
+      type: "object", required: ["name", "prompt"], additionalProperties: false,
+      properties: { name: { ...identifier, pattern: "^[a-zA-Z0-9_-]+$", description: "One agent path segment: letters, digits, hyphens, or underscores." }, prompt: identifier, cwd: identifier },
     },
-    outputSchema: { anyOf: [taskRecordSchema, taskSetSchema] },
-    async validate(input): Promise<ValidationResult<AgentSpawnToolInput>> {
-      if (!isRecord(input)) return { ok: false, message: "expected an object" };
-      if (input.tasks !== undefined) {
-        if (hasAny(input, ["description", "prompt", "mode", "title", "name", "summary", "task", "instructions", "instruction", "message", "subagent_type", "subagentType", "agentType", "type"])) {
-          return { ok: false, message: "Use either tasks or a single description/prompt/mode, not both" };
-        }
-        return batch.validate!(input);
-      }
-      if (hasAny(input, ["maxConcurrency", "max_concurrency", "timeoutMs", "timeout_ms", "batchId", "batch_id"])) {
-        return { ok: false, message: "maxConcurrency, timeoutMs, and batchId require tasks" };
-      }
-      const validated = await single.validate!(input);
-      if (!validated.ok) return renameValidation(validated);
-      if (validated.value.mode !== undefined && !["one_shot", "resumable", "background"].includes(validated.value.mode)) {
-        return { ok: false, message: "mode must be one_shot, resumable, or background" };
-      }
-      return validated;
+    outputSchema: receiptSchema,
+    validate(input) {
+      const checked = strings<AgentSpawnToolInput>(input, ["name", "prompt"], ["cwd"]);
+      if (!checked.ok) return checked;
+      if (!/^[a-zA-Z0-9_-]+$/u.test(checked.value.name)) return { ok: false, message: "name must contain only letters, digits, hyphens, or underscores" };
+      return checked;
     },
-    isConcurrencySafe(input) {
-      return "tasks" in input || input.mode === "background";
-    },
-    approval(input) {
-      return "tasks" in input ? batch.approval!(input) : single.approval!(input);
-    },
-    async execute(input, context) {
-      const result = "tasks" in input ? await batch.execute(input, context) : await single.execute(input, context);
-      return agentResult("agent_spawn", result);
-    },
+    approval: () => ({ permission: "agent_spawn", patterns: ["*"] }),
+    async execute(input, context) { return result("agent_spawn", await controller.spawnAgent(input, context)); },
   };
 }
 
-export function createAgentListTool(
-  lifecycle: SubagentControlController,
-  messages: AgentMessageToolController,
-): ChiliToolDefinition<AgentListToolInput, SubagentToolResult> {
-  const agents = createTaskListTool(lifecycle);
-  const mailbox = createAgentMessageListTool(messages);
+export function createAgentSendTool(controller: AgentToolController): ChiliToolDefinition<AgentSendToolInput> {
   return {
-    name: "agent_list",
-    description: "Inspect agents and their results (default view=agents), or durable messages in FIFO order (view=messages). The host enforces agent ownership and message visibility even with all=true. Use taskIds for agent filters, and taskId/path/from for message filters.",
-    resourcePolicy: "internal",
-    risk: "read",
-    isReadOnly: true,
-    isConcurrencySafe: true,
-    codeMode: true,
+    name: "agent_send",
+    description: "Submit an input to an agent in the same root hierarchy, including a peer or parent, and return a stable inputId. The receiver sees trusted sender identity with the text. mode=queue (default) queues work; mode=steer redirects active work through the same input queue. An idle agent may run queued input; a paused agent stays paused until agent_resume.",
+    resourcePolicy: "internal", risk: "write", codeMode: true, isConcurrencySafe: true,
     inputSchema: {
-      type: "object",
+      type: "object", required: ["agentId", "text"], additionalProperties: false,
+      properties: { agentId: identifier, text: identifier, mode: { type: "string", enum: ["queue", "steer"], default: "queue" } },
+    },
+    outputSchema: receiptSchema,
+    validate(input) {
+      const checked = strings<AgentSendToolInput>(input, ["agentId", "text"], ["mode"]);
+      if (!checked.ok) return checked;
+      if (checked.value.mode !== undefined && checked.value.mode !== "queue" && checked.value.mode !== "steer") return { ok: false, message: "mode must be queue or steer" };
+      return checked;
+    },
+    approval: (input) => ({ permission: "agent_send", patterns: [input.agentId] }),
+    async execute(input, context) { return result("agent_send", await controller.sendAgent(input, context)); },
+  };
+}
+
+export function createAgentWaitTool(controller: AgentToolController): ChiliToolDefinition<AgentWaitToolInput> {
+  return {
+    name: "agent_wait",
+    description: "Wait for the receipt of one specific input in the same root hierarchy, identified by agentId and inputId. Returns the input, its result when available, and timedOut. A timeout ends only this wait and never cancels the input or pauses its agent. Use the same IDs to wait again.",
+    resourcePolicy: "internal", risk: "read", codeMode: true, isReadOnly: true, isConcurrencySafe: true,
+    inputSchema: {
+      type: "object", required: ["agentId", "inputId"], additionalProperties: false,
+      properties: { agentId: identifier, inputId: identifier, timeoutMs: { type: "integer", minimum: 0, maximum: 60000, default: 30000, description: "Milliseconds to wait; 0 returns the current receipt immediately." } },
+    },
+    outputSchema: {
+      type: "object", required: ["input", "timedOut"], additionalProperties: false,
       properties: {
-        view: { type: "string", enum: ["agents", "messages"], default: "agents" },
-        status: { type: "string", enum: [...taskStatusSchema.enum, ...messageStatusSchema.enum] },
-        taskId: { ...taskIdSchema, description: "Messages view only." },
-        taskIds: { ...taskIdsSchema, description: "Agents view only." },
-        path: { type: "string", description: "Messages view only. Canonical recipient agent path." },
-        from: { type: "string", description: "Messages view only. Canonical sender agent path." },
-        limit: { type: "integer", minimum: 1 },
-        all: { type: "boolean" },
+        input: { type: "object", required: ["inputId", "sessionId", "state"], properties: {
+          inputId: identifier, sessionId: identifier, state: { type: "string", enum: ["pending", "claimed", "settled"] },
+          outcome: { type: "string", enum: ["completed", "failed", "cancelled", "interrupted"] },
+        } },
+        result: {}, timedOut: { type: "boolean" },
       },
     },
-    outputSchema: { anyOf: [taskSetSchema, { type: "object", required: ["count", "messages"], properties: { count: { type: "integer" }, messages: { type: "array", items: messageRecordSchema } } }] },
-    async validate(input): Promise<ValidationResult<AgentListToolInput>> {
-      const record = input ?? {};
-      if (!isRecord(record)) return { ok: false, message: "expected an object" };
-      const view = record.view ?? "agents";
-      if (view !== "agents" && view !== "messages") return { ok: false, message: "view must be agents or messages" };
-      if (view === "agents") {
-        if (hasAny(record, ["taskId", "task_id", "path", "from"])) return { ok: false, message: "taskId, path, and from require view=messages; use taskIds to filter agents" };
-        const validated = await agents.validate!(record);
-        return validated.ok ? { ok: true, value: { ...validated.value, view } } : validated;
-      }
-      if (hasAny(record, ["taskIds", "task_ids"])) return { ok: false, message: "taskIds requires view=agents; use taskId to filter messages" };
-      const validated = await mailbox.validate!(record);
-      return validated.ok ? { ok: true, value: { ...validated.value, view } } : validated;
+    validate(input) {
+      if (!isRecord(input)) return { ok: false, message: "expected an object" };
+      const { timeoutMs, ...rest } = input;
+      const checked = strings<Omit<AgentWaitToolInput, "timeoutMs">>(rest, ["agentId", "inputId"]);
+      if (!checked.ok) return checked;
+      if (timeoutMs !== undefined && (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 60000)) return { ok: false, message: "timeoutMs must be an integer between 0 and 60000" };
+      return { ok: true, value: { ...checked.value, ...(timeoutMs === undefined ? {} : { timeoutMs }) } };
     },
     approval: () => false,
-    async execute(input, context) {
-      if (input.view === "messages") {
-        const { view: _view, ...filters } = input;
-        return agentResult("agent_list", await mailbox.execute(filters, context));
-      }
-      const { view: _view, ...filters } = input;
-      return agentResult("agent_list", await agents.execute(filters, context));
-    },
+    async execute(input, context) { return result("agent_wait", await controller.waitAgent(input, context)); },
   };
 }
 
-export function createAgentSendTool(
-  controller: AgentMessageToolController,
-): ChiliToolDefinition<AgentMessageSendToolInput, SubagentToolResult> {
-  return canonicalTool(
-    createAgentMessageSendTool(controller),
-    "agent_send",
-    "Send a durable message to an agent by task id, canonical path, task name, or 'parent', without interrupting its work. delivery=queueOnly (default) stores it for recipient inspection without starting a turn; triggerTurn wakes a live idle recipient. Neither restarts a stopped or completed agent: use agent_resume for that. Use agent_list(view=messages) to inspect delivery.",
-    messageRecordSchema,
-  );
-}
-
-export function createAgentWaitTool(
-  controller: SubagentControlController,
-): ChiliToolDefinition<TaskWaitBatchToolInput, SubagentToolResult> {
-  const base = createTaskWaitBatchTool(controller);
+export function createAgentStopTool(controller: AgentToolController): ChiliToolDefinition<AgentTargetToolInput> {
   return {
-    ...canonicalTool(base, "agent_wait", "Wait for one taskId or multiple taskIds. waitFor=all (default) waits for all terminal results; any returns after one finishes. Timeout returns the latest partial snapshot, including every requested handle. Read terminal summaries, resume work if needed, and integrate required results before finishing.", taskSetSchema),
-    inputSchema: {
-      type: "object",
-      properties: {
-        taskId: taskIdSchema,
-        taskIds: taskIdsSchema,
-        waitFor: { type: "string", enum: ["any", "all"], default: "all" },
-        timeoutMs: timeoutSchema,
-        batchId: taskIdSchema,
-      },
-      oneOf: [{ required: ["taskId"], not: { required: ["taskIds"] } }, { required: ["taskIds"], not: { required: ["taskId"] } }],
-    },
-    async validate(input) {
-      if (!isRecord(input)) return { ok: false, message: "expected an object" };
-      const hasSingle = hasAny(input, ["taskId", "task_id", "id"]);
-      const hasMultiple = hasAny(input, ["taskIds", "task_ids", "ids"]);
-      if (hasSingle === hasMultiple) return { ok: false, message: "Provide either taskId or taskIds, not both" };
-      return base.validate!(hasSingle ? { ...input, taskIds: [input.taskId ?? input.task_id ?? input.id] } : input);
-    },
+    name: "agent_stop",
+    description: "Persistently pause a descendant agent's scheduling and cancel its current activation. Keeps its identity, history, and queued inputs. Repeated stops are safe. Use agent_resume to allow this same agent to run again.",
+    resourcePolicy: "internal", risk: "write", codeMode: true, isConcurrencySafe: true,
+    inputSchema: targetSchema, outputSchema: targetSchema,
+    validate: (input) => strings<AgentTargetToolInput>(input, ["agentId"]),
+    approval: (input) => ({ permission: "agent_stop", patterns: [input.agentId] }),
+    async execute(input, context) { return result("agent_stop", await controller.stopAgent(input, context)); },
   };
 }
 
-export function createAgentStopTool(
-  controller: SubagentControlController,
-): ChiliToolDefinition<AgentStopToolInput, SubagentToolResult> {
-  const base = createTaskCloseTool(controller);
+export function createAgentResumeTool(controller: AgentToolController): ChiliToolDefinition<AgentTargetToolInput> {
   return {
-    ...canonicalTool<AgentStopToolInput>(base, "agent_stop", "Interrupt an agent's active work and mark it cancelled, preserving its session history. Already terminal agents retain their existing status. Stopping does not delete the agent. Use agent_resume to continue a resumable or background agent later.", taskRecordSchema),
-    inputSchema: { type: "object", required: ["taskId"], properties: { taskId: taskIdSchema, summary: { type: "string" } } },
-    async validate(input) {
-      if (!isRecord(input)) return { ok: false, message: "expected an object" };
-      if (hasAny(input, ["status", "state", "outcome", "interrupt", "error"])) return { ok: false, message: "agent_stop always cancels and interrupts; provide only taskId and optional summary" };
-      const validated = await base.validate!(input);
-      if (!validated.ok) return validated;
-      const { taskId, summary } = validated.value;
-      return { ok: true, value: { taskId, ...(summary !== undefined ? { summary } : {}) } };
-    },
-    async execute(input, context) {
-      return agentResult("agent_stop", await base.execute({ taskId: input.taskId, ...(input.summary !== undefined ? { summary: input.summary } : {}), status: "cancelled", interrupt: true }, context));
-    },
+    name: "agent_resume",
+    description: "Unpause a descendant agent and allow its queued or interrupted work to continue under the same identity. Returns agentId and an inputId when work is resumed. Does not create another agent. Submit new instructions with agent_send.",
+    resourcePolicy: "internal", risk: "write", codeMode: true, isConcurrencySafe: true,
+    inputSchema: targetSchema,
+    outputSchema: { ...targetSchema, properties: { agentId: identifier, inputId: identifier } },
+    validate: (input) => strings<AgentTargetToolInput>(input, ["agentId"]),
+    approval: (input) => ({ permission: "agent_resume", patterns: [input.agentId] }),
+    async execute(input, context) { return result("agent_resume", await controller.resumeAgent(input, context)); },
   };
 }
 
-export function createAgentResumeTool(
-  controller: SubagentControlController,
-): ChiliToolDefinition<TaskFollowupToolInput, SubagentToolResult> {
-  const base = createTaskFollowupTool(controller);
+export function createAgentListTool(controller: AgentToolController): ChiliToolDefinition<AgentListToolInput> {
   return {
-    ...canonicalTool(base, "agent_resume", "Continue a stopped or terminal resumable/background agent using its existing history. Optionally supply a new prompt and maxTurns. Omitted prompt continues the previous task. If stop cleanup is still running, retry after it finishes. For an agent already running, use agent_send without interrupting it.", taskRecordSchema),
-    inputSchema: { type: "object", required: ["taskId"], properties: { taskId: taskIdSchema, prompt: { type: "string", minLength: 1 }, maxTurns: { type: "integer", minimum: 1 } } },
-    async validate(input) {
-      if (!isRecord(input)) return { ok: false, message: "expected an object" };
-      return base.validate!(hasAny(input, ["prompt", "text", "message", "instructions"]) ? input : { ...input, prompt: "Continue the previous task from where you stopped." });
+    name: "agent_list",
+    description: "List every agent in this caller's root hierarchy, including the root and caller itself, with stable identities, names, paths, parents, and idle/running/paused state. Other roots are inaccessible.",
+    resourcePolicy: "internal", risk: "read", codeMode: true, isReadOnly: true, isConcurrencySafe: true,
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    outputSchema: {
+      type: "object", required: ["agents"], additionalProperties: false,
+      properties: { agents: { type: "array", items: {
+        type: "object", required: ["agentId", "name", "path", "state"], additionalProperties: false,
+        properties: { agentId: identifier, name: identifier, path: identifier, parentAgentId: identifier, state: { type: "string", enum: ["idle", "running", "paused"] } },
+      } } },
     },
+    validate: (input) => strings<AgentListToolInput>(input === undefined ? {} : input, []),
+    approval: () => false,
+    async execute(input, context) { return result("agent_list", { agents: await controller.listAgents(input, context) }); },
   };
 }
 
-function canonicalTool<Input>(
-  base: ChiliToolDefinition<Input, SubagentToolResult>,
-  name: string,
-  description: string,
-  outputSchema: unknown,
-): ChiliToolDefinition<Input, SubagentToolResult> {
-  const { aliases: _aliases, ...definition } = base;
-  return {
-    ...definition,
-    name,
-    description,
-    codeMode: true,
-    outputSchema,
-    async execute(input, context) {
-      return agentResult(name, await base.execute(input, context));
-    },
-  };
+function result(name: string, data: unknown): ToolResult {
+  return { title: name, output: JSON.stringify(data), structuredData: data };
 }
 
-function agentResult(name: string, result: SubagentToolResult): SubagentToolResult {
-  const structuredData = JSON.parse(result.output) as Record<string, unknown>;
-  // Only generated guidance is renamed; user summaries and message content are untouched.
-  if (typeof structuredData.next_action === "string") structuredData.next_action = agentGuidance(structuredData.next_action);
-  const metadata = { ...result.metadata };
-  if (typeof metadata.nextAction === "string") metadata.nextAction = agentGuidance(metadata.nextAction);
-  return { ...result, title: result.title?.replace(/^\S+/, name), output: JSON.stringify(structuredData), structuredData, metadata };
-}
-
-function agentGuidance(text: string): string {
-  return text.replace(/\btask_wait_batch\b|\btask_wait\b/g, "agent_wait").replace(/\btask_followup\b/g, "agent_resume").replace(/\bwait_for=/g, "waitFor=");
-}
-
-function renameValidation<T>(result: ValidationResult<T>): ValidationResult<T> {
-  return result.ok ? result : { ...result, message: result.message.replace(/\btask_batch\b/g, "agent_spawn with tasks") };
-}
-
-function hasAny(input: Record<string, unknown>, keys: readonly string[]): boolean {
-  return keys.some((key) => input[key] !== undefined);
+function strings<T>(input: unknown, required: readonly string[], optional: readonly string[] = []): ValidationResult<T> {
+  if (!isRecord(input)) return { ok: false, message: "expected an object" };
+  const allowed = new Set([...required, ...optional]);
+  const unexpected = Object.keys(input).find((key) => !allowed.has(key));
+  if (unexpected) return { ok: false, message: `Unsupported field: ${unexpected}` };
+  for (const key of required) if (typeof input[key] !== "string" || !input[key].trim()) return { ok: false, message: `${key} must be a non-empty string` };
+  for (const key of optional) if (input[key] !== undefined && (typeof input[key] !== "string" || !input[key].trim())) return { ok: false, message: `${key} must be a non-empty string` };
+  return { ok: true, value: { ...input } as T };
 }
 
 function isRecord(input: unknown): input is Record<string, unknown> {

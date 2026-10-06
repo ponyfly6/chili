@@ -4,18 +4,16 @@ import path from "node:path";
 import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act, useState, type Dispatch, type SetStateAction } from "react";
-import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type RuntimeSessionSummary, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, ChiliEvent, MessageId, PartId, RuntimeCommandCatalog, RuntimeModelDescriptor, SessionId, TaskId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type RuntimeSessionSummary } from "@chili/sdk";
+import type { ApprovalId, ChiliEvent, MessageId, PartId, RuntimeCommandCatalog, RuntimeModelDescriptor, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import type { ClipboardAccess } from "./clipboard.js";
 import { CONVERSATION_INTERRUPTED_NOTICE, CTRL_C_EXIT_CONFIRM_MS, ChatShellApp, ChatShellSurface, isWithinCtrlCExitWindow, type ChatShellExitInfo } from "./ChatShellApp.js";
 import { PROMPT_PLACEHOLDER } from "./chat/PromptComposer.js";
-import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatApproveOptions, ChatRuntimeState } from "./useChatRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
 import type { SkillSummary } from "@chili/skills";
-import type { TeamLiveSurfaceRuntime } from "./components/types.js";
 import { chiliDarkTheme } from "./theme/index.js";
-import { teamLiveFixture } from "./test-fixtures.js";
+import { runtimeFixture, type RuntimeFixture } from "./test-fixtures.js";
 
 test("plain prompt creates a session and submits through the runtime client", async () => {
   const records = chatClientRecords();
@@ -88,7 +86,7 @@ test("Chinese prompt submits through native input without text drift", async () 
 
 test("ctrl+c clears the prompt before a quick second press exits", async () => {
   const exits: ChatShellExitInfo[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     onExit: (info) => exits.push(info ?? {}),
   });
 
@@ -119,7 +117,7 @@ test("ctrl+c exit confirmation expires outside the quick-press window", () => {
 test("bang prompt runs a local shell command without submitting to the runtime", async () => {
   const cwd = await mkdtemp(path.join(tmpdir(), "chili-tui-shell-"));
   const submitted: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     cwd,
     localMessageTtlMs: 0,
     runtime: {
@@ -148,7 +146,7 @@ test("bang prompt runs a local shell command without submitting to the runtime",
 
 test("empty bang prompt shows local shell help", async () => {
   const submitted: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     localMessageTtlMs: 0,
     runtime: {
       submitPrompt: async (text) => {
@@ -174,7 +172,7 @@ test("empty bang prompt shows local shell help", async () => {
 });
 
 test("bang prompt switches the composer into shell mode while typing", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async () => true,
     },
@@ -235,7 +233,7 @@ for (const scenario of [
     name: "subagent",
     sessionId: "session_subagent" as SessionId,
     sessions: [runtimeSessionSummary("session_subagent" as SessionId, { source: "subagent" as const })],
-    error: "Session session_subagent belongs to a subagent and cannot be resumed directly.",
+    error: "Session session_subagent belongs to an agent and cannot be resumed directly.",
   },
 ] as const) {
   test(`exact resume rejects a ${scenario.name} session before hydration`, async () => {
@@ -567,7 +565,7 @@ test("/session new starts a fresh runtime session for following prompts", async 
 
 test("fresh home keeps its standalone Chili title while typing slash and ordinary drafts", async () => {
   for (const draft of ["ordinary draft", "/mod"]) {
-    const app = await mountShell(teamLiveFixture());
+    const app = await mountShell(runtimeFixture());
 
     try {
       expect(hasStandaloneChiliTitle(app.captureCharFrame())).toBe(true);
@@ -584,7 +582,7 @@ test("fresh home keeps its standalone Chili title while typing slash and ordinar
 });
 
 test("an explicitly resumed empty session starts in the session layout", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       activeSessionId: "session_resumed_empty" as SessionId,
     },
@@ -603,7 +601,7 @@ test("expired /model notice keeps an empty session draft and caret in the sessio
   const modelPersisted = new Promise<boolean>((resolve) => {
     finishModelSelection = resolve;
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     localMessageTtlMs: noticeTtlMs,
     runtime: {
       modelCandidates: [{ provider: "test-provider", model: "test-model" }],
@@ -668,7 +666,7 @@ test("/thinking effort enters the session layout and /session new stably restore
   const newSessionStarted = new Promise<void>((resolve) => {
     finishNewSession = resolve;
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     localMessageTtlMs: noticeTtlMs,
     runtime: {
       setRuntimeReasoning: async () => true,
@@ -723,7 +721,7 @@ test("a stale /model completion cannot move a new-session draft out of Home", as
   const modelPersisted = new Promise<boolean>((resolve) => {
     finishModelSelection = resolve;
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       modelCandidates: [{ provider: "test-provider", model: "test-model" }],
       setRuntimeModel: () => modelPersisted,
@@ -765,7 +763,7 @@ test("a stale /model completion cannot move a new-session draft out of Home", as
 
 test("running session blocks a second prompt submit", async () => {
   const submitted: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       canSubmit: false,
       chatView: {
@@ -797,7 +795,7 @@ test("Escape restores an output-free interrupted prompt for editing", async () =
   const submitted: string[] = [];
   let resolveFirstSubmit: ((accepted: boolean) => void) | undefined;
   let interrupted = 0;
-  const app = await mountStatefulShell(teamLiveFixture(), {
+  const app = await mountStatefulShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async (text) => {
         submitted.push(text);
@@ -872,7 +870,7 @@ test("Escape keeps visible output and adds a persistent red interruption notice"
     chatTextMessage("msg_interrupt_visible_user", "user", "explain", 1),
     chatTextMessage("msg_interrupt_visible_assistant", "assistant", "partial answer", 2),
   ];
-  const app = await mountStatefulShell(teamLiveFixture(), {
+  const app = await mountStatefulShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async () => true,
       interruptActiveSession: async () => {
@@ -933,7 +931,7 @@ test("/session new clears local TUI notices and resets prompt history", async ()
   const clipboard = fakeClipboard({
     readText: async () => "",
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     clipboard,
     runtime: {
       submitPrompt: async (text) => {
@@ -971,7 +969,7 @@ test("/session new clears local TUI notices and resets prompt history", async ()
 
 test("prompt history navigates successful ordinary prompts with Up and Down", async () => {
   const submitted: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async (text) => {
         submitted.push(text);
@@ -1002,7 +1000,7 @@ test("prompt history navigates successful ordinary prompts with Up and Down", as
 });
 
 test("prompt history restores the in-progress draft at the bottom", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async () => true,
     },
@@ -1024,7 +1022,7 @@ test("prompt history restores the in-progress draft at the bottom", async () => 
 });
 
 test("slash completion selection uses Up and Down without switching prompt history", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async () => true,
     },
@@ -1033,23 +1031,23 @@ test("slash completion selection uses Up and Down without switching prompt histo
   try {
     await typeText(app, "history prompt");
     await press(app, () => app.mockInput.pressEnter());
-    await typeText(app, "/team ");
+    await typeText(app, "/agents ");
 
-    expect(app.captureCharFrame()).toContain("> /team agents — Show the agent tree");
+    expect(app.captureCharFrame()).toContain("> /agents list — Show agents in this session");
 
     await press(app, () => app.mockInput.pressArrow("down"));
-    expect(app.captureCharFrame()).toContain("> /team run — Start the selected team loop");
+    expect(app.captureCharFrame()).toContain("> /agents stop <agent-id>");
     expect(app.captureCharFrame()).not.toContain("history prompt");
 
     await press(app, () => app.mockInput.pressArrow("up"));
-    expect(app.captureCharFrame()).toContain("> /team agents — Show the agent tree");
+    expect(app.captureCharFrame()).toContain("> /agents list — Show agents in this session");
   } finally {
     app.renderer.destroy();
   }
 });
 
 test("slash completion visits thinking after model", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async () => true,
     },
@@ -1070,32 +1068,31 @@ test("slash completion visits thinking after model", async () => {
 });
 
 test("slash completion Up wraps from the first item to the last item", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async () => true,
     },
   });
 
   try {
-    await typeText(app, "/team ");
+    await typeText(app, "/agents ");
 
     await press(app, () => app.mockInput.pressArrow("up"));
-    expect(app.captureCharFrame()).toContain("> /team merge — Merge pending team work");
+    expect(app.captureCharFrame()).toContain("> /agents resume <agent-id> — Resume a paused agent");
   } finally {
     app.renderer.destroy();
   }
 });
 
 test("Enter executes the selected slash completion without Tab", async () => {
-  const executed: TeamLiveAction[] = [];
-  const app = await mountShell(withRunLoopReady(teamLiveFixture()), { executed });
+  const app = await mountShell(runtimeFixture());
 
   try {
-    await typeText(app, "/team ");
-    await press(app, () => app.mockInput.pressArrow("down"));
+    await typeText(app, "/agents ");
+    expect(app.captureCharFrame()).toContain("> /agents list — Show agents in this session");
     await press(app, () => app.mockInput.pressEnter());
 
-    expect(executed).toEqual([expect.objectContaining({ type: "run_loop" })]);
+    expect(app.captureCharFrame()).toContain("Agents · 0 active, 0 total");
     expect(app.captureCharFrame()).not.toContain("Unknown command");
   } finally {
     app.renderer.destroy();
@@ -1103,7 +1100,7 @@ test("Enter executes the selected slash completion without Tab", async () => {
 });
 
 test("Enter completes a required-argument leaf and waits for its argument", async () => {
-  const app = await mountShell(teamLiveFixture());
+  const app = await mountShell(runtimeFixture());
 
   try {
     await typeText(app, "/model ");
@@ -1121,7 +1118,7 @@ test("Enter completes a required-argument leaf and waits for its argument", asyn
 });
 
 test("slash completion keeps the input visible in a short frame", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 72,
     height: 12,
     runtime: {
@@ -1130,41 +1127,41 @@ test("slash completion keeps the input visible in a short frame", async () => {
   });
 
   try {
-    await typeText(app, "/te");
+    await typeText(app, "/ag");
     const frame = app.captureCharFrame();
 
     expect(frame).toContain("Commands");
-    expect(frame).toContain("/team");
-    expect(frame).toContain("> /te");
+    expect(frame).toContain("/agents");
+    expect(frame).toContain("> /ag");
   } finally {
     app.renderer.destroy();
   }
 });
 
 test("Tab drills into a command namespace without executing it", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async () => true,
     },
   });
 
   try {
-    await typeText(app, "/tea");
-    expect(app.captureCharFrame()).toContain("Inspect and control agent teamwork");
+    await typeText(app, "/age");
+    expect(app.captureCharFrame()).toContain("Inspect and control agents");
 
     await press(app, () => app.mockInput.pressTab());
     const frame = app.captureCharFrame();
 
-    expect(frame).toContain("/team ");
-    expect(frame).toContain("/team agents");
-    expect(frame).toContain("/team run");
+    expect(frame).toContain("/agents ");
+    expect(frame).toContain("/agents list");
+    expect(frame).toContain("/agents stop");
   } finally {
     app.renderer.destroy();
   }
 });
 
 test("Tab accepts the strongest slash completion for a typed prefix", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async () => true,
     },
@@ -1186,17 +1183,16 @@ test("Tab accepts the strongest slash completion for a typed prefix", async () =
 });
 
 test("Right drills into a command namespace without executing it", async () => {
-  const executed: TeamLiveAction[] = [];
-  const app = await mountShell(withRunLoopReady(teamLiveFixture()), { executed });
+  const app = await mountShell(runtimeFixture());
 
   try {
-    await typeText(app, "/tea");
+    await typeText(app, "/age");
     await press(app, () => app.mockInput.pressArrow("right"));
 
     const frame = app.captureCharFrame();
-    expect(frame).toContain("/team ");
-    expect(frame).toContain("/team run");
-    expect(executed).toEqual([]);
+    expect(frame).toContain("/agents ");
+    expect(frame).toContain("/agents stop");
+    expect(frame).not.toContain("Agents · 0 active, 0 total");
   } finally {
     app.renderer.destroy();
   }
@@ -1204,7 +1200,7 @@ test("Right drills into a command namespace without executing it", async () => {
 
 test("/mcp opens the MCP manager without writing status into the transcript", async () => {
   const calls: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       refreshMcpStatus: async () => {
         calls.push("status");
@@ -1235,7 +1231,7 @@ test("/mcp opens the MCP manager without writing status into the transcript", as
 
 test("/mcp manager opens server tools with keyboard navigation", async () => {
   const toolCalls: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       refreshMcpStatus: async () => ({
         summary: { total: 1, running: 1, disabled: 0, authRequired: 0, errored: 0 },
@@ -1297,7 +1293,7 @@ test("/mcp manager opens server tools with keyboard navigation", async () => {
 });
 
 test("/mcp manager offers tools when tool count is unknown", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       refreshMcpStatus: async () => ({
         summary: { total: 1, running: 1, disabled: 0, authRequired: 0, errored: 0 },
@@ -1333,7 +1329,7 @@ test("/mcp manager offers tools when tool count is unknown", async () => {
 
 test("/mcp status renders runtime MCP server state", async () => {
   const calls: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       refreshMcpStatus: async () => {
         calls.push("status");
@@ -1374,7 +1370,7 @@ test("/mcp status renders runtime MCP server state", async () => {
 test("/mcp tools lists MCP tools without submitting a prompt", async () => {
   const submissions: string[] = [];
   const toolCalls: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async (text) => {
         submissions.push(text);
@@ -1412,7 +1408,7 @@ test("/mcp tools lists MCP tools without submitting a prompt", async () => {
 
 test("/mcp reload refreshes MCP config and prompt commands", async () => {
   const calls: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       reloadMcp: async () => {
         calls.push("mcp");
@@ -1447,7 +1443,7 @@ test("/mcp reload refreshes MCP config and prompt commands", async () => {
 
 test("nested runtime commands submit their canonical commandId in the current session", async () => {
   const submissions: Array<{ commandId: string; args: string }> = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       activeSessionId: "session_runtime_command" as SessionId,
       commandList: {
@@ -1505,7 +1501,7 @@ test("nested runtime commands submit their canonical commandId in the current se
 
 test("$ opens a skill picker and Tab inserts a path-bound skill mention", async () => {
   const submissions: Array<{ text: string; skillMentions?: unknown }> = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     skills: [skillSummary("reviewer"), skillSummary("react-component")],
     runtime: {
       submitPrompt: async (text, options) => {
@@ -1538,7 +1534,7 @@ test("$ opens a skill picker and Tab inserts a path-bound skill mention", async 
 });
 
 test("$ skill picker distinguishes duplicate names with source and path hints", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 160,
     skills: [
       skillSummary("same", { source: "user", baseDir: "/home/.chili/skills/same" }),
@@ -1563,7 +1559,7 @@ test("duplicate skill picker keeps only the latest path binding by name", async 
   const submissions: Array<{ text: string; skillMentions?: unknown }> = [];
   const userSkill = skillSummary("same", { source: "user", baseDir: "/home/.chili/skills/same" });
   const projectSkill = skillSummary("same", { source: "project", baseDir: "/repo/.chili/skills/same" });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     skills: [userSkill, projectSkill],
     runtime: {
       submitPrompt: async (text, options) => {
@@ -1595,7 +1591,7 @@ test("duplicate skill picker keeps only the latest path binding by name", async 
 
 test("manual unknown skill mention warns locally and still submits", async () => {
   const submissions: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     skills: [skillSummary("reviewer")],
     runtime: {
       submitPrompt: async (text) => {
@@ -1618,7 +1614,7 @@ test("manual unknown skill mention warns locally and still submits", async () =>
 
 test("manual ambiguous skill mention warns locally without picker binding", async () => {
   const submissions: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     skills: [
       skillSummary("same", { source: "user", baseDir: "/home/.chili/skills/same" }),
       skillSummary("same", { source: "project", baseDir: "/repo/.chili/skills/same" }),
@@ -1644,7 +1640,7 @@ test("manual ambiguous skill mention warns locally without picker binding", asyn
 
 test("deleted skill mention bindings are not submitted", async () => {
   const submissions: Array<{ text: string; skillMentions?: unknown }> = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     skills: [skillSummary("reviewer")],
     runtime: {
       submitPrompt: async (text, options) => {
@@ -1669,7 +1665,7 @@ test("deleted skill mention bindings are not submitted", async () => {
 });
 
 test("/skills inserts $ and opens the skill picker", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     skills: [skillSummary("reviewer")],
     runtime: {
       submitPrompt: async () => true,
@@ -1690,7 +1686,7 @@ test("/skills inserts $ and opens the skill picker", async () => {
 });
 
 test("/skills browse inserts $ and opens the skill picker", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     skills: [skillSummary("reviewer")],
     runtime: {
       submitPrompt: async () => true,
@@ -1712,7 +1708,7 @@ test("/skills browse inserts $ and opens the skill picker", async () => {
 
 test("/thinking traces hide and show toggle reasoning visibility", async () => {
   const callId = "call_reasoning_toggle" as ToolCallId;
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       chatView: {
         status: "idle",
@@ -1782,7 +1778,7 @@ test("/thinking traces hide and show toggle reasoning visibility", async () => {
 });
 
 test("legacy /hide-thinking and /show-thinking aliases are rejected", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       chatView: {
         status: "idle",
@@ -1824,7 +1820,7 @@ test("legacy /hide-thinking and /show-thinking aliases are rejected", async () =
 test("leading slash absolute paths submit as normal prompts", async () => {
   const submitted: string[] = [];
   const prompt = "/Users/pony/Code/opensource/ai/agent/clis/opencli go inspect this repo";
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async (text) => {
         submitted.push(text);
@@ -1846,7 +1842,7 @@ test("leading slash absolute paths submit as normal prompts", async () => {
 
 test("probable command typos show suggestions and never submit as prompts", async () => {
   const submitted: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async (text) => {
         submitted.push(text);
@@ -1867,7 +1863,7 @@ test("probable command typos show suggestions and never submit as prompts", asyn
 });
 
 test("command palette selection uses Up and Down without switching prompt history", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async () => true,
     },
@@ -1882,7 +1878,7 @@ test("command palette selection uses Up and Down without switching prompt histor
     expect(app.captureCharFrame()).toContain("> /help — Browse commands and keyboard shortcuts");
 
     await press(app, () => app.mockInput.pressArrow("down"));
-    expect(app.captureCharFrame()).toContain("> /status — Show session and team status");
+    expect(app.captureCharFrame()).toContain("> /status — Show session status");
     expect(app.captureCharFrame()).not.toContain("palette history");
   } finally {
     app.renderer.destroy();
@@ -1890,7 +1886,7 @@ test("command palette selection uses Up and Down without switching prompt histor
 });
 
 test("command palette keeps a fixed frame while selection crosses every command group", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     height: 18,
     runtime: {
       submitPrompt: async () => true,
@@ -1939,7 +1935,7 @@ test("command palette keeps a fixed frame while selection crosses every command 
     expect(wrappedToFirstCommand).toBe(true);
     expect([...visitedCommands]).toEqual(expect.arrayContaining([
       "/goal",
-      "/team",
+      "/agents",
       "/auth",
       "/skills",
       "/mcp",
@@ -1952,7 +1948,7 @@ test("command palette keeps a fixed frame while selection crosses every command 
 });
 
 test("command palette keeps the draft visible without entering prompt history", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async () => true,
     },
@@ -1968,14 +1964,14 @@ test("command palette keeps the draft visible without entering prompt history", 
     await press(app, () => app.mockInput.pressArrow("down"));
     const frame = app.captureCharFrame();
     expect(frame).toContain("draft before palette");
-    expect(frame).toContain("> /status — Show session and team status");
+    expect(frame).toContain("> /status — Show session status");
   } finally {
     app.renderer.destroy();
   }
 });
 
 test("/help opens the same searchable command browser", async () => {
-  const app = await mountShell(teamLiveFixture());
+  const app = await mountShell(runtimeFixture());
 
   try {
     await typeText(app, "/help");
@@ -1989,7 +1985,7 @@ test("/help opens the same searchable command browser", async () => {
 });
 
 test("command palette edits its query and preserves the composer draft", async () => {
-  const app = await mountShell(teamLiveFixture());
+  const app = await mountShell(runtimeFixture());
 
   try {
     await typeText(app, "draft stays here");
@@ -2014,25 +2010,25 @@ test("command palette edits its query and preserves the composer draft", async (
 });
 
 test("command palette Tab drills down while Enter executes the selected command", async () => {
-  const app = await mountShell(teamLiveFixture());
+  const app = await mountShell(runtimeFixture());
 
   try {
     await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
-    await typeText(app, "team");
-    expect(app.captureCharFrame()).toContain("> /team — Inspect and control agent teamwork");
+    await typeText(app, "agents");
+    expect(app.captureCharFrame()).toContain("> /agents — Inspect and control agents");
 
     await press(app, () => app.mockInput.pressTab());
     let frame = app.captureCharFrame();
-    expect(frame).toContain("Command Palette · team");
-    expect(frame).toContain("> /team agents — Show the agent tree");
-    expect(frame).toContain("/team run — Start the selected team loop");
+    expect(frame).toContain("Command Palette · agents");
+    expect(frame).toContain("> /agents list — Show agents in this session");
+    expect(frame).toContain("/agents stop <agent-id>");
 
     await press(app, () => app.mockInput.pressEscape());
     await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
-    await typeText(app, "team");
+    await typeText(app, "agents");
     await press(app, () => app.mockInput.pressEnter());
     frame = app.captureCharFrame();
-    expect(frame).toContain("Chili Team Live");
+    expect(frame).toContain("Agents · 0 active, 0 total");
     expect(frame).not.toContain("Command Palette");
   } finally {
     app.renderer.destroy();
@@ -2040,7 +2036,7 @@ test("command palette Tab drills down while Enter executes the selected command"
 });
 
 test("command palette Enter completes required arguments without executing", async () => {
-  const app = await mountShell(teamLiveFixture());
+  const app = await mountShell(runtimeFixture());
 
   try {
     await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
@@ -2063,7 +2059,7 @@ test("Ctrl+V pastes clipboard text into the prompt", async () => {
   const clipboard = fakeClipboard({
     readText: async () => "from\nclipboard",
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     clipboard,
     runtime: {
       submitPrompt: async (text) => {
@@ -2090,7 +2086,7 @@ test("Ctrl+V ignores decorative-only clipboard text", async () => {
   const clipboard = fakeClipboard({
     readText: async () => "▝              ",
   });
-  const app = await mountShell(teamLiveFixture(), { clipboard });
+  const app = await mountShell(runtimeFixture(), { clipboard });
 
   try {
     await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
@@ -2112,7 +2108,7 @@ test("Ctrl+V saves clipboard images and submits them as prompt attachments", asy
       throw new Error("text clipboard should not be read when an image is present");
     },
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     cwd,
     clipboard,
     runtime: {
@@ -2152,7 +2148,7 @@ test("Ctrl+V keeps image placeholders and submits tool-readable paths for known 
   const clipboard = fakeClipboard({
     readImage: async () => ({ bytes: png, mimeType: "image/png", extension: "png" }),
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     cwd,
     clipboard,
     runtime: {
@@ -2199,7 +2195,7 @@ test("Ctrl+V keeps image placeholders and submits tool-readable paths for known 
 
 test("terminal bracketed paste inserts text into the prompt", async () => {
   const submitted: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async (text) => {
         submitted.push(text);
@@ -2232,7 +2228,7 @@ test("large multiline paste uses a prompt placeholder but submits and displays t
   const clipboard = fakeClipboard({
     readText: async () => pasted,
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     clipboard,
     runtime: {
       submitPrompt: async (text, options) => {
@@ -2261,7 +2257,7 @@ test("large multiline paste uses a prompt placeholder but submits and displays t
 
 test("Ctrl+J inserts a newline in the prompt", async () => {
   const submitted: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async (text) => {
         submitted.push(text);
@@ -2286,7 +2282,7 @@ test("Ctrl+V pastes without scrolling the transcript down", async () => {
   const clipboard = fakeClipboard({
     readText: async () => "clip",
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 120,
     height: 24,
     clipboard,
@@ -2326,7 +2322,7 @@ test("Ctrl+Shift+C copies the latest assistant reply when nothing is selected", 
       return true;
     },
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     clipboard,
     kittyKeyboard: true,
     runtime: {
@@ -2369,7 +2365,7 @@ test("local copy notices expire", async () => {
       return true;
     },
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     clipboard,
     kittyKeyboard: true,
     localMessageTtlMs: 120,
@@ -2407,7 +2403,7 @@ test("Ctrl+Shift+C copies the transcript when transcript view is active", async 
       return true;
     },
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     clipboard,
     kittyKeyboard: true,
     runtime: {
@@ -2440,7 +2436,7 @@ test("local notices clear when the active session changes", async () => {
   const clipboard = fakeClipboard({
     readText: async () => "",
   });
-  const app = await mountStatefulShell(teamLiveFixture(), {
+  const app = await mountStatefulShell(runtimeFixture(), {
     clipboard,
   });
 
@@ -2470,7 +2466,7 @@ test("finished terminal selection is copied to the clipboard", async () => {
       return true;
     },
   });
-  const app = await mountShell(teamLiveFixture(), { clipboard });
+  const app = await mountShell(runtimeFixture(), { clipboard });
 
   try {
     emitSelection(app.renderer, "selected text   \n");
@@ -2490,7 +2486,7 @@ test("decorative-only terminal selection is not copied", async () => {
       return true;
     },
   });
-  const app = await mountShell(teamLiveFixture(), { clipboard });
+  const app = await mountShell(runtimeFixture(), { clipboard });
 
   try {
     emitSelection(app.renderer, "▝              ");
@@ -2510,7 +2506,7 @@ test("left double click selects a transcript word", async () => {
       return true;
     },
   });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 90,
     height: 18,
     useMouse: true,
@@ -2550,7 +2546,7 @@ test("left double click selects an assistant markdown path token", async () => {
     },
   });
   const pathToken = "/repo/chili/apps/tui/src/lines.tsx:42";
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 100,
     height: 18,
     useMouse: true,
@@ -2600,7 +2596,7 @@ test("left double click selects a concealed markdown word", async () => {
     },
   });
   const word = "fantastic";
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 100,
     height: 18,
     useMouse: true,
@@ -2650,7 +2646,7 @@ test("left double click selects a wrapped assistant markdown word", async () => 
     },
   });
   const word = "supercalifragilisticexpialidocious";
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 36,
     height: 18,
     useMouse: true,
@@ -2705,7 +2701,7 @@ test("left double click selects only a final assistant markdown word", async () 
     },
   });
   const sentence = "I told my wife she was drawing her eyebrows too high.";
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 100,
     height: 18,
     useMouse: true,
@@ -2765,7 +2761,7 @@ test("left triple click selects an assistant markdown line", async () => {
   });
   const pathToken = "/repo/chili/apps/tui/src/lines.tsx:42";
   const lineText = `Open ${pathToken} now`;
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 100,
     height: 18,
     useMouse: true,
@@ -2808,7 +2804,7 @@ test("left triple click selects an assistant markdown line", async () => {
 });
 
 test("Shift+Up and Shift+Down scroll the transcript instead of prompt history", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 120,
     height: 24,
     runtime: {
@@ -2847,7 +2843,7 @@ test("Shift+Up and Shift+Down scroll the transcript instead of prompt history", 
 });
 
 test("chat scroll stays on history when new messages arrive above the bottom", async () => {
-  const app = await mountStatefulShell(teamLiveFixture(), {
+  const app = await mountStatefulShell(runtimeFixture(), {
     width: 120,
     height: 24,
     runtime: {
@@ -2891,7 +2887,7 @@ test("chat scroll stays on history when new messages arrive above the bottom", a
 });
 
 test("chat follows the bottom when new messages arrive at offset zero", async () => {
-  const app = await mountStatefulShell(teamLiveFixture(), {
+  const app = await mountStatefulShell(runtimeFixture(), {
     width: 120,
     height: 24,
     runtime: {
@@ -2929,7 +2925,7 @@ test("chat follows the bottom when new messages arrive at offset zero", async ()
 });
 
 test("transcript scroll stays on history when raw output grows above the bottom", async () => {
-  const app = await mountStatefulShell(teamLiveFixture(), {
+  const app = await mountStatefulShell(runtimeFixture(), {
     width: 120,
     height: 24,
     runtime: {
@@ -2975,7 +2971,7 @@ test("transcript scroll stays on history when raw output grows above the bottom"
 });
 
 test("running disabled composer does not switch to prompt history", async () => {
-  const app = await mountStatefulShell(teamLiveFixture(), {
+  const app = await mountStatefulShell(runtimeFixture(), {
     runtime: {
       submitPrompt: async () => true,
     },
@@ -3010,7 +3006,7 @@ test("pending approval renders the approval dock and shortcuts resolve it", asyn
   const approved: Array<{ id: ApprovalId; scope: ChatApproveOptions["scope"] }> = [];
   const rejected: ApprovalId[] = [];
   const approvalId = "approval_chat_pending" as ApprovalId;
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       canSubmit: false,
       chatView: {
@@ -3075,7 +3071,7 @@ test("pending approval renders the approval dock and shortcuts resolve it", asyn
 test("one-time approval shortcuts cannot grant a wider scope", async () => {
   const approved: Array<{ id: ApprovalId; scope: ChatApproveOptions["scope"] }> = [];
   const approvalId = "approval_once_only" as ApprovalId;
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       canSubmit: false,
       chatView: {
@@ -3122,7 +3118,7 @@ test("unsandboxed approval cannot be accepted until the full command fits", asyn
   const approved: ApprovalId[] = [];
   const approvalId = "approval_resize_review" as ApprovalId;
   const command = `remindctl status ${"--include-completed ".repeat(60)}`;
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 60,
     height: 18,
     runtime: {
@@ -3166,7 +3162,7 @@ test("unsandboxed approval cannot be accepted until the full command fits", asyn
 test("pending approval shortcuts work when the prompt still has a draft", async () => {
   const approved: Array<{ id: ApprovalId; scope: ChatApproveOptions["scope"] }> = [];
   const approvalId = "approval_with_draft" as ApprovalId;
-  const app = await mountStatefulShell(teamLiveFixture(), {
+  const app = await mountStatefulShell(runtimeFixture(), {
     runtime: {
       approveApproval: async (id, options) => {
         approved.push({ id, scope: options?.scope });
@@ -3287,7 +3283,7 @@ test("/skills enable and disable update project skill settings", async () => {
   const cwd = await mkdtemp(path.join(tmpdir(), "chili-tui-skills-"));
   const refreshed: string[] = [];
   const reviewer = skillSummary("reviewer", { baseDir: path.join(cwd, ".chili", "skills", "reviewer") });
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     cwd,
     skills: [reviewer],
     allSkills: [reviewer],
@@ -3322,24 +3318,8 @@ test("/skills enable and disable update project skill settings", async () => {
   }
 });
 
-test("slash team opens cockpit and Escape returns to chat shell", async () => {
-  const app = await mountShell(teamLiveFixture());
-
-  try {
-    await typeText(app, "/team");
-    await press(app, () => app.mockInput.pressEnter());
-    expect(app.captureCharFrame()).toContain("Chili Team Live");
-
-    await press(app, () => app.mockInput.pressEscape());
-    expect(app.captureCharFrame()).toContain("Ask anything");
-    expect(app.captureCharFrame()).not.toContain("Chili Team Live");
-  } finally {
-    app.renderer.destroy();
-  }
-});
-
 test("Ctrl+P opens the command palette", async () => {
-  const app = await mountShell(teamLiveFixture());
+  const app = await mountShell(runtimeFixture());
 
   try {
     await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
@@ -3348,20 +3328,20 @@ test("Ctrl+P opens the command palette", async () => {
     expect(app.captureCharFrame()).toContain("/model service <standard|fast>");
     expect(app.captureCharFrame()).toContain("/theme — Switch the terminal theme");
 
-    await typeText(app, "team run");
-    expect(app.captureCharFrame()).toContain("> /team run — Start the selected team loop");
+    await typeText(app, "agents stop");
+    expect(app.captureCharFrame()).toContain("> /agents stop <agent-id>");
   } finally {
     app.renderer.destroy();
   }
 });
 
-test("slash completion includes team command", async () => {
-  const app = await mountShell(teamLiveFixture());
+test("slash completion includes agents command", async () => {
+  const app = await mountShell(runtimeFixture());
 
   try {
-    await typeText(app, "/te");
+    await typeText(app, "/ag");
     expect(app.captureCharFrame()).toContain("Commands");
-    expect(app.captureCharFrame()).toContain("/team");
+    expect(app.captureCharFrame()).toContain("/agents");
     expect(app.captureCharFrame()).not.toContain("/hide-thinking");
   } finally {
     app.renderer.destroy();
@@ -3369,7 +3349,7 @@ test("slash completion includes team command", async () => {
 });
 
 test("/theme opens the theme picker", async () => {
-  const app = await mountShell(teamLiveFixture());
+  const app = await mountShell(runtimeFixture());
 
   try {
     await typeText(app, "/theme");
@@ -3427,7 +3407,7 @@ test("/session resume opens a searchable project-scoped picker and switches sess
       updatedAt: 5,
     },
   ];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       activeSessionId: "session_current" as SessionId,
       chatView: {
@@ -3483,7 +3463,7 @@ test("/session resume opens a searchable project-scoped picker and switches sess
 test("/rename edits and saves the current chat title", async () => {
   const renamed: string[] = [];
   const sessionId = "session_rename" as SessionId;
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       chatView: {
         status: "idle",
@@ -3516,7 +3496,7 @@ test("/rename edits and saves the current chat title", async () => {
 });
 
 test("theme picker Up and Down preview the selected theme", async () => {
-  const app = await mountShell(teamLiveFixture());
+  const app = await mountShell(runtimeFixture());
 
   try {
     await typeText(app, "/theme");
@@ -3536,7 +3516,7 @@ test("theme picker Up and Down preview the selected theme", async () => {
 });
 
 test("theme picker Escape rolls back the previewed theme", async () => {
-  const app = await mountShell(teamLiveFixture());
+  const app = await mountShell(runtimeFixture());
 
   try {
     await typeText(app, "/theme");
@@ -3556,7 +3536,7 @@ test("theme picker Escape rolls back the previewed theme", async () => {
 });
 
 test("theme picker preserves an in-progress draft opened from the command palette", async () => {
-  const app = await mountShell(teamLiveFixture());
+  const app = await mountShell(runtimeFixture());
 
   try {
     await typeText(app, "draft before theme");
@@ -3579,7 +3559,7 @@ test("theme picker preserves an in-progress draft opened from the command palett
 });
 
 test("theme picker Enter confirms the previewed theme", async () => {
-  const app = await mountShell(teamLiveFixture());
+  const app = await mountShell(runtimeFixture());
 
   try {
     await typeText(app, "/theme");
@@ -3635,7 +3615,7 @@ test("/model uses runtime catalog and persists the selected model", async () => 
 });
 
 test("/model uses a focused search surface and skips empty sources", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       modelCandidates: [
         { provider: "test-provider", providerDisplayName: "Test Provider", model: "test-model" },
@@ -3710,7 +3690,7 @@ test("/model uses a focused search surface and skips empty sources", async () =>
 });
 
 test("/model keeps its chrome and prompt separate in a 48x13 home terminal", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 48,
     height: 13,
     runtime: {
@@ -3745,7 +3725,7 @@ test("/model keeps its chrome and prompt separate in a 48x13 home terminal", asy
 });
 
 test("/model keeps its chrome and prompt separate in a 48x15 active chat", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 48,
     height: 15,
     runtime: {
@@ -3788,7 +3768,7 @@ test("/model keeps its chrome and prompt separate in a 48x15 active chat", async
 
 test("/model removes result rows when a 48x20 approval dock appears", async () => {
   const approvalId = "approval_model_picker_compact" as ApprovalId;
-  const app = await mountStatefulShell(teamLiveFixture(), {
+  const app = await mountStatefulShell(runtimeFixture(), {
     width: 48,
     height: 20,
     runtime: {
@@ -3860,7 +3840,7 @@ test("/model removes result rows when a 48x20 approval dock appears", async () =
 
 test("/model labels identical Codex models as ChatGPT or Api and selects the right provider", async () => {
   const selected: ModelSelection[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       modelCandidates: [
         {
@@ -3923,7 +3903,7 @@ test("/model search highlights the best match instead of keeping a weaker curren
     { provider: "codex-api", providerDisplayName: "Api", model: "gpt-5.6-luna" },
   ];
   const selected: ModelSelection[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       modelCandidates: candidates,
       modelConfig: {
@@ -3961,7 +3941,7 @@ test("/model keeps the highlighted model stable when a refreshed catalog reorder
     { provider: "stable", providerDisplayName: "Stable", model: "alpha" },
     { provider: "stable", providerDisplayName: "Stable", model: "gamma" },
   ];
-  const app = await mountStatefulShell(teamLiveFixture(), {
+  const app = await mountStatefulShell(runtimeFixture(), {
     runtime: {
       modelCandidates: initialModels,
       setRuntimeModel: async (selection) => {
@@ -4005,7 +3985,7 @@ test("/model falls back to All when a refreshed catalog removes the active sourc
     providerDisplayName: "Stay",
     model: "stay-model",
   };
-  const app = await mountStatefulShell(teamLiveFixture(), {
+  const app = await mountStatefulShell(runtimeFixture(), {
     runtime: {
       modelCandidates: [
         { provider: "gone", providerDisplayName: "Gone", model: "gone-model" },
@@ -4044,7 +4024,7 @@ test("/model falls back to All when a refreshed catalog removes the active sourc
 });
 
 test("/model detail shows safe connection metadata", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       modelCandidates: [{
         provider: "codex-api",
@@ -4073,7 +4053,7 @@ test("/model detail shows safe connection metadata", async () => {
 });
 
 test("/model keeps the old UI state when persistence fails", async () => {
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       modelCandidates: [
         { provider: "openai-codex", model: "gpt-5.5", displayName: "GPT-5.5" },
@@ -4105,7 +4085,7 @@ test("/status separates the live event stream from execution and reports unsuppo
     capabilities: { reasoning: true, toolCalls: true },
     reasoningLevels: [],
   }];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       modelCandidates: models,
       modelConfig: {
@@ -4136,8 +4116,7 @@ test("/status separates the live event stream from execution and reports unsuppo
     expect(frame).toContain("execution: idle");
     expect(frame).toContain("agent capability: available");
     expect(frame).toContain("delegation: not configured");
-    expect(frame).toContain("ad-hoc agents: 0 active");
-    expect(frame).toContain("persistent teams: none");
+    expect(frame).toContain("agents: 0 active, 0 total");
     expect(frame).toContain("thinking: unsupported");
     expect(frame).toContain("service tier: unsupported");
     expect(frame).not.toContain("connection: streaming");
@@ -4161,7 +4140,7 @@ test("/status separates the live event stream from execution and reports unsuppo
 test("/session delegation updates and reads the session delegation policy through runtime APIs", async () => {
   const sessionId = "session_agents_policy" as SessionId;
   const policies: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       activeSessionId: sessionId,
       delegationConfig: { sessionId, policy: "explicit", source: "default" },
@@ -4200,7 +4179,7 @@ test("/status preserves effective reasoning and fast tier for OpenAI Codex", asy
     reasoningLevels: ["off", "low", "medium", "high"],
     serviceTiers: ["standard", "fast"],
   }];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       modelCandidates: models,
       modelConfig: {
@@ -4255,7 +4234,7 @@ test("/status distinguishes a third-party API key connection from ChatGPT OAuth"
       endpoint: "https://gateway-user:secret@gateway.example:8443/v1?api_key=hidden#fragment",
     },
   ];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     runtime: {
       modelCandidates: models,
       modelConfig: {
@@ -4289,7 +4268,7 @@ test("/status distinguishes a third-party API key connection from ChatGPT OAuth"
 test("/status shows status reasons for failed and cancelled executions", async () => {
   for (const status of ["failed", "cancelled"] as const) {
     const reason = `${status} because the provider closed the response stream`;
-    const app = await mountShell(teamLiveFixture(), {
+    const app = await mountShell(runtimeFixture(), {
       runtime: {
         chatView: {
           status,
@@ -4320,7 +4299,7 @@ test("/status shortcut copies the complete status page on a narrow screen and sh
   const sessionId = "session_status_copy_with_a_value_longer_than_the_visible_status_row" as SessionId;
   const reason = "Provider request failed after every response retry was exhausted";
   const cwd = "/repo/chili/a/very/long/path/that/is/not/fully/visible/in/the/status/view";
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 44,
     height: 40,
     cwd,
@@ -4370,7 +4349,7 @@ test("/status shortcut copies the complete status page on a narrow screen and sh
 
 test("/status does not show clipboard feedback left by the chat view", async () => {
   const copied: string[] = [];
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     localMessageTtlMs: 0,
     kittyKeyboard: true,
     clipboard: fakeClipboard({
@@ -4420,7 +4399,7 @@ test("/status discards a pending copy result when the active session changes", a
   });
   const oldSessionId = "session_status_copy_old" as SessionId;
   const newSessionId = "session_status_copy_new" as SessionId;
-  const app = await mountStatefulShell(teamLiveFixture(), {
+  const app = await mountStatefulShell(runtimeFixture(), {
     clipboard: fakeClipboard({ writeText: async () => writeResult }),
     runtime: {
       activeSessionId: oldSessionId,
@@ -4457,7 +4436,7 @@ test("/status discards a pending copy result when the active session changes", a
 test("/status supports themed multi-click selection and keeps selection copy priority", async () => {
   const copied: string[] = [];
   const sessionId = "session_status_selectable" as SessionId;
-  const app = await mountShell(teamLiveFixture(), {
+  const app = await mountShell(runtimeFixture(), {
     width: 100,
     height: 36,
     useMouse: true,
@@ -4497,229 +4476,11 @@ test("/status supports themed multi-click selection and keeps selection copy pri
   }
 });
 
-test("team run slash command executes SDK run-loop action", async () => {
-  const executed: TeamLiveAction[] = [];
-  const app = await mountShell(withRunLoopReady(teamLiveFixture()), { executed });
-
-  try {
-    await typeText(app, "/team run");
-    await press(app, () => app.mockInput.pressEnter());
-    expect(executed[0]).toMatchObject({ type: "run_loop", enabled: true });
-  } finally {
-    app.renderer.destroy();
-  }
-});
-
-test("team merge slash command executes SDK merge action", async () => {
-  const executed: TeamLiveAction[] = [];
-  const app = await mountShell(teamLiveFixture(), { executed });
-
-  try {
-    await typeText(app, "/team merge");
-    await press(app, () => app.mockInput.pressEnter());
-    await press(app, () => app.mockInput.pressArrow("right"));
-    await press(app, () => app.mockInput.pressEnter());
-    expect(executed[0]).toMatchObject({ type: "merge", enabled: true, taskId: "task_live" });
-  } finally {
-    app.renderer.destroy();
-  }
-});
-
-test("keyboard changes focus with Tab and Shift+Tab", async () => {
-  const app = await mountSurface(teamLiveFixture());
-
-  try {
-    expect(app.captureCharFrame()).toContain("[teams]");
-
-    await press(app, () => app.mockInput.pressTab());
-    expect(app.captureCharFrame()).toContain("[runs]");
-
-    await press(app, () => app.mockInput.pressTab({ shift: true }));
-    expect(app.captureCharFrame()).toContain("[teams]");
-  } finally {
-    app.renderer.destroy();
-  }
-});
-
-test("keyboard opens detail and Esc closes it", async () => {
-  const app = await mountSurface(teamLiveFixture(), { width: 80, height: 24 });
-
-  try {
-    await press(app, () => app.mockInput.pressEnter());
-    expect(app.captureCharFrame()).toContain("Detail");
-    expect(app.captureCharFrame()).toContain("lead:/root");
-
-    await press(app, () => app.mockInput.pressEscape());
-    expect(app.captureCharFrame()).toContain("Teams");
-    expect(app.captureCharFrame()).not.toContain("lead:/root");
-  } finally {
-    app.renderer.destroy();
-  }
-});
-
-test("keyboard opens and closes help", async () => {
-  const app = await mountSurface(teamLiveFixture());
-
-  try {
-    await press(app, () => app.mockInput.pressKey("?"));
-    expect(app.captureCharFrame()).toContain("Team Live Help");
-
-    await press(app, () => app.mockInput.pressEscape());
-    expect(app.captureCharFrame()).not.toContain("Team Live Help");
-  } finally {
-    app.renderer.destroy();
-  }
-});
-
-test("approve action asks for confirmation before SDK action", async () => {
-  const executed: TeamLiveAction[] = [];
-  const app = await mountSurface(teamLiveFixture(), { executed });
-
-  try {
-    await press(app, () => app.mockInput.pressKey("a"));
-    expect(app.captureCharFrame()).toContain("Approve pending permission?");
-    expect(executed).toHaveLength(0);
-
-    await press(app, () => app.mockInput.pressEnter());
-    expect(executed[0]?.type).toBe("approve");
-  } finally {
-    app.renderer.destroy();
-  }
-});
-
-test("reject action asks for confirmation before SDK action", async () => {
-  const executed: TeamLiveAction[] = [];
-  const app = await mountSurface(teamLiveFixture(), { executed });
-
-  try {
-    await press(app, () => app.mockInput.pressKey("x"));
-    expect(app.captureCharFrame()).toContain("Reject pending permission?");
-    expect(executed).toHaveLength(0);
-
-    await press(app, () => app.mockInput.pressEnter());
-    expect(executed[0]?.type).toBe("reject");
-  } finally {
-    app.renderer.destroy();
-  }
-});
-
-test("merge action asks for confirmation before SDK action and Esc cancels", async () => {
-  const executed: TeamLiveAction[] = [];
-  const app = await mountSurface(teamLiveFixture(), { executed });
-
-  try {
-    await press(app, () => app.mockInput.pressKey("m"));
-    expect(app.captureCharFrame()).toContain("Merge task worktree?");
-    await press(app, () => app.mockInput.pressEscape());
-    expect(executed).toHaveLength(0);
-    expect(app.captureCharFrame()).not.toContain("Merge task worktree?");
-
-    await press(app, () => app.mockInput.pressKey("m"));
-    await press(app, () => app.mockInput.pressEnter());
-    expect(executed[0]?.type).toBe("merge");
-  } finally {
-    app.renderer.destroy();
-  }
-});
-
-test("merge hotkey stays bound to the selected task", async () => {
-  const executed: TeamLiveAction[] = [];
-  const app = await mountSurface(withMergeActionOnSecondTask(), { executed });
-
-  try {
-    await press(app, () => app.mockInput.pressKey("m"));
-    expect(app.captureCharFrame()).not.toContain("Merge task worktree?");
-    expect(executed).toHaveLength(1);
-    expect(executed[0]).toMatchObject({
-      type: "merge",
-      taskId: "task_without_merge",
-      enabled: false,
-      reason: "no_selected_merge",
-    });
-  } finally {
-    app.renderer.destroy();
-  }
-});
-
-test("approval hotkey stays bound to the selected approval", async () => {
-  const executed: TeamLiveAction[] = [];
-  const app = await mountSurface(withApprovalActionOnSecondApproval(), { executed });
-
-  try {
-    await press(app, () => app.mockInput.pressKey("a"));
-    expect(app.captureCharFrame()).not.toContain("Approve pending permission?");
-    expect(executed).toHaveLength(1);
-    expect(executed[0]).toMatchObject({
-      type: "approve",
-      approvalId: "approval_without_action",
-      enabled: false,
-      reason: "action_unavailable",
-    });
-  } finally {
-    app.renderer.destroy();
-  }
-});
-
-test("keyboard keeps task selection visible past the first window", async () => {
-  const app = await mountSurface(withManyTasks(teamLiveFixture()), { width: 120, height: 40 });
-
-  try {
-    await press(app, () => app.mockInput.pressTab());
-    await press(app, () => app.mockInput.pressTab());
-    await press(app, () => app.mockInput.pressTab());
-    for (let index = 0; index < 15; index += 1) {
-      await press(app, () => app.mockInput.pressArrow("down"));
-    }
-
-    const frame = app.captureCharFrame();
-    expect(frame).toContain("[Task Board 5-16/16]");
-    expect(frame).toContain("Task row 16");
-  } finally {
-    app.renderer.destroy();
-  }
-});
-
-async function mountSurface(
-  model: TeamLiveView,
-  options: {
-    width?: number;
-    height?: number;
-    executed?: TeamLiveAction[];
-  } = {},
-) {
-  const runtime: TeamLiveSurfaceRuntime = {
-    message: "test stream",
-    reconnect: () => undefined,
-    executeAction: (action) => {
-      options.executed?.push(action);
-    },
-    clearActionFeedback: () => undefined,
-  };
-
-  const app = await testRender(
-    <TeamLiveSurface
-      model={model}
-      runtime={runtime}
-      selectedTeamId={model.selectedTeamId}
-      selectedTeamLocked={false}
-      onSelectTeam={() => undefined}
-      onExit={() => undefined}
-      theme={chiliDarkTheme}
-    />,
-    { width: options.width ?? 120, height: options.height ?? 40, exitOnCtrlC: false },
-  );
-  await act(async () => {
-    await app.renderOnce();
-  });
-  return app;
-}
-
 async function mountShell(
-  model: TeamLiveView,
+  model: RuntimeFixture,
   options: {
     width?: number;
     height?: number;
-    executed?: TeamLiveAction[];
     runtime?: Partial<ChatRuntimeState>;
     clipboard?: ClipboardAccess;
     kittyKeyboard?: boolean;
@@ -4738,10 +4499,6 @@ async function mountShell(
     connection: model.connection,
     message: "test stream",
     reconnect: () => undefined,
-    executeAction: (action) => {
-      options.executed?.push(action);
-    },
-    clearActionFeedback: () => undefined,
     hydrateEvents: () => undefined,
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
@@ -4756,6 +4513,8 @@ async function mountShell(
     resumeSession: async () => true,
     renameSession: async () => undefined,
     interruptActiveSession: async () => undefined,
+    stopAgent: async () => undefined,
+    resumeAgent: async () => undefined,
     approveApproval: async () => undefined,
     rejectApproval: async () => undefined,
     ...options.runtime,
@@ -4770,11 +4529,7 @@ async function mountShell(
   };
   const app = await testRender(
     <ChatShellSurface
-      model={model}
       runtime={runtime}
-      selectedTeamId={model.selectedTeamId}
-      selectedTeamLocked={false}
-      onSelectTeam={() => undefined}
       onExit={options.onExit ?? (() => undefined)}
       options={{ cwd: options.cwd ?? "/repo/chili", modeName: "Build", modelName: "test-model", providerName: "test-provider" }}
       clipboard={options.clipboard}
@@ -4792,11 +4547,10 @@ async function mountShell(
 }
 
 async function mountStatefulShell(
-  model: TeamLiveView,
+  model: RuntimeFixture,
   options: {
     width?: number;
     height?: number;
-    executed?: TeamLiveAction[];
     runtime?: Partial<ChatRuntimeState>;
     clipboard?: ClipboardAccess;
   } = {},
@@ -4809,11 +4563,7 @@ async function mountStatefulShell(
     setRuntime = updateRuntime;
     return (
       <ChatShellSurface
-        model={model}
         runtime={runtime}
-        selectedTeamId={model.selectedTeamId}
-        selectedTeamLocked={false}
-        onSelectTeam={() => undefined}
         onExit={() => undefined}
         options={{ cwd: "/repo/chili", modeName: "Build", modelName: "test-model", providerName: "test-provider" }}
         clipboard={options.clipboard}
@@ -4840,9 +4590,8 @@ async function mountStatefulShell(
 }
 
 function chatRuntime(
-  model: TeamLiveView,
+  model: RuntimeFixture,
   options: {
-    executed?: TeamLiveAction[];
     runtime?: Partial<ChatRuntimeState>;
   } = {},
 ): ChatRuntimeState {
@@ -4852,10 +4601,6 @@ function chatRuntime(
     connection: model.connection,
     message: "test stream",
     reconnect: () => undefined,
-    executeAction: (action) => {
-      options.executed?.push(action);
-    },
-    clearActionFeedback: () => undefined,
     hydrateEvents: () => undefined,
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
@@ -4870,6 +4615,8 @@ function chatRuntime(
     resumeSession: async () => true,
     renameSession: async () => undefined,
     interruptActiveSession: async () => undefined,
+    stopAgent: async () => undefined,
+    resumeAgent: async () => undefined,
     approveApproval: async () => undefined,
     rejectApproval: async () => undefined,
     ...options.runtime,
@@ -4972,8 +4719,6 @@ async function mountChatApp(
       options={{
         baseUrl: "http://runtime.test",
         cwd: "/repo/chili",
-        runLoop: false,
-        once: false,
         ...options,
       }}
       onExit={() => undefined}
@@ -5189,35 +4934,7 @@ function fakeChatClient(
       }
       await waitForAbort(input.signal);
     },
-    runTeamLoop: async () => ({
-      teamId: "team_test",
-      cycles: 0,
-      stopReason: "once",
-      startedAt: 0,
-      endedAt: 0,
-      maxConcurrentVerifications: 2,
-      dispatched: [],
-      completed: [],
-      accepted: [],
-      reopened: [],
-      merged: [],
-      mergeFailed: [],
-      mergeConflicted: [],
-      mergeSkipped: [],
-      failed: [],
-      blocked: [],
-      skipped: [],
-      stillRunning: [],
-      errors: [],
-    }),
-    mergeTeamTasks: async () => ({
-      scanned: 0,
-      applied: [],
-      failed: [],
-      conflicted: [],
-      skipped: [],
-      errors: [],
-    }),
+
   };
   return client as unknown as HttpRuntimeClient;
 }
@@ -5285,6 +5002,12 @@ function approvalEvents(sessionId: SessionId, approvalId: ApprovalId): ChiliEven
       payload: { approvalId, callId, permission: "bash", patterns: ["ls -la"] },
     },
   ];
+}
+
+function requireFirst<T>(items: readonly T[]): T {
+  const first = items[0];
+  if (first === undefined) throw new Error("Expected a non-empty test fixture");
+  return first;
 }
 
 function chatMessages(count: number): ChatTranscriptItem[] {
@@ -5371,120 +5094,4 @@ async function waitForAbort(signal: AbortSignal | undefined): Promise<void> {
   await new Promise<void>((resolve) => {
     signal.addEventListener("abort", () => resolve(), { once: true });
   });
-}
-
-function withRunLoopReady(view: TeamLiveView): TeamLiveView {
-  const selected = requireSelected(view);
-  const teamId = requireTeamId(view);
-  const actions: TeamLiveAction[] = [
-    { type: "run_loop", teamId, enabled: true },
-    ...selected.availableActions.filter((action) => action.type !== "run_loop"),
-  ];
-  return {
-    ...view,
-    availableActions: actions,
-    selected: {
-      ...selected,
-      availableActions: actions,
-    },
-  };
-}
-
-function withMergeActionOnSecondTask(): TeamLiveView {
-  const view = teamLiveFixture();
-  const selected = requireSelected(view);
-  const baseTask = requireFirst(selected.tasks);
-  const teamId = requireTeamId(view);
-  const firstTaskId = "task_without_merge" as TaskId;
-  const secondTaskId = "task_with_merge" as TaskId;
-  const { merge: _merge, ...taskWithoutMerge } = baseTask;
-  const firstTask = {
-    ...taskWithoutMerge,
-    id: firstTaskId,
-    title: "Selected task without merge",
-    metadata: withoutMergeMetadata(baseTask.metadata),
-  };
-  const secondTask = {
-    ...baseTask,
-    id: secondTaskId,
-    title: "Second task with merge",
-    merge: { ...requireFirst(selected.mergeQueue), taskId: secondTaskId, title: "Second task with merge" },
-  };
-  const actions: TeamLiveAction[] = [
-    { type: "merge", teamId, taskId: secondTaskId, enabled: true },
-  ];
-
-  return {
-    ...view,
-    availableActions: actions,
-    selected: {
-      ...selected,
-      tasks: [firstTask, secondTask],
-      mergeQueue: [secondTask.merge],
-      availableActions: actions,
-    },
-  };
-}
-
-function withApprovalActionOnSecondApproval(): TeamLiveView {
-  const view = teamLiveFixture();
-  const selected = requireSelected(view);
-  const baseApproval = requireFirst(selected.pendingApprovals);
-  const sessionId = baseApproval.sessionId;
-  if (!sessionId) throw new Error("fixture requires approval session");
-  const firstApprovalId = "approval_without_action" as ApprovalId;
-  const secondApprovalId = "approval_with_action" as ApprovalId;
-  const firstApproval = { ...baseApproval, id: firstApprovalId, toolName: "first-edit" };
-  const secondApproval = { ...baseApproval, id: secondApprovalId, toolName: "second-edit" };
-  const actions: TeamLiveAction[] = [
-    { type: "approve", approvalId: secondApprovalId, sessionId, enabled: true },
-    { type: "reject", approvalId: secondApprovalId, sessionId, enabled: true },
-  ];
-
-  return {
-    ...view,
-    availableActions: actions,
-    selected: {
-      ...selected,
-      pendingApprovals: [firstApproval, secondApproval],
-      availableActions: actions,
-    },
-  };
-}
-
-function withManyTasks(view: TeamLiveView): TeamLiveView {
-  const selected = requireSelected(view);
-  const baseTask = requireFirst(selected.tasks);
-  return {
-    ...view,
-    selected: {
-      ...selected,
-      tasks: Array.from({ length: 16 }, (_, index) => ({
-        ...baseTask,
-        id: `task_window_${index + 1}` as TaskId,
-        title: `Task row ${String(index + 1).padStart(2, "0")}`,
-      })),
-    },
-  };
-}
-
-function withoutMergeMetadata(metadata: NonNullable<TeamLiveView["selected"]>["tasks"][number]["metadata"]) {
-  const { merge: _metadataMerge, ...rest } = metadata;
-  return rest;
-}
-
-function requireSelected(view: TeamLiveView): NonNullable<TeamLiveView["selected"]> {
-  if (!view.selected) throw new Error("fixture requires selected team");
-  return view.selected;
-}
-
-function requireTeamId(view: TeamLiveView): NonNullable<TeamLiveView["selectedTeamId"]> {
-  if (!view.selectedTeamId) throw new Error("fixture requires selected team id");
-  return view.selectedTeamId;
-}
-
-function requireFirst<T>(items: readonly T[]): T {
-  const first = items[0];
-  if (!first) throw new Error("fixture requires at least one item");
-  return first;
 }

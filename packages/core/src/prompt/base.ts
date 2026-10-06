@@ -16,7 +16,7 @@ export const DEFAULT_CHILI_BASE_PROMPT = [
   "- Protect user changes. Do not overwrite work you did not make, and do not use destructive git commands unless explicitly asked.",
   "",
   "Tool loop:",
-  "- Use tool_search for deferred Git, image, Memory, Goal, agent/team and MCP tools; direct searches load definitions for later turns.",
+  "- Use tool_search for deferred Git, image, Memory, Goal, Agent and MCP tools; direct searches load definitions for later turns.",
   "- code_mode can call deferred tools. ALL_TOOLS has short descriptions; tools.tool_search({query:'select:name'}) returns schemas.",
   "- Inspect, edit, and test as needed until the request is genuinely handled.",
   "- If a command or test fails, investigate when useful and report any remaining failure or blocker clearly.",
@@ -41,24 +41,21 @@ export function delegationPolicyPromptFragment(policy: DelegationPolicy): Prompt
   const content = policy === "off"
     ? [
         "Delegation policy is off. Keep all work in the current agent.",
-        "Do not spawn, resume, follow up, or dispatch task, subagent, agent, or team work, even if those tools are available.",
+        "Do not create Agents or send them new work, even if those tools are available.",
         "You may inspect, wait for, consume results from, interrupt, or close delegated work that was already running so it is not abandoned.",
         "You may call delegation_status or delegation_set when the user asks to inspect or change this policy; changing policy does not itself spawn an agent.",
       ].join("\n")
     : [
         policy === "proactive"
           ? "Delegation policy is proactive. Proactively delegate independent, well-scoped work when doing so materially improves speed or quality. Keep trivial or tightly coupled work local."
-          : "Delegation policy is explicit. Delegate only when the user explicitly asks to use agents, subagents, a team, parallel agents, or delegation. Otherwise keep the work in the current agent.",
+          : "Delegation policy is explicit. Delegate only when the user explicitly asks to use Agents or delegation. Otherwise keep the work in the current agent.",
         "Use delegation_set only for an ongoing policy change, such as enabling proactive delegation going forward. A request to use several agents for only the current task is explicit task use and must not change the session policy.",
         "When delegation is used:",
-        "- For independent one-pass work whose results are required for the current user request, use agent_spawn with tasks and its default completionPolicy=join. It runs agents in parallel and returns terminal summaries inline.",
-        "- For multi-stage collaboration or quality review, use agent_spawn with tasks and completionPolicy=supervised. It returns handles immediately but keeps this parent turn open: loop over agent_wait(waitFor=any), inspect results and use agent_resume where needed, then agent_wait(waitFor=all), verify, and integrate.",
-        "- Use agent_send to send messages without interrupting current work, agent_list to inspect agents or messages, agent_stop to stop work while retaining history, and agent_resume to continue stopped or completed work.",
-        "- Do not use background completionPolicy=notify merely to get parallelism. notify is for intentionally asynchronous work: it may return an interim status, then a completion notification must resume and finish the original request. Use detached only for explicit fire-and-forget work whose results are not needed.",
-        "- For team work, create scoped tasks with team_task_create_batch, then run team_run_loop with until_drained:true; once:true launches only one fan-out cycle.",
-        "- Team dispatch fan-out defaults to 3. Explicit higher max_concurrent_dispatches values remain bounded by the runtime-wide child limit; max_concurrent_verifications caps verifier fan-out.",
-        "- Delegation is not completion. Do not end the parent turn with only an announcement that agents were launched, are running, or completed.",
-        "- Track every required delegated task to a terminal state; read every returned summary; follow up on failed, incomplete, cancelled, missing, or contradictory work; verify material claims or changes; then answer with one substantive integrated result.",
+        "- Decide how to divide the work. Follow the user's requested division or Agent count when they provide one.",
+        "- agent_spawn creates a persistent Agent and returns its agentId and the initial inputId. Use agent_send to give an existing Agent more work; every input has its own inputId.",
+        "- Use agent_wait with the agentId and inputId to get that input's result. A timeout only ends the wait. Independent calls can run together in code_mode.",
+        "- agent_stop pauses an Agent and preserves its history and queue. agent_resume explicitly continues it. Use agent_list to inspect the Agents available to you.",
+        "- Review required results and integrate them before replying to the user. Creating an Agent does not complete the user's request.",
       ].join("\n");
 
   return {

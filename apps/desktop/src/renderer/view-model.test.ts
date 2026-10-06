@@ -442,14 +442,21 @@ test("terminal user input events remove stale pending rows after snapshot reload
 
 test("recognizes root and descendant runtime events for snapshot replay", () => {
   const snapshot = baseSnapshot([]);
-  snapshot.agentTree.agents = [{ sessionId: "agent_session", childSessionId: "child_session" } as never];
-  snapshot.agentTree.tasks = [{ childSessionId: "tree_task_session" } as never];
-  snapshot.tasks = [{ childSessionId: "listed_task_session" } as never];
+  snapshot.agents = [
+    { agentId: "agent_session", name: "child", path: "/root/child", parentAgentId: "root", state: "running" },
+    { agentId: "nested_session", name: "nested", path: "/root/child/nested", parentAgentId: "agent_session", state: "paused" },
+  ];
 
-  for (const sessionId of ["root", "agent_session", "child_session", "tree_task_session", "listed_task_session"]) {
+  for (const sessionId of ["root", "agent_session", "nested_session"]) {
     expect(runtimeEventRelated(snapshot, event("session.status_changed", sessionId, { status: "running" }, 20))).toBe(true);
   }
   expect(runtimeEventRelated(snapshot, event("session.status_changed", "unrelated", { status: "running" }, 21))).toBe(false);
+  expect(runtimeEventRelated(snapshot, event("session.created", "new_child", {
+    sessionId: "new_child", cwd: "/repo", agent: { parentSessionId: "agent_session", name: "new", path: "/root/child/new", policy: {} },
+  }, 22))).toBe(true);
+  expect(runtimeEventRelated(snapshot, event("session.created", "foreign_child", {
+    sessionId: "foreign_child", cwd: "/repo", agent: { parentSessionId: "unrelated", name: "new", path: "/root/new", policy: {} },
+  }, 23))).toBe(false);
 });
 
 test("bounds live event bytes exactly and marks a visible truncation warning", () => {
@@ -806,8 +813,7 @@ function baseSnapshot(
   return {
     sessionId: "root",
     events,
-    agentTree: { nodes: [], agents: [], tasks: [], mailbox: [] },
-    tasks: [],
+    agents: [],
     pendingApprovals,
     pendingInputs,
   };

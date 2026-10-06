@@ -75,6 +75,9 @@ export function createElectronTransport(api: ChiliDesktopApi, projectId?: string
       return result;
     },
     stop: (sessionId) => invoke({ type: "session.stop", sessionId }),
+    sendAgent: (sessionId, agentId, text, mode) => invoke({ type: "agent.send", sessionId, agentId, text, ...(mode === undefined ? {} : { mode }) }),
+    stopAgent: (sessionId, agentId) => invoke({ type: "agent.stop", sessionId, agentId }),
+    resumeAgent: (sessionId, agentId) => invoke({ type: "agent.resume", sessionId, agentId }),
     resolveApproval: (approvalId, decision) => invoke({ type: "approval.resolve", approvalId, decision }),
     resolveUserInput: (inputId, answers) => invoke({ type: "user-input.resolve", inputId, answers }),
     completeResync: (barrierId) => invoke({ type: "events.resync.complete", barrierId }),

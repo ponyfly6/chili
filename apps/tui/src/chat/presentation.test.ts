@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test";
 import type { MessageId, PartId, ToolCallId } from "@chili/protocol";
 import type { ChatTranscriptItem } from "@chili/sdk";
-import type { InlineAgentBatchDisplay } from "./AgentBatchCells.js";
 import { buildChatDisplayItems } from "./presentation.js";
 
 test("user message presentation keeps text and images in one card", () => {
@@ -375,41 +374,6 @@ test("empty opaque reasoning stays hidden while the final answer remains visible
 
   expect(display).toHaveLength(1);
   expect(display[0]).toMatchObject({ kind: "assistant_text", text: "Done." });
-});
-
-test("agent batches keep chronological order with surrounding messages", () => {
-  const batch: InlineAgentBatchDisplay = {
-    id: "batch_chronological",
-    kind: "team",
-    title: "Reviewers",
-    status: "running",
-    expected: 1,
-    counts: { total: 1, pending: 0, running: 1, active: 1, completed: 0, incomplete: 0, failed: 0, cancelled: 0 },
-    agents: [],
-    spawnFailures: [],
-    messages: [],
-    integration: { status: "pending" },
-    createdAt: 20,
-    updatedAt: 20,
-  };
-  const display = buildChatDisplayItems([
-    {
-      id: "msg_before_batch" as MessageId,
-      kind: "message",
-      role: "user",
-      createdAt: 10,
-      parts: [{ type: "text", id: "part_before_batch" as PartId, text: "Start" }],
-    },
-    {
-      id: "msg_after_batch" as MessageId,
-      kind: "message",
-      role: "assistant",
-      createdAt: 30,
-      parts: [{ type: "text", id: "part_after_batch" as PartId, text: "Finished", phase: "final_answer" }],
-    },
-  ], { agentBatches: [batch] });
-
-  expect(display.map((item) => item.kind)).toEqual(["user_message", "agent_batch", "assistant_text"]);
 });
 
 test("exploration groups contain only consecutive successes and retain failures", () => {

@@ -76,6 +76,8 @@ export interface ChiliToolExecutionContext extends ToolExecutionContext {
   outputArtifactId: ToolCallId;
   /** Backend-enforced resource constraints; approval is not an isolation boundary. */
   executionPolicy?: ToolAccessPolicy;
+  /** Trusted effective caller grants, denials and scopes for delegated authority. */
+  callerToolPolicy?: ToolAccessPolicy;
   /** Recheck revocation after waiting on a resource lock, immediately before effects. */
   assertCurrentAuthorization?: () => Promise<void>;
   currentResourceDenials?: () => Promise<ToolResourceDenials | undefined>;
@@ -251,9 +253,6 @@ export interface ToolAccessPolicy {
   deniedTools?: readonly string[];
   writeScope?: readonly string[];
   executeScope?: readonly string[];
-  teamId?: string;
-  taskId?: string;
-  memberPath?: string;
   metadata?: Record<string, unknown>;
 }
 

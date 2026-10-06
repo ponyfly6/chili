@@ -1,5 +1,4 @@
 import type { CommandDefinition, CommandSuggestion } from "@chili/commands";
-import type { TeamLiveView } from "@chili/sdk";
 import type { SkillSettingsScope, SkillSummary } from "@chili/skills";
 import type {
   DelegationPolicy,
@@ -12,7 +11,7 @@ import type {
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "../model-state.js";
 
 export type TuiCommandResult =
-  | { type: "open_view"; view: "team" | "help" | "agents" | "status" | "mcp" }
+  | { type: "open_view"; view: "help" | "agents" | "status" | "mcp" }
   | { type: "open_permissions_picker" }
   | { type: "open_theme_picker" }
   | { type: "reload_commands" }
@@ -38,7 +37,7 @@ export type TuiCommandResult =
   | { type: "delegation_action"; action: "status" | "set"; policy?: DelegationPolicy }
   | { type: "skills_action"; action: "enable" | "disable"; name: string; scope?: SkillSettingsScope }
   | McpTuiCommandResult
-  | { type: "sdk_action"; action: "team_run" | "team_merge" | "approve" | "reject"; payload?: unknown }
+  | { type: "agent_action"; action: "stop" | "resume"; agentId: string }
   | { type: "confirm"; title: string; result: TuiCommandResult };
 
 export type McpTuiCommandResult =
@@ -49,7 +48,6 @@ export type McpTuiCommandResult =
   | { type: "mcp_action"; action: "add"; input: RuntimeMcpAddServerRequest };
 
 export interface TuiCommandContext {
-  model: TeamLiveView;
   busy: boolean;
   cwd?: string;
   modelSelection?: ModelSelection;

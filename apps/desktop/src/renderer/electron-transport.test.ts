@@ -7,6 +7,26 @@ import type {
 } from "../shared/contracts.js";
 import { createElectronTransport } from "./electron-transport.js";
 
+test("Agent transport preserves input receipts and binds controls to the parent project", async () => {
+  const calls: DesktopRequest[] = [];
+  const api = {
+    invoke: async (request: DesktopRequest) => {
+      calls.push(request);
+      return { agentId: "child", ...(request.type === "agent.stop" ? {} : { inputId: "receipt" }) };
+    },
+    subscribe: () => () => undefined,
+  } as ChiliDesktopApi;
+  const transport = createElectronTransport(api, "project-a");
+  expect(await transport.sendAgent("parent", "child", "Review", "steer")).toEqual({ agentId: "child", inputId: "receipt" });
+  expect(await transport.stopAgent("parent", "child")).toEqual({ agentId: "child" });
+  expect(await transport.resumeAgent("parent", "child")).toEqual({ agentId: "child", inputId: "receipt" });
+  expect(calls).toEqual([
+    { type: "agent.send", projectId: "project-a", sessionId: "parent", agentId: "child", text: "Review", mode: "steer" },
+    { type: "agent.stop", projectId: "project-a", sessionId: "parent", agentId: "child" },
+    { type: "agent.resume", projectId: "project-a", sessionId: "parent", agentId: "child" },
+  ]);
+});
+
 test("binds every task operation to its project even after another transport activates a project", async () => {
   const calls: DesktopRequest[] = [];
   const api = { invoke: async (request: DesktopRequest) => { calls.push(request); return {}; }, subscribe: () => () => undefined } as ChiliDesktopApi;
@@ -149,8 +169,7 @@ function responseFor(request: DesktopRequest, state: DesktopState): unknown {
     return {
       sessionId: request.sessionId,
       events: [],
-      agentTree: { nodes: [], agents: [], tasks: [], mailbox: [] },
-      tasks: [],
+      agents: [],
       pendingApprovals: [],
       pendingInputs: [],
     };

@@ -1,204 +1,83 @@
 import { expect, test } from "bun:test";
-import { createRuntimeView, runtimeDelegationStatus } from "@chili/sdk";
-import type { AgentPath, SessionId, TaskId, TeamId, ToolCallId } from "@chili/protocol";
-import { adHocAgentsText, agentCapabilityText, agentsViewModel } from "./AgentsView.js";
+import { applyRuntimeEvent, createRuntimeView, type ChiliRuntimeView } from "@chili/sdk";
+import { parseChiliEvent, type RuntimeSessionStatus, type SessionId } from "@chili/protocol";
+import { agentsViewModel, delegationPolicyText } from "./AgentsView.js";
 
-test("observed agent events override stale model catalog capability metadata", () => {
-  const status = runtimeDelegationStatus(createRuntimeView(), { generatedAt: "now" });
-  status.delegation.observed = true;
-  expect(agentCapabilityText(status, false)).toBe("available (used this session)");
+const parentId = "session_main" as SessionId;
 
-  status.delegation.observed = false;
-  expect(agentCapabilityText(status, false)).toBe("unknown (model catalog reports tool calls unsupported)");
-});
+function addAgent(view: ChiliRuntimeView, name: string, status: RuntimeSessionStatus = "idle", parentSessionId = parentId, path = `/root/${name}`): SessionId {
+  const sessionId = `session_${name}` as SessionId;
+  applyRuntimeEvent(view, parseChiliEvent({
+    id: `created_${name}`, type: "session.created", time: 1, sessionId,
+    payload: { sessionId, cwd: "/repo", agent: { parentSessionId, name, path, policy: { deniedTools: ["bash"] } } },
+  }));
+  applyRuntimeEvent(view, parseChiliEvent({
+    id: `status_${name}`, type: "session.status_changed", time: 2, sessionId,
+    payload: { sessionId, status },
+  }));
+  return sessionId;
+}
 
-test("agents summary distinguishes an all-failed spawn from a partially spawned batch", () => {
-  const status = runtimeDelegationStatus(createRuntimeView(), { generatedAt: "now" });
-  status.lastBatch = {
-    callId: "tool_all_failed" as ToolCallId,
-    taskIds: [],
-    expected: 3,
-    untracked: 3,
-    spawnedCount: 0,
-    spawnFailureCount: 3,
-    total: 0,
-    pending: 0,
-    running: 0,
-    active: 0,
-    completed: 0,
-    incomplete: 0,
-    failed: 0,
-    cancelled: 0,
-    mixed: false,
-    partial: false,
-    status: "failed",
-    updatedAt: 1,
-  };
-  expect(adHocAgentsText(status)).toBe("0 active; latest batch failed: 3 of 3 agent tasks failed to spawn");
-
-  const firstTaskId = "task_partial_first" as TaskId;
-  const thirdTaskId = "task_partial_third" as TaskId;
-  status.agents.counts = {
-    total: 2,
-    pending: 2,
-    running: 0,
-    active: 2,
-    completed: 0,
-    incomplete: 0,
-    failed: 0,
-    cancelled: 0,
-  };
-  status.lastBatch = {
-    ...status.lastBatch,
-    callId: "tool_partial" as ToolCallId,
-    taskIds: [firstTaskId, thirdTaskId],
-    untracked: 1,
-    spawnedCount: 2,
-    spawnFailureCount: 1,
-    total: 2,
-    pending: 2,
-    active: 2,
-    partial: true,
-    status: "partial",
-    updatedAt: 2,
-  };
-  expect(adHocAgentsText(status)).toBe("2 active, 2 total; latest batch partial: 1 of 3 agent task failed to spawn");
-});
-
-test("agents view model keeps every scoped persistent team and member outcome", () => {
+test("agents view derives descendant identities and active counts from Session events", () => {
   const view = createRuntimeView();
-  const sessionId = "session_main" as SessionId;
-  const teamA = "team_alpha" as TeamId;
-  const teamB = "team_beta" as TeamId;
-  const lead = "/root" as AgentPath;
-  const reader = "/root/reader" as AgentPath;
-  const tester = "/root/tester" as AgentPath;
-  const failedTask = "task_failed" as TaskId;
-  const completedTask = "task_completed" as TaskId;
+  const readerId = addAgent(view, "reader", "running");
+  addAgent(view, "reviewer", "waiting_for_approval");
+  addAgent(view, "stopping", "cancelling");
+  addAgent(view, "idle");
+  addAgent(view, "failed", "failed");
+  const archivedId = addAgent(view, "archived", "running");
+  addAgent(view, "external", "running", "session_other" as SessionId);
+  addAgent(view, "nested", "running", readerId, "/root/reader/nested");
+  applyRuntimeEvent(view, parseChiliEvent({
+    id: "archive_child", type: "session.archived", time: 3, sessionId: archivedId,
+    payload: { sessionId: archivedId },
+  }));
 
-  view.sessionIds.push(sessionId);
-  view.sessions[sessionId] = {
-    id: sessionId,
-    cwd: "/repo",
-    lifecycle: "active",
-    status: "idle",
-    messageIds: [],
-    toolCallIds: [],
-    approvalIds: [],
-    agentRunIds: [],
-    taskIds: [failedTask, completedTask],
-    updatedAt: 20,
-  };
-  view.teamIds.push(teamA, teamB);
-  view.teams[teamA] = {
-    id: teamA,
-    name: "alpha",
-    leadPath: lead,
-    status: "active",
-    memberIds: [`${teamA}:${lead}`, `${teamA}:${reader}`],
-    taskIds: [failedTask],
-    messageIds: [],
-    runIds: [],
-    createdAt: 1,
-    updatedAt: 20,
-    sessionId,
-  };
-  view.teams[teamB] = {
-    id: teamB,
-    name: "beta",
-    leadPath: lead,
-    status: "active",
-    memberIds: [`${teamB}:${tester}`],
-    taskIds: [completedTask],
-    messageIds: [],
-    runIds: [],
-    createdAt: 2,
-    updatedAt: 19,
-    sessionId,
-  };
-  view.teamMemberIds.push(`${teamA}:${lead}`, `${teamA}:${reader}`, `${teamB}:${tester}`);
-  view.teamMembers[`${teamA}:${lead}`] = {
-    id: `${teamA}:${lead}`,
-    teamId: teamA,
-    path: lead,
-    name: "lead",
-    role: "lead",
-    status: "idle",
-    createdAt: 1,
-    updatedAt: 20,
-  };
-  view.teamMembers[`${teamA}:${reader}`] = {
-    id: `${teamA}:${reader}`,
-    teamId: teamA,
-    path: reader,
-    name: "reader",
-    role: "research",
-    status: "blocked",
-    currentTaskId: failedTask,
-    createdAt: 2,
-    updatedAt: 20,
-  };
-  view.teamMembers[`${teamB}:${tester}`] = {
-    id: `${teamB}:${tester}`,
-    teamId: teamB,
-    path: tester,
-    name: "tester",
-    role: "verification",
-    status: "idle",
-    currentTaskId: completedTask,
-    createdAt: 3,
-    updatedAt: 19,
-  };
-  view.taskIds.push(failedTask, completedTask);
-  view.tasks[failedTask] = {
-    id: failedTask,
-    status: "failed",
-    generation: 0,
-    createdAt: 4,
-    updatedAt: 20,
-    teamId: teamA,
-    sessionId,
-    ownerPath: reader,
-    title: "Read implementation",
-    error: "provider rejected the request",
-  };
-  view.tasks[completedTask] = {
-    id: completedTask,
-    status: "completed",
-    generation: 0,
-    createdAt: 5,
-    updatedAt: 19,
-    teamId: teamB,
-    sessionId,
-    ownerPath: tester,
-    title: "Run verification",
-    summary: "all focused tests passed",
-  };
-
-  const status = runtimeDelegationStatus(view, {
-    sessionId,
-    delegationConfig: { sessionId, policy: "explicit", source: "default" },
-    generatedAt: "2026-08-19T00:00:00.000Z",
+  const model = agentsViewModel({
+    runtimeView: view,
+    sessionId: parentId,
+    parentExecution: "idle",
+    capabilitySupported: true,
+    delegationConfig: { sessionId: parentId, policy: "explicit", source: "session" },
   });
-  const model = agentsViewModel({ runtimeView: view, status, sessionId, capabilitySupported: true });
-
   expect(model).toMatchObject({
     parentExecution: "idle",
-    capability: "available (used this session)",
-    delegation: "on request (explicit; source default)",
-    persistentTeamSummary: "2 total, 2 active",
+    capability: "available",
+    delegation: "on request (source session)",
+    summary: "4 active, 6 total",
+    activeAgents: 4,
   });
-  expect(model.teams.map((team) => team.title)).toEqual(["alpha (team_alpha)", "beta (team_beta)"]);
-  expect(model.teams[0]?.members[1]).toMatchObject({
-    title: "member reader · research",
-    status: "blocked",
-    detail: "provider rejected the request",
-    error: true,
+  expect(model.agents).toEqual([
+    { id: "session_failed", name: "failed", path: "/root/failed", status: "idle" },
+    { id: "session_idle", name: "idle", path: "/root/idle", status: "idle" },
+    { id: readerId, name: "reader", path: "/root/reader", status: "running" },
+    { id: "session_nested", name: "nested", path: "/root/reader/nested", status: "running" },
+    { id: "session_reviewer", name: "reviewer", path: "/root/reviewer", status: "running" },
+    { id: "session_stopping", name: "stopping", path: "/root/stopping", status: "running" },
+  ]);
+});
+
+test("paused inputs retain the same Agent identity without an active count", () => {
+  const view = createRuntimeView();
+  const sessionId = addAgent(view, "reader", "running");
+  applyRuntimeEvent(view, parseChiliEvent({
+    id: "queue_paused", type: "session.input_queue_changed", time: 3, sessionId,
+    payload: { sessionId, paused: true, revision: 1, pendingCount: 0, interruptedCount: 0, items: [] },
+  }));
+  const model = agentsViewModel({ runtimeView: view, sessionId: parentId });
+  expect(model.summary).toBe("0 active, 1 total");
+  expect(model.agents).toEqual([{ id: sessionId, name: "reader", path: "/root/reader", status: "paused" }]);
+});
+
+test("agents view has a simple empty model and explicit capability fallback", () => {
+  expect(agentsViewModel({ runtimeView: createRuntimeView(), capabilitySupported: false })).toEqual({
+    parentExecution: "unknown",
+    capability: "unavailable for the selected model",
+    delegation: "not configured",
+    summary: "0 active, 0 total",
+    activeAgents: 0,
+    agents: [],
   });
-  expect(model.teams[1]?.members[0]).toMatchObject({
-    title: "member tester · verification",
-    status: "idle",
-    detail: "all focused tests passed",
-    error: false,
-  });
+  expect(delegationPolicyText({ sessionId: parentId, policy: "proactive", source: "default" })).toBe("proactive (source default)");
+  expect(delegationPolicyText({ sessionId: parentId, policy: "explicit", source: "default" })).toBe("on request (source default)");
 });

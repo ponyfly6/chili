@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { RuntimeService } from "@chili/core";
-import type { SessionId, SnapshotId, TaskId } from "@chili/protocol";
+import type { SessionId, SnapshotId } from "@chili/protocol";
 import { revertSessionSnapshot } from "./session-recovery.js";
 
 test("direct CLI revert resolves an active root session before invoking recovery", async () => {
@@ -32,21 +32,15 @@ test("direct CLI revert resolves an active root session before invoking recovery
           createdAt: 1,
           updatedAt: 1,
         },
+        {
+          id: childSessionId,
+          cwd: "/repo",
+          source: "subagent" as const,
+          status: "active" as const,
+          createdAt: 1,
+          updatedAt: 1,
+        },
       ];
-    },
-    async agentTasks(query: { childSessionId?: SessionId }) {
-      return query.childSessionId === childSessionId
-        ? [{ id: "task_revert_child" as TaskId, childSessionId }]
-        : [];
-    },
-    async agentRuns() {
-      return [];
-    },
-    async teamMembers() {
-      return [];
-    },
-    async teams() {
-      return [];
     },
   } as unknown as Parameters<typeof revertSessionSnapshot>[0]["store"];
   const recoveryCalls: Array<{ sessionId: SessionId; snapshotId: SnapshotId }> = [];
@@ -68,7 +62,7 @@ test("direct CLI revert resolves an active root session before invoking recovery
   await expect(revertSessionSnapshot({ ...baseInput, resume: archivedSessionId }))
     .rejects.toThrow(`Session is not active: ${archivedSessionId}`);
   await expect(revertSessionSnapshot({ ...baseInput, resume: childSessionId }))
-    .rejects.toThrow("belongs to a subagent");
+    .rejects.toThrow("belongs to an agent");
   expect(recoveryCalls).toEqual([]);
 
   await expect(revertSessionSnapshot({ ...baseInput, resume: activeSessionId }))

@@ -30,7 +30,7 @@ import type {
   SessionId,
   SessionGoal,
 } from "@chili/protocol";
-import { useTeamLiveRuntime, type TeamLiveRuntimeState, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
+import { useRuntimeEvents, type RuntimeEventsState, type RuntimeTuiOptions } from "./useRuntimeEvents.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
 
 export type ChatRequestStatus = "idle" | "pending" | "accepted" | "success" | "error";
@@ -51,7 +51,7 @@ export function acceptedFeedbackMatchesStatus(
   return (chatView.statusEventId ?? null) === feedback.acceptedAgainstStatusEventId;
 }
 
-export interface ChatRuntimeState extends TeamLiveRuntimeState {
+export interface ChatRuntimeState extends RuntimeEventsState {
   activeSessionId?: SessionId;
   chatView: ChatSessionView;
   chatFeedback?: ChatRuntimeFeedback;
@@ -91,6 +91,8 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   resumeSession: (session: Pick<RuntimeSessionSummary, "id">) => Promise<boolean>;
   renameSession: (title: string) => Promise<RuntimeSessionSummary | undefined>;
   interruptActiveSession: () => Promise<void>;
+  stopAgent: (agentId: string) => Promise<void>;
+  resumeAgent: (agentId: string) => Promise<void>;
   approveApproval: (approvalId: ApprovalId, options?: ChatApproveOptions) => Promise<void>;
   rejectApproval: (approvalId: ApprovalId) => Promise<void>;
 }
@@ -118,7 +120,7 @@ export interface ChatApproveOptions {
 
 export interface UseChatRuntimeInput {
   client: HttpRuntimeClient;
-  options: TeamLiveTuiOptions;
+  options: RuntimeTuiOptions;
 }
 
 interface McpSessionScope {
@@ -147,17 +149,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     sessionId: options.sessionId,
     ...(options.cwd ? { cwd: options.cwd } : {}),
   });
-  const resolveTeamActionAuthority = useCallback(() => {
-    const scope = selectedSessionScopeRef.current;
-    return {
-      ...(scope.sessionId ? { sessionId: scope.sessionId } : {}),
-      ...(scope.cwd ? { cwd: scope.cwd } : {}),
-    };
-  }, []);
-  const teamRuntime = useTeamLiveRuntime({
-    ...input,
-    resolveActionAuthority: resolveTeamActionAuthority,
-  });
+  const eventRuntime = useRuntimeEvents(input);
   const [submitPending, setSubmitPending] = useState(false);
   const [chatFeedback, setChatFeedback] = useState<ChatRuntimeFeedback | undefined>();
   const [modelCandidates, setModelCandidates] = useState<readonly ModelCandidate[]>([]);
@@ -247,7 +239,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
         if (controller.signal.aborted || sessionSelectionEpochRef.current !== epoch) return;
         const events = await client.sessionEvents({ sessionId, limit: 5_000, signal: controller.signal });
         if (controller.signal.aborted || sessionSelectionEpochRef.current !== epoch) return;
-        teamRuntime.hydrateEvents(events);
+        eventRuntime.hydrateEvents(events);
         selectActiveSession(sessionId, session.cwd);
         setChatFeedback(undefined);
       } catch (error) {
@@ -267,13 +259,13 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
       controller.abort();
       requestAbortRefs.current.delete(controller);
     };
-  }, [client, options.baseUrl, options.sessionId, selectActiveSession, teamRuntime.hydrateEvents]);
+  }, [client, options.baseUrl, options.sessionId, selectActiveSession, eventRuntime.hydrateEvents]);
 
   const chatView = useMemo(() => {
     const request: Parameters<typeof chatSessionView>[1] = { limit: 120, requireSession: true };
     if (activeSessionId) request.sessionId = activeSessionId;
-    return chatSessionView(teamRuntime.runtimeView, request);
-  }, [activeSessionId, teamRuntime.revision, teamRuntime.runtimeView]);
+    return chatSessionView(eventRuntime.runtimeView, request);
+  }, [activeSessionId, eventRuntime.revision, eventRuntime.runtimeView]);
 
   const visibleSessionId = activeSessionId ?? chatView.sessionId;
   if (
@@ -509,7 +501,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   }, [activeSessionId, chatView.sessionId, refreshMcpStatus]);
 
   useEffect(() => {
-    if (teamRuntime.connection.status !== "streaming") {
+    if (eventRuntime.connection.status !== "streaming") {
       refreshedForStreamingRef.current = false;
       return;
     }
@@ -521,7 +513,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     void refreshPermissionConfig();
     void refreshCommands();
     void refreshMcpStatus();
-  }, [refreshCommands, refreshDelegationConfig, refreshMcpStatus, refreshModelConfig, refreshPermissionConfig, teamRuntime.connection.status]);
+  }, [refreshCommands, refreshDelegationConfig, refreshMcpStatus, refreshModelConfig, refreshPermissionConfig, eventRuntime.connection.status]);
 
   const getMcpServer = useCallback(async (server: string): Promise<RuntimeMcpServerDescriptor | undefined> => {
     const scope = captureMcpScope();
@@ -1106,7 +1098,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
         signal,
       }));
       if (sessionSelectionEpochRef.current !== sessionSelectionEpoch) return false;
-      teamRuntime.hydrateEvents(events);
+      eventRuntime.hydrateEvents(events);
       selectActiveSession(session.id, resumable.cwd);
       await refreshDelegationConfigForSession(session.id);
       if (sessionSelectionEpochRef.current !== sessionSelectionEpoch) return false;
@@ -1129,7 +1121,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     } finally {
       if (sessionSelectionEpochRef.current === sessionSelectionEpoch) setSessionSelectionPending(false);
     }
-  }, [abortPendingRequests, activeSessionId, chatView.cwd, chatView.sessionId, client, invalidateSelectedSession, options.baseUrl, refreshDelegationConfigForSession, running, selectActiveSession, teamRuntime.hydrateEvents, withAbort]);
+  }, [abortPendingRequests, activeSessionId, chatView.cwd, chatView.sessionId, client, invalidateSelectedSession, options.baseUrl, refreshDelegationConfigForSession, running, selectActiveSession, eventRuntime.hydrateEvents, withAbort]);
 
   const renameSession = useCallback(async (title: string): Promise<RuntimeSessionSummary | undefined> => {
     setChatFeedback({ status: "pending", message: "renaming saved chat" });
@@ -1170,8 +1162,22 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     requestAbortRefs.current.clear();
   }, []);
 
+  const stopAgent = useCallback(async (agentId: string): Promise<void> => {
+    const sessionId = selectedSessionScopeRef.current.sessionId;
+    if (!sessionId) throw new Error("Start a session before stopping an agent.");
+    await client.stopAgent({ sessionId, agentId });
+  }, [client]);
+
+  const resumeAgent = useCallback(async (agentId: string): Promise<void> => {
+    const sessionId = selectedSessionScopeRef.current.sessionId;
+    if (!sessionId) throw new Error("Start a session before resuming an agent.");
+    await client.resumeAgent({ sessionId, agentId });
+  }, [client]);
+
   return useMemo(() => ({
-    ...teamRuntime,
+    ...eventRuntime,
+    stopAgent,
+    resumeAgent,
     ...(activeSessionId ? { activeSessionId } : {}),
     chatView,
     ...(chatFeedback ? { chatFeedback } : {}),
@@ -1212,7 +1218,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     interruptActiveSession,
     approveApproval,
     rejectApproval,
-  }), [activeSessionId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, delegationConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshDelegationConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setRuntimeDelegationPolicy, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, listSessions, resumeSession, renameSession, submitCommand, submitPrompt, teamRuntime]);
+  }), [activeSessionId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, delegationConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshDelegationConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setRuntimeDelegationPolicy, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, listSessions, resumeSession, renameSession, submitCommand, submitPrompt, eventRuntime, stopAgent, resumeAgent]);
 }
 
 function upsertMcpServer(current: RuntimeMcpStatusResponse | undefined, server: RuntimeMcpServerDescriptor): RuntimeMcpStatusResponse {
@@ -1294,7 +1300,7 @@ function requireResumableSession(
     throw new Error(`Session ${sessionId} is archived and cannot be resumed.`);
   }
   if (session.source === "subagent") {
-    throw new Error(`Session ${sessionId} belongs to a subagent and cannot be resumed directly.`);
+    throw new Error(`Session ${sessionId} belongs to an agent and cannot be resumed directly.`);
   }
   return session;
 }

@@ -38,21 +38,14 @@ export interface RuntimeEventDependencyReference {
 }
 
 export type RuntimeEventDependencyKind =
+  | "session"
   | "turn"
   | "message"
   | "part"
   | "tool"
   | "approval"
   | "user_input"
-  | "snapshot"
-  | "agent_run"
-  | "agent_mailbox"
-  | "agent_task"
-  | "team"
-  | "team_member"
-  | "team_task"
-  | "team_message"
-  | "team_run";
+  | "snapshot";
 
 interface OrderedRuntimeEvent {
   event: ChiliEvent;
@@ -198,6 +191,8 @@ export function jsonEventArrayUtf8Bytes(events: Iterable<ChiliEvent>): number {
 
 export function runtimeEventProvides(event: ChiliEvent): RuntimeEventDependencyReference[] {
   switch (event.type) {
+    case "session.created":
+      return [reference("session", event.payload.sessionId)];
     case "turn.started":
       return [reference("turn", event.payload.turnId)];
     case "message.created":
@@ -214,22 +209,6 @@ export function runtimeEventProvides(event: ChiliEvent): RuntimeEventDependencyR
       return [reference("user_input", event.payload.inputId)];
     case "snapshot.created":
       return [reference("snapshot", event.payload.snapshotId)];
-    case "agent.spawned":
-      return [reference("agent_run", event.payload.runId)];
-    case "agent.message_queued":
-      return [reference("agent_mailbox", event.id)];
-    case "agent.task_created":
-      return [reference("agent_task", event.payload.taskId)];
-    case "team.created":
-      return [reference("team", event.payload.teamId)];
-    case "team.member_added":
-      return [reference("team_member", teamMemberKey(event.payload.teamId, event.payload.path))];
-    case "team.task_created":
-      return [reference("team_task", event.payload.taskId)];
-    case "team.message_sent":
-      return [reference("team_message", event.payload.messageId)];
-    case "team.run_started":
-      return [reference("team_run", event.payload.runId)];
     default:
       return [];
   }
@@ -273,39 +252,6 @@ export function runtimeEventRequires(event: ChiliEvent): RuntimeEventDependencyR
       return [reference("user_input", event.payload.inputId)];
     case "snapshot.reverted":
       return [reference("snapshot", event.payload.snapshotId)];
-    case "agent.completed":
-      return [reference("agent_run", event.payload.runId)];
-    case "agent.message_claimed":
-    case "agent.message_requeued":
-    case "agent.message_discarded":
-    case "agent.message_consumed":
-      return [reference("agent_mailbox", event.payload.messageId)];
-    case "agent.task_completed":
-      return [reference("agent_task", event.payload.taskId)];
-    case "team.owner_session_bound":
-    case "team.member_added":
-    case "team.task_created":
-    case "team.message_sent":
-    case "team.run_started":
-      return [reference("team", event.payload.teamId)];
-    case "team.member_status_changed":
-      return [
-        reference("team", event.payload.teamId),
-        reference("team_member", teamMemberKey(event.payload.teamId, event.payload.path)),
-      ];
-    case "team.task_assigned":
-    case "team.task_claimed":
-    case "team.task_updated":
-      return [
-        reference("team", event.payload.teamId),
-        reference("team_task", event.payload.taskId),
-      ];
-    case "team.run_progress":
-    case "team.run_completed":
-      return [
-        reference("team", event.payload.teamId),
-        reference("team_run", event.payload.runId),
-      ];
     default:
       return [];
   }
@@ -350,6 +296,12 @@ function retainOrderedRuntimeEvents(
       const dependency = providerByKey.get(key);
       if (dependency === undefined) missingDependencies.push(key);
       else if (!dependencies.includes(dependency)) dependencies.push(dependency);
+    }
+    // Retain a known session's identity with its state, including child Agent
+    // metadata. Old partial histories without a creation event remain valid.
+    if (row.event.sessionId && row.event.type !== "session.created") {
+      const session = providerByKey.get(runtimeEventDependencyKey(reference("session", row.event.sessionId)));
+      if (session !== undefined && !dependencies.includes(session)) dependencies.push(session);
     }
     const chainKey = lifecycleChainKey(row.event);
     return {
@@ -542,31 +494,6 @@ function lifecycleChainKey(event: ChiliEvent): string | undefined {
     case "snapshot.created":
     case "snapshot.reverted":
       return `snapshot:${event.payload.snapshotId}`;
-    case "agent.spawned":
-    case "agent.completed":
-      return `agent_run:${event.payload.runId}`;
-    case "agent.message_queued":
-      return `agent_mailbox:${event.id}`;
-    case "agent.message_claimed":
-    case "agent.message_requeued":
-    case "agent.message_discarded":
-    case "agent.message_consumed":
-      return `agent_mailbox:${event.payload.messageId}`;
-    case "agent.task_created":
-    case "agent.task_completed":
-      return `agent_task:${event.payload.taskId}`;
-    case "team.member_added":
-    case "team.member_status_changed":
-      return `team_member:${teamMemberKey(event.payload.teamId, event.payload.path)}`;
-    case "team.task_created":
-    case "team.task_assigned":
-    case "team.task_claimed":
-    case "team.task_updated":
-      return `team_task:${event.payload.taskId}`;
-    case "team.run_started":
-    case "team.run_progress":
-    case "team.run_completed":
-      return `team_run:${event.payload.runId}`;
     default:
       return undefined;
   }
@@ -637,10 +564,6 @@ function isToolInputPreview(event: ChiliEvent): boolean {
 function toolReference(event: ChiliEvent, callId: string): RuntimeEventDependencyReference {
   // Provider call IDs can repeat in distinct sessions in a combined snapshot.
   return reference("tool", JSON.stringify([event.sessionId ?? null, String(callId)]));
-}
-
-function teamMemberKey(teamId: string, path: string): string {
-  return `${teamId}\u0000${path}`;
 }
 
 function requireRuntimeEventWindowLimits(limits: RuntimeEventWindowLimits): void {

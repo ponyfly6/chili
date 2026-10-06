@@ -1,57 +1,120 @@
 import { expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { RuntimeAgentRunRecord, RuntimeAgentTaskRecord, RuntimeAgentTreeNode, RuntimeAgentTreeSnapshot } from "@chili/sdk";
-import { AgentDetailsPanel, AgentTextDisclosure } from "./AgentDetailsPanel.js";
+import type { RuntimeInputQueue, RuntimeSessionInput } from "@chili/protocol";
+import type { RuntimeAgentRecord } from "@chili/sdk";
+import { AgentDetailsCard, AgentDetailsPanel } from "./AgentDetailsPanel.js";
 import {
-  AGENT_TEXT_LIMIT,
+  AGENT_RECEIPT_PAGE_SIZE,
   AGENT_TREE_PAGE_SIZE,
   agentDetailsScopeKey,
-  agentDuration,
   agentListPage,
-  agentTaskRun,
-  agentTextPreview,
-  agentTextPage,
-  boundedAgentText,
   buildAgentDetailsModel,
+  sessionDescendantAgents,
   visibleAgentRows,
 } from "./agent-details-model.js";
 
-test("merges duplicated snapshot records and presents pending follow-ups instead of the previous completed run", () => {
-  const original = task({ status: "completed", updatedAt: 20 });
-  const followup = task({ status: "pending", generation: 2, updatedAt: 30 });
-  const completedRun = run({ status: "completed", completedAt: 20 });
-  const child = node("/root/review", { tasks: [original], runs: [completedRun] });
-  const model = buildAgentDetailsModel(tree([node("/root", { children: [child] })], { agents: [completedRun], tasks: [original] }), [followup]);
-  expect(model.counts).toEqual({ total: 1, running: 0, pending: 1, completed: 0, failed: 0, incomplete: 0, cancelled: 0 });
-  expect(model.nodes.get("/root/review")?.tasks).toEqual([followup]);
-  expect(model.nodes.get("/root/review")?.runs).toHaveLength(1);
-  expect(model.nodes.get("/root/review")?.status).toBe("pending");
+test("root-only snapshots hide the child section and root identities never receive child lifecycle controls", () => {
+  const root = agent("session", { name: "ROOT_IDENTITY_MARKER", path: "/root", state: "paused" });
+  const child = agent("review", { parentAgentId: root.agentId, state: "running" });
+  const rootOnly = Object.freeze([root]);
+  expect(sessionDescendantAgents(rootOnly, root.agentId)).toEqual([]);
+  expect(sessionDescendantAgents(undefined, root.agentId)).toEqual([]);
+  expect(sessionDescendantAgents([root, child], undefined)).toEqual([]);
+  const snapshotAgents = Object.freeze([root, child]);
+  const descendants = sessionDescendantAgents(snapshotAgents, root.agentId);
+  expect(descendants).toEqual([child]);
+  expect(snapshotAgents).toEqual([root, child]);
+  const model = buildAgentDetailsModel(descendants);
+  expect(model.counts.total).toBe(1);
+  expect(model.nodes.has(root.agentId)).toBe(false);
+  const callback = async () => {};
+  const html = renderToStaticMarkup(<>{[...model.nodes.values()].map((node) => <AgentDetailsCard key={node.agentId} node={node} onClose={() => {}} onStop={callback} onResume={callback} />)}</>);
+  expect(html).toContain("Pause agent");
+  expect(html).not.toContain("Continue agent");
+  expect(html).not.toContain("ROOT_IDENTITY_MARKER");
 });
 
-test("retains nested agents and expands one branch without exposing its sibling descendants", () => {
-  const grandchild = node("/root/review/check", { tasks: [task({ id: "task_check" as never, path: "/root/review/check" as never })] });
-  const review = node("/root/review", { children: [grandchild] });
-  const build = node("/root/build", { children: [node("/root/build/test")] });
-  const model = buildAgentDetailsModel(tree([node("/root", { children: [review, build] })]));
-  expect(visibleAgentRows(model, new Set()).map((item) => item.node.path)).toEqual(["/root"]);
-  const visible = visibleAgentRows(model, new Set(["/root", "/root/review"]));
-  expect(visible.map((item) => item.node.path)).toEqual(["/root", "/root/build", "/root/review", "/root/review/check"]);
-  expect(visible.at(-1)?.depth).toBe(2);
+test("counts unique identities in their current idle, running or paused state", () => {
+  const model = buildAgentDetailsModel([
+    agent("review", { state: "running" }),
+    agent("writer", { state: "running" }),
+    agent("reader", { state: "idle" }),
+    agent("review", { state: "paused" }),
+  ]);
+  expect(model.counts).toEqual({ total: 3, idle: 1, running: 1, paused: 1 });
+  expect(model.nodes.get("review")?.state).toBe("paused");
 });
 
-test("tasks omitted from nested node records remain inspectable from the snapshot task list", () => {
-  const model = buildAgentDetailsModel(tree([]), [task()]);
-  expect(model.roots).toEqual(["/root/review"]);
-  expect(model.counts.running).toBe(1);
-  expect(model.nodes.get("/root/review")?.tasks[0]?.prompt).toBe("Review concurrent state transitions.");
+test("uses parent IDs for hierarchy even when display paths disagree or repeat", () => {
+  const model = buildAgentDetailsModel([
+    agent("root", { path: "/root" }),
+    agent("review", { path: "/display/review", parentAgentId: "root" }),
+    agent("same-path", { path: "/display/review", parentAgentId: "root" }),
+    agent("unrelated", { path: "/root/nested" }),
+    agent("check", { path: "/elsewhere", parentAgentId: "review" }),
+  ]);
+  expect(model.roots).toEqual(["root", "unrelated"]);
+  expect(model.nodes.get("root")?.children).toEqual(["review", "same-path"]);
+  expect(visibleAgentRows(model, new Set(["root", "review"])).map(({ node, depth }) => [node.agentId, depth]))
+    .toEqual([["root", 0], ["review", 1], ["check", 2], ["same-path", 1], ["unrelated", 0]]);
 });
 
-test("current run association never falls back to a different task's result", () => {
-  const other = run({ id: "run_other" as never, taskId: "task_other" as never, createdAt: 90 });
-  const model = buildAgentDetailsModel(tree([], { agents: [other, run()], tasks: [task()] }));
-  const review = model.nodes.get("/root/review")!;
-  expect(agentTaskRun(review, task())?.id).toBe("run_review" as never);
-  expect(agentTaskRun(review, task({ currentRunId: "run_missing" as never }))).toBeUndefined();
+test("keeps identity and expansion across pause, resume and display path changes", () => {
+  const expanded = new Set(["owner", "review"]);
+  const snapshot = (state: RuntimeAgentRecord["state"], path: string) => buildAgentDetailsModel([
+    agent("owner"),
+    agent("review", { parentAgentId: "owner", path, state }),
+    agent("nested", { parentAgentId: "review" }),
+  ]);
+  const paused = snapshot("paused", "/old/review");
+  const resumed = snapshot("running", "/new/review");
+  expect(paused.nodes.get("review")?.children).toEqual(["nested"]);
+  expect(resumed.nodes.get("review")?.children).toEqual(["nested"]);
+  expect(visibleAgentRows(paused, expanded).map(({ node }) => node.agentId))
+    .toEqual(visibleAgentRows(resumed, expanded).map(({ node }) => node.agentId));
+  expect(resumed.counts).toEqual({ total: 3, idle: 2, running: 1, paused: 0 });
+});
+
+test("expanding one branch leaves its sibling descendants collapsed", () => {
+  const model = buildAgentDetailsModel([
+    agent("root"),
+    agent("review", { parentAgentId: "root" }),
+    agent("build", { parentAgentId: "root" }),
+    agent("check", { parentAgentId: "review" }),
+    agent("test", { parentAgentId: "build" }),
+  ]);
+  expect(visibleAgentRows(model, new Set()).map(({ node }) => node.agentId)).toEqual(["root"]);
+  expect(visibleAgentRows(model, new Set(["root", "review"])).map(({ node }) => node.agentId))
+    .toEqual(["root", "build", "review", "check"]);
+});
+
+test("partial and cyclic parent metadata never hide an identity or loop traversal", () => {
+  const agents = [
+    agent("orphan", { parentAgentId: "missing" }),
+    agent("self", { parentAgentId: "self" }),
+    agent("a", { parentAgentId: "b" }),
+    agent("b", { parentAgentId: "c" }),
+    agent("c", { parentAgentId: "a" }),
+    agent("child", { parentAgentId: "b" }),
+  ];
+  const expanded = new Set(agents.map((item) => item.agentId));
+  const model = buildAgentDetailsModel(agents);
+  const reversed = buildAgentDetailsModel([...agents].reverse());
+  const rows = visibleAgentRows(model, expanded);
+  expect(rows).toHaveLength(agents.length);
+  expect(new Set(rows.map(({ node }) => node.agentId)).size).toBe(agents.length);
+  expect(model.roots).toEqual(["a", "orphan", "self"]);
+  expect(rows.map(({ node, depth }) => [node.agentId, depth]))
+    .toEqual(visibleAgentRows(reversed, expanded).map(({ node, depth }) => [node.agentId, depth]));
+});
+
+test("deep hierarchies remain traversable without recursive stack growth or source mutation", () => {
+  const agents = Object.freeze(Array.from({ length: 5_000 }, (_, index) => Object.freeze(agent(String(index), index === 0 ? {} : { parentAgentId: String(index - 1) }))));
+  const model = buildAgentDetailsModel(agents);
+  const rows = visibleAgentRows(model, new Set(agents.map((item) => item.agentId)));
+  expect(rows).toHaveLength(5_000);
+  expect(rows.at(-1)?.depth).toBe(4_999);
+  expect(agents[0]).not.toHaveProperty("children");
 });
 
 test("scope keys separate projects and sessions even when names contain separators", () => {
@@ -60,91 +123,107 @@ test("scope keys separate projects and sessions even when names contain separato
   expect(agentDetailsScopeKey("project-a", "first")).not.toBe(agentDetailsScopeKey("project-a", "second"));
 });
 
-test("previews respect grapheme clusters and expanded text has an explicit bounded budget", () => {
-  expect(agentTextPreview("👩🏽‍💻e\u0301你好", 2)).toBe("👩🏽‍💻e\u0301…");
-  expect(agentTextPreview("  hello  ", 5)).toBe("hello");
-  expect(boundedAgentText("a".repeat(AGENT_TEXT_LIMIT + 100))).toEqual({ text: "a".repeat(AGENT_TEXT_LIMIT), omitted: 100 });
-  expect(boundedAgentText("a😀b", 2)).toEqual({ text: "a", omitted: 3 });
-});
-
-test("every section of a long result remains readable without splitting normal graphemes or mounting the entire output", () => {
-  const text = "👩🏽‍💻e\u0301你好".repeat(4_000) + "FINAL_RESULT_MARKER";
-  const pages: string[] = [];
-  let start = 0;
-  while (start < text.length) {
-    const page = agentTextPage(text, start);
-    expect(page.text.length).toBeLessThanOrEqual(AGENT_TEXT_LIMIT);
-    expect(page.end).toBeGreaterThan(start);
-    pages.push(page.text);
-    start = page.end;
-  }
-  expect(pages.join("")).toBe(text);
-  expect(pages.at(-1)).toEndWith("FINAL_RESULT_MARKER");
-  expect(agentTextPage("a👩🏽‍💻b", 0, 7).text).toBe("a");
-  expect(agentTextPage("a👩🏽‍💻b", 1, 8).text).toBe("👩🏽‍💻b");
-  expect(agentTextPage("e" + "\u0301".repeat(AGENT_TEXT_LIMIT * 2), 0).text.length).toBe(AGENT_TEXT_LIMIT);
-});
-
-test("list pages preserve access to all agents and clamp pages when a tree collapses", () => {
+test("list pages retain every identity and clamp pages after hierarchy collapse", () => {
   const items = Array.from({ length: 241 }, (_, index) => index);
   expect(agentListPage(items, 1, 100)).toEqual({ items: items.slice(100, 200), page: 1, total: 3 });
   expect(agentListPage(items, 9, 100).items).toEqual(items.slice(200));
   expect(agentListPage(["root"], 2, 100)).toEqual({ items: ["root"], page: 0, total: 1 });
 });
 
-test("durations use terminal timestamps and clamp skewed clocks", () => {
-  expect(agentDuration(1_000, 62_000, 9_999_999)).toBe("1m 1s");
-  expect(agentDuration(10_000, undefined, 9_000)).toBe("0s");
-  expect(agentDuration(0, undefined, 3_660_000)).toBe("1h 1m");
-  expect(agentDuration(Number.NaN, undefined, 1)).toBe("Unavailable");
-});
-
-test("initial agent panel leaves instructions and results unmounted until an agent is selected", () => {
-  const html = renderToStaticMarkup(<AgentDetailsPanel projectId="a" sessionId="session" tree={tree([node("/root", { children: [node("/root/review", { tasks: [task({ summary: "PRIVATE_RESULT_MARKER" })] })] })])} />);
-  expect(html).toContain("Delegated agent hierarchy");
-  expect(html).toContain('aria-label="Collapse Main agent"');
+test("initial panel renders current states and waits for selection before mounting receipts", () => {
+  const html = renderToStaticMarkup(<AgentDetailsPanel projectId="a" sessionId="session" agents={[
+    agent("root", { name: "Coordinator" }),
+    agent("review", { parentAgentId: "root", name: "Review runtime", state: "paused" }),
+  ]} inputQueues={{ review: queue([input({ inputId: "PRIVATE_RECEIPT_MARKER" })]) }} />);
+  expect(html).toContain("Agent hierarchy");
+  expect(html).toContain('aria-label="Collapse Coordinator"');
   expect(html).toContain("Review runtime");
-  expect(html).not.toContain("PRIVATE_RESULT_MARKER");
-  expect(html).not.toContain("Review concurrent state transitions.");
+  expect(html).toContain("1 paused");
+  expect(html).toContain("1 idle");
+  expect(html).not.toContain("PRIVATE_RECEIPT_MARKER");
   expect(html).not.toContain("agent-details-card");
 });
 
-test("large trees only mount one page of rows while retaining a next-page control", () => {
-  const children = Array.from({ length: 220 }, (_, index) => node(`/root/agent-${index}`));
-  const html = renderToStaticMarkup(<AgentDetailsPanel projectId="a" sessionId="session" tree={tree([node("/root", { children })])} />);
+test("large hierarchies only mount one page while retaining a next-page control", () => {
+  const children = Array.from({ length: 220 }, (_, index) => agent(`agent-${index}`, { parentAgentId: "root" }));
+  const html = renderToStaticMarkup(<AgentDetailsPanel projectId="a" sessionId="session" agents={[agent("root"), ...children]} />);
   expect(html.match(/<li /g)).toHaveLength(AGENT_TREE_PAGE_SIZE);
   expect(html).toContain('aria-label="Next agent tree page"');
 });
 
-test("result and error bodies are escaped, collapsed and not merely hidden in a large DOM", () => {
-  const html = renderToStaticMarkup(<AgentTextDisclosure label="Error" text={'<script>alert("no")</script>\n' + "a".repeat(500) + "END_MARKER"} error />);
-  expect(html).toContain('aria-expanded="false"');
+test("details keep agent state separate from settled input outcomes and omit legacy histories", () => {
+  const node = buildAgentDetailsModel([agent("review", { state: "idle", parentAgentId: "owner" })]).nodes.get("review")!;
+  const html = renderToStaticMarkup(<AgentDetailsCard node={node} onClose={() => {}} inputQueue={queue([
+    input({ inputId: "input_success", state: "settled", outcome: "completed" }),
+    input({ inputId: "input_cancelled", state: "settled", outcome: "cancelled" }),
+  ])} />);
+  expect(html).toContain('class="agent-details-status agent-details-idle">Idle');
+  expect(html).toContain("<dt>Agent ID</dt><dd>review</dd>");
+  expect(html).toContain("<dt>Parent agent ID</dt><dd>owner</dd>");
+  expect(html).toContain("input_success");
+  expect(html).toContain("settled · queue · completed");
+  expect(html).toContain("settled · queue · cancelled");
+  expect(html).not.toContain("Task history");
+  expect(html).not.toContain("Run history");
+  expect(html).not.toContain("<form");
+  expect(html).not.toContain("Pause agent");
+});
+
+test("paused identities offer continue and idle or running identities offer pause", () => {
+  const callback = async () => {};
+  for (const state of ["idle", "running", "paused"] as const) {
+    const node = buildAgentDetailsModel([agent("review", { state })]).nodes.get("review")!;
+    const html = renderToStaticMarkup(<AgentDetailsCard node={node} onClose={() => {}} onStop={callback} onResume={callback} onSend={callback} />);
+    expect(html).toContain(state === "paused" ? "Continue agent" : "Pause agent");
+    expect(html).not.toContain(state === "paused" ? "Pause agent" : "Continue agent");
+    expect(html).toContain('value="queue"');
+    expect(html).toContain('value="steer"');
+    expect(html).toContain('<button type="submit" disabled="">Send message</button>');
+  }
+});
+
+test("receipt lists paginate and escape errors without exposing input bodies", () => {
+  const node = buildAgentDetailsModel([agent("review")]).nodes.get("review")!;
+  const items = Array.from({ length: 45 }, (_, index) => input({ inputId: `input_${index}`, text: "PRIVATE_PROMPT_MARKER", ...(index === 0 ? { error: '<script>alert("no")</script>' } : {}) }));
+  const html = renderToStaticMarkup(<AgentDetailsCard node={node} onClose={() => {}} inputQueue={queue(items)} />);
+  expect(html.match(/<li>/g)).toHaveLength(AGENT_RECEIPT_PAGE_SIZE);
+  expect(html).toContain('aria-label="Next input receipts page"');
   expect(html).toContain("&lt;script&gt;");
   expect(html).not.toContain("<script>");
-  expect(html).not.toContain("<pre");
-  expect(html).not.toContain("END_MARKER");
-  expect(html.length).toBeLessThan(1_000);
+  expect(html).not.toContain("PRIVATE_PROMPT_MARKER");
+  expect(html).not.toContain("input_44");
 });
 
-test("empty and loading states distinguish an unselected task from an empty snapshot", () => {
-  const render = (sessionId: string | undefined, snapshot: RuntimeAgentTreeSnapshot | undefined) => renderToStaticMarkup(<AgentDetailsPanel projectId="a" sessionId={sessionId} tree={snapshot} />);
-  expect(render(undefined, undefined)).toContain("Select a task");
-  expect(render("session", undefined)).toContain("Loading delegated agents");
-  expect(render("session", tree([]))).toContain("No agents delegated yet");
+test("empty and loading states distinguish unselected sessions from empty snapshots", () => {
+  const render = (sessionId: string | undefined, agents: RuntimeAgentRecord[] | undefined) => renderToStaticMarkup(<AgentDetailsPanel projectId="a" sessionId={sessionId} agents={agents} />);
+  expect(render(undefined, undefined)).toContain("Select a session");
+  expect(render("session", undefined)).toContain("Loading agents");
+  expect(render("session", [])).toContain("No agents created yet");
 });
 
-function task(overrides: Partial<RuntimeAgentTaskRecord> = {}): RuntimeAgentTaskRecord {
-  return { id: "task_review" as never, path: "/root/review" as never, taskName: "Review runtime", status: "running", generation: 1, prompt: "Review concurrent state transitions.", createdAt: 10, updatedAt: 10, ...overrides };
+test("receipt availability distinguishes missing snapshots from a loaded empty queue", () => {
+  const node = buildAgentDetailsModel([agent("review")]).nodes.get("review")!;
+  expect(renderToStaticMarkup(<AgentDetailsCard node={node} onClose={() => {}} />)).toContain("Input receipts are unavailable");
+  expect(renderToStaticMarkup(<AgentDetailsCard node={node} onClose={() => {}} inputQueue={queue([])} />)).toContain("No queued input receipts");
+});
+
+function agent(agentId: string, overrides: Partial<RuntimeAgentRecord> = {}): RuntimeAgentRecord {
+  return { agentId, name: agentId, path: `/display/${agentId}`, state: "idle", ...overrides };
 }
 
-function run(overrides: Partial<RuntimeAgentRunRecord> = {}): RuntimeAgentRunRecord {
-  return { id: "run_review" as never, taskId: "task_review" as never, path: "/root/review" as never, taskName: "Review runtime", status: "running", createdAt: 10, ...overrides };
+function input(overrides: Partial<RuntimeSessionInput> = {}): RuntimeSessionInput {
+  return {
+    inputId: "input_review", submissionId: "submission_review", sessionId: "review" as RuntimeSessionInput["sessionId"],
+    mode: "queue", state: "pending", revision: 1, sequence: 1, text: "Review the source.", acceptedAt: 1, updatedAt: 1,
+    ...overrides,
+  };
 }
 
-function node(path: string, overrides: Partial<RuntimeAgentTreeNode> = {}): RuntimeAgentTreeNode {
-  return { path: path as never, taskName: "", status: "empty", runIds: [], runs: [], tasks: [], mailbox: [], children: [], createdAt: 10, updatedAt: 10, ...overrides };
-}
-
-function tree(nodes: RuntimeAgentTreeNode[], overrides: Partial<RuntimeAgentTreeSnapshot> = {}): RuntimeAgentTreeSnapshot {
-  return { nodes, agents: [], tasks: [], mailbox: [], ...overrides };
+function queue(items: RuntimeSessionInput[]): RuntimeInputQueue {
+  return {
+    sessionId: "review" as RuntimeInputQueue["sessionId"], paused: false, revision: 1,
+    pendingCount: items.filter((item) => item.state === "pending").length,
+    interruptedCount: items.filter((item) => item.outcome === "interrupted").length,
+    items,
+  };
 }

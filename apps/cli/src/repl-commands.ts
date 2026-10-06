@@ -30,10 +30,8 @@ export interface CliReplCommandContext {
   revertSession(sessionId: SessionId, snapshotId: string): Promise<void>;
   showDelegation(sessionId: SessionId, policy?: DelegationPolicy): Promise<void>;
   showAgents(sessionId: SessionId): Promise<void>;
-  showMailbox(sessionId: SessionId): Promise<void>;
-  listTasks(sessionId: SessionId): Promise<void>;
-  showTask(sessionId: SessionId, taskId: string): Promise<void>;
-  recoverTasks(sessionId: SessionId): Promise<void>;
+  stopAgent(sessionId: SessionId, agentId: string): Promise<void>;
+  resumeAgent(sessionId: SessionId, agentId: string): Promise<void>;
   showMemory(cwd: string, scope: string): Promise<void>;
   addMemory(cwd: string, input: string): Promise<void>;
   reloadMemory(cwd: string, scope: string): Promise<void>;
@@ -55,11 +53,9 @@ type CliReplCommandAction =
   | { type: "session_compact"; focus: string }
   | { type: "session_revert"; snapshotId: string }
   | { type: "session_delegation"; policy?: DelegationPolicy }
-  | { type: "team_agents" }
-  | { type: "team_mailbox" }
-  | { type: "team_tasks" }
-  | { type: "team_task"; taskId: string }
-  | { type: "team_recover" }
+  | { type: "agents" }
+  | { type: "agent_stop"; agentId: string }
+  | { type: "agent_resume"; agentId: string }
   | { type: "memory_show"; scope: string }
   | { type: "memory_add"; input: string }
   | { type: "memory_reload"; scope: string }
@@ -87,12 +83,10 @@ export function createCliReplCommandRegistry(runtimeCatalog?: RuntimeCommandCata
       type: "session_delegation",
       ...delegationPolicyInput(input.raw),
     }) },
-    team: { run: () => ({ type: "team_agents" }) },
-    "team.agents": { run: () => ({ type: "team_agents" }) },
-    "team.mailbox": { run: () => ({ type: "team_mailbox" }) },
-    "team.tasks": { run: () => ({ type: "team_tasks" }) },
-    "team.task": { run: (_context, input) => ({ type: "team_task", taskId: input.raw }) },
-    "team.recover": { run: () => ({ type: "team_recover" }) },
+    agents: { run: () => ({ type: "agents" }) },
+    "agents.list": { run: () => ({ type: "agents" }) },
+    "agents.stop": { run: (_context, input) => ({ type: "agent_stop", agentId: input.raw }) },
+    "agents.resume": { run: (_context, input) => ({ type: "agent_resume", agentId: input.raw }) },
     memory: { run: () => ({ type: "memory_show", scope: "" }) },
     "memory.show": { run: (_context, input) => ({ type: "memory_show", scope: input.raw }) },
     "memory.add": { run: (_context, input) => ({ type: "memory_add", input: input.raw }) },
@@ -170,20 +164,14 @@ async function executeAction(
     case "session_delegation":
       await context.showDelegation(context.sessionId, action.policy);
       break;
-    case "team_agents":
+    case "agents":
       await context.showAgents(context.sessionId);
       break;
-    case "team_mailbox":
-      await context.showMailbox(context.sessionId);
+    case "agent_stop":
+      await context.stopAgent(context.sessionId, action.agentId);
       break;
-    case "team_tasks":
-      await context.listTasks(context.sessionId);
-      break;
-    case "team_task":
-      await context.showTask(context.sessionId, action.taskId);
-      break;
-    case "team_recover":
-      await context.recoverTasks(context.sessionId);
+    case "agent_resume":
+      await context.resumeAgent(context.sessionId, action.agentId);
       break;
     case "memory_show":
       await context.showMemory(context.cwd, action.scope);

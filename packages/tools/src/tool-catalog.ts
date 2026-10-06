@@ -12,15 +12,8 @@ export const AGENT_CONTROL_TOOLS = [
 
 export const GOAL_CONTROL_TOOLS = ["create_goal", "get_goal", "update_goal"] as const;
 
-export const TEAM_CONTROL_TOOLS = [
-  "team_create", "team_list", "team_snapshot", "team_member_add", "team_member_list",
-  "team_task_create", "team_task_create_batch", "team_task_list", "team_task_assign",
-  "team_task_claim", "team_task_update", "team_task_dispatch", "team_task_dispatch_batch",
-  "team_task_sync", "team_task_reconcile", "team_run_loop", "team_message_send", "team_message_list",
-] as const;
-
 export const CODING_TOOL_GROUPS: readonly (readonly string[])[] = [
-  AGENT_CONTROL_TOOLS, GOAL_CONTROL_TOOLS, TEAM_CONTROL_TOOLS,
+  AGENT_CONTROL_TOOLS, GOAL_CONTROL_TOOLS,
   ["delegation_status", "delegation_set"],
 ];
 

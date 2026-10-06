@@ -130,7 +130,10 @@ export function createPermissionRules(
     { permission: "write", pattern: "*", action: "allow", source },
     { permission: "bash", pattern: "*", action: options.sandboxedShell ? "allow" : "ask", source },
     { permission: "bash.unsandboxed", pattern: "*", action: "ask", source },
-    { permission: "task", pattern: "*", action: "allow", source },
+    { permission: "agent_spawn", pattern: "*", action: "allow", source },
+    { permission: "agent_send", pattern: "*", action: "allow", source },
+    { permission: "agent_stop", pattern: "*", action: "allow", source },
+    { permission: "agent_resume", pattern: "*", action: "allow", source },
     { permission: "git_status", pattern: "*", action: "allow", source },
     { permission: "git_diff", pattern: "*", action: "allow", source },
   ];

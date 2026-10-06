@@ -22,7 +22,7 @@ Use TypeScript ESM with explicit `.js` extensions for relative runtime imports. 
 ## Testing Guidelines
 
 Add focused tests next to changed code using the `*.test.ts` or `*.test.tsx` convention. Prefer behavioral tests for parsers, state transitions, render models, and tool adapters. Run `bun test`, `bun run typecheck`, and the complete `bun run smoke:all` gate before submitting. Use individual smoke commands such as `bun run smoke:cli` for focused development feedback.
-For team parallel scheduling changes, run `bun run smoke:p3-team-model` and `bun run smoke:p3-team-parallel`.
+For unified Agent lifecycle or scheduling changes, run `bun run smoke:agents`.
 
 ## Commit & Pull Request Guidelines
 

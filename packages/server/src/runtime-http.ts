@@ -21,86 +21,9 @@ import {
 import { createHash, timingSafeEqual } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
-import {
-  resolveTeamSessionAuthority,
-  RuntimeSessionNotFoundError,
-  TeamSessionAuthorityError,
-} from "@chili/core";
-import type {
-  ChiliEvent,
-  EventEnvelope,
-  AgentPath,
-  AgentTaskMode,
-  AgentTaskStatus,
-  ApprovalDecisionAction,
-  DelegationPolicy,
-  RuntimeInterruptResult,
-  RuntimeDelegationConfig,
-  RuntimeModelConfig,
-  RuntimeModelDescriptor,
-  RuntimeMcpAddServerRequest,
-  RuntimeMcpControlService,
-  RuntimeMcpScopeInput,
-  RuntimeMcpAuthRequest,
-  RuntimeMcpListResponse,
-  RuntimeMcpServerDescriptor,
-  RuntimeMcpStatusResponse,
-  RuntimeMcpTransport,
-  MessageImageContent,
-  RuntimePermissionConfig,
-  RuntimePermissionProfileId,
-  RuntimeApprovalResolveResult,
-  RuntimePromptAccepted,
-  RuntimePromptResult,
-  RuntimeSessionRef,
-  RuntimeTurnResult,
-  RuntimeSkillMention,
-  ModelSelection,
-  ReasoningLevel,
-  ServiceTier,
-  SessionId,
-  TaskId,
-  TeamId,
-  TeamMessageDelivery,
-  SessionGoal,
-  SessionGoalStatus,
-  PendingUserInputRequest,
-  UserInputAnswers,
-  UserInputId,
-} from "@chili/protocol";
-import type {
-  AgentTreeSnapshot,
-  AgentTreeSnapshotQuery,
-  ConsumeAgentMailboxInput,
-  AgentTaskCloseInput,
-  AgentTaskFinalStatus,
-  AgentTaskFollowupInput,
-  AgentTaskFollowupResult,
-  AgentTaskReconcileStaleInput,
-  AgentTaskReconcileStaleResult,
-  AgentTaskWaitInput,
-  RuntimeBackgroundErrorHandler,
-  AddTeamMemberInput,
-  AssignTeamTaskInput,
-  ClaimTeamTaskInput,
-  CreateTeamInput,
-  CreateTeamTaskInput,
-  SendTeamMessageInput,
-  SubmitPromptInput,
-  SubmitPromptResult,
-  TeamTaskDispatchInput,
-  TeamTaskDispatchResult,
-  TeamExecutionRunInput,
-  TeamExecutionRunSummary,
-  TeamMergeInput,
-  TeamMergeSweepResult,
-  TeamTaskReconcileInput,
-  TeamTaskReconcileResult,
-  TeamTaskSyncInput,
-  TeamTaskSyncResult,
-  TeamSnapshot,
-  UpdateTeamTaskInput,
-} from "@chili/core";
+import { RuntimeSessionNotFoundError } from "@chili/core";
+import type { ChiliEvent, EventEnvelope, ApprovalDecisionAction, DelegationPolicy, RuntimeInterruptResult, RuntimeDelegationConfig, RuntimeModelConfig, RuntimeModelDescriptor, RuntimeMcpAddServerRequest, RuntimeMcpControlService, RuntimeMcpScopeInput, RuntimeMcpAuthRequest, RuntimeMcpListResponse, RuntimeMcpServerDescriptor, RuntimeMcpStatusResponse, RuntimeMcpTransport, MessageImageContent, RuntimePermissionConfig, RuntimePermissionProfileId, RuntimeApprovalResolveResult, RuntimePromptAccepted, RuntimePromptResult, RuntimeSessionRef, RuntimeTurnResult, RuntimeSkillMention, ModelSelection, ReasoningLevel, ServiceTier, SessionId, SessionGoal, SessionGoalStatus, PendingUserInputRequest, UserInputAnswers, UserInputId } from "@chili/protocol";
+import type { AgentControlService, RuntimeBackgroundErrorHandler, SubmitPromptInput, SubmitPromptResult } from "@chili/core";
 import { SessionInputConflictError, UnknownEventCursorError } from "@chili/store";
 import type { EventPublisher, EventStore } from "@chili/store";
 import {
@@ -120,20 +43,6 @@ import {
   PromptCommandUsageError,
   type PromptCommandControl,
 } from "@chili/commands";
-import type {
-  AgentMailboxQuery,
-  AgentMailboxRow,
-  AgentRunQuery,
-  AgentRunRow,
-  AgentTaskQuery,
-  AgentTaskRow,
-  TeamMemberRow,
-  TeamMessageRow,
-  TeamRow,
-  TeamTaskMutationResult,
-  TeamTaskRow,
-} from "@chili/store";
-import { projectRuntimeAgents } from "./agent-projection.js";
 
 export interface RuntimeHttpSessionOperation {
   readonly signal: AbortSignal;
@@ -172,63 +81,13 @@ export interface RuntimeHttpService {
   renameSession?(sessionId: SessionId, title: string): Promise<void>;
 }
 
-export interface RuntimeTaskControlService {
-  listTasks(query?: AgentTaskQuery): Promise<AgentTaskRow[]>;
-  getTask(taskId: TaskId): Promise<AgentTaskRow>;
-  followupTask(input: AgentTaskFollowupInput): Promise<AgentTaskFollowupResult>;
-  waitForTask(input: AgentTaskWaitInput): Promise<AgentTaskRow>;
-  closeTask(input: AgentTaskCloseInput): Promise<AgentTaskRow>;
-  reconcileStaleTasks(input?: AgentTaskReconcileStaleInput): Promise<AgentTaskReconcileStaleResult>;
-}
-
-export interface RuntimeAgentTreeService {
-  snapshot(query?: AgentTreeSnapshotQuery): Promise<AgentTreeSnapshot>;
-  agentRuns(query?: AgentRunQuery): Promise<AgentRunRow[]>;
-  mailbox(query?: AgentMailboxQuery): Promise<AgentMailboxRow[]>;
-  consumeMailbox(input: ConsumeAgentMailboxInput): Promise<AgentMailboxRow>;
-}
-
-export interface RuntimeTeamService {
-  listTeams(): Promise<TeamRow[]>;
-  snapshot(teamId: TeamId): Promise<TeamSnapshot>;
-  members(teamId: TeamId): Promise<TeamMemberRow[]>;
-  tasks(teamId: TeamId): Promise<TeamTaskRow[]>;
-  messages(teamId: TeamId): Promise<TeamMessageRow[]>;
-  createTeam(input: CreateTeamInput): Promise<TeamRow>;
-  addMember(input: AddTeamMemberInput): Promise<TeamMemberRow>;
-  createTask(input: CreateTeamTaskInput): Promise<TeamTaskRow>;
-  assignTask(input: AssignTeamTaskInput): Promise<TeamTaskRow>;
-  claimTask(input: ClaimTeamTaskInput): Promise<TeamTaskMutationResult>;
-  updateTask(input: UpdateTeamTaskInput): Promise<TeamTaskRow>;
-  sendMessage(input: SendTeamMessageInput): Promise<TeamMessageRow>;
-}
-
-export interface RuntimeTeamDispatcherService {
-  dispatchTask(input: TeamTaskDispatchInput): Promise<TeamTaskDispatchResult>;
-  syncTask(input: TeamTaskSyncInput): Promise<TeamTaskSyncResult>;
-  reconcileTasks(input?: TeamTaskReconcileInput): Promise<TeamTaskReconcileResult>;
-}
-
-export interface RuntimeTeamExecutionRunnerService {
-  run(input: TeamExecutionRunInput): Promise<TeamExecutionRunSummary>;
-}
-
-export interface RuntimeTeamMergeService {
-  mergeTeamTasks(input: TeamMergeInput): Promise<TeamMergeSweepResult>;
-}
-
 export type { RuntimeMcpScopeInput, RuntimeMcpControlService } from "@chili/protocol";
 
 export interface RuntimeHttpHandlerOptions {
   service: RuntimeHttpService;
   store: EventStore & EventPublisher;
   authToken?: string;
-  tasks?: RuntimeTaskControlService;
-  agents?: RuntimeAgentTreeService;
-  teams?: RuntimeTeamService;
-  teamDispatcher?: RuntimeTeamDispatcherService;
-  teamMerger?: RuntimeTeamMergeService;
-  teamRunner?: RuntimeTeamExecutionRunnerService;
+  agents?: Pick<AgentControlService, "forSession">;
   approvals?: ApprovalResolver;
   userInputs?: UserInputController;
   permissions?: PermissionProfileControl;
@@ -311,9 +170,8 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
     }
 
     const url = new URL(request.url);
-    const route = routeRequest(request.method, url.pathname);
-
     try {
+      const route = routeRequest(request.method, url.pathname);
       if (route.name === "health") {
         return json({ ok: true });
       }
@@ -425,284 +283,52 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         return json(await withMcpMutationScope(options, url, (scope) => mcp.logout!(route.server, scope)));
       }
 
-      if (route.name === "listTasks") {
-        const tasks = requireTaskControl(options);
-        return json(await tasks.listTasks(taskQueryFromUrl(url)));
-      }
-
-      if (route.name === "tasksReconcileStale") {
-        const tasks = requireTaskControl(options);
-        const body = await readJson<TaskReconcileStaleBody>(request, [
-          "parentSessionId", "staleAfterMs", "modes", "limit", "summary", "error",
-        ]);
-        return json(await tasks.reconcileStaleTasks(reconcileStaleInput(body)));
-      }
-
-      if (route.name === "task") {
-        const tasks = requireTaskControl(options);
-        return json(await tasks.getTask(route.taskId));
-      }
-
-      if (route.name === "taskFollowup") {
-        const tasks = requireTaskControl(options);
-        const body = await readJson<TaskFollowupBody>(request, ["text", "maxTurns", "system"]);
-        rejectLegacySystemField(body);
-        const input: AgentTaskFollowupInput = {
-          taskId: route.taskId,
-          text: stringField(body.text, "text"),
-          signal: request.signal,
-        };
-        if (body.maxTurns !== undefined) input.maxTurns = positiveInteger(body.maxTurns, "maxTurns");
-        return json(serializeTaskFollowupResult(await tasks.followupTask(input)));
-      }
-
-      if (route.name === "taskWait") {
-        const tasks = requireTaskControl(options);
-        const body = await readJson<TaskWaitBody>(request, ["timeoutMs"]);
-        const input: AgentTaskWaitInput = { taskId: route.taskId, signal: request.signal };
-        if (body.timeoutMs !== undefined) input.timeoutMs = nonNegativeInteger(body.timeoutMs, "timeoutMs");
-        return json(await tasks.waitForTask(input));
-      }
-
-      if (route.name === "taskClose") {
-        const tasks = requireTaskControl(options);
-        const body = await readJson<TaskCloseBody>(request, ["status", "summary", "error", "interrupt"]);
-        const input: AgentTaskCloseInput = {
-          taskId: route.taskId,
-          status: closeStatus(body.status),
-        };
-        if (body.summary !== undefined) input.summary = stringField(body.summary, "summary");
-        if (body.error !== undefined) input.error = stringField(body.error, "error");
-        if (body.interrupt !== undefined) input.interrupt = parseRuntimeBoolean(body.interrupt, "body.interrupt");
-        return json(await tasks.closeTask(input));
-      }
-
-      if (route.name === "agentTree") {
-        const agents = requireAgentTree(options);
-        return json(await agents.snapshot(agentTreeQueryFromUrl(url)));
-      }
-
-      if (route.name === "agentRuns") {
-        const agents = requireAgentTree(options);
-        return json(await agents.agentRuns(agentRunQueryFromUrl(url)));
-      }
-
-      if (route.name === "mailbox") {
-        const agents = requireAgentTree(options);
-        return json(await agents.mailbox(mailboxQueryFromUrl(url)));
-      }
-
-      if (route.name === "consumeMailbox") {
-        const agents = requireAgentTree(options);
-        return json(await agents.consumeMailbox({ messageId: route.messageId }));
-      }
-
-      if (route.name === "agents") {
-        const events = await readAllProjectionEvents(options.store, route.sessionId, maxBacklogEvents);
-        return json(projectRuntimeAgents(events, route.sessionId));
-      }
-
-      if (route.name === "listTeams") {
-        const teams = requireTeams(options);
-        return json(await teams.listTeams());
-      }
-
-      if (route.name === "createTeam") {
-        const teams = requireTeams(options);
-        const body = await readJson<TeamCreateBody>(request, [
-          "teamId", "sessionId", "name", "leadPath", "description", "leadName", "leadRole", "leadStatus", "leadWriteScope",
-        ]);
-        if (!body.name) throw badRequest("name is required");
-        if (!body.leadPath) throw badRequest("leadPath is required");
-        const input = teamCreateInput(body);
-        if (!input.sessionId) return json(await teams.createTeam(input), 201);
-        const sessionId = input.sessionId;
-        await resolveHttpInteractiveSession(options, sessionId);
-        return json(await options.service.withSessionOperation(sessionId, async (operation) => {
-          await resolveHttpInteractiveSession(options, sessionId);
-          operation.assertCurrent();
-          return teams.createTeam(input);
-        }), 201);
-      }
-
-      if (route.name === "teamReconcileDispatches") {
-        const dispatcher = requireTeamDispatcher(options);
-        const body = await readJson<TeamTaskReconcileBody>(request, ["teamId", "sessionId", "limit"]);
-        const input = teamTaskReconcileInput(route.teamId, body);
-        await assertHttpTeamReconcileAuthority(options, input);
-        return json(await dispatcher.reconcileTasks(input));
-      }
-
-      if (route.name === "teamRunLoop") {
-        const runner = requireTeamRunner(options);
-        const body = await readJson<TeamRunLoopBody>(request, [
-          "teamId", "sessionId", "cwd", "mode", "once", "maxCycles", "timeoutMs", "pollIntervalMs",
-        ]);
-        const input = teamRunLoopInput(route.teamId, body);
-        const team = await requireHttpTeam(options, route.teamId);
-        if (team.status !== "active") {
-          throw new TeamSessionAuthorityError(`Cannot operate on archived team ${team.id}`);
+      if (route.name === "agents" || route.name === "agentSpawn" || route.name === "agentSend" || route.name === "agentWait" || route.name === "agentStop" || route.name === "agentResume") {
+        await options.service.assertSessionReadAllowed(route.sessionId);
+        const caller = await requireSession(options.store, route.sessionId);
+        if (caller.status !== "active" || caller.agent || caller.source === "subagent") {
+          return jsonError(403, "Agent control requires an active root session");
         }
-        if (team.sessionId) {
-          const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, input.cwd);
-          input.sessionId = authority.sessionId;
-          input.cwd = authority.cwd;
-        } else {
-          // An unbound team must let the runner create and atomically persist a
-          // fresh owner session. Never promote a caller-provided id to owner.
-          delete input.sessionId;
+        if (!options.agents) return jsonError(501, "No agent control service is configured");
+        const agents = options.agents.forSession(route.sessionId, { signal: request.signal });
+        if (route.name === "agents") {
+          rejectUnknownQueryParameters(url, []);
+          return json(await agents.listAgents({}));
         }
-        input.signal = request.signal;
-        return json(await runner.run(input));
-      }
-
-      if (route.name === "teamMerge") {
-        const merger = requireTeamMerger(options);
-        const body = await readJson<TeamMergeBody>(request, ["teamId", "sessionId", "taskId", "cwd"]);
-        const input = teamMergeInput(route.teamId, body);
-        const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, input.cwd);
-        input.sessionId = authority.sessionId;
-        input.cwd = authority.cwd;
-        input.signal = request.signal;
-        return json(await merger.mergeTeamTasks(input));
-      }
-
-      if (route.name === "teamMembers") {
-        const teams = requireTeams(options);
-        return json(await teams.members(route.teamId));
-      }
-
-      if (route.name === "teamSnapshot") {
-        const teams = requireTeams(options);
-        return json(await teams.snapshot(route.teamId));
-      }
-
-      if (route.name === "teamAddMember") {
-        const teams = requireTeams(options);
-        const body = await readJson<TeamMemberBody>(request, [
-          "teamId", "sessionId", "path", "name", "role", "status", "childSessionId", "model", "toolScope", "writeScope",
-        ]);
-        if (!body.path) throw badRequest("path is required");
-        if (!body.name) throw badRequest("name is required");
-        if (!body.role) throw badRequest("role is required");
-        const input = teamMemberInput(route.teamId, body);
-        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
-          input.sessionId = authority.sessionId;
-          return teams.addMember(input);
-        }), 201);
-      }
-
-      if (route.name === "teamTasks") {
-        const teams = requireTeams(options);
-        return json(await teams.tasks(route.teamId));
-      }
-
-      if (route.name === "teamCreateTask") {
-        const teams = requireTeams(options);
-        const body = await readJson<TeamTaskCreateBody>(request, [
-          "teamId", "sessionId", "taskId", "title", "description", "createdBy", "ownerPath", "dependsOn", "status", "metadata",
-        ]);
-        if (!body.title) throw badRequest("title is required");
-        const input = teamTaskCreateInput(route.teamId, body);
-        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
-          input.sessionId = authority.sessionId;
-          return teams.createTask(input);
-        }), 201);
-      }
-
-      if (route.name === "teamAssignTask") {
-        const teams = requireTeams(options);
-        const body = await readJson<TeamTaskAssignBody>(request, [
-          "teamId", "taskId", "sessionId", "ownerPath", "assignedBy", "message", "messageDelivery", "messageSummary",
-        ]);
-        if (!body.ownerPath) throw badRequest("ownerPath is required");
-        const input = teamTaskAssignInput(route.teamId, route.taskId, body);
-        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
-          input.sessionId = authority.sessionId;
-          return teams.assignTask(input);
-        }));
-      }
-
-      if (route.name === "teamClaimTask") {
-        const teams = requireTeams(options);
-        const body = await readJson<TeamTaskClaimBody>(request, ["teamId", "taskId", "sessionId", "ownerPath", "claimedBy"]);
-        if (!body.ownerPath) throw badRequest("ownerPath is required");
-        const input = teamTaskClaimInput(route.teamId, route.taskId, body);
-        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
-          input.sessionId = authority.sessionId;
-          return teams.claimTask(input);
-        }));
-      }
-
-      if (route.name === "teamDispatchTask") {
-        const dispatcher = requireTeamDispatcher(options);
-        const body = await readJson<TeamTaskDispatchBody>(request, ["teamId", "taskId", "sessionId", "ownerPath", "cwd", "mode", "prompt"]);
-        const input = teamTaskDispatchInput(route.teamId, route.taskId, body);
-        const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, input.cwd);
-        input.sessionId = authority.sessionId;
-        input.cwd = authority.cwd;
-        input.signal = request.signal;
-        return json(
-          serializeTeamTaskDispatchResult(await dispatcher.dispatchTask(input)),
-        );
-      }
-
-      if (route.name === "teamSyncTask") {
-        const dispatcher = requireTeamDispatcher(options);
-        const body = await readJson<TeamContextBody>(request, ["teamId", "taskId", "sessionId"]);
-        const input = teamTaskSyncInput(route.teamId, route.taskId, body);
-        const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, undefined);
-        input.sessionId = authority.sessionId;
-        return json(await dispatcher.syncTask(input));
-      }
-
-      if (route.name === "teamUpdateTask") {
-        const teams = requireTeams(options);
-        const body = await readJson<TeamTaskUpdateBody>(request, [
-          "teamId", "taskId", "sessionId", "status", "ownerPath", "title", "description", "dependsOn", "summary", "error", "metadata",
-        ]);
-        const input = teamTaskUpdateInput(route.teamId, route.taskId, body);
-        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
-          input.sessionId = authority.sessionId;
-          return teams.updateTask(input);
-        }));
-      }
-
-      if (route.name === "teamMessages") {
-        const teams = requireTeams(options);
-        return json(await teams.messages(route.teamId));
-      }
-
-      if (route.name === "teamSendMessage") {
-        const teams = requireTeams(options);
-        const body = await readJson<TeamMessageBody>(request, [
-          "teamId", "sessionId", "messageId", "from", "to", "content", "kind", "delivery", "taskId", "summary", "metadata",
-        ]);
-        if (!body.from) throw badRequest("from is required");
-        if (!body.to) throw badRequest("to is required");
-        if (!body.content) throw badRequest("content is required");
-        const input = teamMessageInput(route.teamId, body);
-        const authority = await resolveHttpTeamAuthority(options, route.teamId, undefined, undefined);
-        const actorSessionId = input.sessionId;
-        if (actorSessionId && actorSessionId !== authority.sessionId) {
-          await resolveHttpActiveActorSession(options, actorSessionId);
+        if (route.name === "agentSpawn") {
+          const body = await readJson<Record<string, unknown>>(request, ["name", "prompt", "cwd"]);
+          const input: { name: string; prompt: string; cwd?: string } = {
+            name: stringField(body.name, "name"),
+            prompt: stringField(body.prompt, "prompt"),
+          };
+          if (body.cwd !== undefined) input.cwd = await requestWorkspaceCwd(body.cwd);
+          return json(await agents.spawnAgent(input), 201);
         }
-        return json(await options.service.withSessionOperation(authority.sessionId, async (operation) => {
-          const current = await resolveHttpTeamAuthority(
-            options,
-            route.teamId,
-            authority.sessionId,
-            undefined,
-          );
-          if (actorSessionId && actorSessionId !== current.sessionId) {
-            await resolveHttpActiveActorSession(options, actorSessionId);
-            input.sessionId = actorSessionId;
-          } else {
-            input.sessionId = current.sessionId;
+        if (route.name === "agentSend") {
+          const body = await readJson<Record<string, unknown>>(request, ["text", "mode"]);
+          const input: { agentId: string; text: string; mode?: "queue" | "steer" } = {
+            agentId: route.agentId,
+            text: stringField(body.text, "text"),
+          };
+          if (body.mode !== undefined) {
+            if (body.mode !== "queue" && body.mode !== "steer") throw badRequest("mode must be queue or steer");
+            input.mode = body.mode;
           }
-          operation.assertCurrent();
-          return teams.sendMessage(input);
-        }), 201);
+          return json(await agents.sendAgent(input), 202);
+        }
+        if (route.name === "agentWait") {
+          const body = await readJson<Record<string, unknown>>(request, ["inputId", "timeoutMs"]);
+          const input: { agentId: string; inputId: string; timeoutMs?: number } = {
+            agentId: route.agentId,
+            inputId: parseRuntimeIdentifier(body.inputId, "body.inputId"),
+          };
+          if (body.timeoutMs !== undefined) input.timeoutMs = nonNegativeInteger(body.timeoutMs, "timeoutMs");
+          return json(await agents.waitAgent(input));
+        }
+        await readJson<Record<string, unknown>>(request, []);
+        return json(route.name === "agentStop"
+          ? await agents.stopAgent({ agentId: route.agentId })
+          : await agents.resumeAgent({ agentId: route.agentId }));
       }
 
       if (route.name === "createSession") {
@@ -1091,7 +717,7 @@ export function startRuntimeHttpServer(options: StartRuntimeHttpServerOptions): 
 }
 
 /**
- * Remote binds expose task execution and filesystem-affecting controls. Keep
+ * Remote binds expose Agent execution and filesystem-affecting controls. Keep
  * loopback development compatible, but require a high-entropy bearer secret
  * and an explicit certificate/private-key pair before Bun opens any other
  * interface.
@@ -1211,10 +837,10 @@ function ipv6Hextets(value: string): number[] | undefined {
 type Route =
   | { name: "health" }
   | { name: "events" }
-  | { name: "agents"; sessionId?: SessionId }
+  | { name: "agents"; sessionId: SessionId }
+  | { name: "agentSpawn"; sessionId: SessionId }
+  | { name: "agentSend" | "agentWait" | "agentStop" | "agentResume"; sessionId: SessionId; agentId: string }
   | { name: "listSessions" }
-  | { name: "listTasks" }
-  | { name: "tasksReconcileStale" }
   | { name: "models" }
   | { name: "permissionsConfig" }
   | { name: "setPermissions" }
@@ -1231,31 +857,6 @@ type Route =
   | { name: "mcpTools"; server: string }
   | { name: "mcpAuth"; server: string }
   | { name: "mcpLogout"; server: string }
-  | { name: "agentTree" }
-  | { name: "agentRuns" }
-  | { name: "mailbox" }
-  | { name: "consumeMailbox"; messageId: string }
-  | { name: "listTeams" }
-  | { name: "createTeam" }
-  | { name: "teamReconcileDispatches"; teamId?: TeamId }
-  | { name: "teamRunLoop"; teamId: TeamId }
-  | { name: "teamMerge"; teamId: TeamId }
-  | { name: "teamSnapshot"; teamId: TeamId }
-  | { name: "teamMembers"; teamId: TeamId }
-  | { name: "teamAddMember"; teamId: TeamId }
-  | { name: "teamTasks"; teamId: TeamId }
-  | { name: "teamCreateTask"; teamId: TeamId }
-  | { name: "teamAssignTask"; teamId: TeamId; taskId: TaskId }
-  | { name: "teamClaimTask"; teamId: TeamId; taskId: TaskId }
-  | { name: "teamDispatchTask"; teamId: TeamId; taskId: TaskId }
-  | { name: "teamSyncTask"; teamId: TeamId; taskId: TaskId }
-  | { name: "teamUpdateTask"; teamId: TeamId; taskId: TaskId }
-  | { name: "teamMessages"; teamId: TeamId }
-  | { name: "teamSendMessage"; teamId: TeamId }
-  | { name: "task"; taskId: TaskId }
-  | { name: "taskFollowup"; taskId: TaskId }
-  | { name: "taskWait"; taskId: TaskId }
-  | { name: "taskClose"; taskId: TaskId }
   | { name: "createSession" }
   | { name: "messages"; sessionId: SessionId }
   | { name: "sessionEvents"; sessionId: SessionId }
@@ -1365,130 +966,6 @@ interface McpAuthBody {
   scopes?: unknown;
 }
 
-interface TaskFollowupBody {
-  text?: unknown;
-  maxTurns?: unknown;
-}
-
-interface TaskWaitBody {
-  timeoutMs?: unknown;
-}
-
-interface TaskCloseBody {
-  status?: unknown;
-  summary?: unknown;
-  error?: unknown;
-  interrupt?: unknown;
-}
-
-interface TaskReconcileStaleBody {
-  parentSessionId?: unknown;
-  staleAfterMs?: unknown;
-  modes?: unknown;
-  limit?: unknown;
-  summary?: unknown;
-  error?: unknown;
-}
-
-interface TeamContextBody {
-  sessionId?: unknown;
-  teamId?: unknown;
-  taskId?: unknown;
-}
-
-interface TeamCreateBody extends TeamContextBody {
-  name?: unknown;
-  leadPath?: unknown;
-  description?: unknown;
-  leadName?: unknown;
-  leadRole?: unknown;
-  leadStatus?: unknown;
-  leadWriteScope?: unknown;
-}
-
-interface TeamMemberBody extends TeamContextBody {
-  path?: unknown;
-  name?: unknown;
-  role?: unknown;
-  status?: unknown;
-  childSessionId?: unknown;
-  model?: unknown;
-  toolScope?: unknown;
-  writeScope?: unknown;
-}
-
-interface TeamTaskCreateBody extends TeamContextBody {
-  taskId?: unknown;
-  title?: unknown;
-  description?: unknown;
-  createdBy?: unknown;
-  ownerPath?: unknown;
-  dependsOn?: unknown;
-  status?: unknown;
-  metadata?: unknown;
-}
-
-interface TeamTaskAssignBody extends TeamContextBody {
-  ownerPath?: unknown;
-  assignedBy?: unknown;
-  message?: unknown;
-  messageDelivery?: unknown;
-  messageSummary?: unknown;
-}
-
-interface TeamTaskClaimBody extends TeamContextBody {
-  ownerPath?: unknown;
-  claimedBy?: unknown;
-}
-
-interface TeamTaskDispatchBody extends TeamContextBody {
-  ownerPath?: unknown;
-  cwd?: unknown;
-  mode?: unknown;
-  prompt?: unknown;
-}
-
-interface TeamTaskReconcileBody extends TeamContextBody {
-  limit?: unknown;
-}
-
-interface TeamRunLoopBody extends TeamContextBody {
-  cwd?: unknown;
-  mode?: unknown;
-  once?: unknown;
-  maxCycles?: unknown;
-  timeoutMs?: unknown;
-  pollIntervalMs?: unknown;
-}
-
-interface TeamMergeBody extends TeamContextBody {
-  taskId?: unknown;
-  cwd?: unknown;
-}
-
-interface TeamTaskUpdateBody extends TeamContextBody {
-  status?: unknown;
-  ownerPath?: unknown;
-  title?: unknown;
-  description?: unknown;
-  dependsOn?: unknown;
-  summary?: unknown;
-  error?: unknown;
-  metadata?: unknown;
-}
-
-interface TeamMessageBody extends TeamContextBody {
-  messageId?: unknown;
-  from?: unknown;
-  to?: unknown;
-  content?: unknown;
-  kind?: unknown;
-  delivery?: unknown;
-  taskId?: unknown;
-  summary?: unknown;
-  metadata?: unknown;
-}
-
 interface InterruptBody {
   reason?: unknown;
 }
@@ -1539,15 +1016,23 @@ interface HttpError {
 
 function routeRequest(method: string, pathname: string): Route {
   const path = pathname.replace(/\/+$/, "") || "/";
+  const agentRoute = /^\/sessions\/([^/]+)\/agents(?:\/([^/]+)\/(send|wait|stop|resume))?$/.exec(path);
+  if (agentRoute) {
+    const sessionId = requestSessionId(decodeURIComponent(agentRoute[1]!));
+    const agentId = agentRoute[2] ? parseRuntimeIdentifier(decodeURIComponent(agentRoute[2]), "agentId") : undefined;
+    const action = agentRoute[3];
+    if (!agentId && method === "GET") return { name: "agents", sessionId };
+    if (!agentId && method === "POST") return { name: "agentSpawn", sessionId };
+    if (agentId && method === "POST") {
+      if (action === "send") return { name: "agentSend", sessionId, agentId };
+      if (action === "wait") return { name: "agentWait", sessionId, agentId };
+      if (action === "stop") return { name: "agentStop", sessionId, agentId };
+      if (action === "resume") return { name: "agentResume", sessionId, agentId };
+    }
+    return { name: "notFound" };
+  }
   if (method === "GET" && path === "/health") return { name: "health" };
   if (method === "GET" && path === "/events") return { name: "events" };
-  if (method === "GET" && path === "/agents") return { name: "agents" };
-  if (method === "GET" && path === "/agents/tree") return { name: "agentTree" };
-  if (method === "GET" && path === "/agent_runs") return { name: "agentRuns" };
-  if (method === "GET" && path === "/mailbox") return { name: "mailbox" };
-  if (method === "GET" && path === "/teams") return { name: "listTeams" };
-  if (method === "POST" && path === "/teams") return { name: "createTeam" };
-  if (method === "POST" && path === "/teams/reconcile_dispatches") return { name: "teamReconcileDispatches" };
   if (method === "GET" && path === "/sessions") return { name: "listSessions" };
   if (method === "GET" && path === "/user-inputs") return { name: "listUserInputs" };
   if (method === "GET" && path === "/approvals") return { name: "listPendingApprovals" };
@@ -1558,8 +1043,6 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "POST" && path === "/mcp") return { name: "mcpAdd" };
   if (method === "GET" && path === "/mcp/status") return { name: "mcpStatus" };
   if (method === "POST" && path === "/mcp/reload") return { name: "mcpReload" };
-  if (method === "GET" && path === "/tasks") return { name: "listTasks" };
-  if (method === "POST" && path === "/tasks/reconcile_stale") return { name: "tasksReconcileStale" };
   if (method === "POST" && path === "/sessions") return { name: "createSession" };
 
   const mcpRoute = /^\/mcp\/([^/]+)(?:\/([^/]+))?$/.exec(path);
@@ -1576,11 +1059,6 @@ function routeRequest(method: string, pathname: string): Route {
     return { name: "notFound" };
   }
 
-  const mailboxRoute = /^\/mailbox\/([^/]+)\/consume$/.exec(path);
-  if (method === "POST" && mailboxRoute) {
-    return { name: "consumeMailbox", messageId: decodeURIComponent(mailboxRoute[1] ?? "") };
-  }
-
   const approvalRoute = /^\/approvals\/([^/]+)\/resolve$/.exec(path);
   if (method === "POST" && approvalRoute) {
     return {
@@ -1592,54 +1070,6 @@ function routeRequest(method: string, pathname: string): Route {
   const userInputRoute = /^\/user-inputs\/([^/]+)\/resolve$/.exec(path);
   if (method === "POST" && userInputRoute) {
     return { name: "resolveUserInput", inputId: decodeURIComponent(userInputRoute[1] ?? "") };
-  }
-
-  const teamRoute = /^\/teams\/([^/]+)(?:\/([^/]+)(?:\/([^/]+)(?:\/([^/]+))?)?)?$/.exec(path);
-  if (teamRoute) {
-    const teamId = decodeURIComponent(teamRoute[1] ?? "") as TeamId;
-    const resource = teamRoute[2];
-    const resourceId = teamRoute[3];
-    const action = teamRoute[4];
-    if (resource === "snapshot" && method === "GET" && !resourceId) return { name: "teamSnapshot", teamId };
-    if (resource === "members") {
-      if (method === "GET" && !resourceId) return { name: "teamMembers", teamId };
-      if (method === "POST" && !resourceId) return { name: "teamAddMember", teamId };
-    }
-    if (resource === "reconcile_dispatches" && method === "POST" && !resourceId) {
-      return { name: "teamReconcileDispatches", teamId };
-    }
-    if ((resource === "run_loop" || resource === "run-loop") && method === "POST" && !resourceId) {
-      return { name: "teamRunLoop", teamId };
-    }
-    if (resource === "merge" && method === "POST" && !resourceId) {
-      return { name: "teamMerge", teamId };
-    }
-    if (resource === "tasks") {
-      if (method === "GET" && !resourceId) return { name: "teamTasks", teamId };
-      if (method === "POST" && !resourceId) return { name: "teamCreateTask", teamId };
-      const taskId = resourceId ? (decodeURIComponent(resourceId) as TaskId) : undefined;
-      if (taskId && method === "POST" && action === "assign") return { name: "teamAssignTask", teamId, taskId };
-      if (taskId && method === "POST" && action === "claim") return { name: "teamClaimTask", teamId, taskId };
-      if (taskId && method === "POST" && action === "dispatch") return { name: "teamDispatchTask", teamId, taskId };
-      if (taskId && method === "POST" && action === "sync") return { name: "teamSyncTask", teamId, taskId };
-      if (taskId && method === "POST" && action === "update") return { name: "teamUpdateTask", teamId, taskId };
-    }
-    if (resource === "messages") {
-      if (method === "GET" && !resourceId) return { name: "teamMessages", teamId };
-      if (method === "POST" && !resourceId) return { name: "teamSendMessage", teamId };
-    }
-    return { name: "notFound" };
-  }
-
-  const taskRoute = /^\/tasks\/([^/]+)(?:\/([^/]+))?$/.exec(path);
-  if (taskRoute) {
-    const taskId = decodeURIComponent(taskRoute[1] ?? "") as TaskId;
-    const action = taskRoute[2];
-    if (method === "GET" && !action) return { name: "task", taskId };
-    if (method === "POST" && action === "followup") return { name: "taskFollowup", taskId };
-    if (method === "POST" && action === "wait") return { name: "taskWait", taskId };
-    if (method === "POST" && action === "close") return { name: "taskClose", taskId };
-    return { name: "notFound" };
   }
 
   if (path === "/permissions") {
@@ -1662,7 +1092,6 @@ function routeRequest(method: string, pathname: string): Route {
 
   const sessionId = requestSessionId(decodeURIComponent(sessionRoute[1] ?? ""));
   const action = sessionRoute[2];
-  if (method === "GET" && action === "agents") return { name: "agents", sessionId };
   if (method === "GET" && action === "messages") return { name: "messages", sessionId };
   if (method === "GET" && action === "events") return { name: "sessionEvents", sessionId };
   if ((method === "POST" || method === "PATCH") && action === "rename") return { name: "renameSession", sessionId };
@@ -1936,29 +1365,6 @@ function rejectUnknownQueryParameters(url: URL, allowed: readonly string[]): voi
   const supported = new Set(allowed);
   for (const key of url.searchParams.keys()) {
     if (!supported.has(key)) throw badRequest(`Query parameter ${JSON.stringify(key)} is not supported`);
-  }
-}
-
-async function readAllProjectionEvents(
-  store: EventStore,
-  sessionId: SessionId | undefined,
-  requestedPageSize: number,
-): Promise<EventEnvelope[]> {
-  const events: EventEnvelope[] = [];
-  const pageSize = Math.max(1, Math.trunc(requestedPageSize));
-  let afterEventId: string | undefined;
-
-  while (true) {
-    const batch = await store.events({
-      compactRequests: true,
-      ...(sessionId ? { sessionId } : {}),
-      ...(afterEventId ? { afterEventId } : {}),
-      limit: pageSize,
-    });
-    events.push(...batch.map((event) => compactRuntimeEvent(event as ChiliEvent)));
-    if (batch.length < pageSize) return events;
-    afterEventId = batch.at(-1)?.id;
-    if (!afterEventId) return events;
   }
 }
 
@@ -2714,13 +2120,6 @@ function serializeSubmitPromptResult(result: SubmitPromptResult): RuntimePromptR
   return failed;
 }
 
-function serializeTaskFollowupResult(result: AgentTaskFollowupResult): { task: AgentTaskRow; result: RuntimePromptResult } {
-  return {
-    task: result.task,
-    result: serializeSubmitPromptResult(result.result),
-  };
-}
-
 function serializeTurnResult(result: SubmitPromptResult["turns"][number]): RuntimeTurnResult {
   if (result.status === "completed") {
     const completed: Extract<RuntimeTurnResult, { status: "completed" }> = {
@@ -2827,12 +2226,6 @@ function requestIdentifier<T extends string = string>(value: unknown, field = "i
   if (identifier.length > 512) throw badRequest(`${field} must not exceed 512 characters`);
   if (/[\u0000-\u001f\u007f]/u.test(identifier)) throw badRequest(`${field} must be valid text`);
   return identifier as T;
-}
-
-function requestAgentPath(value: unknown, field: string): AgentPath {
-  const path = requestIdentifier<string>(value, field);
-  if (!path.startsWith("/")) throw badRequest(`${field} must be an absolute agent path`);
-  return path as AgentPath;
 }
 
 function requestIdentifierArray<T extends string>(value: unknown, field: string): T[] {
@@ -2992,68 +2385,18 @@ function toHttpError(error: unknown): HttpError {
   };
   if (
     err.name === "RuntimeServiceClosedError"
-    || err.name === "AgentTaskControlServiceClosedError"
-    || err.name === "LocalSubagentManagerClosedError"
     || err.name === "RuntimeEventWindowCapacityError"
   ) {
     return { status: 503, message: err.message };
   }
-  if (err.name === "AgentTaskNotFoundError") {
-    return { status: 404, message: err.message };
+  if (err.name === "AgentControlAuthorizationError") {
+    return { status: 403, message: err.message };
   }
-  if (err.name === "AgentTaskNotRunnableError") {
-    return { status: 409, message: err.message };
-  }
-  if (err.name === "AgentTaskWaitTimeoutError") {
-    return { status: 408, message: err.message };
+  if (err.name === "TypeError" || err.name === "URIError") {
+    return { status: 400, message: err.message };
   }
   if (err.name === "AbortError") {
     return { status: 499, message: err.message };
-  }
-  if (err.name === "AgentMailboxNotFoundError") {
-    return { status: 404, message: err.message };
-  }
-  if (err.name === "AgentMailboxNotDeliverableError") {
-    return { status: 409, message: err.message };
-  }
-  if (err.name === "AgentMessageRecipientNotFoundError") {
-    return { status: 404, message: err.message };
-  }
-  if (err.name === "AgentMessageRecipientAmbiguousError" || err.name === "AgentMessageConflictError") {
-    return { status: 409, message: err.message };
-  }
-  if (err.name === "AgentMessageRecipientTerminalError" || err.name === "AgentMessageRecipientMetadataError") {
-    return { status: 422, message: err.message };
-  }
-  if (err.name === "TeamNotFoundError" || err.name === "TeamMemberNotFoundError" || err.name === "TeamTaskNotFoundError") {
-    return { status: 404, message: err.message };
-  }
-  if (err.name === "TeamAlreadyExistsError" || err.name === "TeamTaskAlreadyExistsError") {
-    return { status: 409, message: err.message };
-  }
-  if (err.name === "TeamTaskClaimError") {
-    return { status: 409, message: err.message };
-  }
-  if (err.name === "TeamTaskDispatchAuthorityError") {
-    return { status: 409, message: err.message };
-  }
-  if (err.name === "TeamSessionAuthorityError") {
-    return { status: 409, message: err.message };
-  }
-  if (err.name === "TeamMemberSessionOwnershipError") {
-    return { status: 409, message: err.message };
-  }
-  if (err.name === "TeamTaskWorkerMutationError") {
-    return { status: 403, message: err.message };
-  }
-  if (err.name === "TeamMessageDeliveryError") {
-    return { status: 409, message: err.message };
-  }
-  if (err.name === "TeamMemberTargetAmbiguousError" || err.name === "TeamMessageConflictError") {
-    return { status: 409, message: err.message };
-  }
-  if (err.name === "TeamMessageSenderUnauthorizedError") {
-    return { status: 403, message: err.message };
   }
   if (err.name === "RuntimeBusyError" || err.name === "RuntimeForeignOwnerError" || err.name === "SessionInputConflictError") {
     return { status: 409, message: err.message };
@@ -3220,11 +2563,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function requireTaskControl(options: RuntimeHttpHandlerOptions): RuntimeTaskControlService {
-  if (!options.tasks) throw { status: 501, message: "No task control service is configured" } satisfies HttpError;
-  return options.tasks;
-}
-
 function requireCommandControl(options: RuntimeHttpHandlerOptions): PromptCommandControl {
   if (!options.commands) throw { status: 501, message: "No command control service is configured" } satisfies HttpError;
   return options.commands;
@@ -3258,113 +2596,6 @@ function statusFromMcpList(result: RuntimeMcpListResponse): RuntimeMcpStatusResp
       errored: result.servers.filter((server) => server.status === "error").length,
     },
   };
-}
-
-function requireAgentTree(options: RuntimeHttpHandlerOptions): RuntimeAgentTreeService {
-  if (!options.agents) throw { status: 501, message: "No agent tree service is configured" } satisfies HttpError;
-  return options.agents;
-}
-
-function requireTeams(options: RuntimeHttpHandlerOptions): RuntimeTeamService {
-  if (!options.teams) throw { status: 501, message: "No team service is configured" } satisfies HttpError;
-  return options.teams;
-}
-
-function requireTeamDispatcher(options: RuntimeHttpHandlerOptions): RuntimeTeamDispatcherService {
-  if (!options.teamDispatcher) throw { status: 501, message: "No team dispatcher is configured" } satisfies HttpError;
-  return options.teamDispatcher;
-}
-
-function requireTeamRunner(options: RuntimeHttpHandlerOptions): RuntimeTeamExecutionRunnerService {
-  if (!options.teamRunner) throw { status: 501, message: "No team execution runner is configured" } satisfies HttpError;
-  return options.teamRunner;
-}
-
-function requireTeamMerger(options: RuntimeHttpHandlerOptions): RuntimeTeamMergeService {
-  if (!options.teamMerger) throw { status: 501, message: "No team merge service is configured" } satisfies HttpError;
-  return options.teamMerger;
-}
-
-async function resolveHttpTeamAuthority(
-  options: RuntimeHttpHandlerOptions,
-  teamId: TeamId,
-  requestedSessionId: SessionId | undefined,
-  requestedCwd: string | undefined,
-): Promise<{ sessionId: SessionId; cwd: string }> {
-  const team = await requireHttpTeam(options, teamId);
-  return resolveTeamSessionAuthority({
-    team,
-    tasks: [],
-    ...(requestedSessionId ? { requestedSessionId } : {}),
-    ...(requestedCwd !== undefined ? { requestedCwd } : {}),
-    resolveSession: (sessionId) => resolveHttpInteractiveSession(options, sessionId),
-  });
-}
-
-async function requireHttpTeam(options: RuntimeHttpHandlerOptions, teamId: TeamId) {
-  const team = (await requireTeams(options).listTeams()).find((candidate) => candidate.id === teamId);
-  if (!team) throw { status: 404, message: `Team not found: ${teamId}` } satisfies HttpError;
-  return team;
-}
-
-async function resolveHttpInteractiveSession(options: RuntimeHttpHandlerOptions, sessionId: SessionId) {
-  await options.service.assertSessionTurnAllowed(sessionId);
-  const session = await requireSession(options.store, sessionId);
-  if (session.status !== "active") throw new Error(`Session ${sessionId} is not active (${session.status})`);
-  if (session.source === "subagent") throw new Error(`Session ${sessionId} is reserved for a subagent`);
-  return session;
-}
-
-async function resolveHttpActiveActorSession(options: RuntimeHttpHandlerOptions, sessionId: SessionId) {
-  const session = await requireSession(options.store, sessionId);
-  if (session.status !== "active") {
-    throw { status: 409, message: `Session ${sessionId} is not active (${session.status})` } satisfies HttpError;
-  }
-  return session;
-}
-
-async function withHttpTeamOwnerMutation<T>(
-  options: RuntimeHttpHandlerOptions,
-  teamId: TeamId,
-  requestedSessionId: SessionId | undefined,
-  mutate: (authority: { sessionId: SessionId; cwd: string }) => Promise<T>,
-): Promise<T> {
-  const authority = await resolveHttpTeamAuthority(options, teamId, requestedSessionId, undefined);
-  return options.service.withSessionOperation(authority.sessionId, async (operation) => {
-    const current = await resolveHttpTeamAuthority(
-      options,
-      teamId,
-      authority.sessionId,
-      undefined,
-    );
-    operation.assertCurrent();
-    return mutate(current);
-  });
-}
-
-async function assertHttpTeamReconcileAuthority(
-  options: RuntimeHttpHandlerOptions,
-  input: TeamTaskReconcileInput,
-): Promise<void> {
-  const teams = input.teamId
-    ? [await requireHttpTeam(options, input.teamId)]
-    : (await requireTeams(options).listTeams()).filter((team) => team.status === "active");
-  for (const team of teams) {
-    const authority = await resolveHttpTeamAuthority(options, team.id, input.sessionId, undefined);
-    if (input.teamId) input.sessionId = authority.sessionId;
-  }
-}
-
-function teamContext(body: TeamContextBody): TeamEventContextInput {
-  const input: TeamEventContextInput = {};
-  if (body.sessionId !== undefined) input.sessionId = requestSessionId(body.sessionId);
-  if (body.teamId !== undefined) requestIdentifier<TeamId>(body.teamId, "teamId");
-  if (body.taskId !== undefined) requestIdentifier<TaskId>(body.taskId, "taskId");
-  return input;
-}
-
-interface TeamEventContextInput {
-  sessionId?: SessionId;
 }
 
 function mcpAddInput(body: McpAddBody): RuntimeMcpAddServerRequest {
@@ -3401,356 +2632,6 @@ function mcpTransport(value: unknown): RuntimeMcpTransport | undefined {
   if (value === undefined) return undefined;
   if (value === "stdio" || value === "http" || value === "sse") return value;
   throw badRequest("transport must be stdio, http, or sse");
-}
-
-function teamCreateInput(body: TeamCreateBody): CreateTeamInput {
-  const input: CreateTeamInput = {
-    ...teamContext(body),
-    name: stringField(body.name, "name"),
-    leadPath: requestAgentPath(body.leadPath, "leadPath"),
-  };
-  if (body.teamId !== undefined) input.teamId = requestIdentifier<TeamId>(body.teamId, "teamId");
-  if (body.description !== undefined) input.description = stringField(body.description, "description");
-  if (body.leadName !== undefined) input.leadName = stringField(body.leadName, "leadName");
-  if (body.leadRole !== undefined) input.leadRole = stringField(body.leadRole, "leadRole");
-  const leadStatus = teamMemberStatus(body.leadStatus);
-  if (leadStatus) input.leadStatus = leadStatus;
-  if (body.leadWriteScope !== undefined) input.leadWriteScope = stringArrayField(body.leadWriteScope, "leadWriteScope");
-  return input;
-}
-
-function teamMemberInput(teamId: TeamId, body: TeamMemberBody): AddTeamMemberInput {
-  const input: AddTeamMemberInput = {
-    ...teamContext(body),
-    teamId,
-    path: requestAgentPath(body.path, "path"),
-    name: stringField(body.name, "name"),
-    role: stringField(body.role, "role"),
-  };
-  const status = teamMemberStatus(body.status);
-  if (status) input.status = status;
-  if (body.childSessionId !== undefined) input.childSessionId = requestSessionId(body.childSessionId, "childSessionId");
-  if (body.model !== undefined) input.model = stringField(body.model, "model");
-  if (body.toolScope !== undefined) input.toolScope = stringArrayField(body.toolScope, "toolScope");
-  if (body.writeScope !== undefined) input.writeScope = stringArrayField(body.writeScope, "writeScope");
-  return input;
-}
-
-function teamTaskCreateInput(teamId: TeamId, body: TeamTaskCreateBody): CreateTeamTaskInput {
-  const input: CreateTeamTaskInput = {
-    ...teamContext(body),
-    teamId,
-    title: stringField(body.title, "title"),
-  };
-  if (body.taskId !== undefined) input.taskId = requestIdentifier<TaskId>(body.taskId, "taskId");
-  if (body.description !== undefined) input.description = stringField(body.description, "description");
-  if (body.createdBy !== undefined) input.createdBy = requestAgentPath(body.createdBy, "createdBy");
-  if (body.ownerPath !== undefined) input.ownerPath = requestAgentPath(body.ownerPath, "ownerPath");
-  if (body.dependsOn !== undefined) input.dependsOn = requestIdentifierArray<TaskId>(body.dependsOn, "dependsOn");
-  const status = teamTaskStatus(body.status);
-  if (status) input.status = status;
-  if (body.metadata !== undefined) input.metadata = parseRuntimeRecord(body.metadata, "body.metadata");
-  return input;
-}
-
-function teamTaskAssignInput(teamId: TeamId, taskId: TaskId, body: TeamTaskAssignBody): AssignTeamTaskInput {
-  const input: AssignTeamTaskInput = {
-    ...teamContext(body),
-    teamId,
-    taskId,
-    ownerPath: requestAgentPath(body.ownerPath, "ownerPath"),
-  };
-  if (body.assignedBy !== undefined) input.assignedBy = requestAgentPath(body.assignedBy, "assignedBy");
-  if (body.message !== undefined) input.message = stringField(body.message, "message");
-  const delivery = teamMessageDelivery(body.messageDelivery);
-  if (delivery) input.messageDelivery = delivery;
-  if (body.messageSummary !== undefined) input.messageSummary = stringField(body.messageSummary, "messageSummary");
-  return input;
-}
-
-function teamTaskClaimInput(teamId: TeamId, taskId: TaskId, body: TeamTaskClaimBody): ClaimTeamTaskInput {
-  const input: ClaimTeamTaskInput = {
-    ...teamContext(body),
-    teamId,
-    taskId,
-    ownerPath: requestAgentPath(body.ownerPath, "ownerPath"),
-  };
-  if (body.claimedBy !== undefined) input.claimedBy = requestAgentPath(body.claimedBy, "claimedBy");
-  return input;
-}
-
-function teamTaskDispatchInput(teamId: TeamId, taskId: TaskId, body: TeamTaskDispatchBody): TeamTaskDispatchInput {
-  const input: TeamTaskDispatchInput = {
-    ...teamContext(body),
-    teamId,
-    taskId,
-  };
-  if (body.ownerPath !== undefined) input.ownerPath = requestAgentPath(body.ownerPath, "ownerPath");
-  if (body.cwd !== undefined) {
-    const cwd = stringField(body.cwd, "cwd");
-    if (cwd.includes("\0")) throw badRequest("cwd must be a valid filesystem path");
-    input.cwd = cwd;
-  }
-  if (body.prompt !== undefined) input.prompt = stringField(body.prompt, "prompt");
-  const mode = localSubagentMode(body.mode);
-  if (mode) input.mode = mode;
-  return input;
-}
-
-function teamTaskSyncInput(teamId: TeamId, taskId: TaskId, body: TeamContextBody): TeamTaskSyncInput {
-  return {
-    ...teamContext(body),
-    teamId,
-    taskId,
-  };
-}
-
-function teamTaskReconcileInput(teamId: TeamId | undefined, body: TeamTaskReconcileBody): TeamTaskReconcileInput {
-  const input: TeamTaskReconcileInput = {
-    ...teamContext(body),
-  };
-  if (teamId) input.teamId = teamId;
-  if (body.limit !== undefined) input.limit = positiveInteger(body.limit, "limit");
-  return input;
-}
-
-function teamRunLoopInput(teamId: TeamId, body: TeamRunLoopBody): TeamExecutionRunInput {
-  const input: TeamExecutionRunInput = {
-    ...teamContext(body),
-    teamId,
-  };
-  if (body.cwd !== undefined) input.cwd = teamRequestCwd(body.cwd);
-  const mode = localSubagentMode(body.mode);
-  if (mode) input.mode = mode;
-  if (body.once !== undefined) input.once = parseRuntimeBoolean(body.once, "body.once");
-  if (body.maxCycles !== undefined) input.maxCycles = positiveInteger(body.maxCycles, "maxCycles");
-  if (body.timeoutMs !== undefined) input.timeoutMs = positiveInteger(body.timeoutMs, "timeoutMs");
-  if (body.pollIntervalMs !== undefined) input.pollIntervalMs = nonNegativeInteger(body.pollIntervalMs, "pollIntervalMs");
-  return input;
-}
-
-function teamMergeInput(teamId: TeamId, body: TeamMergeBody): TeamMergeInput {
-  const input: TeamMergeInput = {
-    ...teamContext(body),
-    teamId,
-  };
-  if (body.taskId !== undefined) input.taskId = requestIdentifier<TaskId>(body.taskId, "taskId");
-  if (body.cwd !== undefined) input.cwd = teamRequestCwd(body.cwd);
-  return input;
-}
-
-function teamRequestCwd(value: unknown): string {
-  const cwd = stringField(value, "cwd");
-  if (cwd.includes("\0")) throw badRequest("cwd must be a valid filesystem path");
-  return cwd;
-}
-
-function teamTaskUpdateInput(teamId: TeamId, taskId: TaskId, body: TeamTaskUpdateBody): UpdateTeamTaskInput {
-  const input: UpdateTeamTaskInput = {
-    ...teamContext(body),
-    teamId,
-    taskId,
-  };
-  const status = teamTaskStatus(body.status);
-  if (status) input.status = status;
-  if (body.ownerPath !== undefined) input.ownerPath = requestAgentPath(body.ownerPath, "ownerPath");
-  if (body.title !== undefined) input.title = stringField(body.title, "title");
-  if (body.description !== undefined) input.description = stringField(body.description, "description");
-  if (body.dependsOn !== undefined) input.dependsOn = requestIdentifierArray<TaskId>(body.dependsOn, "dependsOn");
-  if (body.summary !== undefined) input.summary = stringField(body.summary, "summary");
-  if (body.error !== undefined) input.error = stringField(body.error, "error");
-  if (body.metadata !== undefined) input.metadata = parseRuntimeRecord(body.metadata, "body.metadata");
-  return input;
-}
-
-function teamMessageInput(teamId: TeamId, body: TeamMessageBody): SendTeamMessageInput {
-  const from = stringField(body.from, "from");
-  const to = stringField(body.to, "to");
-  const content = stringField(body.content, "content");
-  const input: SendTeamMessageInput = {
-    ...teamContext(body),
-    teamId,
-    from: from as SendTeamMessageInput["from"],
-    to: to as SendTeamMessageInput["to"],
-    content,
-  };
-  if (body.messageId !== undefined) input.messageId = requestIdentifier(body.messageId, "messageId");
-  const kind = teamMessageKind(body.kind);
-  if (kind) input.kind = kind;
-  const delivery = teamMessageDelivery(body.delivery);
-  if (delivery) input.delivery = delivery;
-  if (body.taskId !== undefined) input.taskId = requestIdentifier<TaskId>(body.taskId, "taskId");
-  if (body.summary !== undefined) input.summary = stringField(body.summary, "summary");
-  if (body.metadata !== undefined) input.metadata = parseRuntimeRecord(body.metadata, "body.metadata");
-  return input;
-}
-
-function agentTreeQueryFromUrl(url: URL): AgentTreeSnapshotQuery {
-  const query: AgentTreeSnapshotQuery = {};
-  const rootPath = url.searchParams.get("rootPath");
-  const sessionId = asSessionId(url.searchParams.get("sessionId"));
-  const includeConsumedMailbox = booleanParam(url.searchParams.get("includeConsumedMailbox"));
-  const limit = numberParam(url.searchParams.get("limit"));
-  if (rootPath) query.rootPath = rootPath as AgentPath;
-  if (sessionId) query.sessionId = sessionId;
-  if (includeConsumedMailbox !== undefined) query.includeConsumedMailbox = includeConsumedMailbox;
-  if (limit !== undefined) query.limit = limit;
-  return query;
-}
-
-function agentRunQueryFromUrl(url: URL): AgentRunQuery {
-  const query: AgentRunQuery = {};
-  const sessionId = asSessionId(url.searchParams.get("sessionId"));
-  const childSessionId = asSessionId(url.searchParams.get("childSessionId"), "childSessionId");
-  const path = url.searchParams.get("path");
-  const status = url.searchParams.get("status");
-  const limit = numberParam(url.searchParams.get("limit"));
-  if (sessionId) query.sessionId = sessionId;
-  if (childSessionId) query.childSessionId = childSessionId;
-  if (path) query.path = path as AgentPath;
-  if (status === "running" || status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled") {
-    query.status = status;
-  }
-  if (limit !== undefined) query.limit = limit;
-  return query;
-}
-
-function mailboxQueryFromUrl(url: URL): AgentMailboxQuery {
-  rejectUnknownQueryParameters(url, ["messageId", "taskId", "status", "path", "recipientSessionId", "limit"]);
-  const query: AgentMailboxQuery = {};
-  const messageId = url.searchParams.get("messageId");
-  const taskId = url.searchParams.get("taskId");
-  const status = url.searchParams.get("status");
-  const path = url.searchParams.get("path");
-  const recipientSessionId = asSessionId(url.searchParams.get("recipientSessionId"), "recipientSessionId");
-  const limit = numberParam(url.searchParams.get("limit"));
-  if (messageId) query.messageId = messageId;
-  if (taskId) query.taskId = taskId as TaskId;
-  if (status === "queued" || status === "delivering" || status === "consumed" || status === "discarded") {
-    query.status = status;
-  }
-  if (path) query.path = path as AgentPath;
-  if (recipientSessionId) query.recipientSessionId = recipientSessionId;
-  if (limit !== undefined) query.limit = limit;
-  return query;
-}
-
-function taskQueryFromUrl(url: URL): AgentTaskQuery {
-  const query: AgentTaskQuery = {};
-  const status = taskStatus(url.searchParams.get("status"));
-  const parentSessionId = asSessionId(url.searchParams.get("parentSessionId"), "parentSessionId");
-  const childSessionId = asSessionId(url.searchParams.get("childSessionId"), "childSessionId");
-  const limit = numberParam(url.searchParams.get("limit"));
-  if (status) query.status = status;
-  if (parentSessionId) query.parentSessionId = parentSessionId;
-  if (childSessionId) query.childSessionId = childSessionId;
-  if (limit !== undefined) query.limit = limit;
-  return query;
-}
-
-function taskStatus(value: string | null): AgentTaskStatus | undefined {
-  if (
-    value === "pending" ||
-    value === "running" ||
-    value === "completed" ||
-    value === "incomplete" ||
-    value === "failed" ||
-    value === "cancelled"
-  ) {
-    return value;
-  }
-  return undefined;
-}
-
-function teamMemberStatus(value: unknown): AddTeamMemberInput["status"] | undefined {
-  if (value === undefined) return undefined;
-  if (value === "idle" || value === "running" || value === "waiting" || value === "blocked" || value === "closed") {
-    return value;
-  }
-  throw badRequest("member status must be idle, running, waiting, blocked, or closed");
-}
-
-function teamTaskStatus(value: unknown): CreateTeamTaskInput["status"] | undefined {
-  if (value === undefined) return undefined;
-  if (
-    value === "pending" ||
-    value === "in_progress" ||
-    value === "blocked" ||
-    value === "completed" ||
-    value === "failed" ||
-    value === "cancelled"
-  ) {
-    return value;
-  }
-  throw badRequest("task status must be pending, in_progress, blocked, completed, failed, or cancelled");
-}
-
-function teamMessageKind(value: unknown): SendTeamMessageInput["kind"] | undefined {
-  if (value === undefined) return undefined;
-  if (value === "text" || value === "task_assignment" || value === "system") return value;
-  throw badRequest("message kind must be text, task_assignment, or system");
-}
-
-function teamMessageDelivery(value: unknown): TeamMessageDelivery | undefined {
-  if (value === undefined) return undefined;
-  if (value === "queueOnly" || value === "triggerTurn") return value;
-  throw badRequest("message delivery must be queueOnly or triggerTurn");
-}
-
-function localSubagentMode(value: unknown): TeamTaskDispatchInput["mode"] | undefined {
-  if (value === undefined) return undefined;
-  if (value === "one_shot" || value === "resumable" || value === "background") return value;
-  throw badRequest("mode must be one_shot, resumable, or background");
-}
-
-function serializeTeamTaskDispatchResult(result: TeamTaskDispatchResult): Record<string, unknown> {
-  const agentTask = result.agentTask ? serializeLocalSubagentTask(result.agentTask) : undefined;
-  return {
-    status: result.status,
-    teamTask: result.teamTask,
-    team_task: result.teamTask,
-    reason: result.reason,
-    agentTask,
-    agent_task: agentTask,
-  };
-}
-
-function serializeLocalSubagentTask(task: NonNullable<TeamTaskDispatchResult["agentTask"]>): Record<string, unknown> {
-  return {
-    ...task,
-    error: task.error ? normalizePersistedError(task.error).message : undefined,
-  };
-}
-
-function closeStatus(value: unknown): AgentTaskFinalStatus {
-  if (value === undefined) return "cancelled";
-  if (value === "completed" || value === "incomplete" || value === "failed" || value === "cancelled") return value;
-  throw badRequest("status must be completed, incomplete, failed, or cancelled");
-}
-
-function reconcileStaleInput(body: TaskReconcileStaleBody): AgentTaskReconcileStaleInput {
-  // HTTP is a cross-process boundary. Never expose the single-process unsafe
-  // mode that can close a task before its durable worker lease is committed.
-  const input: AgentTaskReconcileStaleInput = { requireLeaseEvidence: true };
-  if (body.parentSessionId !== undefined) {
-    input.parentSessionId = requestSessionId(body.parentSessionId);
-  }
-  if (body.staleAfterMs !== undefined) {
-    input.staleAfterMs = nonNegativeInteger(body.staleAfterMs, "staleAfterMs");
-  }
-  if (body.limit !== undefined) input.limit = positiveInteger(body.limit, "limit");
-  if (body.summary !== undefined) input.summary = stringField(body.summary, "summary");
-  if (body.error !== undefined) input.error = stringField(body.error, "error");
-  if (body.modes !== undefined) {
-    if (!Array.isArray(body.modes)) throw badRequest("modes must be an array");
-    input.modes = body.modes.map((mode) => {
-      if (mode !== "one_shot" && mode !== "resumable" && mode !== "background") {
-        throw badRequest("modes must contain one_shot, resumable, or background");
-      }
-      return mode as AgentTaskMode;
-    });
-  }
-  return input;
 }
 
 function numberParam(value: string | null): number | undefined {

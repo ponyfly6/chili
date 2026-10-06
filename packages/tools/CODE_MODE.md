@@ -1,9 +1,9 @@
 # Code mode in Chili
 
 Chili exposes `code_mode` alongside its direct tools in CLI, TUI, and Desktop hosts.
-It is a baseline tool for both the main agent and every child agent, including
-scoped Team workers and resumed workers with older allowlists. They all use the
-same implementation; each agent receives its own authorized tool catalog.
+It is a baseline tool for every Agent, including resumed Agents with older
+allowlists. They all use the same implementation; each Agent receives its own
+authorized tool catalog.
 The model supplies `{ "code": "...", "timeoutMs": 30000 }`. JavaScript runs once in
 an isolated QuickJS worker. It can compose the explicitly enabled tools; it cannot
 access Node, Bun, files, network, imports, or timers directly.
@@ -46,12 +46,24 @@ Tool search describes the schema of `.structuredData`, not the outer envelope.
 TypeScript syntax is not accepted; schemas describe the JavaScript contract.
 
 File tools, shell and managed-process tools, Git tools, the six `agent_*` controls,
-and ordinary MCP tools opt in to code mode. Image reads, user input, and Team
-controls remain direct calls. Explicit denials of `code_mode` are still respected;
+and ordinary MCP tools opt in to code mode. Image reads and user input remain
+direct calls. Explicit denials of `code_mode` are still respected;
 each nested tool retains its own allowlist, scope and approval checks.
 The wrapper declares an internal resource policy because it has no direct file
 or process capability. This permits composition under resource restrictions;
 it does not grant its children additional access.
+
+Agent creation is asynchronous. Use `Promise.all` over individual
+`tools.agent_spawn({ name, prompt })` calls for parallel creation; pass `cwd` when
+a different workspace is needed. Each returns `{ agentId, inputId }` in
+`structuredData`. Keep the receipt and call
+`agent_wait({ agentId, inputId, timeoutMs })` to wait for that specific input.
+A wait timeout ends only the wait; it does not cancel the input. `agent_send`
+returns another input receipt, while `agent_stop` persistently pauses scheduling
+and `agent_resume` restores it for the same identity. All six Agent controls
+remain subject to access checks; delegation-off policy blocks spawn, send and
+resume while retaining list, wait and stop. See [Agent tools](AGENT_TOOLS.md) for
+complete examples and contracts.
 
 ## Execution and lifecycle
 
@@ -73,6 +85,9 @@ it does not grant its children additional access.
   failures and turn-budget exhaustion cannot be bypassed with JavaScript catch.
 - Explicit `bash({ background: true, ... })` retains the existing managed-process
   lifecycle and returns a handle. This is separate from an unawaited JS promise.
+- An admitted Agent input has its own durable lifecycle. Await the spawn or send
+  call to obtain its receipt, then use explicit Agent controls to wait, pause or
+  resume. Use bounded Agent waits within the script deadline.
 
 ## Limits
 

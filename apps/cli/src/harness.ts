@@ -9,9 +9,6 @@ import { CliPrinter } from "./printing-store.js";
 export {
   buildHostPromptFragments as buildCliPromptFragments,
   buildHostChildPromptFragments as buildCliChildPromptFragments,
-  createCompleteTaskController,
-  createSubagentControlController,
-  createTeamToolController,
   type HostPermissionProfileControl as CliPermissionProfileControl,
 } from "@chili/host";
 

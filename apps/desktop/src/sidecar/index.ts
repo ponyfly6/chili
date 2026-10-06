@@ -189,12 +189,7 @@ try {
   server = startRuntimeHttpServer({
     service: host.service,
     store: host.events,
-    tasks: host.tasks,
     agents: host.agents,
-    teams: host.teams,
-    teamDispatcher: host.teamDispatcher,
-    teamMerger: host.teamMerger,
-    teamRunner: host.teamRunner,
     approvals: approvalQueue,
     userInputs: userInputQueue,
     permissions: host.permissions,

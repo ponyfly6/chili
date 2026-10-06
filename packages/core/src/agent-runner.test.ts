@@ -103,6 +103,7 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
     id: sessionId,
     cwd: "/repo",
     source: "subagent",
+    agent: { parentSessionId: "session_guarded_parent" as SessionId, name: "worker", path: "/root/worker", policy: {} },
     status: "active",
     createdAt: 1,
     updatedAt: 1,
@@ -116,17 +117,17 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
   );
   await expect(root.submitPrompt(input)).rejects.toMatchObject({
     name: "RuntimeSubagentSessionAccessError",
-    message: expect.stringContaining("Use agent_resume for the owning task"),
+    message: expect.stringContaining("Use agent_resume for this Agent"),
   });
   const asyncError = new Promise<unknown>((resolve) => {
     root.submitPromptAsync({ ...input, text: "async bypass" }, resolve);
   });
   await expect(asyncError).resolves.toMatchObject({
     name: "RuntimeSubagentSessionAccessError",
-    message: expect.stringContaining("Use agent_resume for the owning task"),
+    message: expect.stringContaining("Use agent_resume for this Agent"),
   });
   expect(root.isRunning(sessionId)).toBe(false);
-  await expect(root.appendUserMessage(input)).rejects.toThrow("Use agent_resume for the owning task");
+  await expect(root.appendUserMessage(input)).rejects.toThrow("Use agent_resume for this Agent");
   await expect(root.compactSession({ sessionId })).rejects.toBeInstanceOf(
     RuntimeSubagentSessionAccessError,
   );
@@ -1110,11 +1111,11 @@ test("RuntimeService passes promptFragments by prompt layer", async () => {
 
   expect(result.status).toBe("completed");
   expect(runner.turnInputs[0]?.system).toEqual(["base system"]);
-  expect(runner.turnInputs[0]?.developer?.[0]).toContain("Delegation policy is explicit");
+  expect(runner.turnInputs[0]?.developer?.[0]).toContain("Delegation policy is proactive");
   expect(runner.turnInputs[0]?.contextualUser).toEqual(["skills catalog", "memory context"]);
   expect(runner.turnInputs[0]?.promptDebug?.fragments.map((fragment) => [fragment.id, fragment.source, fragment.layer])).toEqual([
     ["base", "core", "base"],
-    ["chili.delegation.explicit", "runtime", "developer"],
+    ["chili.delegation.proactive", "runtime", "developer"],
     ["skills", "skills", "contextual_user"],
     ["memory", "memory", "contextual_user"],
   ]);
@@ -1339,7 +1340,7 @@ test("RuntimeService canonicalizes symlink cwd aliases and nonexistent lexical t
   }
 });
 
-test("RuntimeService keeps delegation explicit when reasoning is ultra", async () => {
+test("RuntimeService preserves explicitly configured delegation when reasoning is ultra", async () => {
   const runner = new FakeAgentRunner();
   const store = new MemoryEventStore();
   const sessionId = "session_ultra_prompt" as SessionId;
@@ -1349,6 +1350,7 @@ test("RuntimeService keeps delegation explicit when reasoning is ultra", async (
     store,
     cwd: "/repo",
     defaultReasoningLevel: "ultra",
+    defaultDelegationPolicy: "explicit",
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
   });
@@ -1421,7 +1423,7 @@ test("RuntimeService applies session delegation policy independently of model re
   });
   const disabled = await resumed.inspectPrompt({ sessionId, cwd: "/repo", includeContent: true });
   expect(disabled.fragments.find((fragment) => fragment.id === "chili.delegation.off")?.content).toContain(
-    "Do not spawn",
+    "Do not create Agents or send them new work",
   );
 });
 
@@ -1480,8 +1482,8 @@ test("RuntimeService reports model-specific advanced reasoning levels", async ()
   expect(requestedUltra.reasoningLevel).toBe("max");
 
   const inspected = await service.inspectPrompt({ sessionId, cwd: "/repo", includeContent: true });
-  expect(inspected.fragments.some((fragment) => fragment.id === "chili.delegation.proactive")).toBe(false);
-  expect(inspected.fragments.some((fragment) => fragment.id === "chili.delegation.explicit")).toBe(true);
+  expect(inspected.fragments.some((fragment) => fragment.id === "chili.delegation.proactive")).toBe(true);
+  expect(inspected.fragments.some((fragment) => fragment.id === "chili.delegation.explicit")).toBe(false);
 });
 
 test("RuntimeService clears and rejects controls unsupported by a known model", async () => {
@@ -1606,7 +1608,7 @@ test("RuntimeService inspectPrompt only assembles prompt debug output", async ()
 
   expect(debug.fragments.map((fragment) => [fragment.id, fragment.layer, fragment.source])).toEqual([
     ["debug.base", "base", "core"],
-    ["chili.delegation.explicit", "developer", "runtime"],
+    ["chili.delegation.proactive", "developer", "runtime"],
     ["debug.skills", "contextual_user", "skills"],
     ["debug.project", "contextual_user", "project"],
   ]);
@@ -1621,7 +1623,7 @@ test("RuntimeService inspectPrompt only assembles prompt debug output", async ()
     "base instructions".length
       + "skills catalog".length
       + "project instructions".length
-      + debug.fragments.find((fragment) => fragment.id === "chili.delegation.explicit")!.chars,
+      + debug.fragments.find((fragment) => fragment.id === "chili.delegation.proactive")!.chars,
   );
   expect(runner.createInputs).toEqual([]);
   expect(runner.userMessages).toEqual([]);

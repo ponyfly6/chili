@@ -1,6 +1,16 @@
 import { expect, test } from "bun:test";
-import type { SessionId, TimestampMs, TurnId } from "@chili/protocol";
-import type { AgentMessageListToolInput, AgentMessageRecord, AgentMessageSendToolInput, AgentMessageToolController } from "./agent-message.js";
+import type { ChiliEvent, RuntimeSessionInput, SessionId, TimestampMs, TurnId } from "@chili/protocol";
+import type {
+  AgentInputToolReceipt,
+  AgentListToolInput,
+  AgentSendToolInput,
+  AgentSpawnToolInput,
+  AgentTargetToolInput,
+  AgentToolController,
+  AgentToolRecord,
+  AgentWaitToolInput,
+  AgentWaitToolResult,
+} from "./agent.js";
 import {
   createAgentListTool,
   createAgentResumeTool,
@@ -12,195 +22,204 @@ import {
 import { createCodeModeTool } from "./builtins/code-mode.js";
 import { ToolExecutor } from "./executor.js";
 import { InMemoryToolRegistry } from "./registry.js";
-import type {
-  CompleteTaskToolInput,
-  SubagentController,
-  SubagentControlController,
-  SubagentTaskBatchWaitRecord,
-  SubagentTaskRecord,
-  TaskCloseToolInput,
-  TaskFollowupToolInput,
-  TaskListToolInput,
-  TaskToolInput,
-  TaskWaitBatchToolInput,
-} from "./subagent.js";
-import type { ApprovalBrokerRequest, ExecuteToolInput, ExecuteToolResult } from "./types.js";
+import type { ApprovalBrokerRequest, ChiliToolExecutionContext, ExecuteToolInput, ExecuteToolResult } from "./types.js";
 
-test("canonical agent tools expose exactly six names, with no old aliases and with code mode contracts", () => {
+const AGENT_NAMES = ["agent_list", "agent_resume", "agent_send", "agent_spawn", "agent_stop", "agent_wait"];
+
+test("the registry exposes six strict Agent contracts and code mode without legacy aliases", () => {
   const { registry } = setup();
-  expect(registry.list().map((tool) => tool.name).sort()).toEqual([
-    "agent_list", "agent_resume", "agent_send", "agent_spawn", "agent_stop", "agent_wait",
-  ]);
-  for (const tool of registry.list()) {
+  expect(registry.list().map((tool) => tool.name).sort()).toEqual([...AGENT_NAMES, "code_mode"]);
+  for (const name of AGENT_NAMES) {
+    const tool = registry.get(name)!;
     expect(tool.aliases).toBeUndefined();
     expect(tool.codeMode).toBe(true);
+    expect(tool.inputSchema).toMatchObject({ type: "object", additionalProperties: false });
     expect(tool.outputSchema).toBeDefined();
   }
-  for (const name of ["task", "task_batch", "task_wait", "task_followup", "agent_message_send", "agent_message_list"]) {
-    expect(registry.get(name)).toBeUndefined();
-  }
 });
 
-test("agent_spawn preserves single inline defaults and supports explicit background execution", async () => {
+test("legacy fields and invalid input values fail before the controller or approvals run", async () => {
   const { executor, controller, approvals } = setup();
-  const inline = completed(await executor.execute(input("agent_spawn", { description: "inspect", prompt: "task_wait is a symbol in this code" })));
-  const background = completed(await executor.execute(input("agent_spawn", { description: "inspect again", prompt: "work", mode: "background" })));
-  expect(controller.spawnInputs).toMatchObject([
-    { description: "inspect", prompt: "task_wait is a symbol in this code", completionPolicy: "join" },
-    { description: "inspect again", prompt: "work", mode: "background", completionPolicy: "notify" },
-  ]);
-  expect(controller.spawnInputs[0]).not.toHaveProperty("mode");
-  expect(inline.title).toBe("agent_spawn task_1");
-  expect(inline.structuredData).toMatchObject({ task_id: "task_1", status: "completed", summary: "task_wait is a symbol in this code" });
-  expect(inline.metadata).toMatchObject({ taskId: "task_1", task_id: "task_1", completionPolicy: "join" });
-  expect(background.structuredData).toMatchObject({ task_id: "task_2", status: "running", completion_policy: "notify" });
-  expect(approvals.map((approval) => [approval.toolName, approval.permission, approval.patterns])).toEqual([
-    ["agent_spawn", "task", ["spawn"]], ["agent_spawn", "task", ["spawn"]],
-  ]);
-  await expect(executor.canRunConcurrently("agent_spawn", { description: "a", prompt: "b" })).resolves.toBe(false);
-  await expect(executor.canRunConcurrently("agent_spawn", { description: "a", prompt: "b", mode: "background" })).resolves.toBe(true);
-});
-
-test("agent_spawn joins batches and keeps partial spawn failure handles and metadata", async () => {
-  const { executor, controller } = setup();
-  controller.failDescriptions.add("fails");
-  const result = completed(await executor.execute(input("agent_spawn", {
-    tasks: [{ description: "first", prompt: "read" }, { description: "fails", prompt: "read" }, { description: "third", prompt: "read" }],
-    maxConcurrency: 1,
-    batchId: "batch_review",
-    timeoutMs: 25,
-  })));
-  expect(controller.waitInputs).toEqual([{ taskIds: ["task_1", "task_3"], waitFor: "all", timeoutMs: 25, batchId: "batch_review" }]);
-  expect(controller.spawnInputs.map((task) => [task.mode, task.completionPolicy, task.batchId, task.batchIndex])).toEqual([
-    ["background", "join", "batch_review", 0], ["background", "join", "batch_review", 1], ["background", "join", "batch_review", 2],
-  ]);
-  expect(result.structuredData).toMatchObject({
-    batchId: "batch_review", count: 3, spawned_count: 2, spawn_failure_count: 1,
-    tasks: [{ task_id: "task_1" }, { task_id: "task_3" }],
-    spawn_failures: [{ batchIndex: 1, description: "fails", error: "cannot spawn fails" }],
-  });
-  expect(result.metadata).toMatchObject({ batchId: "batch_review", taskIds: ["task_1", "task_3"], status: "partial_spawn" });
-});
-
-test("supervised spawn retains batch obligations while all generated guidance names canonical tools", async () => {
-  const { executor, controller } = setup();
-  const result = completed(await executor.execute(input("agent_spawn", { tasks: [{ description: "first", prompt: "work" }], completionPolicy: "supervised" })));
-  expect(controller.waitInputs).toEqual([]);
-  expect(result.structuredData).toMatchObject({ required_open_batch: true, supervised_confirmation_required: true });
-  const nextAction = (result.structuredData as { next_action: string }).next_action;
-  expect(nextAction).toContain("agent_wait(waitFor=any)");
-  expect(nextAction).toContain("agent_resume");
-  expect(nextAction).not.toContain("task_wait");
-  expect(result.metadata?.nextAction).toBe(nextAction);
-});
-
-test("agent_spawn rejects mixed single/batch requests, batch-only single options, and unsupported modes", async () => {
-  const { executor, controller } = setup();
-  for (const args of [
-    { tasks: [{ description: "a", prompt: "b" }], prompt: "ambiguous" },
-    { tasks: [{ description: "a", prompt: "b" }], mode: "background" },
-    { description: "a", prompt: "b", maxConcurrency: 2 },
-    { description: "a", prompt: "b", batchId: "batch" },
-    { description: "a", prompt: "b", timeoutMs: 2 },
-    { description: "a", prompt: "b", mode: "typo" },
-    { description: "a", prompt: "b", completionPolicy: "supervised" },
-    { tasks: [] },
-    { tasks: [{ description: "a", prompt: "b", mode: "one_shot" }] },
-  ]) expect((await executor.execute(input("agent_spawn", args))).status).toBe("failed");
-  expect(controller.spawnInputs).toEqual([]);
-});
-
-test("agent_list routes agent and message filters without silently discarding cross-view fields", async () => {
-  const { executor, controller } = setup();
-  const agents = completed(await executor.execute(input("agent_list", { taskIds: ["task_1"], status: "completed", all: true })));
-  const messages = completed(await executor.execute(input("agent_list", { view: "messages", taskId: "task_1", path: "/root/reviewer", from: "/root", status: "queued", limit: 2 })));
-  expect(controller.listInputs).toEqual([{ taskIds: ["task_1"], status: "completed", all: true }]);
-  expect(controller.messageListInputs).toEqual([{ taskId: "task_1", path: "/root/reviewer", from: "/root", status: "queued", limit: 2 }]);
-  expect(agents.structuredData).toMatchObject({ tasks: [{ task_id: "task_1", status: "completed" }] });
-  expect(messages.structuredData).toMatchObject({ count: 2, messages: [{ message_id: "message_1" }, { message_id: "message_2" }] });
-  expect(messages.title).toBe("agent_list 2");
-  for (const args of [
-    { view: "unknown" }, { taskId: "task_1" }, { from: "/root" }, { path: "/root" },
-    { view: "messages", taskIds: ["task_1"] }, { view: "messages", status: "completed" }, { status: "queued" },
-  ]) expect((await executor.execute(input("agent_list", args))).status).toBe("failed");
-  expect(controller.listInputs).toHaveLength(1);
-  expect(controller.messageListInputs).toHaveLength(1);
-});
-
-test("agent_send queues messages or requests idle delivery without invoking lifecycle controls", async () => {
-  const { executor, controller } = setup();
-  const queued = completed(await executor.execute(input("agent_send", { to: "reviewer", content: "task_followup is the old API", messageId: "message_queued" })));
-  completed(await executor.execute(input("agent_send", { to: "parent", content: "ready", delivery: "triggerTurn" })));
-  expect(controller.messageInputs).toEqual([
-    { to: "reviewer", content: "task_followup is the old API", messageId: "message_queued", delivery: "queueOnly" },
-    { to: "parent", content: "ready", delivery: "triggerTurn" },
-  ]);
-  expect(controller.closeInputs).toEqual([]);
-  expect(controller.resumeInputs).toEqual([]);
-  expect(queued.structuredData).toMatchObject({ message_id: "message_queued", content: "task_followup is the old API" });
-});
-
-test("agent_wait returns partial snapshots for both single and multiple handles", async () => {
-  const { executor, controller } = setup();
-  controller.timedOut = true;
-  const single = completed(await executor.execute(input("agent_wait", { taskId: "task_running", timeoutMs: 25 })));
-  const batch = completed(await executor.execute(input("agent_wait", { taskIds: ["task_1", "task_running", "task_running"], waitFor: "any", timeoutMs: 50, batchId: "batch_1" })));
-  expect(controller.waitInputs).toEqual([
-    { taskIds: ["task_running"], waitFor: "all", timeoutMs: 25 },
-    { taskIds: ["task_1", "task_running"], waitFor: "any", timeoutMs: 50, batchId: "batch_1" },
-  ]);
-  expect(single.structuredData).toMatchObject({ timedOut: true, satisfied: false, pending_task_ids: ["task_running"], tasks: [{ task_id: "task_running", status: "running" }] });
-  expect(batch.structuredData).toMatchObject({ batchId: "batch_1", final_count: 1, pending_count: 1, count: 2 });
-  expect((batch.structuredData as { next_action: string }).next_action).toContain("agent_wait");
-  for (const args of [{}, { taskId: "a", taskIds: ["a"] }, { taskId: " " }, { taskIds: [] }, { taskId: "a", timeoutMs: 0 }]) {
-    expect((await executor.execute(input("agent_wait", args))).status).toBe("failed");
+  const cases: Array<[string, unknown]> = [
+    ["agent_spawn", { name: "review", prompt: "Inspect", taskId: "old" }],
+    ["agent_spawn", { name: "review", prompt: "Inspect", mode: "background" }],
+    ["agent_spawn", { name: "review", prompt: "Inspect", tasks: [{ name: "nested", prompt: "Inspect" }] }],
+    ["agent_spawn", { description: "review", prompt: "Inspect" }],
+    ["agent_spawn", { name: "review", prompt: "Inspect", completionPolicy: "join" }],
+    ["agent_spawn", { name: " ", prompt: "Inspect" }],
+    ["agent_spawn", { name: "review/files", prompt: "Inspect" }],
+    ["agent_spawn", { name: "review files", prompt: "Inspect" }],
+    ["agent_spawn", { name: "review", prompt: "" }],
+    ["agent_spawn", { name: "review", prompt: "Inspect", cwd: 42 }],
+    ["agent_spawn", []],
+    ["agent_send", { agentId: "agent_1", text: "Inspect", taskId: "old" }],
+    ["agent_send", { agentId: "agent_1", text: "Inspect", mode: "triggerTurn" }],
+    ["agent_send", { agentId: "agent_1", text: "Inspect", delivery: "queueOnly" }],
+    ["agent_send", { to: "agent_1", content: "Inspect" }],
+    ["agent_wait", { taskId: "old" }],
+    ["agent_wait", { agentId: "agent_1" }],
+    ["agent_wait", { agentId: "agent_1", inputId: "input_1", taskIds: ["old"] }],
+    ["agent_wait", { agentId: "agent_1", inputId: "input_1", waitFor: "any" }],
+    ["agent_wait", { agentId: "agent_1", inputId: "input_1", timeoutMs: -1 }],
+    ["agent_wait", { agentId: "agent_1", inputId: "input_1", timeoutMs: 60001 }],
+    ["agent_wait", { agentId: "agent_1", inputId: "input_1", timeoutMs: 1.5 }],
+    ["agent_wait", { agentId: "agent_1", inputId: "input_1", timeoutMs: Number.MAX_SAFE_INTEGER + 1 }],
+    ["agent_stop", { taskId: "old" }],
+    ["agent_stop", { agentId: "agent_1", summary: "done" }],
+    ["agent_resume", { taskId: "old" }],
+    ["agent_resume", { agentId: "agent_1", prompt: "Continue" }],
+    ["agent_list", { taskIds: ["old"] }],
+    ["agent_list", { view: "messages" }],
+    ["agent_list", { all: true }],
+    ["agent_list", null],
+  ];
+  for (const [name, args] of cases) {
+    const result = await executor.execute(input(name, args));
+    if (result.status !== "failed") throw new Error(`Expected invalid input for ${name}: ${JSON.stringify(args)}`);
+    expect(result.error.name).toBe("ToolValidationError");
   }
-  expect(controller.waitInputs).toHaveLength(2);
+  expect(controller.calls).toEqual([]);
+  expect(approvals).toEqual([]);
 });
 
-test("agent_stop always interrupts and cancels; agent_resume accepts an optional continuation prompt", async () => {
-  const { executor, controller, approvals } = setup();
-  const stopped = completed(await executor.execute(input("agent_stop", { taskId: "task_1", summary: "pause investigation" })));
-  const resumed = completed(await executor.execute(input("agent_resume", { taskId: "task_1" })));
-  completed(await executor.execute(input("agent_resume", { taskId: "task_1", prompt: "inspect tests", maxTurns: 3 })));
-  expect(controller.closeInputs).toEqual([{ taskId: "task_1", summary: "pause investigation", status: "cancelled", interrupt: true }]);
-  expect(controller.resumeInputs).toEqual([
-    { taskId: "task_1", prompt: "Continue the previous task from where you stopped." },
-    { taskId: "task_1", prompt: "inspect tests", maxTurns: 3 },
-  ]);
-  expect(stopped.structuredData).toMatchObject({ task_id: "task_1", status: "cancelled", summary: "pause investigation" });
-  expect(resumed.structuredData).toMatchObject({ task_id: "task_1", status: "running" });
-  expect(approvals.map((approval) => [approval.toolName, approval.permission, approval.patterns])).toEqual([
-    ["agent_stop", "task", ["task_1"]], ["agent_resume", "task", ["task_1"]], ["agent_resume", "task", ["task_1"]],
-  ]);
-  for (const args of [{ taskId: "task_1", status: "completed" }, { taskId: "task_1", interrupt: false }]) {
-    expect((await executor.execute(input("agent_stop", args))).status).toBe("failed");
-  }
-  for (const args of [{ taskId: "task_1", prompt: " " }, { taskId: "task_1", maxTurns: 0 }]) {
-    expect((await executor.execute(input("agent_resume", args))).status).toBe("failed");
-  }
-  expect(controller.closeInputs).toHaveLength(1);
-  expect(controller.resumeInputs).toHaveLength(2);
-});
-
-test("code mode can compose agent tools and consume structured results directly", async () => {
+test("removed task, Team and completion tools are unknown calls", async () => {
   const { executor, registry, controller } = setup();
-  registry.register(createCodeModeTool());
-  const result = completed(await executor.execute(input("code_mode", {
-    code: `const spawned = await tools.agent_spawn({description:"review", prompt:"work", mode:"background"});
-      const id = spawned.structuredData.task_id;
-      await tools.agent_send({to:id, content:"check edge cases"});
-      const waited = await tools.agent_wait({taskId:id});
-      text({id, status:waited.structuredData.tasks[0].status});`,
+  for (const name of ["task", "task_batch", "task_wait", "task_followup", "task_close", "agent_message_send", "complete_task", "team_create"]) {
+    expect(registry.get(name)).toBeUndefined();
+    const result = await executor.execute(input(name, {}));
+    expect(result.status).toBe("failed");
+    if (result.status !== "failed") throw new Error(`Expected unknown tool: ${name}`);
+    expect(result.error.name).toBe("UnknownToolError");
+  }
+  expect(controller.calls).toEqual([]);
+});
+
+test("spawn returns an admitted input receipt without waiting for the Agent to complete", async () => {
+  const { executor, controller } = setup();
+  const args = { name: "review", prompt: "Inspect imports", cwd: "/workspace/review" };
+  const spawned = completed(await executor.execute(input("agent_spawn", args)));
+  expect(spawned.structuredData).toEqual({ agentId: "agent_1", inputId: "input_1" });
+  expect(controller.spawnInputs).toEqual([args]);
+  expect(controller.inputs.get("input_1")).toMatchObject({ state: "pending", mode: "start", text: "Inspect imports" });
+  expect(controller.calls).toEqual(["spawn"]);
+  expect(controller.contexts[0]).toMatchObject({ sessionId: "session_agents", turnId: "turn_agents", cwd: process.cwd() });
+  await expect(executor.canRunConcurrently("agent_spawn", args)).resolves.toBe(true);
+});
+
+test("send preserves queue and steer inputs and returns a separate receipt for each", async () => {
+  const { executor, controller } = setup();
+  const sends = [
+    { agentId: "agent_1", text: "First input" },
+    { agentId: "agent_1", text: "Next input", mode: "queue" as const },
+    { agentId: "agent_1", text: "Change direction", mode: "steer" as const },
+  ];
+  const receipts = [];
+  for (const args of sends) receipts.push(completed(await executor.execute(input("agent_send", args))).structuredData);
+  expect(receipts).toEqual([
+    { agentId: "agent_1", inputId: "input_1" },
+    { agentId: "agent_1", inputId: "input_2" },
+    { agentId: "agent_1", inputId: "input_3" },
+  ]);
+  expect(controller.sendInputs).toEqual(sends);
+  expect([...controller.inputs.values()].map((record) => record.mode)).toEqual(["queue", "queue", "steer"]);
+  expect(controller.calls).toEqual(["send", "send", "send"]);
+});
+
+test("wait timeouts preserve the specific receipt and never invoke stop or resume", async () => {
+  const { executor, controller } = setup();
+  const receipt = completed(await executor.execute(input("agent_spawn", { name: "review", prompt: "Inspect" }))).structuredData as AgentInputToolReceipt;
+  const pending = { ...controller.inputs.get(receipt.inputId)! };
+  const args = { ...receipt, timeoutMs: 0 };
+  const timedOut = completed(await executor.execute(input("agent_wait", args)));
+  expect(timedOut.structuredData).toEqual({ input: pending, timedOut: true });
+  expect(controller.inputs.get(receipt.inputId)).toEqual(pending);
+
+  const settled: RuntimeSessionInput = { ...pending, state: "settled", outcome: "completed", revision: 2 };
+  controller.inputs.set(receipt.inputId, settled);
+  const finished = completed(await executor.execute(input("agent_wait", args)));
+  expect(finished.structuredData).toEqual({ input: settled, result: { summary: "Completed: Inspect" }, timedOut: false });
+  expect(controller.waitInputs).toEqual([args, args]);
+  expect(controller.calls).toEqual(["spawn", "wait", "wait"]);
+});
+
+test("stop and resume target the same identity and preserve an optional resumed input receipt", async () => {
+  const { executor, controller } = setup();
+  const target = { agentId: "agent_existing" };
+  controller.resumedInputId = "input_interrupted";
+  expect(completed(await executor.execute(input("agent_stop", target))).structuredData).toEqual(target);
+  expect(completed(await executor.execute(input("agent_stop", target))).structuredData).toEqual(target);
+  expect(completed(await executor.execute(input("agent_resume", target))).structuredData).toEqual({ ...target, inputId: "input_interrupted" });
+  controller.resumedInputId = undefined;
+  expect(completed(await executor.execute(input("agent_resume", target))).structuredData).toEqual(target);
+  expect(controller.stopInputs).toEqual([target, target]);
+  expect(controller.resumeInputs).toEqual([target, target]);
+  expect(controller.calls).toEqual(["stop", "stop", "resume", "resume"]);
+});
+
+test("list preserves visible hierarchy identities and idle, running and paused states", async () => {
+  const { executor, controller } = setup();
+  controller.agents = [
+    { agentId: "root", name: "root", path: "/root", state: "idle" },
+    { agentId: "review", name: "review", path: "/root/review", parentAgentId: "root", state: "running" },
+    { agentId: "verify", name: "verify", path: "/root/review/verify", parentAgentId: "review", state: "paused" },
+  ];
+  const listed = completed(await executor.execute(input("agent_list", {})));
+  expect(listed.structuredData).toEqual({ agents: controller.agents });
+  expect(controller.listInputs).toEqual([{}]);
+  expect(controller.contexts[0]!.sessionId).toBe("session_agents" as SessionId);
+});
+
+test("Agent mutations request write approval under their own tool permissions", async () => {
+  const { executor, approvals } = setup();
+  completed(await executor.execute(input("agent_spawn", { name: "review", prompt: "Inspect" })));
+  completed(await executor.execute(input("agent_send", { agentId: "agent_1", text: "Verify" })));
+  completed(await executor.execute(input("agent_stop", { agentId: "agent_1" })));
+  completed(await executor.execute(input("agent_resume", { agentId: "agent_1" })));
+  completed(await executor.execute(input("agent_wait", { agentId: "agent_1", inputId: "input_1", timeoutMs: 1 })));
+  completed(await executor.execute(input("agent_list", {})));
+  expect(approvals.map(({ toolName, permission, risk, patterns }) => ({ toolName, permission, risk, patterns }))).toEqual([
+    { toolName: "agent_spawn", permission: "agent_spawn", risk: "write", patterns: ["*"] },
+    { toolName: "agent_send", permission: "agent_send", risk: "write", patterns: ["agent_1"] },
+    { toolName: "agent_stop", permission: "agent_stop", risk: "write", patterns: ["agent_1"] },
+    { toolName: "agent_resume", permission: "agent_resume", risk: "write", patterns: ["agent_1"] },
+  ]);
+});
+
+test("code mode composes parallel spawn calls and waits on their structured input receipts", async () => {
+  const { executor, controller, events, approvals } = setup();
+  controller.completeWaits = true;
+  const script = completed(await executor.execute(input("code_mode", {
+    code: `
+      const receipts = await Promise.all([
+        {name:"imports", prompt:"Inspect imports"},
+        {name:"coverage", prompt:"Inspect coverage"},
+      ].map(async (work) => (await tools.agent_spawn(work)).structuredData));
+      const results = await Promise.all(receipts.map(async (receipt) =>
+        (await tools.agent_wait({...receipt, timeoutMs:100})).structuredData));
+      text({receipts, results});
+    `,
   })));
-  expect(result.output).toContain('"id":"task_1"');
-  expect(result.output).toContain('"status":"completed"');
-  expect(controller.messageInputs).toEqual([{ to: "task_1", content: "check edge cases", delivery: "queueOnly" }]);
+  const parsed = JSON.parse(script.output);
+  expect(parsed.receipts).toEqual([
+    { agentId: "agent_1", inputId: "input_1" },
+    { agentId: "agent_2", inputId: "input_2" },
+  ]);
+  expect(parsed.results).toMatchObject([
+    { input: { inputId: "input_1", sessionId: "agent_1", state: "settled", outcome: "completed" }, result: { summary: "Completed: Inspect imports" }, timedOut: false },
+    { input: { inputId: "input_2", sessionId: "agent_2", state: "settled", outcome: "completed" }, result: { summary: "Completed: Inspect coverage" }, timedOut: false },
+  ]);
+  expect(controller.waitInputs).toEqual(parsed.receipts.map((receipt: AgentInputToolReceipt) => ({ ...receipt, timeoutMs: 100 })));
+  const starts = events.filter((event) => event.type === "tool.call_started");
+  const outer = starts.find((event) => event.payload.toolName === "code_mode")!;
+  const nested = starts.filter((event) => event.payload.parentCallId === outer.payload.callId);
+  expect(nested.map((event) => event.payload.toolName).sort()).toEqual(["agent_spawn", "agent_spawn", "agent_wait", "agent_wait"]);
+  expect(new Set(nested.map((event) => event.payload.callId)).size).toBe(4);
+  expect(approvals.map((request) => request.permission)).toEqual(["agent_spawn", "agent_spawn"]);
 });
 
 function completed(result: ExecuteToolResult) {
   if (result.status !== "completed") throw result.error;
-  expect(result.result.structuredData === undefined || JSON.stringify(result.result.structuredData) === result.result.output).toBe(true);
+  if (result.result.structuredData !== undefined) expect(JSON.parse(result.result.output)).toEqual(result.result.structuredData);
   return result.result;
 }
 
@@ -208,61 +227,84 @@ function setup() {
   const controller = new FakeController();
   const registry = new InMemoryToolRegistry();
   const approvals: ApprovalBrokerRequest[] = [];
+  const events: ChiliEvent[] = [];
   for (const tool of [
-    createAgentSpawnTool(controller, controller), createAgentListTool(controller, controller),
-    createAgentSendTool(controller), createAgentWaitTool(controller), createAgentStopTool(controller), createAgentResumeTool(controller),
+    createAgentSpawnTool(controller), createAgentListTool(controller), createAgentSendTool(controller),
+    createAgentWaitTool(controller), createAgentStopTool(controller), createAgentResumeTool(controller), createCodeModeTool(),
   ]) registry.register(tool);
   let nextId = 0;
   const executor = new ToolExecutor({
     registry,
-    events: { publish: async () => undefined },
+    events: { publish: async (event) => { events.push(event); } },
     approvals: { decide: async (request) => { approvals.push(request); return { action: "allow_once" }; } },
     createId: (prefix) => `${prefix}_${++nextId}`,
     now: () => 1 as TimestampMs,
   });
-  return { controller, registry, executor, approvals };
+  return { controller, registry, executor, approvals, events };
 }
 
-class FakeController implements SubagentController, SubagentControlController, AgentMessageToolController {
-  spawnInputs: TaskToolInput[] = [];
-  listInputs: TaskListToolInput[] = [];
-  waitInputs: TaskWaitBatchToolInput[] = [];
-  resumeInputs: TaskFollowupToolInput[] = [];
-  closeInputs: TaskCloseToolInput[] = [];
-  messageInputs: AgentMessageSendToolInput[] = [];
-  messageListInputs: AgentMessageListToolInput[] = [];
-  failDescriptions = new Set<string>();
-  timedOut = false;
+class FakeController implements AgentToolController {
+  calls: string[] = [];
+  contexts: ChiliToolExecutionContext[] = [];
+  spawnInputs: AgentSpawnToolInput[] = [];
+  sendInputs: AgentSendToolInput[] = [];
+  waitInputs: AgentWaitToolInput[] = [];
+  stopInputs: AgentTargetToolInput[] = [];
+  resumeInputs: AgentTargetToolInput[] = [];
+  listInputs: AgentListToolInput[] = [];
+  inputs = new Map<string, RuntimeSessionInput>();
+  agents: AgentToolRecord[] = [];
+  resumedInputId: string | undefined;
+  completeWaits = false;
 
-  async spawnTask(args: TaskToolInput) {
+  async spawnAgent(args: AgentSpawnToolInput, context: ChiliToolExecutionContext) {
+    this.record("spawn", context);
     this.spawnInputs.push(args);
-    if (this.failDescriptions.has(args.description)) throw new Error(`cannot spawn ${args.description}`);
-    return { taskId: `task_${this.spawnInputs.length}`, status: args.mode === "background" ? "running" as const : "completed" as const, summary: args.prompt };
+    return this.admit(`agent_${this.spawnInputs.length}`, args.prompt, "start");
   }
-  async completeTask(args: CompleteTaskToolInput) { return { taskId: args.taskId, summary: args.summary, status: args.status ?? "completed" as const }; }
-  async listTasks(args: TaskListToolInput) { this.listInputs.push(args); return [record("task_1")]; }
-  async waitTask(): Promise<SubagentTaskRecord> { throw new Error("agent_wait must use waitTasks, including single handles"); }
-  async waitTasks(args: TaskWaitBatchToolInput): Promise<SubagentTaskBatchWaitRecord> {
+  async sendAgent(args: AgentSendToolInput, context: ChiliToolExecutionContext) {
+    this.record("send", context);
+    this.sendInputs.push(args);
+    return this.admit(args.agentId, args.text, args.mode ?? "queue");
+  }
+  async waitAgent(args: AgentWaitToolInput, context: ChiliToolExecutionContext): Promise<AgentWaitToolResult> {
+    this.record("wait", context);
     this.waitInputs.push(args);
-    return { waitFor: args.waitFor ?? "all", satisfied: !this.timedOut, timedOut: this.timedOut, tasks: args.taskIds.map((id) => record(id, id === "task_running" ? "running" : "completed")) };
+    const stored = this.inputs.get(args.inputId);
+    if (!stored || stored.sessionId !== args.agentId) throw new Error("Unknown input receipt");
+    const record: RuntimeSessionInput = this.completeWaits ? { ...stored, state: "settled", outcome: "completed" } : { ...stored };
+    return record.state === "settled"
+      ? { input: record, result: { summary: `Completed: ${record.text}` }, timedOut: false }
+      : { input: record, timedOut: true };
   }
-  async followupTask(args: TaskFollowupToolInput) { this.resumeInputs.push(args); return record(args.taskId, "running"); }
-  async closeTask(args: TaskCloseToolInput) { this.closeInputs.push(args); return { ...record(args.taskId, args.status), summary: args.summary ?? "stopped" }; }
-  async listMailbox() { return []; }
-  async consumeMailbox(): Promise<never> { throw new Error("mailbox consumption is internal"); }
-  async sendAgentMessage(args: AgentMessageSendToolInput) {
-    this.messageInputs.push(args);
-    return { ...message(args.messageId ?? `message_${this.messageInputs.length}`), content: args.content, delivery: args.delivery ?? "queueOnly" };
+  async stopAgent(args: AgentTargetToolInput, context: ChiliToolExecutionContext) {
+    this.record("stop", context);
+    this.stopInputs.push(args);
+    return { ...args };
   }
-  async listAgentMessages(args: AgentMessageListToolInput) { this.messageListInputs.push(args); return [message("message_1"), message("message_2")]; }
-}
-
-function record(taskId: string, status: SubagentTaskRecord["status"] = "completed"): SubagentTaskRecord {
-  return { taskId, status, path: `/root/${taskId}`, mode: "background", summary: "done" };
-}
-
-function message(messageId: string): AgentMessageRecord {
-  return { messageId, fromPath: "/root", toPath: "/root/reviewer", status: "queued", delivery: "queueOnly", content: "message" };
+  async resumeAgent(args: AgentTargetToolInput, context: ChiliToolExecutionContext) {
+    this.record("resume", context);
+    this.resumeInputs.push(args);
+    return { ...args, ...(this.resumedInputId === undefined ? {} : { inputId: this.resumedInputId }) };
+  }
+  async listAgents(args: AgentListToolInput, context: ChiliToolExecutionContext) {
+    this.record("list", context);
+    this.listInputs.push(args);
+    return this.agents;
+  }
+  private record(method: string, context: ChiliToolExecutionContext) {
+    this.calls.push(method);
+    this.contexts.push(context);
+  }
+  private admit(agentId: string, text: string, mode: RuntimeSessionInput["mode"]): AgentInputToolReceipt {
+    const sequence = this.inputs.size + 1;
+    const inputId = `input_${sequence}`;
+    this.inputs.set(inputId, {
+      inputId, submissionId: `submission_${sequence}`, sessionId: agentId as SessionId,
+      mode, state: "pending", revision: 1, sequence, text, acceptedAt: 1, updatedAt: 1,
+    });
+    return { agentId, inputId };
+  }
 }
 
 function input(toolName: string, args: unknown): ExecuteToolInput {

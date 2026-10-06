@@ -16,10 +16,8 @@ function context(calls: string[], sessionId = currentSessionId): CliReplCommandC
     revertSession: async (id, snapshotId) => { calls.push(`revert:${id}:${snapshotId}`); },
     showDelegation: async (id, policy) => { calls.push(`delegation:${id}:${policy ?? "status"}`); },
     showAgents: async (id) => { calls.push(`agents:${id}`); },
-    showMailbox: async (id) => { calls.push(`mailbox:${id}`); },
-    listTasks: async (id) => { calls.push(`tasks:${id}`); },
-    showTask: async (id, taskId) => { calls.push(`task:${id}:${taskId}`); },
-    recoverTasks: async (id) => { calls.push(`recover:${id}`); },
+    stopAgent: async (id, agentId) => { calls.push(`stop:${id}:${agentId}`); },
+    resumeAgent: async (id, agentId) => { calls.push(`resume:${id}:${agentId}`); },
     showMemory: async (cwd, scope) => { calls.push(`memory-show:${cwd}:${scope}`); },
     addMemory: async (cwd, input) => { calls.push(`memory-add:${cwd}:${input}`); },
     reloadMemory: async (cwd, scope) => { calls.push(`memory-reload:${cwd}:${scope}`); },
@@ -27,7 +25,7 @@ function context(calls: string[], sessionId = currentSessionId): CliReplCommandC
   };
 }
 
-test("CLI dispatcher scopes session and team commands to the active session", async () => {
+test("CLI dispatcher scopes session and agent commands to the active session", async () => {
   const calls: string[] = [];
   const registry = createCliReplCommandRegistry();
   const ctx = context(calls);
@@ -36,11 +34,10 @@ test("CLI dispatcher scopes session and team commands to the active session", as
   await dispatchCliReplCommand(registry, ctx, "/session compact keep decisions");
   await dispatchCliReplCommand(registry, ctx, "/session revert snap_1");
   await dispatchCliReplCommand(registry, ctx, "/session delegation");
-  await dispatchCliReplCommand(registry, ctx, "/team agents");
-  await dispatchCliReplCommand(registry, ctx, "/team mailbox");
-  await dispatchCliReplCommand(registry, ctx, "/team tasks");
-  await dispatchCliReplCommand(registry, ctx, "/team task task_1");
-  await dispatchCliReplCommand(registry, ctx, "/team recover");
+  await dispatchCliReplCommand(registry, ctx, "/agents");
+  await dispatchCliReplCommand(registry, ctx, "/agents list");
+  await dispatchCliReplCommand(registry, ctx, "/agents stop session_worker");
+  await dispatchCliReplCommand(registry, ctx, "/agents resume session_worker");
   await dispatchCliReplCommand(registry, ctx, "/memory show --all");
   await dispatchCliReplCommand(registry, ctx, "/memory add --project remember this");
   await dispatchCliReplCommand(registry, ctx, "/memory reload --user");
@@ -51,10 +48,9 @@ test("CLI dispatcher scopes session and team commands to the active session", as
     "revert:session_current:snap_1",
     "delegation:session_current:status",
     "agents:session_current",
-    "mailbox:session_current",
-    "tasks:session_current",
-    "task:session_current:task_1",
-    "recover:session_current",
+    "agents:session_current",
+    "stop:session_current:session_worker",
+    "resume:session_current:session_worker",
     "memory-show:/repo:--all",
     "memory-add:/repo:--project remember this",
     "memory-reload:/repo:--user",
@@ -87,11 +83,11 @@ test("CLI help includes canonical session-scoped recovery", async () => {
   expect(help.output).toContain("/model select <provider/model>");
   expect(help.output).toContain("/session compact [focus]");
   expect(help.output).toContain("/session delegation [off|explicit|proactive|status]");
-  expect(help.output).toContain("/team agents");
-  expect(help.output).toContain("/team recover");
+  expect(help.output).toContain("/agents list");
+  expect(help.output).toContain("/agents resume");
   expect(help.output).toContain("/app exit");
 
-  for (const legacy of ["/exit", "/quit", "/sessions", "/agents", "/tasks", "/recover-tasks", "/compact", "/revert"]) {
+  for (const legacy of ["/exit", "/quit", "/sessions", "/team", "/tasks", "/recover-tasks", "/compact", "/revert"]) {
     const result = await dispatchCliReplCommand(registry, ctx, legacy);
     expect(result.status).toBe("error");
   }
@@ -100,9 +96,9 @@ test("CLI help includes canonical session-scoped recovery", async () => {
 test("CLI dispatcher reports invalid, incomplete, and non-command input without fuzzy execution", async () => {
   const registry = createCliReplCommandRegistry();
   const ctx = context([]);
-  const incomplete = await dispatchCliReplCommand(registry, ctx, "/team task");
+  const incomplete = await dispatchCliReplCommand(registry, ctx, "/agents stop");
   expect(incomplete).toMatchObject({ status: "error" });
-  expect(incomplete.output).toContain("Usage: /team task <task-id>");
+  expect(incomplete.output).toContain("Usage: /agents stop <agent-id>");
 
   const unknown = await dispatchCliReplCommand(registry, ctx, "/sesion list");
   expect(unknown).toMatchObject({ status: "error" });

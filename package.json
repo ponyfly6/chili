@@ -29,19 +29,13 @@
     "smoke:p0": "bun run scripts/smoke.ts",
     "smoke:cli": "bun run scripts/smoke-cli.ts",
     "smoke:p0p1": "bun run scripts/smoke-p0-p1.ts",
-    "smoke:p2": "bun run scripts/smoke-p2-subagent.ts",
-    "smoke:p2-control": "bun run scripts/smoke-p2-task-control.ts",
-    "smoke:p3": "bun run scripts/smoke-p3-agent-tree.ts",
-    "smoke:p3-background": "bun run scripts/smoke-p3-background.ts",
-    "smoke:p3-multi-agent-lifecycle": "bun run scripts/smoke-p3-multi-agent-lifecycle.ts",
-    "smoke:p3-team-model": "bun run scripts/smoke-p3-team-model.ts",
-    "smoke:p3-team-parallel": "bun run scripts/smoke-p3-team-parallel.ts",
     "test:index": "bun run scripts/test-index.ts",
     "eval:coding": "bun run scripts/coding-eval/index.ts",
     "typecheck": "tsc -b && bun run --cwd apps/desktop typecheck && bun run --cwd apps/control-web typecheck",
     "control-web:build": "bun run --cwd apps/control-web build",
     "control-web:typecheck": "bun run --cwd apps/control-web typecheck",
-    "test:e2e:remote": "bun run --cwd apps/desktop typecheck:e2e && bun run apps/desktop/e2e/remote-control.e2e.ts"
+    "test:e2e:remote": "bun run --cwd apps/desktop typecheck:e2e && bun run apps/desktop/e2e/remote-control.e2e.ts",
+    "smoke:agents": "bun run scripts/smoke-agents.ts"
   },
   "devDependencies": {
     "@types/react": "19.2.14",

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { renderToolActivity, type ToolRenderInput } from "./tool-renderers.js";
+import { defaultToolRendererRegistry, renderToolActivity, type ToolRenderInput } from "./tool-renderers.js";
 
 test("tool renderers expose inline and block cell modes without compact raw output", () => {
   const read = renderToolActivity(toolInput({
@@ -478,261 +478,128 @@ test("file-changing and diff tools are block-ready while fallback stays inline",
   expect(unknown.mode).toBe("inline");
 });
 
-test("team renderers label batched tasks and summarize run loop output", () => {
-  const created = renderToolActivity(toolInput({
-    toolName: "team_task_create_batch",
-    inputSummary: { title: "team_task_create_batch" },
-    input: { team_id: "team_core" },
-  }));
-  const dispatched = renderToolActivity(toolInput({
-    toolName: "team_task_dispatch_batch",
-    inputSummary: { title: "team_task_dispatch_batch" },
-    input: { team_id: "team_core" },
-  }));
-  const runLoop = renderToolActivity(toolInput({
-    toolName: "team_run_loop",
-    inputSummary: { title: "team_run_loop" },
-    input: { team_id: "team_core" },
-    output: JSON.stringify({
-      stop_reason: "once",
-      max_concurrent_dispatches: 4,
-      max_concurrent_verifications: 2,
-      dispatched: [{ task_id: "task_a" }, { task_id: "task_b" }],
-      completed: [],
-      accepted: [{ task_id: "task_done" }],
-      merged: [],
-      still_running: [{ task_id: "task_a" }],
-      blocked: [{ task_id: "task_blocked" }],
-      errors: [],
-    }),
-  }));
-
-  expect(created).toMatchObject({
-    label: "Created persistent team tasks team_core",
-    mode: "inline",
-  });
-  expect(dispatched).toMatchObject({
-    label: "Dispatched persistent team tasks team_core",
-    mode: "inline",
-  });
-  expect(runLoop).toMatchObject({
-    label: "Ran persistent team loop team_core",
-    mode: "inline",
-    summary: "stop=once, bottleneck=blocked, fanout=4, verify=2, dispatched=2, completed=1, running=1, blocked=1",
-  });
-});
-
 test.each([
-  { toolName: "agent_spawn", input: { description: "inspect API", prompt: "inspect" }, label: "Started ad-hoc agent inspect API" },
-  { toolName: "agent_list", input: { status: "running" }, label: "Listed ad-hoc agents running" },
-  { toolName: "agent_list", input: { view: "messages", status: "queued" }, label: "Listed agent messages queued" },
-  { toolName: "agent_send", input: { to: "/root/reader", content: "inspect API" }, label: "Sent agent message to /root/reader" },
-  { toolName: "agent_wait", input: { taskId: "task_a" }, label: "Waited for ad-hoc agent task_a" },
-  { toolName: "agent_stop", input: { taskId: "task_a" }, label: "Stopped ad-hoc agent task_a" },
-  { toolName: "agent_resume", input: { taskId: "task_a", prompt: "continue" }, label: "Resumed ad-hoc agent task_a" },
+  { toolName: "agent_spawn", input: { name: "reviewer", prompt: "inspect API" }, label: "Started agent reviewer" },
+  { toolName: "agent_list", input: {}, label: "Listed agents" },
+  { toolName: "agent_send", input: { agentId: "session_reader", text: "inspect API" }, label: "Sent input to agent session_reader" },
+  { toolName: "agent_wait", input: { agentId: "session_reader", inputId: "input_review" }, label: "Waited for input input_review · agent session_reader" },
+  { toolName: "agent_stop", input: { agentId: "session_reader" }, label: "Stopped agent session_reader" },
+  { toolName: "agent_resume", input: { agentId: "session_reader" }, label: "Resumed agent session_reader" },
 ])("unified $toolName renderer exposes its lifecycle action", ({ toolName, input, label }) => {
   expect(renderToolActivity(toolInput({
     toolName,
     inputSummary: { title: toolName },
     input,
-  })).label).toBe(label);
+  }))).toMatchObject({ label, mode: "inline" });
 });
 
-test("unified agent spawn and wait retain batch summaries", () => {
-  const tasks = [
-    { taskId: "task_a", status: "completed" },
-    { taskId: "task_b", status: "running" },
-  ];
-  const spawned = renderToolActivity(toolInput({
+test("agent submission summaries retain stable agent and input receipts", () => {
+  for (const toolName of ["agent_spawn", "agent_send", "agent_resume"]) {
+    const rendered = renderToolActivity(toolInput({
+      toolName,
+      input: { name: "reviewer", agentId: "session_reader" },
+      output: JSON.stringify({ agentId: "session_reader", inputId: "input_review" }),
+    }));
+    expect(rendered.summary).toBe(toolName === "agent_spawn"
+      ? "agent session_reader · input input_review"
+      : "input input_review");
+  }
+});
+
+test("agent compact summaries omit prompts and bound receipt identifiers", () => {
+  const running = renderToolActivity(toolInput({
     toolName: "agent_spawn",
-    inputSummary: { title: "agent_spawn" },
-    input: { tasks: [{ description: "API" }, { description: "TUI" }], maxConcurrency: 2 },
-    output: JSON.stringify({ count: 2, maxConcurrency: 2, tasks }),
+    status: "running",
+    displayStatus: "running",
+    input: { name: "reviewer", prompt: "PRIVATE_PROMPT" },
+    inputSummary: { title: "agent_spawn", detail: "PRIVATE_PROMPT" },
   }));
+  expect(running.label).toBe("Starting agent reviewer");
+  expect(running.summary).toBe("");
+  const completed = renderToolActivity(toolInput({
+    toolName: "agent_spawn",
+    input: { name: "reviewer" },
+    output: JSON.stringify({ agentId: `session_${"a".repeat(300)}`, inputId: `input_${"b".repeat(300)}` }),
+  }));
+  expect(completed.summary?.length).toBeLessThanOrEqual(160);
+  expect(completed.summary).toContain("…");
+});
+
+test.each(["completed", "failed", "cancelled", "interrupted"])("agent wait reports the specific input outcome: %s", (outcome) => {
   const waited = renderToolActivity(toolInput({
     toolName: "agent_wait",
-    inputSummary: { title: "agent_wait" },
-    input: { taskIds: ["task_a", "task_b"], waitFor: "any" },
-    output: JSON.stringify({ count: 2, waitFor: "any", timedOut: false, tasks }),
-  }));
-  expect(spawned).toMatchObject({
-    label: "Started 2 ad-hoc agents",
-    mode: "inline",
-    summary: "agents=2, fanout=2, running=1, completed=1",
-  });
-  expect(waited).toMatchObject({
-    label: "Waited for 2 ad-hoc agents (any)",
-    mode: "inline",
-    summary: "wait=any, agents=2, timed_out=false, running=1, completed=1",
-  });
-});
-
-test("agent and team renderers distinguish ad-hoc work from persistent teams", () => {
-  const batch = renderToolActivity(toolInput({
-    toolName: "task_batch",
-    inputSummary: { title: "task_batch" },
-    input: {
-      max_concurrency: 2,
-      tasks: [
-        { description: "inspect API" },
-        { description: "inspect TUI" },
-        { description: "run tests" },
-      ],
-    },
+    input: { agentId: "session_reader", inputId: "input_review" },
     output: JSON.stringify({
-      count: 3,
-      max_concurrency: 2,
-      tasks: [
-        { task_id: "task_a", status: "running" },
-        { task_id: "task_b", status: "completed" },
-        { task_id: "task_c", status: "failed" },
-      ],
-    }),
-  }));
-  const createdTeam = renderToolActivity(toolInput({
-    toolName: "team_create",
-    inputSummary: { title: "team_create" },
-    input: { name: "research" },
-  }));
-  const addedMember = renderToolActivity(toolInput({
-    toolName: "team_member_add",
-    inputSummary: { title: "team_member_add" },
-    input: { team_id: "team_research", name: "reader", path: "/root/reader" },
-  }));
-
-  expect(batch).toMatchObject({
-    label: "Started 3 ad-hoc agents",
-    mode: "inline",
-    summary: "agents=3, fanout=2, running=1, completed=1, failed=1",
-  });
-  expect(createdTeam.label).toBe("Created persistent team research");
-  expect(addedMember.label).toBe("Added persistent team member reader");
-});
-
-test("batch wait and agent message renderers expose lifecycle semantics", () => {
-  const joined = renderToolActivity(toolInput({
-    toolName: "task_batch",
-    inputSummary: { title: "task_batch" },
-    input: { tasks: [{ description: "a" }, { description: "b" }] },
-    output: JSON.stringify({
-      count: 2,
-      completion_policy: "join",
-      max_concurrency: 4,
-      joined: true,
-      tasks: [
-        { task_id: "task_a", status: "completed", summary: "done" },
-        { task_id: "task_b", status: "incomplete", summary: "turn limit" },
-      ],
-    }),
-  }));
-  const waited = renderToolActivity(toolInput({
-    toolName: "task_wait_batch",
-    inputSummary: { title: "task_wait_batch" },
-    input: { task_ids: ["task_a", "task_b", "task_c"], wait_for: "any" },
-    output: JSON.stringify({
-      wait_for: "any",
-      count: 3,
-      timed_out: true,
-      tasks: [
-        { task_id: "task_a", status: "completed" },
-        { task_id: "task_b", status: "running" },
-        { task_id: "task_c", status: "failed" },
-      ],
-    }),
-  }));
-  const sent = renderToolActivity(toolInput({
-    toolName: "agent_message_send",
-    inputSummary: { title: "agent_message_send" },
-    input: { to: "/root/reader", content: "focus on projection" },
-  }));
-  const listed = renderToolActivity(toolInput({
-    toolName: "agent_message_list",
-    inputSummary: { title: "agent_message_list" },
-    input: { status: "queued" },
-  }));
-
-  expect(joined).toMatchObject({
-    label: "Started 2 ad-hoc agents",
-    summary: "agents=2, policy=join, fanout=4, joined=true, completed=1, incomplete=1",
-  });
-  expect(waited).toMatchObject({
-    label: "Waited for 3 ad-hoc agents (any)",
-    mode: "inline",
-    summary: "wait=any, agents=3, timed_out=true, running=1, completed=1, failed=1",
-  });
-  expect(sent.label).toBe("Sent agent message to /root/reader");
-  expect(listed.label).toBe("Listed agent messages queued");
-});
-
-test("task batch renderer reports an all-failed camel-case spawn result", () => {
-  const batch = renderToolActivity(toolInput({
-    toolName: "task_batch",
-    inputSummary: { title: "task_batch" },
-    input: {
-      tasks: [
-        { description: "inspect API" },
-        { description: "inspect TUI" },
-        { description: "run tests" },
-      ],
-    },
-    output: JSON.stringify({
-      expectedBatchSize: 3,
-      spawnedCount: 0,
-      spawnFailureCount: 3,
-      spawnFailures: [
-        { batchIndex: 0, description: "inspect API", error: "spawn failed: inspect API" },
-        { batchIndex: 1, description: "inspect TUI", error: "spawn failed: inspect TUI" },
-        { batchIndex: 2, description: "run tests", error: "spawn failed: run tests" },
-      ],
-      completionPolicy: "join",
-      maxConcurrency: 3,
-      joined: true,
+      input: { inputId: "input_review", state: "settled", outcome },
+      result: { parts: [{ text: "PRIVATE_RESULT_BODY" }] },
       timedOut: false,
-      tasks: [],
     }),
   }));
-
-  expect(batch).toMatchObject({
-    label: "Failed to spawn 3 ad-hoc agents",
+  expect(waited).toMatchObject({
+    label: "Waited for input input_review · agent session_reader",
+    summary: outcome,
     mode: "inline",
-    summary: "agents=0, planned=3, spawn_failed=3, policy=join, fanout=3, joined=true, timed_out=false",
+    bodyKind: "none",
+    bodyLines: [],
   });
+  expect(JSON.stringify(waited)).not.toContain("PRIVATE_RESULT_BODY");
 });
 
-test("task batch renderer reports a partial snake-case spawn result", () => {
-  const batch = renderToolActivity(toolInput({
-    toolName: "task_batch",
-    inputSummary: { title: "task_batch" },
-    input: {
-      tasks: [
-        { description: "inspect API" },
-        { description: "inspect TUI" },
-        { description: "run tests" },
-      ],
-    },
-    output: JSON.stringify({
-      expected_batch_size: 3,
-      spawned_count: 2,
-      spawn_failure_count: 1,
-      spawn_failures: [
-        { batch_index: 1, description: "inspect TUI", error: "spawn failed: inspect TUI" },
-      ],
-      completion_policy: "join",
-      max_concurrency: 3,
-      joined: true,
-      timed_out: false,
-      tasks: [
-        { task_id: "task_api", status: "completed" },
-        { task_id: "task_tests", status: "running" },
-      ],
-    }),
+test("agent wait timeout describes the input without implying the agent stopped", () => {
+  const waited = renderToolActivity(toolInput({
+    toolName: "agent_wait",
+    input: { agentId: "session_reader", inputId: "input_review" },
+    output: JSON.stringify({ input: { inputId: "input_review", state: "claimed" }, timedOut: true }),
   }));
+  expect(waited.summary).toBe("claimed · wait timed out");
+  expect(waited.status).toBe("succeeded");
+  const running = renderToolActivity(toolInput({
+    toolName: "agent_wait",
+    status: "running",
+    displayStatus: "running",
+    input: { agentId: "session_reader", inputId: "input_review" },
+  }));
+  expect(running.label).toBe("Waiting for input input_review · agent session_reader");
+});
 
-  expect(batch).toMatchObject({
-    label: "Started 2 of 3 ad-hoc agents (1 failed to spawn)",
-    mode: "inline",
-    summary: "agents=2, planned=3, spawn_failed=1, policy=join, fanout=3, joined=true, timed_out=false, running=1, completed=1",
-  });
+test("agent list summarizes current agent states", () => {
+  const list = (agents: unknown[]) => renderToolActivity(toolInput({
+    toolName: "agent_list",
+    input: {},
+    output: JSON.stringify({ agents }),
+  }));
+  expect(list([
+    { agentId: "session_1", state: "running" },
+    { agentId: "session_2", state: "paused" },
+    { agentId: "session_3", state: "idle" },
+  ])).toMatchObject({ label: "Listed agents", summary: "3 agents · 1 running · 1 paused · 1 idle", mode: "inline" });
+  expect(list([]).summary).toBe("0 agents");
+});
+
+test("agent details and failures remain inspectable", () => {
+  const detailed = renderToolActivity(toolInput({
+    toolName: "agent_wait",
+    input: { agentId: "session_reader", inputId: "input_review" },
+    output: JSON.stringify({ input: { inputId: "input_review", state: "settled", outcome: "completed" }, timedOut: false }),
+    showToolDetails: true,
+  }));
+  expect(detailed.mode).toBe("block");
+  expect(detailed.details.find((detail) => detail.label === "input")?.lines.join(" ")).toContain("input_review");
+  const failed = renderToolActivity(toolInput({
+    toolName: "agent_send",
+    input: { agentId: "session_reader", text: "inspect API" },
+    status: "failed",
+    displayStatus: "failed",
+    error: "Agent is not visible to this caller",
+  }));
+  expect(failed).toMatchObject({ mode: "block", compactErrorLines: ["Agent is not visible to this caller"] });
+});
+
+test("removed Team and task tools use the generic historical renderer", () => {
+  for (const name of ["team_create", "team_run_loop", "task", "task_batch", "task_wait_batch", "complete_task", "agent_message_send", "agent_message_list", "agent_unknown"]) {
+    expect(defaultToolRendererRegistry.rendererFor(name).name).toBe("fallback");
+  }
+  expect(defaultToolRendererRegistry.rendererFor("tool.agent_wait").name).toBe("agent");
 });
 
 function toolInput(overrides: Partial<ToolRenderInput> & { toolName: string }): ToolRenderInput {

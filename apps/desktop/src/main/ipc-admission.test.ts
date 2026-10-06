@@ -29,9 +29,11 @@ test("bounds concurrent ordinary IPC while preserving critical stop admission", 
   await waitUntil(() => active === 4);
 
   const releaseStop = admission.admit({ type: "session.stop", sessionId: "session_1" });
+  const releaseAgentStop = admission.admit({ type: "agent.stop", sessionId: "session_1", agentId: "agent_1" });
   expect(peak).toBe(4);
   expect(rejected).toBe(96);
   releaseStop();
+  releaseAgentStop();
   gate.resolve();
   await Promise.all(reads);
 });

@@ -7,6 +7,8 @@ import { conversationTitle, matchingDesktopCommands,
 import { ProjectSidebar } from "./ProjectSidebar.js";
 import { SessionList } from "./SessionList.js";
 import { TimelineViewport } from "./TimelineViewport.js";
+import { AgentDetailsPanel } from "./AgentDetailsPanel.js";
+import { sessionDescendantAgents } from "./agent-details-model.js";
 import { formatWorkDuration, workCurrentDetail, workHeadline, workStages, workToolStatus, workToolSubject, workToolTitle, type WorkStage } from "./work-presentation.js";
 import { eventMatchesProject, ProjectViewMemory } from "./project-view-state.js";
 import { useDesktopTheme } from "./useDesktopTheme.js";
@@ -174,6 +176,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const sessions = projection.sessions;
   const selectedId = projection.selectedId;
   const snapshot = projection.snapshot;
+  const descendantAgents = useMemo(() => sessionDescendantAgents(snapshot?.agents, selectedId), [snapshot?.agents, selectedId]);
   useEffect(() => {
     projectViews.current.remember(desktop.workspace, selectedId, composer);
   }, [desktop.workspace, selectedId, composer]);
@@ -644,8 +647,11 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       }
       if (event.event.type.startsWith("session.")) {
         projectionRefreshes.sessions(() => void refreshSessions());
-      } else if (event.event.type.startsWith("agent.") || event.event.type.startsWith("task.")
-        || event.event.type === "user_input.requested" || event.event.type === "user_input.resolved"
+        if (event.event.type === "session.created" || event.event.type === "session.input_queue_changed"
+          || event.event.type === "session.status_changed") {
+          projectionRefreshes.snapshot(() => void reloadSelected());
+        }
+      } else if (event.event.type === "user_input.requested" || event.event.type === "user_input.resolved"
         || event.event.type === "user_input.cancelled") {
         projectionRefreshes.snapshot(() => void reloadSelected());
       }
@@ -1192,6 +1198,29 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           </TimelineViewport>
           </div>
           </div>
+
+          {selectedId && descendantAgents.length > 0 ? (
+            <details className="conversation-agents">
+              <summary>Agents · {descendantAgents.length}</summary>
+              <div>
+                <AgentDetailsPanel
+                  projectId={desktop.projectId}
+                  sessionId={selectedId}
+                  agents={descendantAgents}
+                  inputQueues={Object.fromEntries(Object.entries(presentation?.runtime.sessions ?? {})
+                    .flatMap(([id, session]) => session.inputQueue ? [[id, session.inputQueue]] : []))}
+                  {...(!runtimeActionsDisabled && !selectedArchived ? {
+                    onStop: async (agentId: string) => { await transport.stopAgent(selectedId, agentId); await reloadSelected(); },
+                    onResume: async (agentId: string) => { await transport.resumeAgent(selectedId, agentId); await reloadSelected(); },
+                    onSend: async (agentId: string, text: string, mode: "queue" | "steer") => {
+                      await transport.sendAgent(selectedId, agentId, text, mode);
+                      await reloadSelected();
+                    },
+                  } : {})}
+                />
+              </div>
+            </details>
+          ) : null}
 
           {presentation && presentation.pendingApprovals.length > 0 ? (
             <div className="blocking-dock">
@@ -2356,8 +2385,6 @@ function applyDesktopFrames(
 function requiresSnapshotRehydrate(frame: DesktopEvent): boolean {
   if (frame.type !== "runtime.event") return false;
   return frame.event.type.startsWith("session.")
-    || frame.event.type.startsWith("agent.")
-    || frame.event.type.startsWith("task.")
     || frame.event.type === "user_input.requested"
     || frame.event.type === "user_input.resolved"
     || frame.event.type === "user_input.cancelled";

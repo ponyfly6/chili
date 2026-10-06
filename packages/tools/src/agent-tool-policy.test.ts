@@ -1,31 +1,27 @@
 import { expect, test } from "bun:test";
 import { isToolVisible } from "./tool-policy.js";
 import type { ChiliToolDefinition } from "./types.js";
+import { AGENT_CONTROL_TOOLS } from "./tool-catalog.js";
+import { DELEGATION_OFF_DENIED_TOOL_NAMES } from "./builtins/delegation.js";
 
-function tool(name: string): ChiliToolDefinition {
-  return { name, description: name, risk: "read", resourcePolicy: "internal", inputSchema: { type: "object" },
-    execute: async () => ({ title: name, output: "ok" }) };
-}
+const tool = (name: string): ChiliToolDefinition => ({
+  name, description: name, resourcePolicy: "internal", risk: "write", inputSchema: {},
+  execute: async () => ({ title: name, output: "ok" }),
+});
 
-test("canonical Agent tools preserve explicit denials for merged legacy names", () => {
-  for (const [current, previous] of [
-    ["agent_spawn", "task"], ["agent_spawn", "task_batch"],
-    ["agent_list", "task_list"], ["agent_list", "agent_message_list"],
-    ["agent_send", "agent_message_send"], ["agent_wait", "task_wait"],
-    ["agent_wait", "task_wait_batch"], ["agent_stop", "task_close"],
-    ["agent_resume", "task_followup"],
-  ] as const) {
-    expect(isToolVisible(tool(current), { allowedTools: ["*"], deniedTools: [previous] })).toBe(false);
+test("Agent controls require their own grants and explicit denials always win", () => {
+  for (const name of AGENT_CONTROL_TOOLS) {
+    expect(isToolVisible(tool(name), { allowedTools: [name], writeScope: [], executeScope: [] })).toBe(true);
+    expect(isToolVisible(tool(name), { allowedTools: [name], deniedTools: [name] })).toBe(false);
+    expect(isToolVisible(tool(name), { allowedTools: ["read"] })).toBe(false);
+    expect(isToolVisible(tool(name), { deniedTools: ["*"] })).toBe(false);
   }
 });
 
-test("persisted messaging grants survive migration without granting lifecycle controls", () => {
-  const policy = { allowedTools: ["agent_message_send", "agent_message_list"], writeScope: [] };
-  expect(isToolVisible(tool("agent_send"), policy)).toBe(true);
-  expect(isToolVisible(tool("agent_list"), policy)).toBe(true);
-  for (const name of ["agent_spawn", "agent_wait", "agent_stop", "agent_resume"]) {
-    expect(isToolVisible(tool(name), policy)).toBe(false);
+test("delegation off denies new work and retains observation and stopping", () => {
+  expect([...DELEGATION_OFF_DENIED_TOOL_NAMES].sort()).toEqual(["agent_resume", "agent_send", "agent_spawn"]);
+  for (const name of AGENT_CONTROL_TOOLS) {
+    expect(isToolVisible(tool(name), { deniedTools: DELEGATION_OFF_DENIED_TOOL_NAMES }))
+      .toBe(!["agent_spawn", "agent_send", "agent_resume"].includes(name));
   }
-  expect(isToolVisible(tool("agent_send"), { ...policy, deniedTools: ["agent_message_send"] })).toBe(false);
-  expect(isToolVisible(tool("agent_list"), { ...policy, deniedTools: ["agent_message_list"] })).toBe(false);
 });

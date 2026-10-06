@@ -28,7 +28,12 @@ export async function assertDelegatedConversation(page: Page, workspace: string,
       const session = sessions.find((candidate) => candidate.title === "Delegated conversation E2E");
       if (!session) return undefined;
       const snapshot = await api.invoke({ type: "session.snapshot", sessionId: String(session.id) });
-      return snapshot.tasks.find((task) => task.prompt === "read package" && task.status === "completed")?.path;
+      const agent = snapshot.agents.find((candidate) => candidate.name === "reader");
+      if (!agent) return undefined;
+      const completed = snapshot.events.some((event) => event.type === "message.part_added"
+        && event.sessionId === agent.agentId && event.payload.part.type === "text"
+        && event.payload.part.text === "I read the file and the tool loop works.");
+      return completed && agent.state === "idle" ? agent.path : undefined;
     });
     if (!agentPath) await delay(100);
   }

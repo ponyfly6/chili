@@ -6,6 +6,7 @@ import {
   parseRuntimeExecutionIdentity,
   parseRuntimeInputQueue,
   type RuntimeInputQueue,
+  type RuntimeAgentRecord,
   parseRuntimeDelegationConfig as parseProtocolDelegationConfig,
   parseRuntimeMcpReloadResponse as parseProtocolMcpReloadResponse,
   parseRuntimeMcpStatusResponse as parseProtocolMcpStatusResponse,
@@ -29,8 +30,6 @@ import {
   type SessionGoalStatus,
 } from "@chili/protocol";
 import type {
-  RuntimeAgentTreeSnapshot,
-  RuntimeAgentTaskRecord,
   RuntimePendingApprovalRequest,
   RuntimeSessionSummary,
 } from "@chili/sdk";
@@ -94,8 +93,7 @@ export interface RuntimeSnapshot {
   inputQueue?: RuntimeInputQueue;
   sessionId: string;
   events: ChiliEvent[];
-  agentTree: RuntimeAgentTreeSnapshot;
-  tasks: RuntimeAgentTaskRecord[];
+  agents: RuntimeAgentRecord[];
   /** Authoritative replacement set from the runtime approval store. */
   pendingApprovals: RuntimePendingApprovalRequest[];
   pendingInputs: UserInputRequest[];
@@ -223,6 +221,9 @@ type DesktopOperation =
   | { type: "mcp.reload"; sessionId?: string }
   | { type: "session.send"; sessionId: string; text: string; mode: SendMode; submissionId?: string }
   | { type: "session.stop"; sessionId: string }
+  | { type: "agent.send"; sessionId: string; agentId: string; text: string; mode?: SendMode }
+  | { type: "agent.stop"; sessionId: string; agentId: string }
+  | { type: "agent.resume"; sessionId: string; agentId: string }
   | {
       type: "approval.resolve";
       approvalId: string;
@@ -267,6 +268,9 @@ export interface DesktopResponseMap {
   "mcp.reload": RuntimeMcpReloadResponse;
   "session.send": { status: "accepted" | "queued"; position?: number };
   "session.stop": { interrupted: boolean };
+  "agent.send": { agentId: string; inputId: string };
+  "agent.stop": { agentId: string };
+  "agent.resume": { agentId: string; inputId?: string };
   "approval.resolve": { resolved: boolean };
   "user-input.resolve": { resolved: boolean };
   "events.resync.complete": { status: "completed" | "retry" };
@@ -430,6 +434,18 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
       mode,
       ...(record.submissionId !== undefined ? { submissionId: requireIdentifier(record.submissionId, "submissionId") } : {}),
     };
+  }
+  if (type === "agent.send") {
+    return {
+      type,
+      sessionId: requireIdentifier(record.sessionId, "sessionId"),
+      agentId: requireIdentifier(record.agentId, "agentId"),
+      text: requireString(record.text, "text", 200_000),
+      ...(record.mode !== undefined ? { mode: requireEnum(record.mode, ["queue", "steer"], "mode") as SendMode } : {}),
+    };
+  }
+  if (type === "agent.stop" || type === "agent.resume") {
+    return { type, sessionId: requireIdentifier(record.sessionId, "sessionId"), agentId: requireIdentifier(record.agentId, "agentId") };
   }
   if (type === "approval.resolve") {
     const decision = record.decision;
@@ -690,6 +706,13 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
     response = result;
   } else if (request.type === "session.stop") {
     response = { interrupted: requireBoolean(requireRecord(value, "stop response").interrupted, "interrupted") };
+  } else if (request.type === "agent.send" || request.type === "agent.stop" || request.type === "agent.resume") {
+    const record = requireRecord(value, "agent response");
+    assertOnlyKeys(record, request.type === "agent.stop" ? ["agentId"] : ["agentId", "inputId"]);
+    response = {
+      agentId: requireIdentifier(record.agentId, "agentId"),
+      ...(request.type === "agent.send" || record.inputId !== undefined ? { inputId: requireIdentifier(record.inputId, "inputId") } : {}),
+    };
   } else if (request.type === "approval.resolve" || request.type === "user-input.resolve") {
     response = { resolved: requireBoolean(requireRecord(value, "resolve response").resolved, "resolved") };
   } else if (request.type === "events.resync.complete") {
@@ -728,6 +751,10 @@ export function parseDesktopInvokeResponse<Request extends DesktopRequest>(
 }
 
 function assertDesktopResponseScope(request: DesktopRequest, response: unknown): void {
+  if (request.type === "agent.send" || request.type === "agent.stop" || request.type === "agent.resume") {
+    if ((response as { agentId: string }).agentId !== request.agentId) throw new TypeError("Agent response belongs to a different agentId");
+    return;
+  }
   if (request.type === "session.snapshot" || request.type === "session.resume") {
     requireMatchingSessionId(request.sessionId, (response as RuntimeSnapshot).sessionId, "snapshot.sessionId");
     return;
@@ -832,8 +859,9 @@ export function parseDesktopState(value: unknown): DesktopState {
 
 function parseRuntimeSnapshot(value: unknown): RuntimeSnapshot {
   const record = requireRecord(value, "runtime snapshot");
+  assertOnlyKeys(record, ["sessionId", "events", "agents", "pendingApprovals", "pendingInputs", "inputQueue", "omittedMessageParts", "truncated", "warning"]);
   if (!Array.isArray(record.events) || record.events.length > 20_000) throw new TypeError("Invalid snapshot events");
-  if (!Array.isArray(record.tasks) || record.tasks.length > 2_000) throw new TypeError("Invalid snapshot tasks");
+  if (!Array.isArray(record.agents) || record.agents.length > 2_000) throw new TypeError("Invalid snapshot agents");
   if (!Array.isArray(record.pendingApprovals) || record.pendingApprovals.length > 2_000) {
     throw new TypeError("Invalid pending approvals");
   }
@@ -841,25 +869,17 @@ function parseRuntimeSnapshot(value: unknown): RuntimeSnapshot {
     throw new TypeError("Pending approvals exceed the JSON byte budget");
   }
   if (!Array.isArray(record.pendingInputs) || record.pendingInputs.length > 2_000) throw new TypeError("Invalid pending inputs");
-  const agentTree = requireRecord(record.agentTree, "agentTree");
-  if (!Array.isArray(agentTree.nodes) || !Array.isArray(agentTree.agents)
-    || !Array.isArray(agentTree.tasks) || !Array.isArray(agentTree.mailbox)) {
-    throw new TypeError("Invalid agent tree");
-  }
-  assertJsonValue(agentTree, "agentTree", 0);
-  assertAgentTreeIdentifiers(agentTree);
-  for (const task of record.tasks) parseTaskRecord(task);
   const snapshot: RuntimeSnapshot = {
     sessionId: requireIdentifier(record.sessionId, "sessionId"),
     events: record.events.map((event) => parseRuntimeEvent(event)),
-    agentTree: agentTree as unknown as RuntimeAgentTreeSnapshot,
-    tasks: record.tasks as RuntimeAgentTaskRecord[],
+    agents: record.agents.map((agent) => parseAgentRecord(agent)),
     pendingApprovals: record.pendingApprovals.map((approval) => parsePendingApprovalRequest(approval)),
     pendingInputs: record.pendingInputs.map((input) => parseUserInputRequest(input)),
   };
   if (record.inputQueue !== undefined) {
     snapshot.inputQueue = parseRuntimeInputQueue(record.inputQueue);
     requireMatchingSessionId(snapshot.sessionId, snapshot.inputQueue.sessionId, "snapshot.inputQueue.sessionId");
+    assertInputQueueIdentifiers(snapshot.inputQueue);
   }
   if (record.truncated !== undefined) snapshot.truncated = requireBoolean(record.truncated, "snapshot.truncated");
   if (record.warning !== undefined) snapshot.warning = requireString(record.warning, "snapshot.warning", 2_000);
@@ -910,6 +930,15 @@ function parseRuntimeEvent(value: unknown): ChiliEvent {
   const payload = requireRecord(event.payload, "event.payload");
   if (event.sessionId !== undefined) requireIdentifier(event.sessionId, "event.sessionId");
   assertJsonValue(payload, "event.payload", 0);
+  if (type === "session.created" || type === "session.input_queue_changed") {
+    const parsed = parseChiliEvent(value);
+    assertRuntimePayloadIdentifiers(type, payload);
+    if (parsed.type === "session.created" && parsed.payload.agent) {
+      requireIdentifier(parsed.payload.agent.parentSessionId, "event.payload.agent.parentSessionId");
+    }
+    if (parsed.type === "session.input_queue_changed") assertInputQueueIdentifiers(parsed.payload);
+    return parsed;
+  }
   if (type === "model.request_prepared" || type === "model.request_identity" || type === "session.identity_bound") {
     return parseChiliEvent(value);
   }
@@ -1103,23 +1132,16 @@ function parseRuntimeMcpReload(value: unknown, field: string): RuntimeMcpReloadR
   return parseProtocolMcpReloadResponse(value, field);
 }
 
-function parseTaskRecord(value: unknown): RuntimeAgentTaskRecord {
-  const task = requireRecord(value, "task");
-  requireIdentifier(task.id, "task.id");
-  requireString(task.path, "task.path", 4_096);
-  requireString(task.status, "task.status", 80);
-  requireString(task.taskName, "task.taskName", 2_000);
-  requireNonNegativeInteger(task.generation, "task.generation");
-  requireFiniteNumber(task.createdAt, "task.createdAt");
-  requireFiniteNumber(task.updatedAt, "task.updatedAt");
-  assertJsonValue(task, "task", 0);
-  requireKnownIdentifiers(task, "task", [
-    "parentSessionId",
-    "childSessionId",
-    "currentRunId",
-    "leaseOwner",
-  ]);
-  return value as RuntimeAgentTaskRecord;
+function parseAgentRecord(value: unknown): RuntimeAgentRecord {
+  const agent = requireRecord(value, "agent");
+  assertOnlyKeys(agent, ["agentId", "name", "path", "parentAgentId", "state"]);
+  return {
+    agentId: requireIdentifier(agent.agentId, "agent.agentId"),
+    name: requireString(agent.name, "agent.name", 2_000),
+    path: requireString(agent.path, "agent.path", 4_096),
+    state: requireEnum(agent.state, ["idle", "running", "paused"], "agent.state") as RuntimeAgentRecord["state"],
+    ...(agent.parentAgentId !== undefined ? { parentAgentId: requireIdentifier(agent.parentAgentId, "agent.parentAgentId") } : {}),
+  };
 }
 
 function parseUserInputRequest(value: unknown): UserInputRequest {
@@ -1196,6 +1218,8 @@ function requestKeys(type: string): readonly string[] {
   if (type === "session.goal.update") return ["type", "sessionId", "status", "objective", "tokenBudget"];
   if (type === "mcp.status" || type === "mcp.reload") return ["type", "sessionId"];
   if (type === "session.send") return ["type", "sessionId", "text", "mode", "submissionId"];
+  if (type === "agent.send") return ["type", "sessionId", "agentId", "text", "mode"];
+  if (type === "agent.stop" || type === "agent.resume") return ["type", "sessionId", "agentId"];
   if (type === "approval.resolve") return ["type", "approvalId", "decision", "feedback"];
   if (type === "user-input.resolve") return ["type", "inputId", "answers"];
   if (type === "events.resync.complete") return ["type", "barrierId"];
@@ -2069,59 +2093,15 @@ function assertMessagePartIdentifiers(part: Record<string, unknown>, field: stri
   if (part.type === "tool_result") requireKnownIdentifiers(part, field, [], ["artifactIds"]);
 }
 
-function assertAgentTreeIdentifiers(agentTree: Record<string, unknown>): void {
-  for (const [index, node] of (agentTree.nodes as unknown[]).entries()) {
-    assertAgentTreeNodeIdentifiers(requireRecord(node, `agentTree.nodes[${index}]`), `agentTree.nodes[${index}]`);
-  }
-  for (const [index, run] of (agentTree.agents as unknown[]).entries()) {
-    assertAgentRunIdentifiers(requireRecord(run, `agentTree.agents[${index}]`), `agentTree.agents[${index}]`);
-  }
-  for (const [index, task] of (agentTree.tasks as unknown[]).entries()) {
-    requireKnownIdentifiers(requireRecord(task, `agentTree.tasks[${index}]`), `agentTree.tasks[${index}]`, [
-      "id", "parentSessionId", "childSessionId", "currentRunId", "leaseOwner",
+function assertInputQueueIdentifiers(queue: RuntimeInputQueue): void {
+  requireIdentifier(queue.sessionId, "inputQueue.sessionId");
+  if (queue.executionRef !== undefined) requireIdentifier(queue.executionRef, "inputQueue.executionRef");
+  for (const [index, input] of queue.items.entries()) {
+    requireKnownIdentifiers(input as unknown as Record<string, unknown>, `inputQueue.items[${index}]`, [
+      "inputId", "submissionId", "sessionId", "executionRef", "messageId", "turnId", "resultMessageId",
     ]);
+    requireMatchingSessionId(queue.sessionId, input.sessionId, `inputQueue.items[${index}].sessionId`);
   }
-  for (const [index, mailbox] of (agentTree.mailbox as unknown[]).entries()) {
-    requireKnownIdentifiers(
-      requireRecord(mailbox, `agentTree.mailbox[${index}]`),
-      `agentTree.mailbox[${index}]`,
-      ["id", "taskId", "recipientSessionId"],
-    );
-  }
-}
-
-function assertAgentTreeNodeIdentifiers(node: Record<string, unknown>, field: string): void {
-  requireKnownIdentifiers(node, field, [], ["runIds"]);
-  if (Array.isArray(node.runs)) {
-    for (const [index, run] of node.runs.entries()) {
-      assertAgentRunIdentifiers(requireRecord(run, `${field}.runs[${index}]`), `${field}.runs[${index}]`);
-    }
-  }
-  if (Array.isArray(node.tasks)) {
-    for (const [index, task] of node.tasks.entries()) {
-      requireKnownIdentifiers(requireRecord(task, `${field}.tasks[${index}]`), `${field}.tasks[${index}]`, [
-        "id", "parentSessionId", "childSessionId", "currentRunId", "leaseOwner",
-      ]);
-    }
-  }
-  if (Array.isArray(node.mailbox)) {
-    for (const [index, mailbox] of node.mailbox.entries()) {
-      requireKnownIdentifiers(
-        requireRecord(mailbox, `${field}.mailbox[${index}]`),
-        `${field}.mailbox[${index}]`,
-        ["id", "taskId", "recipientSessionId"],
-      );
-    }
-  }
-  if (Array.isArray(node.children)) {
-    for (const [index, child] of node.children.entries()) {
-      assertAgentTreeNodeIdentifiers(requireRecord(child, `${field}.children[${index}]`), `${field}.children[${index}]`);
-    }
-  }
-}
-
-function assertAgentRunIdentifiers(run: Record<string, unknown>, field: string): void {
-  requireKnownIdentifiers(run, field, ["id", "sessionId", "taskId", "parentSessionId", "childSessionId"]);
 }
 
 function requireKnownIdentifiers(

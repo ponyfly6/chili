@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, spyOn, test } from "bun:test";
-import { AgentMailboxDeliveryPump, type ModelStreamEvent } from "@chili/core";
+import { type ModelStreamEvent } from "@chili/core";
 import type { ChiliEvent, RuntimePermissionProfileId, SessionId, TimestampMs } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import type { ApprovalBrokerRequest, BashRunner } from "@chili/tools";
@@ -117,21 +117,18 @@ test("Host observes committed startup events and isolates an observer failure", 
   });
 });
 
-test("Host initialization failure stops its mailbox pump and closes SQLite", async () => {
+test("Host initialization failure drains runtimes and closes SQLite", async () => {
   await withWorkspace(async (options) => {
     const close = spyOn(SqliteEventStore.prototype, "close");
-    const stop = spyOn(AgentMailboxDeliveryPump.prototype, "stop");
     const error = new Error("MCP fixture failed during initialization");
     try {
       await expect(createChiliHost({
         ...options,
         mcpRuntimeFactory: async () => { throw error; },
       })).rejects.toBe(error);
-      expect(stop).toHaveBeenCalledTimes(1);
       expect(close).toHaveBeenCalledTimes(1);
     } finally {
       close.mockRestore();
-      stop.mockRestore();
     }
     const restarted = await createChiliHost(options);
     try {

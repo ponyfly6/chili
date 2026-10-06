@@ -97,10 +97,10 @@ export function createTuiCommandRegistry(runtimeCatalog?: RuntimeCommandCatalog)
     "goal.pause": { run: () => ({ type: "goal_action", action: "pause" }) },
     "goal.resume": { run: () => ({ type: "goal_action", action: "resume" }) },
     "goal.clear": { run: () => confirm("Clear the current goal?", { type: "goal_action", action: "clear" }) },
-    team: { run: () => ({ type: "open_view", view: "team" }) },
-    "team.agents": { run: () => ({ type: "open_view", view: "agents" }) },
-    "team.run": { available: idle, run: () => ({ type: "sdk_action", action: "team_run" }) },
-    "team.merge": { available: idle, run: () => confirm("Merge pending team work?", { type: "sdk_action", action: "team_merge" }) },
+    agents: { run: () => ({ type: "open_view", view: "agents" }) },
+    "agents.list": { run: () => ({ type: "open_view", view: "agents" }) },
+    "agents.stop": { run: (_context, input) => agentActionResult("stop", input.raw) },
+    "agents.resume": { run: (_context, input) => agentActionResult("resume", input.raw) },
     auth: { run: () => authResult("status") },
     "auth.status": { run: () => authResult("status") },
     "auth.login": { available: idle, run: () => authResult("login") },
@@ -379,4 +379,9 @@ function reasoningDescription(level: ReasoningLevel): string {
     case "max": return "Maximum reasoning for the hardest problems";
     case "ultra": return "Maximum reasoning with proactive agents";
   }
+}
+
+function agentActionResult(action: "stop" | "resume", raw: string): TuiCommandResult {
+  const agentId = raw.trim();
+  return agentId ? { type: "agent_action", action, agentId } : localError(`Agent ${action} requires an agent id.`);
 }

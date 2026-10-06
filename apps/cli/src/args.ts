@@ -1,5 +1,4 @@
 import type { CliModelName, CliReasoningLevel } from "./model.js";
-import type { AgentTaskStatus } from "@chili/protocol";
 
 export interface CliArgs {
   command:
@@ -8,26 +7,9 @@ export interface CliArgs {
     | "sessions"
     | "revert"
     | "agents"
-    | "teams"
-    | "team"
-    | "team-members"
-    | "team-tasks"
-    | "team-messages"
-    | "team-dispatch"
-    | "team-run"
-    | "team-run-loop"
-    | "team-merge"
-    | "team-sync"
-    | "team-reconcile"
-    | "tasks"
-    | "task"
-    | "task-followup"
-    | "task-wait"
-    | "task-close"
-    | "tasks-reconcile-stale"
+    | "agent-stop"
+    | "agent-resume"
     | "prompt-debug"
-    | "mailbox"
-    | "mailbox-consume"
     | "skills-list"
     | "skills-enable"
     | "skills-disable"
@@ -44,9 +26,7 @@ export interface CliArgs {
   port: number;
   resume?: string;
   snapshotId?: string;
-  taskId?: string;
-  teamId?: string;
-  messageId?: string;
+  agentId?: string;
   memoryScope?: "user" | "project" | "all";
   mcpAction?: "list" | "status" | "reload" | "add" | "remove" | "auth" | "logout";
   mcpServer?: string;
@@ -62,20 +42,12 @@ export interface CliArgs {
   mcpScopes?: string[];
   skillName?: string;
   skillScope?: "user" | "project";
-  taskStatus?: Extract<AgentTaskStatus, "completed" | "incomplete" | "failed" | "cancelled">;
-  timeoutMs?: number;
-  staleAfterMs?: number;
-  maxCycles?: number;
-  maxConcurrentDispatches?: number;
-  maxConcurrentVerifications?: number;
   provider?: string;
   model?: CliModelName;
   reasoningLevel?: CliReasoningLevel;
   yes: boolean;
   json: boolean;
   content: boolean;
-  once: boolean;
-  untilDrained?: boolean;
   maxTurns: number;
 }
 
@@ -89,7 +61,6 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     yes: false,
     json: false,
     content: false,
-    once: false,
     maxTurns: 128,
   };
   const prompt: string[] = [];
@@ -102,112 +73,13 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.command = "sessions";
       continue;
     }
-    if (arg === "tasks") {
-      result.command = "tasks";
-      continue;
-    }
-    if (arg === "recover-tasks") {
-      result.command = "tasks-reconcile-stale";
-      continue;
-    }
     if (arg === "agents" || arg === "tree") {
       result.command = "agents";
       continue;
     }
-    if (arg === "teams") {
-      result.command = "teams";
-      continue;
-    }
-    if (arg === "team") {
-      const next = requireValue(arg, args);
-      if (next === "status") {
-        result.command = "team";
-        result.teamId = requireValue(next, args);
-        continue;
-      }
-      if (next === "members") {
-        result.command = "team-members";
-        result.teamId = requireValue(next, args);
-        continue;
-      }
-      if (next === "tasks") {
-        result.command = "team-tasks";
-        result.teamId = requireValue(next, args);
-        continue;
-      }
-      if (next === "messages") {
-        result.command = "team-messages";
-        result.teamId = requireValue(next, args);
-        continue;
-      }
-      if (next === "run-loop") {
-        result.command = "team-run-loop";
-        result.teamId = requireValue(next, args);
-        continue;
-      }
-      result.command = "team";
-      result.teamId = next;
-      continue;
-    }
-    if (arg === "team-status") {
-      result.command = "team";
-      result.teamId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "team-members") {
-      result.command = "team-members";
-      result.teamId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "team-tasks") {
-      result.command = "team-tasks";
-      result.teamId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "team-messages") {
-      result.command = "team-messages";
-      result.teamId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "team-dispatch") {
-      result.command = "team-dispatch";
-      result.teamId = requireValue(arg, args);
-      result.taskId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "team-run") {
-      result.command = "team-run";
-      result.teamId = requireValue(arg, args);
-      result.taskId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "team-run-loop") {
-      result.command = "team-run-loop";
-      result.teamId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "team-merge") {
-      result.command = "team-merge";
-      result.teamId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "team-sync") {
-      result.command = "team-sync";
-      result.teamId = requireValue(arg, args);
-      result.taskId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "team-reconcile") {
-      result.command = "team-reconcile";
-      const teamId = args[0];
-      if (teamId && !teamId.startsWith("-")) {
-        result.teamId = teamId;
-        args.shift();
-      }
-      continue;
-    }
-    if (arg === "mailbox") {
-      result.command = "mailbox";
+    if (arg === "agent-stop" || arg === "agent-resume") {
+      result.command = arg;
+      result.agentId = requireValue(arg, args);
       continue;
     }
     if (arg === "skills") {
@@ -230,33 +102,6 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     }
     if (arg === "prompt-debug") {
       result.command = "prompt-debug";
-      continue;
-    }
-    if (arg === "consume") {
-      result.command = "mailbox-consume";
-      result.messageId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "task") {
-      result.command = "task";
-      result.taskId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "followup") {
-      result.command = "task-followup";
-      result.taskId = requireValue(arg, args);
-      prompt.push(...args.splice(0));
-      continue;
-    }
-    if (arg === "wait") {
-      result.command = "task-wait";
-      result.taskId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "close") {
-      result.command = "task-close";
-      result.taskId = requireValue(arg, args);
-      prompt.push(...args.splice(0));
       continue;
     }
     if (arg === "serve") {
@@ -326,61 +171,9 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       prompt.push(requireValue(arg, args));
       continue;
     }
-    if (arg === "--once") {
-      result.once = true;
-      continue;
-    }
-    if (arg === "--until-drained") {
-      result.once = false;
-      result.untilDrained = true;
-      continue;
-    }
     if (arg === "--max-turns") {
       result.maxTurns = Number.parseInt(requireValue(arg, args), 10);
       if (!Number.isInteger(result.maxTurns) || result.maxTurns <= 0) throw new Error("--max-turns must be a positive integer");
-      continue;
-    }
-    if (arg === "--max-cycles") {
-      result.maxCycles = Number.parseInt(requireValue(arg, args), 10);
-      if (!Number.isInteger(result.maxCycles) || result.maxCycles <= 0) throw new Error("--max-cycles must be a positive integer");
-      continue;
-    }
-    if (arg === "--max-concurrent-dispatches") {
-      result.maxConcurrentDispatches = Number.parseInt(requireValue(arg, args), 10);
-      if (!Number.isInteger(result.maxConcurrentDispatches) || result.maxConcurrentDispatches <= 0) {
-        throw new Error("--max-concurrent-dispatches must be a positive integer");
-      }
-      continue;
-    }
-    if (arg === "--max-concurrent-verifications") {
-      result.maxConcurrentVerifications = Number.parseInt(requireValue(arg, args), 10);
-      if (!Number.isInteger(result.maxConcurrentVerifications) || result.maxConcurrentVerifications <= 0 || result.maxConcurrentVerifications > 4) {
-        throw new Error("--max-concurrent-verifications must be an integer from 1 to 4");
-      }
-      continue;
-    }
-    if (arg === "--status") {
-      const status = requireValue(arg, args);
-      if (status !== "completed" && status !== "incomplete" && status !== "failed" && status !== "cancelled") {
-        throw new Error("--status must be completed, incomplete, failed, or cancelled");
-      }
-      result.taskStatus = status;
-      continue;
-    }
-    if (arg === "--task") {
-      result.taskId = requireValue(arg, args);
-      continue;
-    }
-    if (arg === "--timeout-ms") {
-      result.timeoutMs = Number.parseInt(requireValue(arg, args), 10);
-      if (!Number.isInteger(result.timeoutMs) || result.timeoutMs <= 0) throw new Error("--timeout-ms must be a positive integer");
-      continue;
-    }
-    if (arg === "--stale-after-ms") {
-      result.staleAfterMs = Number.parseInt(requireValue(arg, args), 10);
-      if (!Number.isInteger(result.staleAfterMs) || result.staleAfterMs < 0) {
-        throw new Error("--stale-after-ms must be a non-negative integer");
-      }
       continue;
     }
     if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
@@ -399,23 +192,9 @@ export function usage(): string {
     "  bun run chili -- \"fix the failing test\"",
     "  bun run chili -- --resume <session-id> \"continue\"",
     "  bun run chili -- sessions",
-    "  bun run chili -- tasks",
-    "  bun run chili -- recover-tasks --stale-after-ms 30000",
-    "  bun run chili -- agents",
-    "  bun run chili -- teams",
-    "  bun run chili -- team <team-id>",
-    "  bun run chili -- team status <team-id> --json",
-    "  bun run chili -- team tasks <team-id>",
-    "  bun run chili -- team-members <team-id>",
-    "  bun run chili -- team-tasks <team-id>",
-    "  bun run chili -- team-messages <team-id>",
-    "  bun run chili -- team-dispatch <team-id> <task-id>",
-    "  bun run chili -- team-run <team-id> <task-id>",
-    "  bun run chili -- team-run-loop <team-id> --until-drained --max-cycles 10 --timeout-ms 30000 --max-concurrent-dispatches 4 --max-concurrent-verifications 2",
-    "  bun run chili -- team-merge <team-id> [--task <task-id>] [--json]",
-    "  bun run chili -- team-sync <team-id> <task-id>",
-    "  bun run chili -- team-reconcile [team-id]",
-    "  bun run chili -- mailbox",
+    "  bun run chili -- agents --resume <session-id>",
+    "  bun run chili -- agent-stop <agent-id> --resume <session-id>",
+    "  bun run chili -- agent-resume <agent-id> --resume <session-id>",
     "  bun run chili -- skills [list|enable|disable] [--user|--project] [skill-name]",
     "  bun run chili -- memory show",
     "  bun run chili -- memory add [--user|--project] \"remember this\"",
@@ -429,11 +208,6 @@ export function usage(): string {
     "  bun run chili -- mcp auth <server-name>",
     "  bun run chili -- mcp logout <server-name>",
     "  bun run chili -- prompt-debug [--resume <session-id>] [--text <prompt>] [--content] [--json]",
-    "  bun run chili -- consume <mailbox-message-id>",
-    "  bun run chili -- task <task-id>",
-    "  bun run chili -- followup <task-id> \"continue this task\"",
-    "  bun run chili -- wait <task-id> --timeout-ms 30000",
-    "  bun run chili -- --status cancelled close <task-id> \"stopped\"",
     "  bun run chili -- serve --port 4777",
     "  bun run chili -- revert <snapshot-id> --resume <session-id>",
     "  bun run chili -- --model fake \"hello\"",
@@ -466,16 +240,7 @@ export function usage(): string {
     "  --project           Use project scope for memory or skills commands",
     "  --text <prompt>     Assemble prompt-debug as if this current-turn text were submitted",
     "  --content           Include prompt fragment content for prompt-debug",
-    "  --once              Run one team execution cycle",
-    "  --until-drained     Run team execution until drained, max cycles, or timeout",
     "  --max-turns <n>     Max automatic tool-use continuation turns before final answer, default 128",
-    "  --max-cycles <n>    Max team execution runner cycles",
-    "  --max-concurrent-dispatches <n>  Team dispatch cap, default 3; live children also obey the runtime-wide cap",
-    "  --max-concurrent-verifications <n>  Max parallel team verifier fan-out, 1-4",
-    "  --status <status>   Task close status: completed | incomplete | failed | cancelled",
-    "  --task <task-id>     Limit team merge to one task",
-    "  --timeout-ms <n>    Task wait timeout in milliseconds",
-    "  --stale-after-ms <n> Recover running background tasks older than this many milliseconds",
   ].join("\n");
 }
 

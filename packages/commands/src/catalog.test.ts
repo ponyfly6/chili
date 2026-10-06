@@ -28,14 +28,10 @@ const EXPECTED_PATHS = [
   "/goal pause",
   "/goal resume",
   "/goal clear",
-  "/team",
-  "/team agents",
-  "/team mailbox",
-  "/team tasks",
-  "/team task",
-  "/team recover",
-  "/team run",
-  "/team merge",
+  "/agents",
+  "/agents list",
+  "/agents stop",
+  "/agents resume",
   "/memory",
   "/memory show",
   "/memory add",
@@ -82,7 +78,7 @@ test("canonical catalog exposes only the breaking command vocabulary", () => {
     "/resume",
     "/compact",
     "/revert",
-    "/agents",
+    "/team",
     "/login",
     "/logout",
     "/reasoning",
@@ -134,12 +130,12 @@ test("catalog carries interaction and concurrency semantics", () => {
 test("unbound leaves and now-empty parents are omitted for a surface", () => {
   const commands = bindBuiltinCommands({
     help: { run: () => "help" },
-    "team.run": { run: () => "run" },
+    "agents.stop": { run: () => "stop" },
   });
 
   expect(collectCommandNodes(commands).map((command) => command.path)).toEqual([
     "/help",
-    "/team",
-    "/team run",
+    "/agents",
+    "/agents stop",
   ]);
 });

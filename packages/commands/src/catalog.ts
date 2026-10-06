@@ -32,14 +32,10 @@ export const BUILTIN_COMMAND_IDS = [
   "goal.pause",
   "goal.resume",
   "goal.clear",
-  "team",
-  "team.agents",
-  "team.mailbox",
-  "team.tasks",
-  "team.task",
-  "team.recover",
-  "team.run",
-  "team.merge",
+  "agents",
+  "agents.list",
+  "agents.stop",
+  "agents.resume",
   "memory",
   "memory.show",
   "memory.add",
@@ -107,7 +103,7 @@ export function bindBuiltinCommands<TContext, TResult>(
 
 const BUILTIN_COMMAND_SPECS: readonly BuiltinCommandSpec[] = [
   leaf("help", "help", "Help", "Browse commands and keyboard shortcuts", "general"),
-  leaf("status", "status", "Status", "Show session and team status", "general"),
+  leaf("status", "status", "Status", "Show session status", "general"),
   leaf("theme", "theme", "Theme", "Switch the terminal theme", "general"),
   leaf("permissions", "permissions", "Permissions", "Choose what Chili may do", "general"),
   parent("model", "model", "Model", "Configure the active model", "model", [
@@ -186,18 +182,18 @@ const BUILTIN_COMMAND_SPECS: readonly BuiltinCommandSpec[] = [
     leaf("goal.resume", "resume", "Resume goal", "Resume the persistent goal", "session"),
     leaf("goal.clear", "clear", "Clear goal", "Clear the persistent goal", "session"),
   ]),
-  parent("team", "team", "Team", "Inspect and control agent teamwork", "team", [
-    leaf("team.agents", "agents", "Agents", "Show the agent tree", "team"),
-    leaf("team.mailbox", "mailbox", "Mailbox", "Show queued agent messages", "team"),
-    leaf("team.tasks", "tasks", "Tasks", "List agent tasks", "team"),
-    leaf("team.task", "task", "Task", "Show one agent task", "team", {
+  parent("agents", "agents", "Agents", "Inspect and control agents", "agents", [
+    leaf("agents.list", "list", "List agents", "Show agents in this session", "agents"),
+    leaf("agents.stop", "stop", "Stop agent", "Pause an agent and interrupt its current input", "agents", {
       argumentMode: "required",
-      argumentHint: "<task-id>",
+      argumentHint: "<agent-id>",
       selectionMode: "complete",
     }),
-    leaf("team.recover", "recover", "Recover tasks", "Close stale background tasks", "team", { concurrency: "deny" }),
-    leaf("team.run", "run", "Run team", "Start the selected team loop", "team", { concurrency: "deny" }),
-    leaf("team.merge", "merge", "Merge team work", "Merge pending team work", "team", { concurrency: "deny" }),
+    leaf("agents.resume", "resume", "Resume agent", "Resume a paused agent", "agents", {
+      argumentMode: "required",
+      argumentHint: "<agent-id>",
+      selectionMode: "complete",
+    }),
   ]),
   parent("memory", "memory", "Memory", "Inspect and update Chili memory", "memory", [
     leaf("memory.show", "show", "Show memory", "Show loaded memory and instructions", "memory", {

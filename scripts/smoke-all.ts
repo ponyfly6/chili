@@ -7,13 +7,7 @@ const suites = [
   "smoke",
   "smoke:cli",
   "smoke:p0p1",
-  "smoke:p2",
-  "smoke:p2-control",
-  "smoke:p3",
-  "smoke:p3-background",
-  "smoke:p3-multi-agent-lifecycle",
-  "smoke:p3-team-model",
-  "smoke:p3-team-parallel",
+  "smoke:agents",
 ] as const;
 
 for (const suite of suites) {

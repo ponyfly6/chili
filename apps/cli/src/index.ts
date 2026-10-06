@@ -5,7 +5,6 @@ import { join, resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { addChiliMemoryEntry, loadChiliMemoryContext } from "@chili/core";
 import { resolveHostExecutionIdentity } from "@chili/host";
-import type { AgentTreeNode, TeamExecutionRunSummary, TeamMergeSweepResult, TeamSnapshot } from "@chili/core";
 import type {
   RuntimeMcpAddServerRequest,
   RuntimeMcpAuthRequest,
@@ -18,10 +17,7 @@ import type {
   RuntimeMcpStatusResponse,
   SessionId,
   SnapshotId,
-  TaskId,
-  TeamId,
 } from "@chili/protocol";
-import { ROOT_AGENT_PATH } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
 import { loadSkillSettings, loadSkills, updateSkillDisabledSetting, type Skill } from "@chili/skills";
 import { inspectSqliteEventStore } from "@chili/store";
@@ -35,7 +31,6 @@ import { runSessionCommand, runSessionPrompt } from "./runner.js";
 import { resolveSession } from "./session.js";
 import { revertSessionSnapshot } from "./session-recovery.js";
 import { formatStoreDoctorText } from "./store-doctor.js";
-import { bindNewTeamOwnerSession } from "./team-owner-session.js";
 
 async function main(): Promise<void> {
   if (process.argv[2] === "--chili-mcp-stdio-guardian") {
@@ -130,130 +125,21 @@ async function main(): Promise<void> {
       return;
     }
 
-    if (args.command === "tasks") {
-      await printTasks(harness);
-      return;
-    }
-
-    if (args.command === "tasks-reconcile-stale") {
-      const input: { staleAfterMs?: number } = {};
-      if (args.staleAfterMs !== undefined) input.staleAfterMs = args.staleAfterMs;
-      const result = await harness.tasks.reconcileStaleTasks(input);
-      console.log(`[tasks] scanned=${result.scanned} closed=${result.closed.length}`);
-      for (const task of result.closed) {
-        console.log(`[task] ${task.id}\t${task.status}\t${task.summary ?? ""}`);
-      }
-      return;
-    }
-
     if (args.command === "agents") {
-      await printAgentTree(harness);
+      if (!args.resume) throw new Error("agents requires --resume <session-id>");
+      await printAgents(harness, args.resume as SessionId, args.json);
       return;
     }
 
-    if (args.command === "teams") {
-      await printTeams(harness, args.json);
-      return;
-    }
-
-    if (args.command === "team") {
-      if (!args.teamId) throw new Error("team requires a team id");
-      await printTeam(harness, args.teamId as TeamId, args.json);
-      return;
-    }
-
-    if (args.command === "team-members") {
-      if (!args.teamId) throw new Error("team-members requires a team id");
-      await printTeamMembers(harness, args.teamId as TeamId, args.json);
-      return;
-    }
-
-    if (args.command === "team-tasks") {
-      if (!args.teamId) throw new Error("team-tasks requires a team id");
-      await printTeamTasks(harness, args.teamId as TeamId, args.json);
-      return;
-    }
-
-    if (args.command === "team-messages") {
-      if (!args.teamId) throw new Error("team-messages requires a team id");
-      await printTeamMessages(harness, args.teamId as TeamId, args.json);
-      return;
-    }
-
-    if (args.command === "team-dispatch") {
-      if (!args.teamId || !args.taskId) throw new Error("team-dispatch requires a team id and task id");
-      await dispatchTeamTask(
-        harness,
-        args.teamId as TeamId,
-        args.taskId as TaskId,
-        "background",
-        signalLifecycle.signal,
-      );
-      return;
-    }
-
-    if (args.command === "team-run") {
-      if (!args.teamId || !args.taskId) throw new Error("team-run requires a team id and task id");
-      await dispatchTeamTask(
-        harness,
-        args.teamId as TeamId,
-        args.taskId as TaskId,
-        "one_shot",
-        signalLifecycle.signal,
-      );
-      return;
-    }
-
-    if (args.command === "team-run-loop") {
-      if (!args.teamId) throw new Error("team-run-loop requires a team id");
-      const input: Parameters<typeof harness.teamRunner.run>[0] = {
-        teamId: args.teamId as TeamId,
-        once: args.once,
-        signal: signalLifecycle.signal,
-      };
-      if (args.maxCycles !== undefined) input.maxCycles = args.maxCycles;
-      if (args.timeoutMs !== undefined) input.timeoutMs = args.timeoutMs;
-      if (args.maxConcurrentDispatches !== undefined) input.maxConcurrentDispatches = args.maxConcurrentDispatches;
-      if (args.maxConcurrentVerifications !== undefined) input.maxConcurrentVerifications = args.maxConcurrentVerifications;
-      const result = await harness.teamRunner.run(input);
-      if (args.json) console.log(jsonStringify(result));
-      else printTeamRunLoopSummary(result);
-      return;
-    }
-
-    if (args.command === "team-merge") {
-      if (!args.teamId) throw new Error("team-merge requires a team id");
-      const input: Parameters<typeof harness.teamMerger.mergeTeamTasks>[0] = {
-        teamId: args.teamId as TeamId,
-        signal: signalLifecycle.signal,
-      };
-      if (args.taskId) input.taskId = args.taskId as TaskId;
-      const result = await harness.teamMerger.mergeTeamTasks(input);
-      if (args.json) console.log(jsonStringify(result));
-      else printTeamMergeSummary(result);
-      return;
-    }
-
-    if (args.command === "team-sync") {
-      if (!args.teamId || !args.taskId) throw new Error("team-sync requires a team id and task id");
-      const result = await harness.teamDispatcher.syncTask({
-        teamId: args.teamId as TeamId,
-        taskId: args.taskId as TaskId,
-      });
+    if (args.command === "agent-stop" || args.command === "agent-resume") {
+      if (!args.resume) throw new Error(`${args.command} requires --resume <session-id>`);
+      if (!args.agentId) throw new Error(`${args.command} requires an agent id`);
+      const agents = harness.agents.forSession(args.resume as SessionId);
+      const input = { agentId: args.agentId as SessionId };
+      const result = args.command === "agent-stop"
+        ? await agents.stopAgent(input)
+        : await agents.resumeAgent(input);
       console.log(jsonStringify(result));
-      return;
-    }
-
-    if (args.command === "team-reconcile") {
-      const input: Parameters<typeof harness.teamDispatcher.reconcileTasks>[0] = {};
-      if (args.teamId) input.teamId = args.teamId as TeamId;
-      const result = await harness.teamDispatcher.reconcileTasks(input);
-      console.log(jsonStringify(result));
-      return;
-    }
-
-    if (args.command === "mailbox") {
-      await printMailbox(harness);
       return;
     }
 
@@ -275,56 +161,6 @@ async function main(): Promise<void> {
 
     if (args.command === "prompt-debug") {
       await printPromptDebug(harness, args);
-      return;
-    }
-
-    if (args.command === "mailbox-consume") {
-      if (!args.messageId) throw new Error("consume requires a mailbox message id");
-      const message = await harness.agents.consumeMailbox({ messageId: args.messageId });
-      console.log(`[mailbox] ${message.id}\t${message.status}`);
-      return;
-    }
-
-    if (args.command === "task") {
-      if (!args.taskId) throw new Error("task requires a task id");
-      await printTask(harness, args.taskId as TaskId);
-      return;
-    }
-
-    if (args.command === "task-followup") {
-      if (!args.taskId) throw new Error("followup requires a task id");
-      if (!args.prompt) throw new Error("followup requires prompt text");
-      const result = await harness.tasks.followupTask({
-        taskId: args.taskId as TaskId,
-        text: args.prompt,
-        maxTurns: args.maxTurns,
-        signal: signalLifecycle.signal,
-      });
-      console.log(`[task] ${result.task.id}\t${result.task.status}\t${result.task.summary ?? ""}`);
-      return;
-    }
-
-    if (args.command === "task-wait") {
-      if (!args.taskId) throw new Error("wait requires a task id");
-      const input: { taskId: TaskId; timeoutMs?: number; signal: AbortSignal } = {
-        taskId: args.taskId as TaskId,
-        signal: signalLifecycle.signal,
-      };
-      if (args.timeoutMs !== undefined) input.timeoutMs = args.timeoutMs;
-      const task = await harness.tasks.waitForTask(input);
-      console.log(`[task] ${task.id}\t${task.status}\t${task.summary ?? ""}`);
-      return;
-    }
-
-    if (args.command === "task-close") {
-      if (!args.taskId) throw new Error("close requires a task id");
-      const input: { taskId: TaskId; status?: "completed" | "incomplete" | "failed" | "cancelled"; summary?: string } = {
-        taskId: args.taskId as TaskId,
-      };
-      if (args.taskStatus) input.status = args.taskStatus;
-      if (args.prompt) input.summary = args.prompt;
-      const task = await harness.tasks.closeTask(input);
-      console.log(`[task] ${task.id}\t${task.status}\t${task.summary ?? ""}`);
       return;
     }
 
@@ -359,10 +195,8 @@ async function main(): Promise<void> {
         maxTurns: args.maxTurns,
         signal: signalLifecycle.signal,
       });
-      // A one-shot CLI process owns any background agents it started. Let
-      // successful work reach its durable terminal state before the finally
-      // block invokes the cancellation-oriented host shutdown path.
-      if (!signalLifecycle.signal.aborted) await harness.waitForBackgroundTasks();
+      // Let active agent inputs settle before closing this process.
+      if (!signalLifecycle.signal.aborted) await harness.waitForAgents();
       return;
     }
 
@@ -442,12 +276,7 @@ async function serve(input: {
   const server = startRuntimeHttpServer({
     service: input.harness.service,
     store: input.harness.events,
-    tasks: input.harness.tasks,
     agents: input.harness.agents,
-    teams: input.harness.teams,
-    teamDispatcher: input.harness.teamDispatcher,
-    teamMerger: input.harness.teamMerger,
-    teamRunner: input.harness.teamRunner,
     approvals: input.approvalQueue,
     permissions: input.harness.permissions,
     commands: input.harness.commands,
@@ -962,6 +791,22 @@ async function printSessions(store: Awaited<ReturnType<typeof createCliHarness>>
   }
 }
 
+async function printAgents(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  sessionId: SessionId,
+  asJson = false,
+): Promise<void> {
+  const agents = await harness.agents.forSession(sessionId).listAgents({});
+  if (asJson) {
+    console.log(jsonStringify(agents));
+    return;
+  }
+  if (agents.length === 0) console.log("No agents yet.");
+  for (const agent of agents) {
+    console.log([agent.agentId, agent.state, agent.path, agent.name].join("\t"));
+  }
+}
+
 async function handleStoreDoctorCommand(args: ReturnType<typeof parseArgs>): Promise<void> {
   const dbPath = join(resolvePath(args.cwd), ".chili", "chili.sqlite");
   if (!(await fileExists(dbPath))) {
@@ -972,360 +817,6 @@ async function handleStoreDoctorCommand(args: ReturnType<typeof parseArgs>): Pro
 
   const report = await inspectSqliteEventStore(dbPath);
   console.log(args.json ? jsonStringify(report) : formatStoreDoctorText(report));
-}
-
-async function printTasks(
-  harness: Awaited<ReturnType<typeof createCliHarness>>,
-  sessionId?: SessionId,
-): Promise<void> {
-  const tasks = await harness.tasks.listTasks(sessionId ? { parentSessionId: sessionId } : {});
-  if (tasks.length === 0) {
-    console.log("No tasks yet.");
-    return;
-  }
-  for (const task of tasks) {
-    console.log(
-      [
-        task.id,
-        task.status,
-        task.childSessionId ?? "",
-        task.updatedAt ? new Date(task.updatedAt).toISOString() : "",
-        task.taskName,
-        task.summary ?? "",
-      ].join("\t"),
-    );
-  }
-}
-
-async function printTask(
-  harness: Awaited<ReturnType<typeof createCliHarness>>,
-  taskId: TaskId,
-  sessionId?: SessionId,
-): Promise<void> {
-  const task = await harness.tasks.getTask(taskId);
-  if (sessionId && task.parentSessionId !== sessionId) {
-    throw new Error(`Task ${taskId} does not belong to session ${sessionId}`);
-  }
-  console.log(JSON.stringify(task, null, 2));
-}
-
-async function printAgentTree(
-  harness: Awaited<ReturnType<typeof createCliHarness>>,
-  sessionId?: SessionId,
-): Promise<void> {
-  const snapshot = await harness.agents.snapshot(
-    sessionId ? { rootPath: ROOT_AGENT_PATH, sessionId } : { rootPath: ROOT_AGENT_PATH },
-  );
-  if (snapshot.nodes.length === 0) {
-    console.log("No agents yet.");
-    return;
-  }
-  for (const node of snapshot.nodes) {
-    printAgentTreeNode(node, 0);
-  }
-}
-
-async function printTeams(harness: Awaited<ReturnType<typeof createCliHarness>>, asJson: boolean): Promise<void> {
-  const teams = await harness.teams.listTeams();
-  if (teams.length === 0) {
-    console.log(asJson ? "[]" : "No teams yet.");
-    return;
-  }
-  const snapshots = await Promise.all(teams.map((team) => harness.teams.snapshot(team.id)));
-  if (asJson) {
-    console.log(jsonStringify(snapshots));
-    return;
-  }
-  for (const team of teams) {
-    const snapshot = snapshots.find((item) => item.team.id === team.id);
-    console.log(
-      [
-        team.id,
-        team.status,
-        team.leadPath,
-        snapshot ? `members=${snapshot.stats.memberCount}` : "members=?",
-        snapshot ? `tasks=${snapshot.stats.taskCount}` : "tasks=?",
-        snapshot ? `ready=${snapshot.stats.readyTaskIds.length}` : "ready=?",
-        snapshot ? `blocked=${snapshot.stats.blockedTaskIds.length}` : "blocked=?",
-        team.updatedAt ? new Date(team.updatedAt).toISOString() : "",
-        team.name,
-        team.description ?? "",
-      ].join("\t"),
-    );
-  }
-}
-
-async function printTeam(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId, asJson: boolean): Promise<void> {
-  const snapshot = await harness.teams.snapshot(teamId);
-  if (asJson) {
-    console.log(jsonStringify(snapshot));
-    return;
-  }
-
-  const stats = snapshot.stats;
-  console.log(
-    `[team] ${snapshot.team.name} ${snapshot.team.id} ${snapshot.team.status} lead=${snapshot.team.leadPath} updated=${formatTime(
-      snapshot.team.updatedAt,
-    )}`,
-  );
-  console.log(
-    `[stats] members=${stats.memberCount} tasks=${stats.taskCount} ready=${stats.readyTaskIds.length} blocked=${stats.blockedTaskIds.length} messages=${stats.messageCount} deliveries=${stats.deliveryCount}`,
-  );
-  printTeamMembersFromSnapshot(snapshot);
-  printTeamTasksFromSnapshot(snapshot);
-  printTeamMessagesFromSnapshot(snapshot, 8);
-}
-
-async function printTeamMembers(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId, asJson: boolean): Promise<void> {
-  const snapshot = await harness.teams.snapshot(teamId);
-  if (asJson) {
-    console.log(jsonStringify(snapshot.members));
-    return;
-  }
-  printTeamMembersFromSnapshot(snapshot);
-}
-
-async function printTeamTasks(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId, asJson: boolean): Promise<void> {
-  const snapshot = await harness.teams.snapshot(teamId);
-  if (asJson) {
-    console.log(jsonStringify(snapshot.tasks));
-    return;
-  }
-  printTeamTasksFromSnapshot(snapshot);
-}
-
-async function printTeamMessages(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId, asJson: boolean): Promise<void> {
-  const snapshot = await harness.teams.snapshot(teamId);
-  if (asJson) {
-    console.log(jsonStringify(snapshot.messages));
-    return;
-  }
-  printTeamMessagesFromSnapshot(snapshot);
-}
-
-function printTeamMembersFromSnapshot(snapshot: TeamSnapshot): void {
-  if (snapshot.members.length === 0) {
-    console.log("[members] none");
-    return;
-  }
-  console.log("[members]");
-  for (const member of snapshot.members) {
-    console.log(
-      [
-        `  ${member.path}`,
-        member.status,
-        `task=${member.currentTaskId ?? "-"}`,
-        `queued=${member.deliveryIds.length}`,
-        member.childSessionId ? `session=${member.childSessionId}` : "session=-",
-        member.name,
-        member.role,
-      ].join("\t"),
-    );
-  }
-}
-
-function printTeamTasksFromSnapshot(snapshot: TeamSnapshot): void {
-  if (snapshot.tasks.length === 0) {
-    console.log("[tasks] none");
-    return;
-  }
-  console.log("[tasks]");
-  for (const task of snapshot.tasks) {
-    console.log(
-      [
-        `  ${task.id}`,
-        taskStatusLabel(task),
-        `owner=${task.ownerPath ?? "-"}`,
-        `depends=${formatList(task.dependsOn)}`,
-        `blocks=${formatList(task.blocks)}`,
-        `messages=${task.messageIds.length}`,
-        task.dispatch ? "dispatched" : "not_dispatched",
-        task.title,
-        task.summary ?? "",
-      ].join("\t"),
-    );
-  }
-}
-
-function printTeamMessagesFromSnapshot(snapshot: TeamSnapshot, limit?: number): void {
-  const messages = limit === undefined ? snapshot.messages : snapshot.messages.slice(-limit);
-  if (messages.length === 0) {
-    console.log("[messages] none");
-    return;
-  }
-  console.log(limit === undefined || snapshot.messages.length <= limit ? "[messages]" : `[messages] latest ${messages.length}/${snapshot.messages.length}`);
-  for (const message of messages) {
-    console.log(
-      [
-        `  ${message.id}`,
-        message.kind,
-        `delivery=${message.deliveryStatus ?? "none"}`,
-        `deliveries=${message.deliveries.length}`,
-        `from=${message.fromPath}`,
-        `to=${message.toPath}`,
-        message.taskId ? `task=${message.taskId}` : "task=-",
-        formatTime(message.createdAt),
-        message.summary ?? preview(message.content),
-      ].join("\t"),
-    );
-  }
-}
-
-async function dispatchTeamTask(
-  harness: Awaited<ReturnType<typeof createCliHarness>>,
-  teamId: TeamId,
-  taskId: TaskId,
-  mode: "background" | "one_shot",
-  signal: AbortSignal,
-): Promise<void> {
-  const team = (await harness.teams.listTeams()).find((item) => item.id === teamId);
-  if (!team) throw new Error(`Team not found: ${teamId}`);
-  const task = (await harness.teams.tasks(teamId)).find((item) => item.id === taskId);
-  if (!task) throw new Error(`Team task not found: ${taskId}`);
-
-  let sessionId = team.sessionId;
-  if (!sessionId) {
-    const session = await harness.service.createSession({ cwd: harness.cwd });
-    sessionId = await bindNewTeamOwnerSession({
-      teams: harness.teams,
-      teamId,
-      candidateSessionId: session.sessionId,
-      discardCandidate: () => harness.service.archiveSession(session.sessionId),
-    });
-  }
-
-  const result = await harness.teamDispatcher.dispatchTask({
-    teamId,
-    taskId,
-    mode,
-    sessionId,
-    signal,
-  });
-  console.log(jsonStringify(result));
-}
-
-function printTeamRunLoopSummary(summary: TeamExecutionRunSummary): void {
-  console.log(
-    [
-      `[team-run-loop] ${summary.teamId}`,
-      `stop=${summary.stopReason}`,
-      `bottleneck=${teamRunLoopBottleneck(summary)}`,
-      `cycles=${summary.cycles}`,
-      `fanout=${summary.maxConcurrentDispatches}`,
-      `verify=${summary.maxConcurrentVerifications}`,
-      `dispatched=${summary.dispatched.length}`,
-      `completed=${summary.completed.length}`,
-      `accepted=${summary.accepted.length}`,
-      `reopened=${summary.reopened.length}`,
-      `merged=${summary.merged.length}`,
-      `mergeFailed=${summary.mergeFailed.length}`,
-      `mergeConflicted=${summary.mergeConflicted.length}`,
-      `mergeSkipped=${summary.mergeSkipped.length}`,
-      `failed=${summary.failed.length}`,
-      `blocked=${summary.blocked.length}`,
-      `skipped=${summary.skipped.length}`,
-      `running=${summary.stillRunning.length}`,
-      `errors=${summary.errors.length}`,
-    ].join("\t"),
-  );
-  for (const item of summary.dispatched) {
-    console.log(["[dispatch]", item.taskId, item.status, item.ownerPath ?? "-", item.agentTaskId ?? "-"].join("\t"));
-  }
-  for (const item of summary.completed) {
-    console.log(["[complete]", item.taskId, item.status, item.ownerPath ?? "-", item.summary ?? ""].join("\t"));
-  }
-  for (const item of summary.accepted) {
-    console.log(["[accepted]", item.taskId, item.status, item.ownerPath ?? "-", item.summary ?? ""].join("\t"));
-  }
-  for (const item of summary.reopened) {
-    console.log(["[reopened]", item.taskId, item.status, item.ownerPath ?? "-", item.feedback ?? ""].join("\t"));
-  }
-  for (const item of summary.merged) {
-    console.log(["[merged]", item.taskId, item.status, item.ownerPath ?? "-", mergeFilesChanged(item.diffSummary)].join("\t"));
-  }
-  for (const item of summary.mergeConflicted) {
-    console.log(["[merge-conflicted]", item.taskId, item.status, item.ownerPath ?? "-", item.error ?? item.conflicts?.join("; ") ?? ""].join("\t"));
-  }
-  for (const item of summary.mergeFailed) {
-    console.log(["[merge-failed]", item.taskId, item.status, item.ownerPath ?? "-", item.error ?? ""].join("\t"));
-  }
-  for (const item of summary.mergeSkipped) {
-    console.log(["[merge-skipped]", item.taskId, item.reason, item.ownerPath ?? "-", item.error ?? ""].join("\t"));
-  }
-  for (const item of summary.failed) {
-    console.log(["[failed]", item.taskId, item.status, item.ownerPath ?? "-", item.error ?? item.summary ?? ""].join("\t"));
-  }
-  for (const item of summary.blocked) {
-    console.log(["[blocked]", item.taskId, item.reason, item.ownerPath ?? "-", item.blockedBy ? `blocked_by=${item.blockedBy.join(",")}` : ""].join("\t"));
-  }
-  for (const item of summary.skipped) {
-    console.log(["[skipped]", item.taskId, item.reason, item.ownerPath ?? "-"].join("\t"));
-  }
-  for (const item of summary.stillRunning) {
-    console.log(["[running]", item.taskId, item.ownerPath ?? "-", item.agentTaskId ?? "-", item.title].join("\t"));
-  }
-  for (const item of summary.errors) {
-    console.log(["[error]", item.taskId ?? "-", item.error].join("\t"));
-  }
-}
-
-function teamRunLoopBottleneck(summary: TeamExecutionRunSummary): string {
-  if (summary.errors.length > 0) return "errors";
-  if (summary.mergeConflicted.length > 0) return "merge-conflict";
-  if (summary.mergeFailed.length > 0) return "merge-failed";
-  if (summary.reopened.length > 0) return "verify-failed";
-  if (summary.blocked.some((item) => item.reason !== "dependency_incomplete")) return "blocked";
-  if (summary.stillRunning.length >= summary.maxConcurrentDispatches && summary.maxConcurrentDispatches > 0) return "fanout-full";
-  if (summary.stillRunning.length > 0) return "workers-running";
-  if (summary.blocked.length > 0) return "waiting-dependencies";
-  if (summary.completed.length > 0 && summary.accepted.length === 0 && summary.merged.length === 0) return "verify-pending";
-  if (summary.stopReason === "timeout") return "timeout";
-  if (summary.stopReason === "max_cycles") return "max-cycles";
-  if (summary.stopReason === "drained") return "drained";
-  if (summary.stopReason === "once") return "one-cycle";
-  return summary.stopReason;
-}
-
-function printTeamMergeSummary(result: TeamMergeSweepResult): void {
-  console.log(
-    [
-      "[team-merge]",
-      `scanned=${result.scanned}`,
-      `applied=${result.applied.length}`,
-      `failed=${result.failed.length}`,
-      `conflicted=${result.conflicted.length}`,
-      `skipped=${result.skipped.length}`,
-      `errors=${result.errors.length}`,
-    ].join("\t"),
-  );
-  for (const item of result.applied) console.log(["[merged]", item.teamTask.id, mergeFilesChanged(item.diffSummary)].join("\t"));
-  for (const item of result.conflicted) console.log(["[conflicted]", item.teamTask.id, item.error ?? item.conflicts?.join("; ") ?? ""].join("\t"));
-  for (const item of result.failed) console.log(["[merge-failed]", item.teamTask.id, item.error ?? ""].join("\t"));
-  for (const item of result.skipped) console.log(["[merge-skipped]", item.teamTask.id, item.reason, item.error ?? ""].join("\t"));
-  for (const item of result.errors) console.log(["[error]", item.taskId, item.error].join("\t"));
-}
-
-function mergeFilesChanged(summary: unknown): string {
-  if (!summary || typeof summary !== "object" || !("filesChanged" in summary)) return "files=0";
-  const filesChanged = (summary as { filesChanged?: unknown }).filesChanged;
-  return `files=${typeof filesChanged === "number" ? filesChanged : 0}`;
-}
-
-async function printMailbox(
-  harness: Awaited<ReturnType<typeof createCliHarness>>,
-  sessionId?: SessionId,
-): Promise<void> {
-  const messages = sessionId
-    ? (await harness.agents.snapshot({ rootPath: ROOT_AGENT_PATH, sessionId })).mailbox.filter((message) => message.status === "queued")
-    : await harness.agents.mailbox({ status: "queued" });
-  if (messages.length === 0) {
-    console.log("No mailbox messages.");
-    return;
-  }
-  for (const message of messages) {
-    const content = message.message && "content" in message.message ? message.message.content : "";
-    console.log([message.id, message.status, message.fromPath, message.path, content].join("\t"));
-  }
 }
 
 type MemoryScopeArg = "user" | "project" | "all" | undefined;
@@ -1548,16 +1039,14 @@ async function repl(input: {
         : await input.harness.service.getDelegationConfig(sessionId);
       console.log(`[delegation] ${config.policy} (${config.source})`);
     },
-    showAgents: async (sessionId) => printAgentTree(input.harness, sessionId),
-    showMailbox: async (sessionId) => printMailbox(input.harness, sessionId),
-    listTasks: async (sessionId) => printTasks(input.harness, sessionId),
-    showTask: async (sessionId, taskId) => printTask(input.harness, taskId as TaskId, sessionId),
-    recoverTasks: async (sessionId) => {
-      const result = await input.harness.tasks.reconcileStaleTasks({ parentSessionId: sessionId });
-      console.log(`[tasks] scanned=${result.scanned} closed=${result.closed.length}`);
-      for (const task of result.closed) {
-        console.log(`[task] ${task.id}\t${task.status}\t${task.summary ?? ""}`);
-      }
+    showAgents: async (sessionId) => printAgents(input.harness, sessionId),
+    stopAgent: async (sessionId, agentId) => {
+      await input.harness.agents.forSession(sessionId).stopAgent({ agentId: agentId as SessionId });
+      console.log(`[agent] stopped ${agentId}`);
+    },
+    resumeAgent: async (sessionId, agentId) => {
+      const result = await input.harness.agents.forSession(sessionId).resumeAgent({ agentId: agentId as SessionId });
+      console.log(jsonStringify(result));
     },
     showMemory: async (cwd, scope) => handleMemoryReplCommand(input.harness, `show ${scope}`.trim(), cwd),
     addMemory: async (cwd, value) => input.harness.service.withSessionOperation(input.sessionId,
@@ -1663,35 +1152,6 @@ function parseReplMemoryAdd(input: string): { scope: MemoryScopeArg; text: strin
     return { scope: "project", text: input.slice("--project ".length).trim() };
   }
   return { scope: "project", text: input.trim() };
-}
-
-function printAgentTreeNode(node: AgentTreeNode, depth: number): void {
-  const indent = "  ".repeat(depth);
-  const runs = node.runIds.length > 0 ? ` runs=${node.runIds.length}` : "";
-  const mailbox = node.mailbox.length > 0 ? ` mailbox=${node.mailbox.length}` : "";
-  console.log(`${indent}${node.path}\t${node.status}\t${node.taskName || "(agent)"}${runs}${mailbox}`);
-  for (const child of node.children) {
-    printAgentTreeNode(child, depth + 1);
-  }
-}
-
-function taskStatusLabel(task: TeamSnapshot["tasks"][number]): string {
-  if (task.blockedBy.length > 0) return `${task.status}:blocked_by=${task.blockedBy.join(",")}`;
-  if (task.ready) return `${task.status}:ready`;
-  return task.status;
-}
-
-function formatList(values: readonly string[]): string {
-  return values.length === 0 ? "-" : values.join(",");
-}
-
-function formatTime(value: number | undefined): string {
-  return value === undefined ? "-" : new Date(value).toISOString();
-}
-
-function preview(value: string, max = 96): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}...`;
 }
 
 function installReplInterruptHandler(shutdownSignal: AbortSignal): { signal: AbortSignal; dispose(): void } {
