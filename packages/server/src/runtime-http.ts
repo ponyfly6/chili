@@ -2,7 +2,6 @@ import {
   DELEGATION_POLICIES,
   compactRuntimeEvent,
   compactRuntimeMessage,
-  isTransientEvent,
   normalizePersistedError,
   normalizeSessionTitle,
   parseRuntimeArray,
@@ -24,7 +23,9 @@ import { basename, dirname, resolve } from "node:path";
 import { RuntimeSessionNotFoundError } from "@chili/core";
 import type { ChiliEvent, EventEnvelope, ApprovalDecisionAction, DelegationPolicy, RuntimeInterruptResult, RuntimeDelegationConfig, RuntimeModelConfig, RuntimeModelDescriptor, RuntimeMcpAddServerRequest, RuntimeMcpControlService, RuntimeMcpScopeInput, RuntimeMcpAuthRequest, RuntimeMcpListResponse, RuntimeMcpServerDescriptor, RuntimeMcpStatusResponse, RuntimeMcpTransport, MessageImageContent, RuntimePermissionConfig, RuntimePermissionProfileId, RuntimeApprovalResolveResult, RuntimePromptAccepted, RuntimePromptResult, RuntimeSessionRef, RuntimeTurnResult, RuntimeSkillMention, ModelSelection, ReasoningLevel, ServiceTier, SessionId, SessionGoal, SessionGoalStatus, PendingUserInputRequest, UserInputAnswers, UserInputId } from "@chili/protocol";
 import type { AgentControlService, RuntimeBackgroundErrorHandler, SubmitPromptInput, SubmitPromptResult } from "@chili/core";
-import { SessionInputConflictError, UnknownEventCursorError } from "@chili/store";
+import { SessionInputConflictError } from "@chili/store";
+import { eventStream, type EventStreamOptions } from "./event-stream.js";
+import { startNodeHttpTransport } from "./node-http-transport.js";
 import type { EventPublisher, EventStore } from "@chili/store";
 import {
   jsonEventArrayUtf8Bytes,
@@ -96,6 +97,11 @@ export interface RuntimeHttpHandlerOptions {
   maxBacklogEvents?: number;
   maxEventStreamDurableEvents?: number;
   maxEventStreamAgeMs?: number;
+  maxEventStreamBufferedBytes?: number;
+  maxEventStreamTransientBytes?: number;
+  maxEventStreamPageBytes?: number;
+  eventStreamPollIntervalMs?: number;
+  eventStreamStallTimeoutMs?: number;
   maxSessionEventWindowBytes?: number;
   maxSessionEventScanPages?: number;
   maxSessionEventScanEvents?: number;
@@ -142,12 +148,7 @@ export interface RuntimeHttpServer {
 export const RUNTIME_HTTP_MINIMUM_REMOTE_AUTH_TOKEN_BYTES = 32;
 
 export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (request: Request) => Promise<Response> {
-  const maxBacklogEvents = options.maxBacklogEvents ?? 5000;
-  const maxEventStreamDurableEvents = positiveIntegerOrDefault(
-    options.maxEventStreamDurableEvents,
-    4096,
-  );
-  const maxEventStreamAgeMs = positiveIntegerOrDefault(options.maxEventStreamAgeMs, 5 * 60_000);
+  const maxBacklogEvents = positiveIntegerOrDefault(options.maxBacklogEvents, 5000);
   const sessionEventWindowLimits: SessionEventWindowLimits = {
     maxBytes: positiveIntegerOrDefault(options.maxSessionEventWindowBytes, 4_000_000),
     maxScanPages: positiveIntegerOrDefault(options.maxSessionEventScanPages, 512),
@@ -159,6 +160,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
     positiveIntegerOrDefault(options.maxSessionEventWindowConcurrency, 4),
   );
   const inFlightSessionEventWindows = new Map<string, Promise<RuntimeSessionEventWindow>>();
+  const eventSnapshotAdmission = new AsyncAdmissionGate(2);
   const authTokenDigest = configuredAuthTokenDigest(options.authToken);
 
   return async function runtimeHttpHandler(request: Request): Promise<Response> {
@@ -337,6 +339,35 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         if (body.sessionId !== undefined) input.sessionId = requestSessionId(body.sessionId);
         if (body.cwd !== undefined) input.cwd = await requestWorkspaceCwd(body.cwd);
         return json(await options.service.createSession(input), 201);
+      }
+
+      if (route.name === "eventSnapshot") {
+        rejectUnknownQueryParameters(url, ["sessionId"]);
+        if (request.signal.aborted) return new Response(null, { status: 499 });
+        const sessionId = asSessionId(url.searchParams.get("sessionId"));
+        if (sessionId) {
+          await options.service.assertSessionReadAllowed(sessionId);
+          await requireSession(options.store, sessionId);
+        }
+        if (!options.store.runtimeSnapshot) {
+          return jsonError(503, "This event store does not support atomic state recovery.");
+        }
+        try {
+          const snapshot = await eventSnapshotAdmission.run(async () => {
+            if (request.signal.aborted) throw request.signal.reason;
+            return options.store.runtimeSnapshot!({ ...(sessionId ? { sessionId } : {}) });
+          });
+          if (request.signal.aborted) return new Response(null, { status: 499 });
+          return json(snapshot, 200, { "cache-control": "no-store" });
+        } catch (error) {
+          if (request.signal.aborted) return new Response(null, { status: 499 });
+          if (error instanceof Error && (
+            error.name === "RuntimeSnapshotLimitError" || error.name === "RuntimeEventWindowCapacityError"
+          )) {
+            return jsonError(503, "Runtime state recovery exceeds its bounded snapshot capacity.");
+          }
+          throw error;
+        }
       }
 
       if (route.name === "messages") {
@@ -660,18 +691,27 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "events") {
-        rejectUnknownQueryParameters(url, ["sessionId", "afterEventId"]);
+        rejectUnknownQueryParameters(url, ["sessionId", "afterEventId", "fromStart"]);
         const streamOptions: EventStreamOptions = {
           store: options.store,
           request,
           maxBacklogEvents,
-          maxDurableEvents: maxEventStreamDurableEvents,
-          maxAgeMs: maxEventStreamAgeMs,
+          ...(options.maxEventStreamDurableEvents ? { maxDurableEvents: positiveIntegerOrDefault(options.maxEventStreamDurableEvents, 4096) } : {}),
+          ...(options.maxEventStreamAgeMs ? { maxAgeMs: positiveIntegerOrDefault(options.maxEventStreamAgeMs, 300_000) } : {}),
+          maxBufferedBytes: positiveIntegerOrDefault(options.maxEventStreamBufferedBytes, 4_000_000),
+          maxTransientBytes: positiveIntegerOrDefault(options.maxEventStreamTransientBytes, 256_000),
+          maxPageBytes: positiveIntegerOrDefault(options.maxEventStreamPageBytes, 256_000),
+          pollIntervalMs: positiveIntegerOrDefault(options.eventStreamPollIntervalMs, 1_000),
+          stallTimeoutMs: positiveIntegerOrDefault(options.eventStreamStallTimeoutMs, 30_000),
         };
         const sessionId = asSessionId(url.searchParams.get("sessionId"));
         const afterEventId = url.searchParams.get("afterEventId");
         if (sessionId) streamOptions.sessionId = sessionId;
         if (afterEventId) streamOptions.afterEventId = afterEventId;
+        const fromStart = url.searchParams.get("fromStart");
+        if (fromStart !== null && fromStart !== "true") throw badRequest("fromStart must be true when provided");
+        if (fromStart && afterEventId) throw badRequest("fromStart cannot be combined with afterEventId");
+        if (fromStart) streamOptions.fromStart = true;
         return await eventStream(streamOptions);
       }
 
@@ -691,29 +731,23 @@ export function startRuntimeHttpServer(options: StartRuntimeHttpServerOptions): 
   assertRuntimeHttpServerAuthentication(options.hostname, options.authToken, options.tls);
   const handler = createRuntimeHttpHandler(options);
   const protectLoopbackHost = isLoopbackBindHostname(options.hostname ?? "127.0.0.1");
-  const server = Bun.serve({
+  return startNodeHttpTransport({
     hostname: options.hostname ?? "127.0.0.1",
     port: options.port ?? 0,
     idleTimeout: options.idleTimeout ?? 255,
+    stallTimeoutMs: positiveIntegerOrDefault(options.eventStreamStallTimeoutMs, 30_000),
     ...(options.tls !== undefined ? { tls: options.tls } : {}),
-    fetch(request, listener) {
-      if (protectLoopbackHost && (listener.port === undefined || !isTrustedLoopbackHostAuthority(
+    handler(request, listenerPort) {
+      if (protectLoopbackHost && !isTrustedLoopbackHostAuthority(
         request.headers.get("host"),
-        listener.port,
+        listenerPort,
         options.tls !== undefined,
-      ))) {
+      )) {
         return jsonError(421, "Misdirected request");
       }
       return handler(request);
     },
   });
-
-  return {
-    url: server.url.href,
-    close: async () => {
-      await server.stop(true);
-    },
-  };
 }
 
 /**
@@ -860,6 +894,7 @@ type Route =
   | { name: "createSession" }
   | { name: "messages"; sessionId: SessionId }
   | { name: "sessionEvents"; sessionId: SessionId }
+  | { name: "eventSnapshot" }
   | { name: "renameSession"; sessionId: SessionId }
   | { name: "modelConfig"; sessionId: SessionId }
   | { name: "setModel"; sessionId: SessionId }
@@ -999,16 +1034,6 @@ interface ScannedDependencyEvent {
   discoveryOrder: number;
 }
 
-interface EventStreamOptions {
-  store: EventStore & EventPublisher;
-  request: Request;
-  sessionId?: SessionId;
-  afterEventId?: string;
-  maxBacklogEvents: number;
-  maxDurableEvents: number;
-  maxAgeMs: number;
-}
-
 interface HttpError {
   status: number;
   message: string;
@@ -1033,6 +1058,7 @@ function routeRequest(method: string, pathname: string): Route {
   }
   if (method === "GET" && path === "/health") return { name: "health" };
   if (method === "GET" && path === "/events") return { name: "events" };
+  if (method === "GET" && path === "/events/snapshot") return { name: "eventSnapshot" };
   if (method === "GET" && path === "/sessions") return { name: "listSessions" };
   if (method === "GET" && path === "/user-inputs") return { name: "listUserInputs" };
   if (method === "GET" && path === "/approvals") return { name: "listPendingApprovals" };
@@ -1826,283 +1852,6 @@ function boundedSessionWindowWarning(warnings: ReadonlySet<string>): string | un
   return text.length <= 2_000 ? text : `${text.slice(0, 1_997)}...`;
 }
 
-async function eventStream(options: EventStreamOptions): Promise<Response> {
-  const encoder = new TextEncoder();
-  const pending: ChiliEvent[] = [];
-  const maxBacklogEvents = Math.max(1, Math.trunc(options.maxBacklogEvents));
-  const maxDurableEvents = Math.max(1, Math.trunc(options.maxDurableEvents));
-  const maxAgeMs = Math.max(1, Math.trunc(options.maxAgeMs));
-  // This set is bounded by rotating the connection after maxDurableEvents. A
-  // resumed connection never trusts live durable notification order: it pumps
-  // committed events after its durable cursor, so an arbitrarily late emit from
-  // an older connection cannot move the stream backwards or duplicate an event.
-  const seenDurableEventIds = new Set<string>();
-  let backlogDone = false;
-  let closed = false;
-  let durableEventsSent = 0;
-  let durableCursor = options.afterEventId;
-  let durablePumpRunning = false;
-  let durablePumpRequested = false;
-  let rotationDue = false;
-  let heartbeat: ReturnType<typeof setInterval> | undefined;
-  let rotationTimer: ReturnType<typeof setTimeout> | undefined;
-  let unsubscribe: (() => void) | undefined;
-  let closeController: (() => void) | undefined;
-  let sendEvent: ((event: ChiliEvent) => void) | undefined;
-  let requestDurablePump: (() => void) | undefined;
-
-  const cleanup = (): void => {
-    if (closed) return;
-    closed = true;
-    unsubscribe?.();
-    unsubscribe = undefined;
-    if (heartbeat) clearInterval(heartbeat);
-    heartbeat = undefined;
-    if (rotationTimer) clearTimeout(rotationTimer);
-    rotationTimer = undefined;
-    closeController?.();
-  };
-
-  type BacklogQuery = {
-    compactRequests: true;
-    sessionId?: SessionId;
-    afterEventId?: string;
-    limit: number;
-    tail: boolean;
-  };
-  const query = (input: { afterEventId?: string; limit: number; tail: boolean }): BacklogQuery => ({
-    ...input,
-    compactRequests: true,
-    ...(options.sessionId ? { sessionId: options.sessionId } : {}),
-  });
-
-  unsubscribe = options.store.subscribe((event) => {
-    if (!matchesEvent(event, options)) return;
-    if (backlogDone) {
-      if (isTransientEvent(event)) sendEvent?.(event);
-      else requestDurablePump?.();
-    } else {
-      pending.push(event);
-    }
-  });
-  options.request.signal.addEventListener("abort", cleanup, { once: true });
-
-  let backlog: ChiliEvent[];
-  try {
-    if (options.afterEventId) {
-      const resumed = await options.store.events(query({
-        afterEventId: options.afterEventId,
-        limit: maxBacklogEvents + 1,
-        tail: false,
-      }));
-      if (resumed.length > maxBacklogEvents) {
-        throw {
-          status: 409,
-          message: `Event backlog exceeds the ${maxBacklogEvents}-event replay limit. Reconnect without afterEventId to resync from the latest events.`,
-        } satisfies HttpError;
-      }
-      backlog = resumed as ChiliEvent[];
-    } else {
-      backlog = await options.store.events(query({
-        limit: maxBacklogEvents,
-        tail: true,
-      })) as ChiliEvent[];
-    }
-  } catch (error) {
-    cleanup();
-    if (error instanceof UnknownEventCursorError) {
-      throw {
-        status: 409,
-        message: `Unknown event cursor ${JSON.stringify(error.eventId)}. Reconnect without afterEventId to resync from the latest events.`,
-      } satisfies HttpError;
-    }
-    throw error;
-  }
-
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const send = (event: ChiliEvent): void => {
-        if (closed || !matchesEvent(event, options)) return;
-        const durable = !isTransientEvent(event);
-        if (durable && seenDurableEventIds.has(event.id)) return;
-        try {
-          controller.enqueue(formatSse(event));
-          if (durable) {
-            seenDurableEventIds.add(event.id);
-            durableCursor = event.id;
-            durableEventsSent += 1;
-            if (durableEventsSent >= maxDurableEvents || rotationDue) cleanup();
-          }
-        } catch (error) {
-          // Legacy/corrupt stores may predate today's producer limits. Advance
-          // only through the exact persisted poison row, tell the SDK to force
-          // an authoritative snapshot, then rotate. No synthetic ChiliEvent is
-          // allowed into the projection and reconnect cannot loop forever.
-          if (durable && isRuntimeEventTransportLimitError(error)) {
-            try {
-              controller.enqueue(formatSseResync(event));
-              seenDurableEventIds.add(event.id);
-              durableCursor = event.id;
-              durableEventsSent += 1;
-            } catch {
-              // An invalid legacy cursor that cannot fit the bounded control
-              // frame still closes safely without allocating another payload.
-            }
-          }
-          cleanup();
-        }
-      };
-      sendEvent = send;
-
-      const pumpDurableEvents = async (): Promise<void> => {
-        while (!closed) {
-          const remaining = maxDurableEvents - durableEventsSent;
-          if (remaining <= 0) return;
-          const limit = Math.min(maxBacklogEvents, remaining);
-          const cursorBeforeQuery = durableCursor;
-          const batch = await options.store.events(query({
-            ...(cursorBeforeQuery ? { afterEventId: cursorBeforeQuery } : {}),
-            limit,
-            tail: false,
-          })) as ChiliEvent[];
-          if (closed || batch.length === 0) return;
-
-          let advanced = false;
-          for (const event of batch) {
-            if (isTransientEvent(event)) continue;
-            send(event);
-            advanced = true;
-            if (closed) return;
-          }
-          if (!advanced || batch.length < limit) return;
-        }
-      };
-
-      requestDurablePump = (): void => {
-        durablePumpRequested = true;
-        if (durablePumpRunning || closed) return;
-        durablePumpRunning = true;
-        void (async () => {
-          try {
-            while (durablePumpRequested && !closed) {
-              durablePumpRequested = false;
-              await pumpDurableEvents();
-            }
-          } catch {
-            // Closing normally lets the client reconnect with the last durable
-            // cursor. A rejected cursor then receives the regular 409 resync.
-            cleanup();
-          } finally {
-            durablePumpRunning = false;
-            if (durablePumpRequested && !closed) requestDurablePump?.();
-          }
-        })();
-      };
-
-      closeController = (): void => {
-        try {
-          controller.close();
-        } catch {
-          // The client may have closed first.
-        }
-      };
-
-      if (closed) {
-        closeController();
-        return;
-      }
-      heartbeat = setInterval(() => {
-        if (closed) return;
-        try {
-          controller.enqueue(encoder.encode(": heartbeat\n\n"));
-        } catch {
-          cleanup();
-        }
-      }, 5_000);
-      rotationTimer = setTimeout(() => {
-        rotationDue = true;
-        // Once a durable cursor exists, closing is a safe replay boundary. If
-        // the stream has only transient data, wait for its next durable event.
-        if (durableCursor) cleanup();
-      }, maxAgeMs);
-      rotationTimer.unref?.();
-
-      for (const event of backlog) {
-        send(event);
-        if (closed) return;
-      }
-      let pendingDurable = false;
-      for (const event of pending) {
-        if (isTransientEvent(event)) send(event);
-        else pendingDurable = true;
-        if (closed) return;
-      }
-      pending.length = 0;
-      backlogDone = true;
-      if (pendingDurable) requestDurablePump();
-    },
-    cancel() {
-      cleanup();
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-      "content-type": "text/event-stream; charset=utf-8",
-      "x-accel-buffering": "no",
-    },
-  });
-}
-
-function matchesEvent(event: ChiliEvent, options: EventStreamOptions): boolean {
-  if (options.sessionId && event.sessionId !== options.sessionId) return false;
-  return true;
-}
-
-const MAX_SSE_FRAME_BYTES = 4_000_000;
-const MAX_SSE_RESYNC_FRAME_BYTES = 4_096;
-
-function formatSse(event: ChiliEvent): Uint8Array {
-  const payload = JSON.stringify(compactRuntimeEvent(event));
-  const payloadBytes = Buffer.byteLength(payload, "utf8");
-  const prefix = `${!isTransientEvent(event) ? `id: ${event.id}\n` : ""}event: chili.event\ndata: `;
-  const suffix = "\n\n";
-  const prefixBytes = Buffer.byteLength(prefix, "utf8");
-  const frameBytes = prefixBytes + payloadBytes + Buffer.byteLength(suffix, "utf8");
-  if (frameBytes > MAX_SSE_FRAME_BYTES) {
-    const error = new Error(`Runtime event ${event.id} exceeds the ${MAX_SSE_FRAME_BYTES}-byte SSE frame boundary`);
-    error.name = "RuntimeEventTransportLimitError";
-    throw error;
-  }
-  const frame = Buffer.allocUnsafe(frameBytes);
-  let offset = frame.write(prefix, 0, "utf8");
-  offset += frame.write(payload, offset, "utf8");
-  frame.write(suffix, offset, "utf8");
-  return frame;
-}
-
-function formatSseResync(event: ChiliEvent): Uint8Array {
-  const payload = JSON.stringify({
-    reason: "event_transport_limit",
-    afterEventId: event.id,
-    message: `Runtime event ${event.id} exceeded the ${MAX_SSE_FRAME_BYTES}-byte transport boundary. An authoritative resync is required.`,
-  });
-  const frame = `event: chili.resync\ndata: ${payload}\n\n`;
-  const bytes = Buffer.byteLength(frame, "utf8");
-  if (bytes > MAX_SSE_RESYNC_FRAME_BYTES) {
-    const error = new Error("Runtime event resync control frame exceeds its byte boundary");
-    error.name = "RuntimeEventTransportLimitError";
-    throw error;
-  }
-  return Buffer.from(frame, "utf8");
-}
-
-function isRuntimeEventTransportLimitError(error: unknown): boolean {
-  return error instanceof Error && error.name === "RuntimeEventTransportLimitError";
-}
-
 function serializeSubmitPromptResult(result: SubmitPromptResult): RuntimePromptResult {
   const turns = result.turns.map(serializeTurnResult);
   if (result.status === "completed") {
@@ -2282,14 +2031,36 @@ async function readJson<T>(request: Request, allowedFields?: readonly string[]):
       throw { status: 413, message: `JSON body must not exceed ${MAX_RUNTIME_HTTP_JSON_BODY_BYTES} bytes` } satisfies HttpError;
     }
   }
-  let text: string;
-  try {
-    text = await request.text();
-  } catch {
-    throw badRequest("JSON body could not be read");
-  }
-  if (utf8Bytes(text) > MAX_RUNTIME_HTTP_JSON_BODY_BYTES) {
-    throw { status: 413, message: `JSON body must not exceed ${MAX_RUNTIME_HTTP_JSON_BODY_BYTES} bytes` } satisfies HttpError;
+  let text = "";
+  if (request.body) {
+    const reader = request.body.getReader();
+    const decoder = new TextDecoder();
+    const fragments: string[] = [];
+    const tooLarge = { status: 413, message: `JSON body must not exceed ${MAX_RUNTIME_HTTP_JSON_BODY_BYTES} bytes` } satisfies HttpError;
+    let bytes = 0;
+    let done = false;
+    const abort = () => { void reader.cancel(request.signal.reason).catch(() => {}); };
+    request.signal.addEventListener("abort", abort, { once: true });
+    try {
+      request.signal.throwIfAborted();
+      while (true) {
+        const chunk = await reader.read();
+        request.signal.throwIfAborted();
+        if (chunk.done) { done = true; break; }
+        bytes += chunk.value.byteLength;
+        if (bytes > MAX_RUNTIME_HTTP_JSON_BODY_BYTES) throw tooLarge;
+        fragments.push(decoder.decode(chunk.value, { stream: true }));
+      }
+      fragments.push(decoder.decode());
+      text = fragments.join("");
+    } catch (error) {
+      if (error === tooLarge) throw error;
+      throw badRequest("JSON body could not be read");
+    } finally {
+      request.signal.removeEventListener("abort", abort);
+      if (!done) await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
   }
   if (text.trim().length === 0) return {} as T;
   let value: unknown;

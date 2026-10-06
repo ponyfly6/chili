@@ -1,7 +1,10 @@
 import { access, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { connect as connectTcp } from "node:net";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { normalizePersistedError, PERSISTED_ERROR_LIMITS } from "@chili/protocol";
 import {
   RuntimeSessionAlreadyExistsError,
@@ -165,53 +168,42 @@ test("keeps safe bind hosts in diagnostics but never reflects hostile host input
   }
 });
 
-test("passes validated TLS configuration through to Bun.serve", async () => {
+test("serves authenticated HTTPS with typed-array and Bun.file TLS credentials", async () => {
   const store = new ObservableEventStore(new MemoryEventStore());
-  const tls: Bun.TLSOptions[] = [
-    { cert: "first certificate", key: "first private key" },
-    { cert: "second certificate", key: "second private key" },
-  ];
-  const mutableBun = Bun as unknown as { serve: typeof Bun.serve };
-  const originalServe = mutableBun.serve;
-  let capturedOptions: unknown;
-  let stopped = false;
-  mutableBun.serve = ((options: unknown) => {
-    capturedOptions = options;
-    return {
-      url: new URL("https://0.0.0.0:4443/"),
-      stop(closeActiveConnections?: boolean) {
-        expect(closeActiveConnections).toBe(true);
-        stopped = true;
-      },
-    } as unknown as ReturnType<typeof Bun.serve>;
-  }) as typeof Bun.serve;
-
+  const certificate = readFileSync(new URL("./fixtures/localhost-test-cert.pem", import.meta.url));
+  const server = startRuntimeHttpServer({
+    service: new FakeRuntimeService(store), store, hostname: "0.0.0.0", authToken: "x".repeat(32),
+    tls: {
+      cert: new Uint8Array(certificate),
+      key: Bun.file(new URL("./fixtures/localhost-test-key.pem", import.meta.url)),
+    },
+  });
   try {
-    const server = startRuntimeHttpServer({
-      service: new FakeRuntimeService(store),
-      store,
-      hostname: "0.0.0.0",
-      authToken: "x".repeat(32),
-      tls,
+    const url = server.url.replace("0.0.0.0", "127.0.0.1");
+    expect(new URL(server.url).protocol).toBe("https:");
+    const unauthorized = await fetch(`${url}health`, { tls: { rejectUnauthorized: false } });
+    expect(unauthorized.status).toBe(401);
+    const response = await fetch(`${url}health`, {
+      headers: { authorization: `Bearer ${"x".repeat(32)}` },
+      tls: { rejectUnauthorized: false },
     });
-    expect((capturedOptions as { tls?: unknown }).tls).toBe(tls);
-    expect(server.url).toBe("https://0.0.0.0:4443/");
-    const transportFetch = (capturedOptions as {
-      fetch: (request: Request, listener: { port: number }) => Response | Promise<Response>;
-    }).fetch;
-    const publicHostResponse = await transportFetch(new Request("https://control.private.example:4443/health", {
-      headers: {
-        authorization: `Bearer ${"x".repeat(32)}`,
-        host: "control.private.example:4443",
-      },
-    }), { port: 4443 });
-    expect(publicHostResponse.status).toBe(200);
-    expect(await publicHostResponse.json()).toEqual({ ok: true });
-    await server.close();
-    expect(stopped).toBe(true);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
   } finally {
-    mutableBun.serve = originalServe;
+    await server.close();
   }
+});
+
+test("rejects unsupported multiple TLS certificates without silently dropping SNI", () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const tls = {
+    cert: readFileSync(new URL("./fixtures/localhost-test-cert.pem", import.meta.url)),
+    key: readFileSync(new URL("./fixtures/localhost-test-key.pem", import.meta.url)),
+  };
+  expect(() => startRuntimeHttpServer({
+    service: new FakeRuntimeService(store), store,
+    tls: [tls, { ...tls, serverName: "secondary.test" }],
+  })).toThrow("multiple TLS certificates");
 });
 
 test("loopback server accepts explicit loopback Host authorities on its listener port", async () => {
@@ -737,6 +729,39 @@ test("emits a bounded resync cursor for a legacy event above the 4 MB transport 
   );
   expect(resumed).toContain("event_sse_after_oversized");
   expect(resumed).not.toContain("event_sse_oversized");
+});
+
+test("SSE streams SQLite byte pages and resyncs oversized rows even without metadata acceleration", async () => {
+  const baseStore = new SqliteEventStore(":memory:");
+  const observable = new ObservableEventStore(baseStore);
+  const sessionId = "session_sse_byte_pages" as SessionId;
+  const store: EventStore & EventPublisher = {
+    append: observable.append.bind(observable), appendMany: observable.appendMany.bind(observable),
+    events: observable.events.bind(observable), sessions: observable.sessions.bind(observable),
+    messages: observable.messages.bind(observable), pendingApprovals: observable.pendingApprovals.bind(observable),
+    subscribe: observable.subscribe.bind(observable),
+  };
+  const small = Array.from({ length: 12 }, (_, index) => sseStatusEvent(sessionId, index));
+  try {
+    await store.appendMany([
+      ...small,
+      { id: "event_large_legal", type: "session.renamed", time: 20 as TimestampMs, sessionId, payload: { sessionId, title: "x".repeat(300_000) } },
+      { id: "event_large_poison", type: "session.renamed", time: 21 as TimestampMs, sessionId, payload: { sessionId, title: "x".repeat(4_100_000) } },
+    ]);
+    const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store, maxEventStreamPageBytes: 1_024 });
+    const reader = (await handler(new Request(`http://chili.test/events?sessionId=${sessionId}`))).body!.getReader();
+    const received: string[] = [];
+    for (let index = 0; index < small.length + 1; index += 1) {
+      received.push(...sseIds(new TextDecoder().decode((await reader.read()).value)));
+    }
+    expect(received).toEqual([...small.map((event) => event.id), "event_large_legal"]);
+    const recovery = new TextDecoder().decode((await reader.read()).value);
+    expect(recovery).toContain("event: chili.resync");
+    expect(recovery).toContain('"afterEventId":"event_large_poison"');
+    expect((await reader.read()).done).toBe(true);
+  } finally {
+    baseStore.close();
+  }
 });
 
 test("streams and resumes a worst legal tool result that remains replayable beside a near-limit approval window", async () => {
@@ -1541,7 +1566,7 @@ test("event backlog stays bounded and oversized resume cursors require a tail re
     expect(oversizedResume.status).toBe(409);
     expect(await oversizedResume.json()).toMatchObject({
       error: {
-        message: "Event backlog exceeds the 5-event replay limit. Reconnect without afterEventId to resync from the latest events.",
+        message: "Event backlog exceeds the 5-event replay limit. Restore /events/snapshot, then resume from its cursor.",
       },
     });
 
@@ -1596,7 +1621,7 @@ test("SSE de-duplicates a committed backlog event whose observable emit arrives 
   reader.releaseLock();
 });
 
-test("SSE keeps backlog identity after many live events and drops an extremely late emit", async () => {
+test("SSE cursor excludes an extremely late emit after many live events", async () => {
   const store = new DelayedEmitEventStore();
   const sessionId = "session_sse_lifetime_dedupe" as SessionId;
   const committed: RuntimeEvent = {
@@ -1645,6 +1670,238 @@ test("SSE keeps backlog identity after many live events and drops an extremely l
   controller.abort();
   await nextRead;
   reader.releaseLock();
+});
+
+test("SSE streams beyond the former 4096-event boundary and remains live", async () => {
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_unlimited" as SessionId;
+  const events = Array.from({ length: 4_200 }, (_, index) => sseStatusEvent(sessionId, index));
+  store.items.push(...events);
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+  const response = await handler(new Request(`http://chili.test/events?sessionId=${sessionId}`));
+  const reader = response.body!.getReader();
+  try {
+    const ids: string[] = [];
+    for (let index = 0; index < events.length; index += 1) {
+      const chunk = await reader.read();
+      expect(chunk.done).toBe(false);
+      ids.push(...sseIds(new TextDecoder().decode(chunk.value)));
+    }
+    expect(ids).toEqual(events.map((event) => event.id));
+    store.emit(events[0]!);
+    const next = sseStatusEvent(sessionId, 4_200);
+    store.items.push(next);
+    store.emit(next);
+    expect(sseIds(new TextDecoder().decode((await reader.read()).value))).toEqual([next.id]);
+  } finally {
+    await reader.cancel();
+  }
+});
+
+test("SSE polls committed rows without notifications and catches up before a live delta", async () => {
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_poll" as SessionId;
+  const handler = createRuntimeHttpHandler({
+    service: new FakeRuntimeService(store), store, eventStreamPollIntervalMs: 5,
+  });
+  const response = await handler(new Request(`http://chili.test/events?sessionId=${sessionId}`));
+  const reader = response.body!.getReader();
+  try {
+    const unannounced = sseStatusEvent(sessionId, 0);
+    store.items.push(unannounced);
+    expect(sseIds(new TextDecoder().decode((await reader.read()).value))).toEqual([unannounced.id]);
+    const anchor: RuntimeEvent = {
+      id: "event_poll_anchor", type: "tool.call_started", time: 2 as TimestampMs, sessionId,
+      payload: { turnId: "turn_poll" as TurnId, callId: "call_poll" as ToolCallId, toolName: "shell", input: {} },
+    };
+    store.items.push(anchor);
+    store.emit(sseOutputEvent(sessionId, 1, "call_poll"));
+    expect(sseIds(new TextDecoder().decode((await reader.read()).value))).toEqual([anchor.id]);
+    const delta = new TextDecoder().decode((await reader.read()).value);
+    expect(delta).toContain("tool.output_delta");
+    expect(sseIds(delta)).toEqual([]);
+  } finally {
+    await reader.cancel();
+  }
+});
+
+test("SSE orders replay-time writes and delayed notifications before their transient output", async () => {
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_handoff" as SessionId;
+  const initial = sseStatusEvent(sessionId, 0);
+  store.items.push(initial);
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const originalEvents = store.events.bind(store);
+  let first = true;
+  store.events = async (query = {}) => {
+    const rows = await originalEvents(query);
+    if (first) {
+      first = false;
+      entered.resolve();
+      await release.promise;
+    }
+    return rows;
+  };
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+  const responsePromise = handler(new Request(`http://chili.test/events?sessionId=${sessionId}`));
+  await entered.promise;
+  const anchor: RuntimeEvent = {
+    id: "event_handoff_anchor", type: "tool.call_started", time: 2 as TimestampMs, sessionId,
+    payload: { turnId: "turn_handoff" as TurnId, callId: "call_handoff" as ToolCallId, toolName: "shell", input: {} },
+  };
+  store.items.push(anchor);
+  store.emit(sseOutputEvent(sessionId, 1, "call_handoff"));
+  store.emit(initial);
+  release.resolve();
+  const reader = (await responsePromise).body!.getReader();
+  try {
+    const chunks = [];
+    for (let index = 0; index < 3; index += 1) chunks.push(new TextDecoder().decode((await reader.read()).value));
+    expect(sseIds(chunks.join(""))).toEqual([initial.id, anchor.id]);
+    expect(chunks[2]).toContain("tool.output_delta");
+  } finally {
+    await reader.cancel();
+  }
+});
+
+test("SSE resumes from the client-consumed cursor rather than the server enqueue position", async () => {
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_partial" as SessionId;
+  const events = Array.from({ length: 120 }, (_, index) => sseStatusEvent(sessionId, index));
+  store.items.push(...events);
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store, maxEventStreamBufferedBytes: 4_096 });
+  const first = (await handler(new Request(`http://chili.test/events?sessionId=${sessionId}`))).body!.getReader();
+  const consumed: string[] = [];
+  for (let index = 0; index < 3; index += 1) consumed.push(...sseIds(new TextDecoder().decode((await first.read()).value)));
+  await first.cancel();
+  const resumed = (await handler(new Request(
+    `http://chili.test/events?sessionId=${sessionId}&afterEventId=${consumed.at(-1)}`,
+  ))).body!.getReader();
+  try {
+    for (let index = consumed.length; index < events.length; index += 1) {
+      consumed.push(...sseIds(new TextDecoder().decode((await resumed.read()).value)));
+    }
+    expect(consumed).toEqual(events.map((event) => event.id));
+  } finally {
+    await resumed.cancel();
+  }
+});
+
+test("SSE pauses database reads under byte backpressure and resumes when pulled", async () => {
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_pressure" as SessionId;
+  store.items.push(...Array.from({ length: 200 }, (_, index) => sseStatusEvent(sessionId, index)));
+  const originalEvents = store.events.bind(store);
+  let queries = 0;
+  store.events = async (query = {}) => { queries += 1; return originalEvents(query); };
+  const handler = createRuntimeHttpHandler({
+    service: new FakeRuntimeService(store), store,
+    maxEventStreamBufferedBytes: 1_024, eventStreamPollIntervalMs: 5,
+  });
+  const reader = (await handler(new Request(`http://chili.test/events?sessionId=${sessionId}`))).body!.getReader();
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const blockedQueries = queries;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(queries).toBe(blockedQueries);
+    for (let index = 0; index < 80; index += 1) expect((await reader.read()).done).toBe(false);
+    expect(queries).toBeGreaterThan(blockedQueries);
+  } finally {
+    await reader.cancel();
+  }
+});
+
+test("SSE drops queued bytes and subscriptions when a slow consumer times out", async () => {
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_stall" as SessionId;
+  store.items.push(...Array.from({ length: 100 }, (_, index) => sseStatusEvent(sessionId, index)));
+  const handler = createRuntimeHttpHandler({
+    service: new FakeRuntimeService(store), store,
+    maxEventStreamBufferedBytes: 1_024, eventStreamStallTimeoutMs: 15,
+  });
+  const reader = (await handler(new Request(`http://chili.test/events?sessionId=${sessionId}`))).body!.getReader();
+  expect(store.listenerCount).toBe(1);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  expect(store.listenerCount).toBe(0);
+  await expect(reader.read()).rejects.toThrow("buffer stall timeout");
+});
+
+test("HTTP socket backpressure stops SSE reads while a fast connection continues", async () => {
+  const store = new GeneratedTransportEventStore();
+  const server = startRuntimeHttpServer({
+    service: new FakeRuntimeService(store), store,
+    maxBacklogEvents: 50_000,
+    maxEventStreamBufferedBytes: 32_768,
+    maxEventStreamPageBytes: 32_768,
+    eventStreamPollIntervalMs: 5,
+    eventStreamStallTimeoutMs: 400,
+  });
+  const address = new URL(server.url);
+  const socket = connectTcp({ host: "127.0.0.1", port: Number(address.port) });
+  socket.on("error", () => {});
+  const fastAbort = new AbortController();
+  try {
+    await once(socket, "connect");
+    socket.pause();
+    socket.write(`GET /events?sessionId=session_transport_slow HTTP/1.1\r\nHost: 127.0.0.1:${address.port}\r\nConnection: close\r\n\r\n`);
+    await waitUntil(() => (store.produced.get("session_transport_slow") ?? 0) > 0);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const paused = store.produced.get("session_transport_slow")!;
+    expect(paused).toBeLessThan(5_000);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(store.produced.get("session_transport_slow")).toBe(paused);
+
+    const response = await fetch(`${server.url}events?sessionId=session_transport_fast`, { signal: fastAbort.signal });
+    const reader = response.body!.getReader();
+    let text = "";
+    while (sseIds(text).length < GeneratedTransportEventStore.fastCount) {
+      const chunk = await reader.read();
+      expect(chunk.done).toBe(false);
+      text += new TextDecoder().decode(chunk.value);
+    }
+    expect(sseIds(text)).toEqual(Array.from({ length: GeneratedTransportEventStore.fastCount }, (_, index) => `transport_${index}`));
+    await reader.cancel();
+    fastAbort.abort();
+    await waitUntil(() => store.listenerCount === 0, 2_000);
+    expect(store.produced.get("session_transport_slow")).toBe(paused);
+  } finally {
+    fastAbort.abort();
+    socket.destroy();
+    await server.close();
+  }
+});
+
+test("SSE bounds transient notifications even while initial replay is blocked", async () => {
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_transient_pressure" as SessionId;
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  store.events = async () => { entered.resolve(); await release.promise; return []; };
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store, maxEventStreamTransientBytes: 1_024 });
+  const pending = handler(new Request(`http://chili.test/events?sessionId=${sessionId}`));
+  await entered.promise;
+  for (let index = 0; index < 100; index += 1) store.emit(sseOutputEvent(sessionId, index, "call_buffer"));
+  expect(store.listenerCount).toBe(0);
+  release.resolve();
+  const reader = (await pending).body!.getReader();
+  const chunk = await reader.read();
+  const text = new TextDecoder().decode(chunk.value);
+  expect(chunk.value!.byteLength).toBeLessThan(4_096);
+  expect(text).toContain("event: chili.resync");
+  expect(text).toContain("transient_buffer_overflow");
+  expect(text).not.toContain("tool.output_delta");
+  expect((await reader.read()).done).toBe(true);
+});
+
+test("SSE fromStart rejects an oversized empty-snapshot catchup instead of silently tailing", async () => {
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_from_start" as SessionId;
+  store.items.push(...Array.from({ length: 4 }, (_, index) => sseStatusEvent(sessionId, index)));
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store, maxBacklogEvents: 3 });
+  expect((await handler(new Request(`http://chili.test/events?sessionId=${sessionId}&fromStart=true`))).status).toBe(409);
+  expect((await handler(new Request(`http://chili.test/events?fromStart=true&afterEventId=event`))).status).toBe(400);
+  expect((await handler(new Request("http://chili.test/events?fromStart=false"))).status).toBe(400);
 });
 
 test("SSE rotates at a durable cursor and resumes without loss or late-emit duplicates", async () => {
@@ -1727,6 +1984,32 @@ test("SSE age rotation closes a stream only after it has a durable cursor", asyn
   ]);
   expect(completion).toBe(true);
   reader.releaseLock();
+});
+
+test("default SSE remains live past the former five-minute rotation deadline", async () => {
+  const originalTimeout = globalThis.setTimeout;
+  const timers = spyOn(globalThis, "setTimeout").mockImplementation(((callback: TimerHandler, delay?: number, ...args: unknown[]) => (
+    originalTimeout(callback, delay !== undefined && delay >= 300_000 ? 5 : delay, ...args)
+  )) as typeof setTimeout);
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_no_age_rotation" as SessionId;
+  const initial = sseStatusEvent(sessionId, 0);
+  store.items.push(initial);
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+  const reader = (await handler(new Request(`http://chili.test/events?sessionId=${sessionId}`))).body!.getReader();
+  try {
+    expect(sseIds(new TextDecoder().decode((await reader.read()).value))).toEqual([initial.id]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const fresh = sseStatusEvent(sessionId, 1);
+    store.items.push(fresh);
+    store.emit(fresh);
+    const chunk = await reader.read();
+    expect(chunk.done).toBe(false);
+    expect(sseIds(new TextDecoder().decode(chunk.value))).toEqual([fresh.id]);
+  } finally {
+    await reader.cancel();
+    timers.mockRestore();
+  }
 });
 
 test("rejects unknown SSE cursors but keeps a known tip cursor live without transient ids", async () => {
@@ -3233,6 +3516,19 @@ test("cleans up SSE subscriptions when the stream reader is cancelled", async ()
   expect(store.listenerCount).toBe(0);
 });
 
+test("SSE never subscribes or queries an already-cancelled request", async () => {
+  const store = new CountingEventStore();
+  let queries = 0;
+  store.events = async () => { queries += 1; return []; };
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+  const controller = new AbortController();
+  controller.abort();
+  const response = await handler(new Request("http://chili.test/events", { signal: controller.signal }));
+  expect(store.listenerCount).toBe(0);
+  expect(queries).toBe(0);
+  expect((await response.body!.getReader().read()).done).toBe(true);
+});
+
 class FakeRuntimeService implements RuntimeHttpService {
   modelSelection: ModelSelection | undefined;
   reasoningLevel: ReasoningLevel | undefined;
@@ -3617,6 +3913,20 @@ function sseIds(text: string): string[] {
     .map((line) => line.slice("id: ".length));
 }
 
+function sseStatusEvent(sessionId: SessionId, index: number): RuntimeEvent {
+  return {
+    id: `event_${sessionId}_${index}`, type: "session.status_changed", time: (index + 1) as TimestampMs,
+    sessionId, payload: { sessionId, status: "running" },
+  };
+}
+
+function sseOutputEvent(sessionId: SessionId, index: number, callId: string): RuntimeEvent {
+  return {
+    id: `delta_${sessionId}_${index}`, type: "tool.output_delta", time: (index + 1) as TimestampMs, sessionId,
+    payload: { callId: callId as ToolCallId, stream: "stdout", delta: "live output ".repeat(10), sequence: index },
+  };
+}
+
 function permissionConfig(profile: RuntimePermissionProfileId): RuntimePermissionConfig {
   return {
     profile,
@@ -3765,6 +4075,8 @@ class CountingEventStore extends MemoryEventStore implements EventPublisher {
 class DelayedEmitEventStore extends MemoryEventStore implements EventPublisher {
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
 
+  get listenerCount(): number { return this.listeners.size; }
+
   subscribe(listener: (event: RuntimeEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -3772,6 +4084,30 @@ class DelayedEmitEventStore extends MemoryEventStore implements EventPublisher {
 
   emit(event: RuntimeEvent): void {
     for (const listener of this.listeners) listener(event);
+  }
+}
+
+class GeneratedTransportEventStore extends CountingEventStore {
+  static readonly fastCount = 500;
+  readonly produced = new Map<string, number>();
+
+  async eventReplayBoundary(query: { sessionId?: SessionId; limit?: number }): Promise<{ count: number }> {
+    return { count: Math.min(this.total(query.sessionId), query.limit ?? 50_000) };
+  }
+
+  override async events(query: EventQuery = {}): Promise<EventEnvelope[]> {
+    const sessionId = query.sessionId!;
+    const start = query.afterEventId ? Number(query.afterEventId.slice("transport_".length)) + 1 : 0;
+    const count = Math.min(query.limit ?? 64, Math.max(1, Math.floor((query.maxBytes ?? 32_768) / 2_400)), this.total(sessionId) - start);
+    this.produced.set(sessionId, start + count);
+    return Array.from({ length: count }, (_, index) => ({
+      id: `transport_${start + index}`, type: "session.renamed", time: 1 as TimestampMs, sessionId,
+      payload: { sessionId, title: "x".repeat(2_048) },
+    }));
+  }
+
+  private total(sessionId?: SessionId): number {
+    return sessionId === "session_transport_fast" ? GeneratedTransportEventStore.fastCount : 50_000;
   }
 }
 
