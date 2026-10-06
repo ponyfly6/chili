@@ -132,7 +132,7 @@ test("tool discovery respects visibility and preserves canonical JavaScript name
   expect(result.structuredData).toEqual({ tools: [dashed, underscored].map((tool) => ({
     name: tool.name, description: tool.description, inputSchema: tool.inputSchema, outputSchema: tool.outputSchema,
     codeMode: true, call: `tools[${JSON.stringify(tool.name)}]`,
-  })), truncated: false });
+  })), truncated: false, loaded: [] });
   expect(result.output).not.toContain("hidden");
   expect(result.output).toContain(".structuredData schema");
   expect((await search.execute({ query: "select:a-b,a_b", maxResults: 1 }, ctx)).structuredData).toMatchObject({ truncated: true });

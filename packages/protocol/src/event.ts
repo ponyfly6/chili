@@ -90,6 +90,7 @@ export function compactRuntimeEvent(event: ChiliEvent): ChiliEvent {
 }
 
 export type SessionEvent =
+  | SessionScopedEventEnvelope<"session.tools_loaded", { sessionId: SessionId; turnId: TurnId; callId: ToolCallId; names: string[] }>
   | SessionScopedEventEnvelope<"session.input_queue_changed", RuntimeInputQueue>
   | SessionScopedEventEnvelope<"session.created", { sessionId: SessionId; cwd: string; identity?: ExecutionIdentity }>
   | SessionScopedEventEnvelope<"session.identity_bound", { sessionId: SessionId; identity: ExecutionIdentity }>

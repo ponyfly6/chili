@@ -64,6 +64,11 @@ export interface SingleAgentRuntimeOptions {
   toolRegistry: ToolRegistry;
   toolExecutor: ToolExecutor;
   toolPolicyResolver?: ToolAccessPolicyResolver;
+  /** Model definitions only; discovery and nested execution retain the authorized catalog. */
+  toolExposure?: {
+    eagerTools: readonly string[];
+    requiredTools?: (context: { sessionId: SessionId; cwd: string }) => Promise<readonly string[]>;
+  };
   contextBudget?: ContextBudgetOptions;
   contextBuilder?: ContextWindowBuilder;
   contextCompaction?: Omit<ContextCompactionOptions, "model" | "now">;
@@ -302,6 +307,10 @@ export class SingleAgentRuntime implements AgentRunner {
 
       const visibleTools = await this.visibleTools(input, turnId);
       const advertisedCatalogRevision = this.options.toolRegistry.getRevision?.();
+      const modelTools = await this.modelTools(input, visibleTools);
+      const modelToolNames = new Set(modelTools.map((tool) => tool.name));
+      const unloadedToolNames = new Set(visibleTools.filter((tool) => !modelToolNames.has(tool.name))
+        .flatMap((tool) => [tool.name, ...(tool.aliases ?? [])]));
       const requestLimits = await this.options.model.resolveRequestLimits?.({
         ...(input.modelSelection ? { modelSelection: input.modelSelection } : {}),
         ...(input.reasoningLevel !== undefined ? { reasoningLevel: input.reasoningLevel } : {}),
@@ -317,7 +326,7 @@ export class SingleAgentRuntime implements AgentRunner {
         system: input.system ?? [],
         developer: input.developer ?? [],
         contextualUser: input.contextualUser ?? [],
-        tools: visibleTools,
+        tools: modelTools,
       };
       const rawMessages = await messagesForContext(this.options.store, input.sessionId);
       let context = this.contextBuilder().build(rawMessages, contextSurface);
@@ -418,8 +427,9 @@ export class SingleAgentRuntime implements AgentRunner {
         pendingToolCalls,
         request.toolCatalogRevision,
         dispatch,
+        unloadedToolNames,
         new Set(
-          visibleTools
+          modelTools
             .map((tool) => tool.name)
             .filter((toolName) => !modelInput.tools.some((tool) => tool.name === toolName)),
         ),
@@ -523,6 +533,23 @@ export class SingleAgentRuntime implements AgentRunner {
     }
     if (!input.suppressExternalImageTools) return tools;
     return tools.filter((tool) => !isExternalImageUnderstandingTool(tool));
+  }
+
+  private async modelTools(input: RunTurnInput, available: readonly ChiliToolDefinition[]): Promise<ChiliToolDefinition[]> {
+    if (available.length === 0) return [];
+    // Embedders that provide their own registry may not install a discovery tool.
+    // Host opts into an explicit surface; unconfigured runtimes retain their catalog.
+    if (!this.options.toolExposure) return [...available];
+    const selected = new Set(this.options.toolExposure.eagerTools);
+    const events = await this.options.store.events({ sessionId: input.sessionId, type: "session.tools_loaded" });
+    for (const event of events) {
+      const payload = event.payload as { names?: unknown } | null;
+      if (Array.isArray(payload?.names)) {
+        for (const name of payload.names) if (typeof name === "string") selected.add(name);
+      }
+    }
+    for (const name of await this.options.toolExposure?.requiredTools?.(input) ?? []) selected.add(name);
+    return available.filter((tool) => selected.has(tool.name));
   }
 
   private async prepareRequest(
@@ -1075,6 +1102,7 @@ export class SingleAgentRuntime implements AgentRunner {
     pendingToolCalls: Set<PendingToolCall>,
     advertisedCatalogRevision: number | undefined,
     dispatch: TurnToolDispatch,
+    unloadedToolNames: ReadonlySet<string>,
     envelopeHiddenToolNames: ReadonlySet<string>,
   ): Promise<void> {
     const concurrentLimit = this.options.maxConcurrentToolCalls ?? 10;
@@ -1120,14 +1148,16 @@ export class SingleAgentRuntime implements AgentRunner {
         await this.appendPart(input, assistantMessageId, part);
         continue;
       }
-      if (envelopeHiddenToolNames.has(toolCall.toolName)) {
+      if (unloadedToolNames.has(toolCall.toolName) || envelopeHiddenToolNames.has(toolCall.toolName)) {
         await flush();
         const part = await this.failToolCallWithoutExecution(
           input,
           turnId,
           assistantMessageId,
           toolCall,
-          "Tool was not advertised to the model because its definition exceeded the context envelope.",
+          unloadedToolNames.has(toolCall.toolName)
+            ? `Tool is not loaded for direct calls. Use tool_search with query "select:${toolCall.toolName}" first, then call it on the next turn. Code-mode-enabled tools remain callable from scripts without loading.`
+            : "Tool was not advertised to the model because its definition exceeded the context envelope.",
         );
         pendingToolCalls.delete(toolCall);
         await this.appendPart(input, assistantMessageId, part);

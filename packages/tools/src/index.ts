@@ -30,6 +30,7 @@ export * from "./macos-seatbelt.js";
 export * from "./managed-process.js";
 export * from "./process.js";
 export * from "./registry.js";
+export * from "./tool-catalog.js";
 export * from "./snapshot.js";
 export * from "./subagent.js";
 export * from "./agent-message.js";

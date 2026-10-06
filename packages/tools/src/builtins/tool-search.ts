@@ -1,18 +1,25 @@
 import type { ChiliToolDefinition, ToolRegistry, ValidationResult } from "../types.js";
+import { expandToolGroups } from "../tool-catalog.js";
+import { searchTools } from "../tool-search-ranker.js";
 
 export interface ToolSearchInput {
   query: string;
   maxResults?: number;
+  load?: boolean;
 }
 
-export function createToolSearchTool(registry: ToolRegistry): ChiliToolDefinition<ToolSearchInput> {
+export function createToolSearchTool(
+  registry: ToolRegistry,
+  options: { groups?: readonly (readonly string[])[] } = {},
+): ChiliToolDefinition<ToolSearchInput> {
   return {
     name: "tool_search",
     codeMode: true,
     outputSchema: {
       type: "object",
-      required: ["tools", "truncated"],
+      required: ["tools", "truncated", "loaded"],
       properties: {
+        loaded: { type: "array", items: { type: "string" }, description: "Tools selected for subsequent direct model calls, including related control tools." },
         tools: { type: "array", items: {
           type: "object", required: ["name", "description", "inputSchema", "outputSchema", "codeMode", "call"],
           properties: {
@@ -27,7 +34,7 @@ export function createToolSearchTool(registry: ToolRegistry): ChiliToolDefinitio
     aliases: ["toolsearch"],
     searchHint: "Search available tool names, aliases, descriptions, and search hints.",
     alwaysLoad: true,
-    description: "Search available tools by capability or name. Returns parameter and structuredData schemas and the exact JavaScript access expression for code mode. JavaScript calls return a ToolResult envelope: read .structuredData for machine values and .output for display text; Tools may omit .structuredData; inspect each tool's description and .metadata for its data contract. Use select:name1,name2 for exact names or aliases.",
+    description: "Discover tools by capability or name. Direct calls load matches and related controls for the next model request in this session; script calls inspect without loading unless load=true. Returns complete parameter and structuredData schemas and exact JavaScript access expressions. JavaScript calls return a ToolResult envelope: read .structuredData for machine values and .output for display text. Tools may omit .structuredData. Use select:name1,name2 to inspect exact names or aliases, including already loaded tools. Search never grants permissions.",
     risk: "read",
     resourcePolicy: "internal",
     isReadOnly: true,
@@ -38,7 +45,8 @@ export function createToolSearchTool(registry: ToolRegistry): ChiliToolDefinitio
       required: ["query"],
       properties: {
         query: { type: "string" },
-        maxResults: { type: "number" },
+        maxResults: { type: "integer", minimum: 1, maximum: 20 },
+        load: { type: "boolean", description: "Load definitions for subsequent model calls. Defaults to true for direct calls, false inside code_mode." },
       },
     },
     validate(input): ValidationResult<ToolSearchInput> {
@@ -46,11 +54,13 @@ export function createToolSearchTool(registry: ToolRegistry): ChiliToolDefinitio
       if (typeof input.query !== "string" || input.query.trim().length === 0) {
         return { ok: false, message: "query must be a non-empty string" };
       }
-      if (input.maxResults !== undefined && !isPositiveInteger(input.maxResults)) {
-        return { ok: false, message: "maxResults must be a positive integer" };
+      if (input.maxResults !== undefined && (!isPositiveInteger(input.maxResults) || input.maxResults > 20)) {
+        return { ok: false, message: "maxResults must be an integer between 1 and 20" };
       }
+      if (input.load !== undefined && typeof input.load !== "boolean") return { ok: false, message: "load must be a boolean" };
       const value: ToolSearchInput = { query: input.query };
       if (input.maxResults !== undefined) value.maxResults = input.maxResults;
+      if (input.load !== undefined) value.load = input.load;
       return { ok: true, value };
     },
     approval: () => false,
@@ -59,6 +69,9 @@ export function createToolSearchTool(registry: ToolRegistry): ChiliToolDefinitio
       const maxResults = input.maxResults ?? 8;
       const matches = searchTools(tools, input.query, maxResults + 1);
       const results = matches.slice(0, maxResults);
+      const shouldLoad = input.load ?? context.invocationMode !== "code";
+      const loaded = shouldLoad && context.loadTools
+        ? await context.loadTools(expandToolGroups(results, tools, options.groups ?? [])) : [];
       const descriptions = results.map((tool) => ({
         name: tool.name,
         description: tool.description,
@@ -77,67 +90,16 @@ export function createToolSearchTool(registry: ToolRegistry): ChiliToolDefinitio
       return {
         title: `tool search ${input.query}`,
         output,
-        structuredData: { tools: descriptions, truncated: matches.length > results.length },
+        structuredData: { tools: descriptions, truncated: matches.length > results.length, loaded },
         metadata: {
           query: input.query,
           count: results.length,
           tools: results.map((tool) => tool.name),
+          loaded,
         },
       };
     },
   };
-}
-
-function searchTools(
-  tools: readonly ChiliToolDefinition[],
-  query: string,
-  maxResults: number,
-): ChiliToolDefinition[] {
-  const selected = selectedTools(query);
-  if (selected.length > 0) {
-    const names = new Set(selected.map((name) => name.toLowerCase()));
-    return tools.filter((tool) => names.has(tool.name.toLowerCase()) || tool.aliases?.some((alias) => names.has(alias.toLowerCase()))).slice(0, maxResults);
-  }
-
-  const terms = query
-    .toLowerCase()
-    .split(/\s+/)
-    .map((term) => term.trim())
-    .filter(Boolean);
-  return tools
-    .filter((tool) => tool.name !== "tool_search")
-    .map((tool) => ({ tool, score: scoreTool(tool, terms) }))
-    .filter((entry) => entry.score > 0)
-    .sort((left, right) => right.score - left.score || left.tool.name.localeCompare(right.tool.name))
-    .slice(0, maxResults)
-    .map((entry) => entry.tool);
-}
-
-function selectedTools(query: string): string[] {
-  const trimmed = query.trim();
-  if (!trimmed.toLowerCase().startsWith("select:")) return [];
-  return trimmed
-    .slice("select:".length)
-    .split(",")
-    .map((name) => name.trim())
-    .filter(Boolean);
-}
-
-function scoreTool(tool: ChiliToolDefinition, terms: readonly string[]): number {
-  const haystacks = [
-    tool.name,
-    ...(tool.aliases ?? []),
-    tool.description,
-    tool.searchHint ?? "",
-  ].map((value) => value.toLowerCase());
-  let score = 0;
-  for (const term of terms) {
-    for (const haystack of haystacks) {
-      if (haystack === term) score += 6;
-      else if (haystack.includes(term)) score += 2;
-    }
-  }
-  return score;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

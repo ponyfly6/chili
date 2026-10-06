@@ -646,6 +646,18 @@ export class ToolExecutor {
         throwIfAborted(input.signal);
       },
       visibleTools: tool.isOrchestrator ? async () => (await loadCatalog()).tools : () => this.visibleTools(input),
+      invocationMode: input.parentCallId ? "code" : "direct",
+      loadTools: async (names) => {
+        const requested = new Set(names);
+        const available = await this.visibleTools(input);
+        const loaded = available.filter((candidate) => requested.has(candidate.name)).map((candidate) => candidate.name).sort();
+        throwIfAborted(input.signal);
+        await assertCurrentAuthorization?.();
+        if (loaded.length > 0) {
+          await this.publish("session.tools_loaded", input, { sessionId: input.sessionId, turnId: input.turnId, callId, names: loaded });
+        }
+        return loaded;
+      },
       ...(tool.isOrchestrator ? {
         invokeTool: async (name: string, childInput: unknown, childSignal?: AbortSignal): Promise<ToolResult> => {
           input.dispatchScope?.throwIfFailed();

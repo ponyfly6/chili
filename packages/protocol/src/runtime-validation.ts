@@ -606,6 +606,7 @@ export function parseRuntimeMcpLogoutResponse(value: unknown, path = "response")
 }
 
 const CHILI_EVENT_TYPES = [
+  "session.tools_loaded",
   "session.input_queue_changed",
   "session.created",
   "session.identity_bound",
@@ -673,6 +674,7 @@ const CHILI_EVENT_TYPES = [
 ] as const satisfies readonly ChiliEvent["type"][];
 
 const SESSION_SCOPED_EVENT_TYPES = new Set<ChiliEvent["type"]>([
+  "session.tools_loaded",
   "session.created",
   "session.identity_bound",
   "session.renamed",
@@ -757,6 +759,12 @@ function validateChiliEventPayload(
   _eventId: string,
 ): void {
   switch (type) {
+    case "session.tools_loaded":
+      matchingEventSessionId(payload.sessionId, envelopeSessionId, `${path}.sessionId`);
+      parseRuntimeIdentifier(payload.turnId, `${path}.turnId`);
+      parseRuntimeIdentifier(payload.callId, `${path}.callId`);
+      parseRuntimeStringArray(payload.names, `${path}.names`);
+      return;
     case "session.input_queue_changed":
       matchingEventSessionId(payload.sessionId, envelopeSessionId, `${path}.sessionId`);
       parseRuntimeInputQueue(payload, path);

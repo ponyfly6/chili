@@ -82,6 +82,9 @@ export interface ChiliToolExecutionContext extends ToolExecutionContext {
   assertFileResourceAccess?: (paths: readonly string[], access: "read" | "write") => Promise<void>;
   fileReads?: FileReadStateStore;
   visibleTools?: () => Promise<ChiliToolDefinition[]> | ChiliToolDefinition[];
+  /** Discovery records model exposure, never grants execution authority. */
+  loadTools?: (names: readonly string[]) => Promise<string[]>;
+  invocationMode?: "direct" | "code";
   invokeTool?: (name: string, input: unknown, signal?: AbortSignal) => Promise<ToolResult>;
   persistedOutputLimits?: {
     maxBytes?: number;
@@ -106,7 +109,7 @@ export interface ToolRegistrySelector {
 }
 
 export interface ToolRegistryListOptions {
-  /** Defaults to true: runtime advertises the complete catalog, without hidden activation. */
+  /** Defaults to true. Model exposure is selected separately from the execution catalog. */
   includeDeferred?: boolean;
 }
 
