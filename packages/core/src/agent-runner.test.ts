@@ -3,17 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import type {
-  AgentPath,
-  AgentRunId,
   ChiliEvent,
   EventEnvelope,
   Message,
   MessageId,
   PartId,
+  RuntimeEvent,
   RuntimeModelDescriptor,
   SessionId,
-  TaskId,
-  TeamId,
   TimestampMs,
   ToolCallId,
   TurnId,
@@ -39,7 +36,7 @@ import {
   RuntimeSessionInactiveError,
   RuntimeSessionNotFoundError,
   RuntimeService,
-  RuntimeSubagentSessionAccessError,
+  RuntimeSessionAccessError,
   type RuntimeSessionOperation,
 } from "./runtime-service.js";
 import { SingleAgentRuntime } from "./single-agent-runtime.js";
@@ -70,7 +67,7 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
   const handle = await service.createSession({
     cwd: "/workspace",
   });
-  store.addSession(handle.sessionId, "interactive", "/workspace");
+  store.addSession(handle.sessionId, "/workspace");
   const result = await service.submitPrompt({
     sessionId: handle.sessionId,
     text: "hello",
@@ -97,13 +94,12 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
   expect(statuses(store)).toEqual(["idle", "running", "idle"]);
 });
 
-test("root RuntimeService rejects direct subagent turns while an explicit child service remains usable", async () => {
+test("root RuntimeService rejects child sessions while the child runtime admits their persisted identity", async () => {
   const sessionId = "session_guarded_child" as SessionId;
-  const store = new SessionSourceEventStore({
+  const store = new SessionIdentityEventStore({
     id: sessionId,
     cwd: "/repo",
-    source: "subagent",
-    agent: { parentSessionId: "session_guarded_parent" as SessionId, name: "worker", path: "/root/worker", policy: {} },
+    agent: childMetadata(),
     status: "active",
     createdAt: 1,
     updatedAt: 1,
@@ -113,49 +109,49 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
   const input = { sessionId, text: "bypass child policy" };
 
   await expect(root.assertSessionReadAllowed(sessionId)).rejects.toBeInstanceOf(
-    RuntimeSubagentSessionAccessError,
+    RuntimeSessionAccessError,
   );
   await expect(root.submitPrompt(input)).rejects.toMatchObject({
-    name: "RuntimeSubagentSessionAccessError",
-    message: expect.stringContaining("Use agent_resume for this Agent"),
+    name: "RuntimeSessionAccessError",
+    message: expect.stringContaining(sessionId),
   });
   const asyncError = new Promise<unknown>((resolve) => {
     root.submitPromptAsync({ ...input, text: "async bypass" }, resolve);
   });
   await expect(asyncError).resolves.toMatchObject({
-    name: "RuntimeSubagentSessionAccessError",
-    message: expect.stringContaining("Use agent_resume for this Agent"),
+    name: "RuntimeSessionAccessError",
+    message: expect.stringContaining(sessionId),
   });
   expect(root.isRunning(sessionId)).toBe(false);
-  await expect(root.appendUserMessage(input)).rejects.toThrow("Use agent_resume for this Agent");
+  await expect(root.appendUserMessage(input)).rejects.toThrow(sessionId);
   await expect(root.compactSession({ sessionId })).rejects.toBeInstanceOf(
-    RuntimeSubagentSessionAccessError,
+    RuntimeSessionAccessError,
   );
   await expect(root.setGoal({ sessionId, objective: "bypass through goal continuation" })).rejects.toBeInstanceOf(
-    RuntimeSubagentSessionAccessError,
+    RuntimeSessionAccessError,
   );
   await expect(root.updateGoal({ sessionId, status: "paused" })).rejects.toBeInstanceOf(
-    RuntimeSubagentSessionAccessError,
+    RuntimeSessionAccessError,
   );
-  await expect(root.clearGoal({ sessionId })).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
-  await expect(root.inspectPrompt({ sessionId })).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
+  await expect(root.clearGoal({ sessionId })).rejects.toBeInstanceOf(RuntimeSessionAccessError);
+  await expect(root.inspectPrompt({ sessionId })).rejects.toBeInstanceOf(RuntimeSessionAccessError);
   await expect(root.setModel({
     sessionId,
     modelSelection: { provider: "custom", model: "blocked" },
-  })).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
+  })).rejects.toBeInstanceOf(RuntimeSessionAccessError);
   await expect(root.setReasoning({ sessionId, reasoningLevel: "high" })).rejects.toBeInstanceOf(
-    RuntimeSubagentSessionAccessError,
+    RuntimeSessionAccessError,
   );
   await expect(root.setServiceTier({ sessionId, serviceTier: "fast" })).rejects.toBeInstanceOf(
-    RuntimeSubagentSessionAccessError,
+    RuntimeSessionAccessError,
   );
   await expect(root.setDelegationPolicy({ sessionId, policy: "off" })).rejects.toBeInstanceOf(
-    RuntimeSubagentSessionAccessError,
+    RuntimeSessionAccessError,
   );
   await expect(root.renameSession(sessionId, "blocked rename")).rejects.toBeInstanceOf(
-    RuntimeSubagentSessionAccessError,
+    RuntimeSessionAccessError,
   );
-  await expect(root.archiveSession(sessionId)).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
+  await expect(root.archiveSession(sessionId)).rejects.toBeInstanceOf(RuntimeSessionAccessError);
   expect(rootRunner.userMessages).toEqual([]);
   expect(rootRunner.turnInputs).toEqual([]);
 
@@ -172,7 +168,7 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
     runtime: childRunner,
     store,
     cwd: "/repo",
-    allowSubagentSessions: true,
+    sessionAccess: "child",
   });
   await expect(child.assertSessionReadAllowed(sessionId)).resolves.toBeUndefined();
   await expect(child.submitPrompt({ ...input, text: "authorized child continuation" })).resolves.toMatchObject({
@@ -186,12 +182,52 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
   expect(childRunner.turnInputs).toHaveLength(1);
 });
 
+test("child runtimes reject root sessions and cannot create sessions outside atomic Agent creation", async () => {
+  const sessionId = "session_root_not_child" as SessionId;
+  const store = new MemoryEventStore();
+  store.addSession(sessionId);
+  const runner = new FakeAgentRunner();
+  const child = new RuntimeService({ runtime: runner, store, cwd: "/repo", sessionAccess: "child" });
+
+  await expect(child.assertSessionReadAllowed(sessionId)).rejects.toBeInstanceOf(RuntimeSessionAccessError);
+  await expect(child.submitPrompt({ sessionId, text: "wrong identity" })).rejects.toMatchObject({ name: "RuntimeSessionAccessError" });
+  await expect(child.createSession({ sessionId: "session_unowned_child" as SessionId })).rejects.toBeInstanceOf(RuntimeSessionAccessError);
+  expect(runner.createInputs).toEqual([]);
+  expect(runner.userMessages).toEqual([]);
+  expect(runner.turnInputs).toEqual([]);
+  expect(store.items).toEqual([]);
+});
+
+test("historical sessions remain readable and reject execution and mutation in both runtimes", async () => {
+  const sessionId = "session_historical_read_only" as SessionId;
+  for (const sessionAccess of ["root", "child"] as const) {
+    const store = new SessionIdentityEventStore({ id: sessionId, cwd: "/history", readOnly: true,
+      status: "active", createdAt: 1, updatedAt: 1 });
+    const runner = new FakeAgentRunner();
+    const service = new RuntimeService({ runtime: runner, store, cwd: "/repo", sessionAccess });
+    await expect(service.assertSessionReadAllowed(sessionId)).resolves.toBeUndefined();
+    const mutations: Array<() => Promise<unknown>> = [
+      () => service.submitPrompt({ sessionId, text: "restart legacy work" }),
+      () => service.appendUserMessage({ sessionId, text: "change history" }),
+      () => service.compactSession({ sessionId }),
+      () => service.setGoal({ sessionId, objective: "restart legacy work" }),
+      () => service.updateGoal({ sessionId, status: "active" }),
+      () => service.setDelegationPolicy({ sessionId, policy: "proactive" }),
+      () => service.renameSession(sessionId, "changed"),
+      () => service.archiveSession(sessionId),
+    ];
+    for (const mutate of mutations) await expect(mutate()).rejects.toMatchObject({ name: "RuntimeSessionAccessError" });
+    expect(runner.userMessages).toEqual([]);
+    expect(runner.turnInputs).toEqual([]);
+    expect(store.items).toEqual([]);
+  }
+});
+
 test("RuntimeService allows archived root reads without reopening turn admission", async () => {
   const sessionId = "session_archived_root_read" as SessionId;
-  const store = new SessionSourceEventStore({
+  const store = new SessionIdentityEventStore({
     id: sessionId,
     cwd: "/repo",
-    source: "interactive",
     status: "archived",
     createdAt: 1,
     updatedAt: 2,
@@ -208,7 +244,7 @@ test("RuntimeService rejects duplicate explicit session ids before creating or c
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();
   const sessionId = "session_existing_create" as SessionId;
-  store.addSession(sessionId, "interactive", "/authoritative/repo");
+  store.addSession(sessionId, "/authoritative/repo");
   const service = new RuntimeService({ runtime: runner, store, cwd: "/default/repo" });
 
   await expect(service.createSession({
@@ -310,7 +346,7 @@ test("SQLite keeps generated session creation fenced through the initial idle st
   const idleEntered = deferred<void>();
   const releaseIdle = deferred<void>();
   class InitialIdleGateStore extends ObservableEventStore {
-    override async append(event: ChiliEvent, options?: Parameters<ObservableEventStore["append"]>[1]): Promise<void> {
+    override async append(event: RuntimeEvent, options?: Parameters<ObservableEventStore["append"]>[1]): Promise<void> {
       if (
         event.type === "session.status_changed"
         && event.payload.reason === "session_created"
@@ -393,7 +429,7 @@ test("SQLite rejects a stale initial idle after the creation claim is lost insid
   const idleEntered = deferred<void>();
   const releaseIdle = deferred<void>();
   class InitialIdleGateStore extends ObservableEventStore {
-    override async append(event: ChiliEvent, options?: Parameters<ObservableEventStore["append"]>[1]): Promise<void> {
+    override async append(event: RuntimeEvent, options?: Parameters<ObservableEventStore["append"]>[1]): Promise<void> {
       if (
         event.type === "session.status_changed"
         && event.payload.reason === "session_created"
@@ -433,14 +469,13 @@ test("SQLite rejects a stale initial idle after the creation claim is lost insid
       sessionId,
       claimId: "creation_claim_expiry_probe",
       cwd: "/repo",
-      owner: "root",
       time: future,
       leaseDurationMs: 120_000,
     })).toEqual({ status: "already_exists" });
     expect(peerStore.claimSessionRun({
       sessionId,
       claimId: "run_claim_after_creation_expired",
-      allowSubagentSessions: false,
+      sessionAccess: "root",
       time: future,
       leaseDurationMs: 120_000,
     })).toEqual({ status: "claimed" });
@@ -548,109 +583,23 @@ test("RuntimeService fails closed on incomplete atomic session claim capabilitie
   expect(runService.isRunning(runSessionId)).toBe(false);
 });
 
-test("SQLite rechecks a child reservation after a root creation claim while allowing the child claimant", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-runtime-create-reservation-race-"));
-  const path = join(dir, "events.sqlite");
-  const rootStore = new SqliteEventStore(path);
-  const reservationStore = new SqliteEventStore(path);
-  const rootEvents = new ObservableEventStore(rootStore);
-  const reservationEvents = new ObservableEventStore(reservationStore);
-  const parentSessionId = "session_create_race_parent" as SessionId;
-  const childSessionId = "session_create_race_child" as SessionId;
-  const createId = createSequentialId();
-  const rootEnteredRunner = deferred<void>();
-  const releaseRootRunner = deferred<void>();
-  const rootRunner = new FakeAgentRunner();
-  rootRunner.onCreateSession = async (input) => {
-    rootEnteredRunner.resolve();
-    await releaseRootRunner.promise;
-    await rootEvents.append({
-      id: createId("event"),
-      type: "session.created",
-      time: 2 as TimestampMs,
-      sessionId: childSessionId,
-      payload: { sessionId: childSessionId, cwd: input.cwd },
-    });
-  };
-
-  try {
-    const root = new RuntimeService({ runtime: rootRunner, store: rootEvents, cwd: "/repo", createId });
-    const rootCreation = root.createSession({ sessionId: childSessionId });
-    await rootEnteredRunner.promise;
-
-    await reservationEvents.append({
-      id: "event_create_race_task_reserved",
-      type: "agent.task_created",
-      time: 1 as TimestampMs,
-      sessionId: parentSessionId,
-      payload: {
-        taskId: "task_create_race_child" as TaskId,
-        path: "/root/create-race-child" as AgentPath,
-        parentPath: "/root" as AgentPath,
-        parentSessionId,
-        childSessionId,
-        taskName: "create race child",
-        cwd: "/repo",
-        prompt: "claim the reserved child session",
-        mode: "background",
-      },
-    });
-    releaseRootRunner.resolve();
-
-    await expect(rootCreation).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
-    expect(await rootStore.sessions()).toEqual([]);
-    expect((await rootStore.events({ sessionId: childSessionId, type: "session.created", limit: 10 }))).toEqual([]);
-
-    const childRunner = new FakeAgentRunner();
-    childRunner.onCreateSession = async (input) => {
-      await reservationEvents.append({
-        id: createId("event"),
-        type: "session.created",
-        time: 3 as TimestampMs,
-        sessionId: childSessionId,
-        payload: { sessionId: childSessionId, cwd: input.cwd },
-      });
-    };
-    const child = new RuntimeService({
-      runtime: childRunner,
-      store: reservationEvents,
-      cwd: "/repo",
-      allowSubagentSessions: true,
-      createId,
-    });
-    await expect(child.createSession({ sessionId: childSessionId })).resolves.toEqual({
-      sessionId: childSessionId,
-    });
-    expect((await rootStore.sessions()).find((session) => session.id === childSessionId)).toMatchObject({
-      id: childSessionId,
-      source: "subagent",
-      status: "active",
-    });
-  } finally {
-    reservationStore.close();
-    rootStore.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
 test("RuntimeService rethrows inactive prompt boundaries without status side effects", async () => {
   const sessionId = "session_archived_guard" as SessionId;
   const row: SessionRow = {
     id: sessionId,
     cwd: "/archived/repo",
-    source: "interactive",
     status: "archived",
     createdAt: 1,
     updatedAt: 2,
   };
 
-  for (const allowSubagentSessions of [false, true]) {
-    const store = new SessionSourceEventStore(row);
+  for (const sessionAccess of ["root", "child"] as const) {
+    const store = new SessionIdentityEventStore({ ...row, ...(sessionAccess === "child" ? { agent: childMetadata() } : {}) });
     const service = new RuntimeService({
       runtime: new FakeAgentRunner(),
       store,
       cwd: "/default/repo",
-      allowSubagentSessions,
+      sessionAccess,
     });
     const operations: Array<() => Promise<unknown>> = [
       () => service.inspectPrompt({ sessionId }),
@@ -684,177 +633,6 @@ test("RuntimeService rethrows inactive prompt boundaries without status side eff
     expect(service.isRunning(sessionId)).toBe(false);
     expect(statuses(store)).toEqual([]);
     expect(store.items).toEqual([]);
-  }
-});
-
-test("RuntimeService rejects a pending child before its session row exists", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-runtime-pending-child-"));
-  const store = new SqliteEventStore(join(dir, "events.sqlite"));
-  const parentSessionId = "session_guard_pending_parent" as SessionId;
-  const childSessionId = "session_guard_pending_child" as SessionId;
-  const runner = new FakeAgentRunner();
-
-  try {
-    await store.append({
-      id: "event_guard_pending_task",
-      type: "agent.task_created",
-      time: 1 as TimestampMs,
-      sessionId: parentSessionId,
-      payload: {
-        taskId: "task_guard_pending_child" as TaskId,
-        path: "/root/pending-child" as AgentPath,
-        parentPath: "/root" as AgentPath,
-        parentSessionId,
-        childSessionId,
-        taskName: "pending child",
-        cwd: "/repo",
-        prompt: "wait for a lifecycle permit",
-        mode: "background",
-      },
-    });
-    expect(await store.sessions()).toEqual([]);
-
-    const root = new RuntimeService({ runtime: runner, store, cwd: "/repo" });
-    const input = { sessionId: childSessionId, text: "race the pending child" };
-    await expect(root.createSession({ sessionId: childSessionId })).rejects.toBeInstanceOf(
-      RuntimeSubagentSessionAccessError,
-    );
-    await expect(root.submitPrompt(input)).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
-    expect(() => root.submitPromptAsync({ ...input, text: "race asynchronously" }))
-      .toThrow(RuntimeSubagentSessionAccessError);
-
-    expect(root.isRunning(childSessionId)).toBe(false);
-    expect(runner.userMessages).toEqual([]);
-    expect(runner.turnInputs).toEqual([]);
-    expect((await store.agentTasks({ childSessionId }))[0]).toMatchObject({ status: "pending" });
-
-    const childRunner = new FakeAgentRunner();
-    childRunner.onCreateSession = async (createInput) => {
-      await store.append({
-        id: "event_guard_pending_child_session",
-        type: "session.created",
-        time: 2 as TimestampMs,
-        sessionId: childSessionId,
-        payload: { sessionId: childSessionId, cwd: createInput.cwd },
-      });
-    };
-    const child = new RuntimeService({
-      runtime: childRunner,
-      store,
-      cwd: "/repo",
-      allowSubagentSessions: true,
-    });
-    await expect(child.createSession({ sessionId: childSessionId })).resolves.toEqual({
-      sessionId: childSessionId,
-    });
-    expect((await store.sessions()).find((session) => session.id === childSessionId)).toMatchObject({
-      id: childSessionId,
-      source: "subagent",
-    });
-  } finally {
-    store.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("RuntimeService root creation rejects a session id reserved only by an agent run", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-runtime-pending-run-session-"));
-  const store = new SqliteEventStore(join(dir, "events.sqlite"));
-  const parentSessionId = "session_guard_pending_run_parent" as SessionId;
-  const childSessionId = "session_guard_pending_run_child" as SessionId;
-  const runner = new FakeAgentRunner();
-
-  try {
-    await store.append({
-      id: "event_guard_pending_run",
-      type: "agent.spawned",
-      time: 1 as TimestampMs,
-      sessionId: parentSessionId,
-      payload: {
-        runId: "agent_guard_pending_run" as AgentRunId,
-        path: "/root/pending-run" as AgentPath,
-        parentPath: "/root" as AgentPath,
-        parentSessionId,
-        childSessionId,
-        taskName: "pending run",
-        cwd: "/repo",
-        mode: "background",
-      },
-    });
-    expect(await store.sessions()).toEqual([]);
-
-    const root = new RuntimeService({ runtime: runner, store, cwd: "/repo" });
-    await expect(root.createSession({ sessionId: childSessionId })).rejects.toBeInstanceOf(
-      RuntimeSubagentSessionAccessError,
-    );
-    expect(runner.createInputs).toEqual([]);
-  } finally {
-    store.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("RuntimeService rejects team sessions before their session rows exist", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-runtime-pending-team-worker-"));
-  const store = new SqliteEventStore(join(dir, "events.sqlite"));
-  const rootSessionId = "session_guard_team_root" as SessionId;
-  const workerSessionId = "session_guard_team_worker" as SessionId;
-  const teamId = "team_guard_pending_worker" as TeamId;
-  const runner = new FakeAgentRunner();
-
-  try {
-    await store.appendMany([
-      {
-        id: "event_guard_pending_team",
-        type: "team.created",
-        time: 1 as TimestampMs,
-        sessionId: rootSessionId,
-        payload: { teamId, name: "pending worker guard", leadPath: "/root" as AgentPath },
-      },
-      {
-        id: "event_guard_pending_team_lead",
-        type: "team.member_added",
-        time: 2 as TimestampMs,
-        sessionId: rootSessionId,
-        payload: {
-          teamId,
-          path: "/root" as AgentPath,
-          name: "lead",
-          role: "leader",
-          childSessionId: rootSessionId,
-        },
-      },
-      {
-        id: "event_guard_pending_team_worker",
-        type: "team.member_added",
-        time: 3 as TimestampMs,
-        sessionId: rootSessionId,
-        payload: {
-          teamId,
-          path: "/root/worker" as AgentPath,
-          name: "worker",
-          role: "implementer",
-          childSessionId: workerSessionId,
-        },
-      },
-    ]);
-    expect(await store.sessions()).toEqual([]);
-
-    const root = new RuntimeService({ runtime: runner, store, cwd: "/repo" });
-    await expect(root.assertSessionTurnAllowed(rootSessionId)).rejects.toBeInstanceOf(RuntimeSessionNotFoundError);
-    await expect(root.createSession({ sessionId: workerSessionId })).rejects.toBeInstanceOf(
-      RuntimeSubagentSessionAccessError,
-    );
-    await expect(root.submitPrompt({
-      sessionId: workerSessionId,
-      text: "race the team worker",
-    })).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
-
-    expect(runner.userMessages).toEqual([]);
-    expect(runner.turnInputs).toEqual([]);
-  } finally {
-    store.close();
-    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -1269,7 +1047,7 @@ test("RuntimeService inspectPrompt resolves the persisted cwd and rejects a conf
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();
   const sessionId = "session_prompt_authoritative_cwd" as SessionId;
-  store.addSession(sessionId, "interactive", "/persisted/repo");
+  store.addSession(sessionId, "/persisted/repo");
   const observedCwds: string[] = [];
   const service = new RuntimeService({
     runtime: runner,
@@ -1323,7 +1101,7 @@ test("RuntimeService canonicalizes symlink cwd aliases and nonexistent lexical t
     })).resolves.toEqual({ sessionId });
     expect(runner.createInputs).toEqual([{ sessionId, cwd: canonicalCwd }]);
 
-    store.addSession(sessionId, "interactive", `${workspaceAlias}/future`);
+    store.addSession(sessionId, `${workspaceAlias}/future`);
     await expect(service.inspectPrompt({
       sessionId,
       cwd: canonicalCwd,
@@ -1557,7 +1335,7 @@ test("RuntimeService inspectPrompt only assembles prompt debug output", async ()
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();
   const sessionId = "session_prompt_debug" as SessionId;
-  store.addSession(sessionId, "interactive", "/repo/app");
+  store.addSession(sessionId, "/repo/app");
   const service = new RuntimeService({
     runtime: runner,
     store,
@@ -1708,9 +1486,9 @@ test("RuntimeService rejects async prompt claim boundary races synchronously", a
       errorType: RuntimeSessionInactiveError,
     },
     {
-      name: "subagent",
-      claim: { status: "subagent" as const },
-      errorType: RuntimeSubagentSessionAccessError,
+      name: "forbidden",
+      claim: { status: "forbidden" as const },
+      errorType: RuntimeSessionAccessError,
     },
     {
       name: "not-found",
@@ -2474,7 +2252,7 @@ test("session operation callers release reservations when the initial lease asse
 });
 
 test("goal continuation boundary rejections do not publish failed session status", async () => {
-  for (const boundary of ["inactive", "subagent", "missing"] as const) {
+  for (const boundary of ["inactive", "child", "missing"] as const) {
     const sessionId = `session_goal_boundary_${boundary}` as SessionId;
     const store = new GoalBoundaryEventStore(sessionId, boundary);
     const runner = new FakeAgentRunner();
@@ -2671,7 +2449,7 @@ test("RuntimeService stops before another tool-use turn when interrupted", async
     finishReason: "tool_use",
   };
   runner.onRunTurn = async () => {
-    await service.interrupt(sessionId, "complete_task");
+    await service.interrupt(sessionId, "stop");
   };
 
   const result = await service.submitPrompt({
@@ -2706,7 +2484,7 @@ test("SingleAgentRuntime satisfies AgentRunner without starting an already abort
     toolRegistry: registry,
     toolExecutor: new ToolExecutor({
       registry,
-      events: { publish: (event) => store.append(event) },
+      events: { publish: (event: RuntimeEvent) => store.append(event) },
       approvals: { decide: async () => ({ action: "allow_once" }) },
     }),
     retryPolicy: { maxAttempts: 3, initialDelayMs: 0 },
@@ -2760,7 +2538,7 @@ test("RuntimeService excludes cancelled prompt with no assistant output from sub
     toolRegistry: registry,
     toolExecutor: new ToolExecutor({
       registry,
-      events: { publish: (event) => store.append(event) },
+      events: { publish: (event: RuntimeEvent) => store.append(event) },
       approvals: { decide: async () => ({ action: "allow_once" }) },
     }),
     createId,
@@ -2843,7 +2621,7 @@ test("RuntimeService persists encrypted reasoning output into the next turn cont
     toolRegistry: registry,
     toolExecutor: new ToolExecutor({
       registry,
-      events: { publish: (event) => store.append(event) },
+      events: { publish: (event: RuntimeEvent) => store.append(event) },
       approvals: { decide: async () => ({ action: "allow_once" }) },
     }),
     createId,
@@ -2900,7 +2678,7 @@ test("RuntimeService excludes a failed prompt with only a synthetic error from s
     toolRegistry: registry,
     toolExecutor: new ToolExecutor({
       registry,
-      events: { publish: (event) => store.append(event) },
+      events: { publish: (event: RuntimeEvent) => store.append(event) },
       approvals: { decide: async () => ({ action: "allow_once" }) },
     }),
     retryPolicy: { maxAttempts: 1 },
@@ -2947,6 +2725,10 @@ test("RuntimeService excludes a failed prompt with only a synthetic error from s
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+function childMetadata(): NonNullable<SessionRow["agent"]> {
+  return { parentSessionId: "session_guarded_parent" as SessionId, name: "worker", path: "/root/worker", policy: {} };
+}
 
 class FakeAgentRunner implements AgentRunner {
   readonly createInputs: CreateSessionInput[] = [];
@@ -3015,13 +2797,11 @@ class MemoryEventStore implements EventStore {
 
   addSession(
     sessionId: SessionId,
-    source: SessionRow["source"] = "interactive",
     cwd = "/repo",
   ): void {
     this.sessionRows.push({
       id: sessionId,
       cwd,
-      source,
       status: "active",
       createdAt: 1,
       updatedAt: 1,
@@ -3046,14 +2826,14 @@ class LeaseControlledEventStore extends MemoryEventStore {
   claimSessionRun(input: {
     sessionId: SessionId;
     claimId: string;
-    allowSubagentSessions: boolean;
+    sessionAccess?: "root" | "child";
     time: number;
     leaseDurationMs: number;
-  }): { status: "claimed" | "busy" | "inactive" | "not_found" | "subagent"; sessionStatus?: string } {
+  }): { status: "claimed" | "busy" | "inactive" | "not_found" | "forbidden"; sessionStatus?: string } {
     const session = this.sessionRows.find((candidate) => candidate.id === input.sessionId);
     if (!session) return { status: "not_found" };
     if (session.status !== "active") return { status: "inactive", sessionStatus: session.status };
-    if (!input.allowSubagentSessions && session.source === "subagent") return { status: "subagent" };
+    if (session.readOnly || Boolean(session.agent) !== (input.sessionAccess === "child")) return { status: "forbidden" };
     if (this.claimId) return { status: "busy" };
     this.claimId = input.claimId;
     return { status: "claimed" };
@@ -3073,7 +2853,7 @@ class LeaseControlledEventStore extends MemoryEventStore {
   }
 }
 
-class SessionSourceEventStore extends MemoryEventStore {
+class SessionIdentityEventStore extends MemoryEventStore {
   constructor(private readonly row: SessionRow) {
     super();
   }
@@ -3088,7 +2868,7 @@ class GoalBoundaryEventStore extends MemoryEventStore {
 
   constructor(
     private readonly sessionId: SessionId,
-    private readonly boundary: "inactive" | "subagent" | "missing",
+    private readonly boundary: "inactive" | "child" | "missing",
   ) {
     super();
     this.addSession(sessionId);
@@ -3104,7 +2884,7 @@ class GoalBoundaryEventStore extends MemoryEventStore {
     } else if (row && this.boundary === "inactive") {
       row.status = "archived";
     } else if (row) {
-      row.source = "subagent";
+      row.agent = childMetadata();
     }
   }
 }

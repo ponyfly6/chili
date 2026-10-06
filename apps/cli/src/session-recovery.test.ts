@@ -6,6 +6,7 @@ import { revertSessionSnapshot } from "./session-recovery.js";
 test("direct CLI revert resolves an active root session before invoking recovery", async () => {
   const activeSessionId = "session_revert_active" as SessionId;
   const archivedSessionId = "session_revert_archived" as SessionId;
+  const historySessionId = "session_revert_history" as SessionId;
   const childSessionId = "session_revert_child" as SessionId;
   const snapshotId = "snapshot_cli_revert" as SnapshotId;
   const service = {
@@ -19,7 +20,6 @@ test("direct CLI revert resolves an active root session before invoking recovery
         {
           id: activeSessionId,
           cwd: "/repo",
-          source: "interactive" as const,
           status: "active" as const,
           createdAt: 1,
           updatedAt: 1,
@@ -27,7 +27,6 @@ test("direct CLI revert resolves an active root session before invoking recovery
         {
           id: archivedSessionId,
           cwd: "/repo",
-          source: "interactive" as const,
           status: "archived" as const,
           createdAt: 1,
           updatedAt: 1,
@@ -35,7 +34,15 @@ test("direct CLI revert resolves an active root session before invoking recovery
         {
           id: childSessionId,
           cwd: "/repo",
-          source: "subagent" as const,
+          agent: { parentSessionId: activeSessionId, name: "child", path: "/root/child", policy: {} },
+          status: "active" as const,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+        {
+          id: historySessionId,
+          cwd: "/repo",
+          readOnly: true,
           status: "active" as const,
           createdAt: 1,
           updatedAt: 1,
@@ -63,6 +70,7 @@ test("direct CLI revert resolves an active root session before invoking recovery
     .rejects.toThrow(`Session is not active: ${archivedSessionId}`);
   await expect(revertSessionSnapshot({ ...baseInput, resume: childSessionId }))
     .rejects.toThrow("belongs to an agent");
+  await expect(revertSessionSnapshot({ ...baseInput, resume: historySessionId })).rejects.toThrow("read-only history");
   expect(recoveryCalls).toEqual([]);
 
   await expect(revertSessionSnapshot({ ...baseInput, resume: activeSessionId }))

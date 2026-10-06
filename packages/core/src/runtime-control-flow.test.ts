@@ -1447,11 +1447,10 @@ class MemoryEventStore implements EventStore {
     return this.sessionRows.map((row) => ({ ...row }));
   }
 
-  addSession(sessionId: SessionId, source: SessionRow["source"] = "interactive"): void {
+  addSession(sessionId: SessionId): void {
     this.sessionRows.push({
       id: sessionId,
       cwd: "/repo",
-      source,
       status: "active",
       createdAt: 1,
       updatedAt: 1,

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import type {
-  ChiliEvent,
+  RuntimeEvent,
   MessageId,
   MessagePart,
   PartId,
@@ -342,7 +342,7 @@ function creation(
   messageId: MessageId,
   role: "user" | "assistant",
   time: number,
-): Extract<ChiliEvent, { type: "message.created" }> {
+): Extract<RuntimeEvent, { type: "message.created" }> {
   return {
     id,
     type: "message.created",
@@ -354,7 +354,7 @@ function creation(
 
 function appendOlderCreation(
   db: Database,
-  event: Extract<ChiliEvent, { type: "message.created" }>,
+  event: Extract<RuntimeEvent, { type: "message.created" }>,
 ): void {
   // Match the prior store's transaction order and INSERT column list.
   db.transaction(() => {
@@ -376,7 +376,7 @@ function textPart(
   partId: string,
   text: string,
   time: number,
-): ChiliEvent {
+): RuntimeEvent {
   return {
     id,
     type: "message.part_added",

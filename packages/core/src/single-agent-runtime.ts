@@ -1,6 +1,6 @@
 import type {
   AssistantMessagePhase,
-  ChiliEvent,
+  RuntimeEvent,
   EventEnvelope,
   ExecutionIdentity,
   Message,
@@ -1384,7 +1384,7 @@ export class SingleAgentRuntime implements AgentRunner {
     });
   }
 
-  private async append<TType extends ChiliEvent["type"], TPayload>(
+  private async append<TType extends RuntimeEvent["type"], TPayload>(
     input: EventContext,
     type: TType,
     payload: TPayload,
@@ -1396,7 +1396,7 @@ export class SingleAgentRuntime implements AgentRunner {
       sessionId: input.sessionId,
       payload,
     };
-    await this.options.store.append(event as ChiliEvent);
+    await this.options.store.append(event as RuntimeEvent);
   }
 
   private id<T extends string>(prefix: string): T {

@@ -569,11 +569,27 @@ test("agent list summarizes current agent states", () => {
     output: JSON.stringify({ agents }),
   }));
   expect(list([
-    { agentId: "session_1", state: "running" },
-    { agentId: "session_2", state: "paused" },
-    { agentId: "session_3", state: "idle" },
+    { agentId: "session_1", parentAgentId: "root", state: "running" },
+    { agentId: "session_2", parentAgentId: "root", state: "paused" },
+    { agentId: "session_3", parentAgentId: "session_1", state: "idle" },
   ])).toMatchObject({ label: "Listed agents", summary: "3 agents · 1 running · 1 paused · 1 idle", mode: "inline" });
   expect(list([]).summary).toBe("0 agents");
+  expect(list([{ agentId: "root", state: "running" }]).summary).toBe("0 agents");
+});
+
+test.each([0, 1, 2, 3])("agent list excludes the root at position %s from child counts", (rootIndex) => {
+  const agents: Array<{ agentId: string; parentAgentId?: string; state: string }> = [
+    { agentId: "session_1", parentAgentId: "root", state: "running" },
+    { agentId: "session_2", parentAgentId: "root", state: "paused" },
+    { agentId: "session_3", parentAgentId: "session_1", state: "idle" },
+  ];
+  agents.splice(rootIndex, 0, { agentId: "root", state: "running" });
+  const rendered = renderToolActivity(toolInput({
+    toolName: "agent_list",
+    input: {},
+    output: JSON.stringify({ agents }),
+  }));
+  expect(rendered.summary).toBe("3 agents · 1 running · 1 paused · 1 idle");
 });
 
 test("agent details and failures remain inspectable", () => {

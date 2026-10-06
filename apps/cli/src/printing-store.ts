@@ -1,4 +1,4 @@
-import type { ChiliEvent, EventEnvelope, Message, MessagePart, MessageRole, SessionId } from "@chili/protocol";
+import type { ChiliEvent, RuntimeEvent, EventEnvelope, Message, MessagePart, MessageRole, SessionId } from "@chili/protocol";
 import type {
   ApprovalRow,
   EventAppendOptions,
@@ -29,11 +29,11 @@ export class PrintingEventStore
 {
   constructor(private readonly inner: EventStore, private readonly printer: CliPrinter) {}
 
-  async append(event: ChiliEvent, options?: EventAppendOptions): Promise<void> {
+  async append(event: RuntimeEvent, options?: EventAppendOptions): Promise<void> {
     await this.appendCommitted(event, options);
   }
 
-  async appendCommitted(event: ChiliEvent, options?: EventAppendOptions): Promise<boolean> {
+  async appendCommitted(event: RuntimeEvent, options?: EventAppendOptions): Promise<boolean> {
     const aware = this.inner as EventStore & Partial<EventCommitAwareStore>;
     const committed = aware.appendCommitted
       ? await aware.appendCommitted(event, options)
@@ -43,16 +43,16 @@ export class PrintingEventStore
   }
 
   async appendMany(
-    events: readonly ChiliEvent[],
+    events: readonly RuntimeEvent[],
     options?: EventAppendOptions,
   ): Promise<void> {
     await this.appendManyCommitted(events, options);
   }
 
   async appendManyCommitted(
-    events: readonly ChiliEvent[],
+    events: readonly RuntimeEvent[],
     options?: EventAppendOptions,
-  ): Promise<readonly ChiliEvent[]> {
+  ): Promise<readonly RuntimeEvent[]> {
     const aware = this.inner as EventStore & Partial<EventCommitAwareStore>;
     const committed = aware.appendManyCommitted
       ? await aware.appendManyCommitted(events, options)
@@ -61,7 +61,7 @@ export class PrintingEventStore
     return committed;
   }
 
-  async reconcileStaleTurns(input: StaleTurnRecoveryInput): Promise<ChiliEvent[]> {
+  async reconcileStaleTurns(input: StaleTurnRecoveryInput): Promise<RuntimeEvent[]> {
     const recovery = this.inner as EventStore & Partial<StaleTurnRecoveryStore>;
     if (!recovery.reconcileStaleTurns) return [];
     const events = await recovery.reconcileStaleTurns(input);

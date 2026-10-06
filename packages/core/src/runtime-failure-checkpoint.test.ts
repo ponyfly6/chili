@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { expect, test } from "bun:test";
 import type {
   ChiliEvent,
+  RuntimeEvent,
   MessageId,
   MessagePart,
   SessionId,
@@ -248,9 +249,9 @@ test("publishes prompt-level status and never bounces cancelling back to running
 });
 
 class TrackingSqliteEventStore extends SqliteEventStore {
-  readonly appendManyBatches: ChiliEvent[][] = [];
+  readonly appendManyBatches: RuntimeEvent[][] = [];
 
-  override async appendMany(events: readonly ChiliEvent[]): Promise<void> {
+  override async appendMany(events: readonly RuntimeEvent[]): Promise<void> {
     this.appendManyBatches.push([...events]);
     await super.appendMany(events);
   }

@@ -218,8 +218,11 @@ export function App() {
     setNotice({ kind: "success", text: "本页的授权已清除。如需再次连接，请回桌面生成新的配对码。设备也可在桌面撤销。" });
   }, [client, setNotice]);
 
+  const task = snapshot?.session.id === selectedId ? snapshot.session : tasks.find((candidate) => candidate.id === selectedId);
+  const taskControllable = task?.status === "active" && !task.readOnly;
+
   const send = async (mode: "queue" | "steer") => {
-    if (!client || !connected || !selectedId || !canSendPrompt(draft) || sendPending.current) return;
+    if (!client || !connected || !selectedId || !taskControllable || !canSendPrompt(draft) || sendPending.current) return;
     sendPending.current = true;
     setSending(mode);
     setNotice(null);
@@ -257,7 +260,7 @@ export function App() {
   };
 
   const stop = async () => {
-    if (!client || !connected || !selectedId || stopPending.current) return;
+    if (!client || !connected || !selectedId || !taskControllable || stopPending.current) return;
     stopPending.current = true;
     setStopping(true);
     setNotice(null);
@@ -286,7 +289,6 @@ export function App() {
     }
   };
 
-  const task = snapshot?.session ?? tasks.find((candidate) => candidate.id === selectedId);
   const needsDesktop = snapshot?.session.needsDesktop.approval || snapshot?.session.needsDesktop.input;
   const sendDisabled = !connected || !selectedId || !!sending || !canSendPrompt(draft) || !!needsDesktop;
   const byteLength = promptByteLength(draft);
@@ -380,12 +382,12 @@ export function App() {
                     {snapshot?.truncated && <p className="limit-note">已省略部分较早或较长的内容。完整记录请回桌面查看。</p>}
                     {snapshot?.messages.map((message) => <article className={`message message-${message.role}`} key={message.id}><div className="message-heading"><strong>{message.role === "user" ? "你" : "Chili"}</strong><span>{formatMessageTime(message.createdAt)}</span></div><p>{message.text}</p></article>)}
                   </div>
-                  <section className="composer" aria-label="任务控制">
+                  {!taskControllable ? <p className="limit-note">此会话仅供查看历史。</p> : <section className="composer" aria-label="任务控制">
                     <label htmlFor="message-input">补充一条指令</label>
                     <textarea id="message-input" data-testid="message-input" value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={needsDesktop ? "请先回桌面处理待审批或提问" : "让 Chili 接下来做什么？"} rows={3} disabled={!connected || !!needsDesktop} aria-describedby="composer-help composer-bytes" />
                     <div className="composer-help"><span id="composer-help">Queue 排队执行 · Steer 引导当前任务</span><span id="composer-bytes" className={byteLength > MAX_PROMPT_BYTES ? "over-limit" : ""}>{byteLength.toLocaleString()} / {MAX_PROMPT_BYTES.toLocaleString()} B</span></div>
                     <div className="composer-actions"><button type="button" className="secondary-button" data-testid="queue-send" disabled={sendDisabled} onClick={() => void send("queue")}>{sending === "queue" ? "正在发送…" : "Queue"}</button><button type="button" className="primary-button" data-testid="steer-send" disabled={sendDisabled} onClick={() => void send("steer")}>{sending === "steer" ? "正在发送…" : "Steer"}<span aria-hidden="true">↗</span></button><button type="button" className="stop-button" data-testid="stop-task" disabled={!connected || stopping} onClick={() => void stop()}><span aria-hidden="true">■</span>{stopping ? "停止中…" : "Stop"}</button></div>
-                  </section>
+                  </section>}
                 </>}
               </section>
             </div>

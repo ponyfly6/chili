@@ -4,9 +4,10 @@ import type { SessionId } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
 import { resolveSession } from "./session.js";
 
-test("CLI resume accepts only an existing active interactive session without creating events", async () => {
+test("CLI resume accepts only an existing active root session without creating events", async () => {
   const activeSessionId = "session_resume_active" as SessionId;
   const archivedSessionId = "session_resume_archived" as SessionId;
+  const historySessionId = "session_resume_history" as SessionId;
   const childSessionId = "session_resume_child" as SessionId;
   let createCalls = 0;
   const service = {
@@ -21,7 +22,6 @@ test("CLI resume accepts only an existing active interactive session without cre
         {
           id: activeSessionId,
           cwd: "/repo",
-          source: "interactive" as const,
           status: "active" as const,
           createdAt: 1,
           updatedAt: 1,
@@ -29,7 +29,6 @@ test("CLI resume accepts only an existing active interactive session without cre
         {
           id: archivedSessionId,
           cwd: "/repo",
-          source: "interactive" as const,
           status: "archived" as const,
           createdAt: 1,
           updatedAt: 1,
@@ -37,7 +36,15 @@ test("CLI resume accepts only an existing active interactive session without cre
         {
           id: childSessionId,
           cwd: "/repo",
-          source: "subagent" as const,
+          agent: { parentSessionId: activeSessionId, name: "child", path: "/root/child", policy: {} },
+          status: "active" as const,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+        {
+          id: historySessionId,
+          cwd: "/repo",
+          readOnly: true,
           status: "active" as const,
           createdAt: 1,
           updatedAt: 1,
@@ -64,5 +71,6 @@ test("CLI resume accepts only an existing active interactive session without cre
     ...input,
     resume: activeSessionId,
   })).resolves.toEqual({ sessionId: activeSessionId, isNew: false });
+  await expect(resolveSession({ ...input, resume: historySessionId })).rejects.toThrow("read-only history");
   expect(createCalls).toBe(0);
 });

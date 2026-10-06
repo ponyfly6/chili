@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import type { ChiliEvent, SessionId, TimestampMs, TurnId } from "@chili/protocol";
+import type { RuntimeEvent, SessionId, TimestampMs, TurnId } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import { GoalService } from "./goal.js";
 
@@ -55,7 +55,7 @@ test("over ten thousand durable receipts survive replay and reset only at clear 
     let goals = new GoalService({ store });
     const initial = await goals.setGoal({ sessionId, objective: "long ledger", tokenBudget: 50_000 });
     const scope = await goals.captureUsage({ sessionId });
-    const events: ChiliEvent[] = Array.from({ length: 10_001 }, (_, index) => ({
+    const events: RuntimeEvent[] = Array.from({ length: 10_001 }, (_, index) => ({
       id: `event_history_${index}`,
       type: "goal.updated",
       sessionId,

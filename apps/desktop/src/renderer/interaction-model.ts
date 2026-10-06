@@ -53,10 +53,11 @@ export function canOpenSession(state: Pick<RuntimeInteractionState, "healthy" | 
 }
 
 export function canEditComposer(
-  state: RuntimeInteractionState & { selectedId: string | undefined },
+  state: RuntimeInteractionState & { selectedId: string | undefined; readOnly?: boolean },
 ): boolean {
   return Boolean(state.selectedId)
     && state.healthy
+    && !state.readOnly
     && !state.resyncing
     && !state.loadingSession
     && !state.working;

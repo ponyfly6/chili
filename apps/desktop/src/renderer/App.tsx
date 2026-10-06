@@ -86,6 +86,7 @@ import {
   goalResumeBudgetMinimum,
   goalProgress,
   hydrateNewTaskChoices,
+  isSessionReadOnly,
   modelFromKey,
   modelKey,
   newTaskSubmission,
@@ -278,12 +279,11 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     || presentation?.chat.status === "waiting_for_approval"
     || presentation?.chat.status === "cancelling";
   const selectedSession = sessions.find((session) => session.id === selectedId);
-  const selectedArchived = selectedSession?.status === "archived";
+  const selectedReadOnly = isSessionReadOnly(selectedSession);
   const healthy = desktop.sidecar.phase === "healthy";
   const actionsDisabled = working || resyncing || loadingSession;
-  const runtimeActionsDisabled = actionsDisabled || !healthy;
-  const composerEditable = !selectedArchived
-    && canEditComposer({ selectedId: selectedId ?? (healthy ? "new" : undefined), healthy, resyncing, loadingSession, working });
+  const runtimeActionsDisabled = actionsDisabled || !healthy || selectedReadOnly;
+  const composerEditable = canEditComposer({ selectedId: selectedId ?? (healthy ? "new" : undefined), healthy, resyncing, loadingSession, working, readOnly: selectedReadOnly });
   const workspaceSwitchEnabled = canSwitchWorkspace({ working, loadingSession, resyncing, resyncRetryAvailable });
   const sidecarGuidance = sidecarRecoveryGuidance(desktop.sidecar);
   const selectedTitle = selectedSession?.title || selectedSession?.preview || "新会话";
@@ -293,9 +293,9 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     [sessionListStatus, sessionQuery, sessions],
   );
   const selectedGoal = sessionConfig?.goal ?? undefined;
-  const canResumeSession = canResumeTask(presentation?.chat.status, selectedGoal?.status, Boolean(selectedArchived), snapshot?.inputQueue?.paused);
+  const canResumeSession = canResumeTask(presentation?.chat.status, selectedGoal?.status, selectedReadOnly, snapshot?.inputQueue?.paused);
   const emptyConversation = !loadingSession && timelineItems.length === 0;
-  const commands = commandsOpen ? matchingDesktopCommands(composer.startsWith("/") ? composer : "/") : [];
+  const commands = commandsOpen && !selectedReadOnly ? matchingDesktopCommands(composer.startsWith("/") ? composer : "/") : [];
   useEffect(() => {
     setCommandsOpen(false);
   }, [desktop.projectId, selectedId]);
@@ -809,7 +809,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
 
   const renameSession = async (session: RuntimeSessionSummary, title: string) => {
     const normalized = title.trim();
-    if (!normalized) return;
+    if (!normalized || isSessionReadOnly(session)) return;
     await runAction(async () => {
       await transport.renameSession(String(session.id), normalized);
       setRenameTarget(undefined);
@@ -818,6 +818,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   };
 
   const archiveSession = async (session: RuntimeSessionSummary) => {
+    if (isSessionReadOnly(session)) return;
     await runAction(async () => {
       await transport.archiveSession(String(session.id));
       setArchiveTarget(undefined);
@@ -827,7 +828,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   };
 
   const resumeSession = async () => {
-    if (!selectedId || selectedArchived) return;
+    if (!selectedId || selectedReadOnly) return;
     await runAction(async () => {
       const next = await coordinator.refreshSessionSnapshot(
         selectedId,
@@ -840,7 +841,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   };
 
   const saveSessionSettings = async (values: SessionSettingsValues, section: "models" | "permissions") => {
-    if (!selectedId || !sessionConfig || selectedArchived) return;
+    if (!selectedId || !sessionConfig || selectedReadOnly) return;
     await runAction(async () => {
       if (section === "models") {
         const catalog = models.length > 0 ? models : sessionConfig.model.models;
@@ -865,7 +866,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   };
 
   const changeGoalStatus = async (status: SessionGoalStatus) => {
-    if (!selectedId || selectedArchived) return;
+    if (!selectedId || selectedReadOnly) return;
     await runAction(async () => {
       await transport.updateGoal(selectedId, { status });
       await reloadSessionConfig(selectedId);
@@ -873,7 +874,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   };
 
   const resumeBudgetLimitedGoal = async (tokenBudget: number) => {
-    if (!selectedId || !selectedGoal || selectedGoal.status !== "budgetLimited" || selectedArchived) return;
+    if (!selectedId || !selectedGoal || selectedGoal.status !== "budgetLimited" || selectedReadOnly) return;
     await runAction(async () => {
       await transport.updateGoal(selectedId, { tokenBudget, status: "active" });
       setGoalBudgetOpen(false);
@@ -882,7 +883,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   };
 
   const addGoal = async (objective: string, tokenBudget?: number) => {
-    if (!selectedId || selectedArchived) return;
+    if (!selectedId || selectedReadOnly) return;
     await runAction(async () => {
       await transport.setGoal(selectedId, objective, tokenBudget);
       setGoalSetupOpen(false);
@@ -891,7 +892,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   };
 
   const clearGoal = async () => {
-    if (!selectedId || selectedArchived) return;
+    if (!selectedId || selectedReadOnly) return;
     await runAction(async () => {
       await transport.clearGoal(selectedId);
       await reloadSessionConfig(selectedId);
@@ -899,7 +900,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   };
 
   const reloadMcp = async () => {
-    if (!selectedId || selectedArchived) return;
+    if (!selectedId || selectedReadOnly) return;
     await runAction(async () => {
       await transport.reloadMcp(selectedId);
       await reloadSessionConfig(selectedId);
@@ -907,6 +908,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   };
 
   const chooseCommand = (command: DesktopCommand) => {
+    if (selectedReadOnly) return;
     setCommandsOpen(false);
     setCommandIndex(0);
     if (command.group === "prompt") {
@@ -948,7 +950,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   };
 
   const stop = async () => {
-    if (!selectedId) return;
+    if (!selectedId || selectedReadOnly) return;
     await runAction(async () => {
       await transport.stop(selectedId);
     });
@@ -957,10 +959,13 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const resolveApproval = async (
     approvalId: string,
     decision: "allow_once" | "allow_session" | "allow_always" | "deny",
-  ) => runAction(async () => {
-    await transport.resolveApproval(approvalId, decision);
-    await reloadSelected();
-  });
+  ) => {
+    if (selectedReadOnly) return Promise.resolve();
+    return runAction(async () => {
+      await transport.resolveApproval(approvalId, decision);
+      await reloadSelected();
+    });
+  };
 
   async function runAction(action: () => Promise<void>): Promise<void> {
     if (actionInFlightRef.current) return;
@@ -1099,12 +1104,13 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                       <span className="session-title">{session.title || session.preview || "新会话"}</span>
                       <span className="session-meta">
                         {formatRelativeTime(session.updatedAt)}
+                        {session.readOnly ? " · 历史只读" : ""}
                         {(desktop.queuedBySession[session.id] ?? 0) > 0 ? ` · ${desktop.queuedBySession[session.id]} queued` : ""}
                       </span>
                     </span>
                     {selectedId === session.id ? <span className="session-active-mark" aria-hidden="true" /> : null}
                   </button>
-                  {canExposeTaskActions(session.status) ? (
+                  {canExposeTaskActions(session) ? (
                     <>
                       <button
                         ref={(node) => {
@@ -1173,14 +1179,14 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             <div className="conversation-title"><h1>{selectedId ? selectedTitle : "新会话"}</h1></div>
             <div className="conversation-heading-actions">
               {canResumeSession ? <button className="secondary compact-action" disabled={runtimeActionsDisabled} onClick={() => void resumeSession()}><Icon name="resume" />继续处理</button> : null}
-              {sessionBusy ? <span className="session-status status-running"><span />正在处理</span> : null}
-              {selectedId && !selectedArchived ? <button className="icon-button" aria-label="Task runtime settings" title="会话设置" disabled={runtimeActionsDisabled || !sessionConfig} onClick={() => openSettings("models")}><Icon name="more" /></button> : null}
+              {sessionBusy && !selectedReadOnly ? <span className="session-status status-running"><span />正在处理</span> : null}
+              {selectedId && !selectedReadOnly ? <button className="icon-button" aria-label="Task runtime settings" title="会话设置" disabled={runtimeActionsDisabled || !sessionConfig} onClick={() => openSettings("models")}><Icon name="more" /></button> : null}
             </div>
           </div>
-          {selectedArchived ? (
+          {selectedReadOnly ? (
             <div className="read-only-banner" role="status">
               <Icon name="archive" />
-              <span>此会话已归档，可以查看历史记录。</span>
+              <span>{selectedSession?.readOnly ? "此会话为历史只读记录，可以查看历史内容。" : "此会话已归档，可以查看历史记录。"}</span>
             </div>
           ) : null}
 
@@ -1209,7 +1215,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                   agents={descendantAgents}
                   inputQueues={Object.fromEntries(Object.entries(presentation?.runtime.sessions ?? {})
                     .flatMap(([id, session]) => session.inputQueue ? [[id, session.inputQueue]] : []))}
-                  {...(!runtimeActionsDisabled && !selectedArchived ? {
+                  {...(!runtimeActionsDisabled ? {
                     onStop: async (agentId: string) => { await transport.stopAgent(selectedId, agentId); await reloadSelected(); },
                     onResume: async (agentId: string) => { await transport.resumeAgent(selectedId, agentId); await reloadSelected(); },
                     onSend: async (agentId: string, text: string, mode: "queue" | "steer") => {
@@ -1238,6 +1244,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                   request={input}
                   disabled={runtimeActionsDisabled}
                   submit={(answers) => runAction(async () => {
+                    if (selectedReadOnly) return;
                     await transport.resolveUserInput(input.id, answers);
                     await reloadSelected();
                   })}
@@ -1275,7 +1282,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                     else if (composerEditable) void submit("queue");
                   }
                 }}
-                placeholder={selectedArchived ? "已归档的会话仅供查看" : sessionBusy ? "补充想法，或告诉 Chili 调整方向…" : "说说你想做什么…"}
+                placeholder={selectedSession?.readOnly ? "历史只读会话仅供查看" : selectedReadOnly ? "已归档的会话仅供查看" : sessionBusy ? "补充想法，或告诉 Chili 调整方向…" : "说说你想做什么…"}
                 aria-expanded={commandsOpen && commands.length > 0}
                 aria-controls={commandsOpen && commands.length > 0 ? "composer-commands" : undefined}
                 aria-activedescendant={commandsOpen && commands.length > 0 ? `command-${commands[commandIndex % commands.length]!.id}` : undefined}
@@ -1285,7 +1292,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
               <div className="composer-actions">
                 <div className="composer-context">
                   <button className="slash-trigger" aria-label="更多命令" disabled={!composerEditable} onClick={() => { setCommandsOpen((open) => !open); setCommandIndex(0); composerRef.current?.focus(); }}>/ <span>更多</span></button>
-                  {snapshot?.inputQueue?.paused ? <span>已暂停 · 可继续处理</span> : null}
+                  {snapshot?.inputQueue?.paused && !selectedReadOnly ? <span>已暂停 · 可继续处理</span> : null}
                   {(desktop.queuedBySession[selectedId ?? ""] ?? 0) > 0 ? <span>{desktop.queuedBySession[selectedId ?? ""]} 条待处理</span> : null}
                 </div>
                 <div className="composer-buttons">
@@ -1357,14 +1364,14 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
 
       {settingsOpen ? <ModalFrame labelId="desktop-settings-title" className="desktop-settings-dialog" onClose={() => setSettingsOpen(false)} closeDisabled={working || themeSaving || preferencesSaving}>
         <DesktopSettings page={settingsPage} onPage={setSettingsPage} project={projectLabel} session={selectedId} config={sessionConfig}
-          models={models} disabled={runtimeActionsDisabled || Boolean(selectedArchived)} busy={working} error={error} theme={theme} onTheme={changeTheme}
+          models={models} disabled={runtimeActionsDisabled} busy={working} error={error} theme={theme} onTheme={changeTheme}
           themeSaveFailed={themeSaveFailed} themeSaving={themeSaving || preferencesSaving} preferences={preferences} onPreferences={savePreferences} preferenceSaveFailed={preferenceSaveFailed}
           goalControls={<section className="settings-section goal-section" aria-label="持续任务">
             <div className="section-heading compact"><h4>持续任务</h4>{selectedGoal ? <span className={`goal-status goal-${selectedGoal.status}`}>{goalStatusLabel(selectedGoal.status)}</span> : null}</div>
             {selectedGoal ? (
               <GoalCard
                 goal={selectedGoal}
-                disabled={runtimeActionsDisabled || selectedArchived}
+                disabled={runtimeActionsDisabled}
                 busy={Boolean(sessionBusy)}
                 onStatus={(status) => void changeGoalStatus(status)}
                 onRaiseBudget={() => { setSettingsOpen(false); setGoalBudgetOpen(true); }}
@@ -1373,21 +1380,21 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             ) : (
               <div className="compact-empty-action">
                 <p className="empty-copy">No autonomous Goal is attached to this task.</p>
-                {selectedId && !selectedArchived ? (
+                {selectedId && !selectedReadOnly ? (
                   <button className="secondary" disabled={runtimeActionsDisabled} onClick={() => { setSettingsOpen(false); setGoalSetupOpen(true); }}>Add Goal</button>
                 ) : null}
               </div>
             )}
           </section>}
           onSave={(values, section) => void saveSessionSettings(values, section)} onReloadMcp={() => void reloadMcp()}
-          onPrompt={(text) => { setSettingsOpen(false); setComposer(text); requestAnimationFrame(() => composerRef.current?.focus()); }}
+          onPrompt={(text) => { if (selectedReadOnly) return; setSettingsOpen(false); setComposer(text); requestAnimationFrame(() => composerRef.current?.focus()); }}
           onNewSession={() => { setSettingsOpen(false); openNewTask(); }} onClose={() => setSettingsOpen(false)} />
       </ModalFrame> : null}
 
       {goalSetupOpen ? (
         <GoalSetupDialog
           defaultObjective={composer.trim()}
-          disabled={working}
+          disabled={runtimeActionsDisabled}
           onClose={() => !working && setGoalSetupOpen(false)}
           onSubmit={(objective, tokenBudget) => void addGoal(objective, tokenBudget)}
         />
@@ -1396,7 +1403,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       {goalBudgetOpen && selectedGoal?.status === "budgetLimited" ? (
         <GoalBudgetDialog
           goal={selectedGoal}
-          disabled={working}
+          disabled={runtimeActionsDisabled}
           onClose={() => !working && setGoalBudgetOpen(false)}
           onSubmit={(tokenBudget) => void resumeBudgetLimitedGoal(tokenBudget)}
         />

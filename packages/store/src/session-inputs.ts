@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type {
-  ChiliEvent, MessageId, PartId, RuntimeInputMode, RuntimeInputOutcome,
+  RuntimeEvent, MessageId, PartId, RuntimeInputMode, RuntimeInputOutcome,
   RuntimeInputQueue, RuntimeSessionInput, SessionId, TimestampMs, TurnId,
   MessageImageContent,
 } from "@chili/protocol";
@@ -17,7 +17,7 @@ export interface StoredSessionInput extends RuntimeSessionInput {
 
 export interface SessionInputMutationOptions {
   /** Trusted runtime option, never accepted from the input payload. */
-  allowSubagentSessions?: boolean;
+  sessionAccess?: "root" | "child";
 }
 
 export type SessionInputAccept = { kind: "accept"; sessionId: SessionId; submissionId: string; inputId: string; mode: RuntimeInputMode; payload: string; text: string; source: string; identity?: string };
@@ -36,7 +36,7 @@ export type SessionInputMutation =
 export interface SessionInputMutationResult {
   input?: StoredSessionInput;
   queue: RuntimeInputQueue;
-  events: ChiliEvent[];
+  events: RuntimeEvent[];
   duplicate?: boolean;
 }
 
@@ -63,8 +63,8 @@ interface InputRow {
 }
 
 interface InputRepositoryOptions {
-  commit(events: readonly ChiliEvent[], fence?: SessionRunClaimFence): void;
-  claim(input: { sessionId: SessionId; claimId: string; allowSubagentSessions: boolean; time: number; leaseDurationMs: number }): { status: string };
+  commit(events: readonly RuntimeEvent[], fence?: SessionRunClaimFence): void;
+  claim(input: { sessionId: SessionId; claimId: string; sessionAccess: "root" | "child"; time: number; leaseDurationMs: number }): { status: string };
   forgetClaim(sessionId: SessionId, claimId: string): void;
   assertSession(sessionId: SessionId, options: SessionInputMutationOptions): void;
   retry<T>(operation: () => T): T;
@@ -161,7 +161,7 @@ export class SessionInputRepository {
       let input: StoredSessionInput | undefined;
       let changed = false;
       let fence: SessionRunClaimFence | undefined;
-      const events: ChiliEvent[] = [];
+      const events: RuntimeEvent[] = [];
       if (command.kind === "accept") {
         const existing = this.db.query<InputRow, [string, string]>(
           "select * from session_inputs where session_id = ? and submission_id = ?",
@@ -210,7 +210,7 @@ export class SessionInputRepository {
         const row = this.db.query<InputRow, [string]>(`select * from session_inputs where session_id = ? and state = 'pending'
           order by resumed desc, case mode when 'steer' then 0 else 1 end, sequence limit 1`).get(sessionId);
         if (!row) return { queue: this.queue(sessionId), events };
-        const result = this.options.claim({ sessionId, claimId: command.claimId, allowSubagentSessions: options.allowSubagentSessions === true, time, leaseDurationMs: command.leaseDurationMs });
+        const result = this.options.claim({ sessionId, claimId: command.claimId, sessionAccess: options.sessionAccess ?? "root", time, leaseDurationMs: command.leaseDurationMs });
         if (result.status !== "claimed") return { queue: this.queue(sessionId), events };
         claimed = true;
         fence = { sessionId, claimId: command.claimId };

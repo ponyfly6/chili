@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { ChiliEvent, SessionId, TimestampMs } from "@chili/protocol";
+import type { RuntimeEvent, SessionId, TimestampMs } from "@chili/protocol";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import { DelegationPolicyGate } from "./delegation.js";
 import type { AgentRunner } from "./runner.js";
@@ -28,7 +28,7 @@ test("delegation policy reads the durable latest value across runtime instances 
       source: "session",
     });
 
-    const laterEvents = Array.from({ length: 501 }, (_, index): ChiliEvent => ({
+    const laterEvents = Array.from({ length: 501 }, (_, index): RuntimeEvent => ({
       id: `event_delegation_page_${index}`,
       type: "session.delegation_changed",
       time: (index + 10) as TimestampMs,
@@ -60,7 +60,7 @@ function runtimeService(store: SqliteEventStore): RuntimeService {
   });
 }
 
-function sessionCreatedEvent(id: string, sessionId: SessionId): Extract<ChiliEvent, { type: "session.created" }> {
+function sessionCreatedEvent(id: string, sessionId: SessionId): Extract<RuntimeEvent, { type: "session.created" }> {
   return {
     id,
     type: "session.created",

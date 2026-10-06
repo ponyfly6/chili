@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { McpElicitationRequest, McpElicitationResult, McpServerConfig } from "@chili/mcp";
-import { timestampNow, parseUserInputQuestions, type ChiliEvent, type SessionId, type ToolCallId, type UserInputId, type UserInputQuestion } from "@chili/protocol";
+import { timestampNow, parseUserInputQuestions, type RuntimeEvent, type SessionId, type ToolCallId, type UserInputId, type UserInputQuestion } from "@chili/protocol";
 import { type DeferredUserInputQueue, UserInputDeniedError, validateExternalInputSchema } from "@chili/tools";
 
 export interface McpElicitationContext {
@@ -10,7 +10,7 @@ export interface McpElicitationContext {
 }
 export interface McpElicitationOptions {
   queue: DeferredUserInputQueue;
-  events: { publish(event: ChiliEvent): Promise<void> };
+  events: { publish(event: RuntimeEvent): Promise<void> };
 }
 
 /** Form values are disclosed only after explicit consent for this server request. */

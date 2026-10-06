@@ -4,7 +4,7 @@ import type { SessionRow } from "@chili/store";
 import { DelegationPolicyGate, resolveDelegationConfig } from "./delegation.js";
 
 function session(id: string, parent?: string): SessionRow {
-  return { id: id as SessionId, cwd: "/repo", source: parent ? "subagent" : "interactive", status: "active", createdAt: 1, updatedAt: 1,
+  return { id: id as SessionId, cwd: "/repo", status: "active", createdAt: 1, updatedAt: 1,
     ...(parent ? { agent: { parentSessionId: parent as SessionId, name: id, path: `/root/${id}` as AgentPath, policy: {} } } : {}) };
 }
 function gate(sessions: SessionRow[]) {
@@ -25,7 +25,7 @@ test("nested Agent operations inherit the persisted root delegation override", a
 test("missing, archived and legacy child ownership cannot become a root grant", async () => {
   await expect(gate([session("child","missing")]).rootSessionId("child" as SessionId)).rejects.toThrow("not found");
   await expect(gate([{...session("root"),status:"archived"},session("child","root")]).rootSessionId("child" as SessionId)).rejects.toThrow("not active");
-  await expect(gate([{...session("legacy"),source:"subagent"}]).rootSessionId("legacy" as SessionId)).rejects.toThrow("subagent");
+  await expect(gate([{...session("legacy"),readOnly:true}]).rootSessionId("legacy" as SessionId)).rejects.toThrow("read-only");
 });
 test("persisted parent cycles and oversized chains fail closed", async () => {
   await expect(gate([session("a","b"),session("b","a")]).rootSessionId("a" as SessionId)).rejects.toThrow("Cyclic");

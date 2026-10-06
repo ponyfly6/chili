@@ -1,5 +1,5 @@
 import type {
-  ChiliEvent,
+  RuntimeEvent,
   DelegationPolicy,
   EventEnvelope,
   ExecutionIdentity,
@@ -41,7 +41,7 @@ import {
   SessionAlreadyExistsError,
   SessionCreationClaimConflictError,
   SessionCwdConflictError,
-  SessionReservedForSubagentError,
+  SessionAccessError,
   SessionRunClaimConflictError,
   SessionStateConflictError,
   type EventAppendOptions,
@@ -133,8 +133,8 @@ export interface RuntimeServiceOptions {
   defaultDelegationPolicy?: DelegationPolicy;
   sessionClaimLeaseMs?: number;
   sessionClaimHeartbeatMs?: number;
-  /** Internal child runtime only. Root/user-facing services must leave this false. */
-  allowSubagentSessions?: boolean;
+  /** Selects the persisted Session identities this instance may execute. Defaults to root. */
+  sessionAccess?: "root" | "child";
   /** Wrap one accepted input, including its model/tool continuations. */
   runInput?: (sessionId: SessionId, signal: AbortSignal, run: () => Promise<SubmitPromptResult>) => Promise<SubmitPromptResult>;
   onModelChanged?: (input: RuntimeModelChangedInput) => Promise<void> | void;
@@ -283,10 +283,9 @@ interface RuntimeAtomicSessionStore {
     sessionId: SessionId;
     claimId: string;
     cwd: string;
-    owner: "root" | "child";
     time: number;
     leaseDurationMs: number;
-  }): { status: "claimed" | "already_exists" | "subagent" };
+  }): { status: "claimed" | "already_exists" | "forbidden" };
   renewSessionCreation(input: {
     sessionId: SessionId;
     claimId: string;
@@ -297,11 +296,11 @@ interface RuntimeAtomicSessionStore {
   claimSessionRun(input: {
     sessionId: SessionId;
     claimId: string;
-    allowSubagentSessions: boolean;
+    sessionAccess: "root" | "child";
     time: number;
     leaseDurationMs: number;
     respectDispatch?: boolean;
-  }): { status: "claimed" | "busy" | "inactive" | "not_found" | "subagent"; sessionStatus?: string };
+  }): { status: "claimed" | "busy" | "inactive" | "not_found" | "forbidden"; sessionStatus?: string };
   renewSessionRun(input: {
     sessionId: SessionId;
     claimId: string;
@@ -357,13 +356,10 @@ export class RuntimeForeignOwnerError extends RuntimeBusyError {
   }
 }
 
-export class RuntimeSubagentSessionAccessError extends Error {
-  constructor(readonly sessionId: SessionId) {
-    super(
-      `Session ${sessionId} belongs to a subagent and cannot be run through the root runtime. ` +
-      "Use agent_resume for this Agent so its persisted tool policy and concurrency limits are preserved.",
-    );
-    this.name = "RuntimeSubagentSessionAccessError";
+export class RuntimeSessionAccessError extends Error {
+  constructor(readonly sessionId: SessionId, reason = "Session identity is not admitted by this runtime") {
+    super(`${reason}: ${sessionId}`);
+    this.name = "RuntimeSessionAccessError";
   }
 }
 
@@ -470,6 +466,9 @@ export class RuntimeService {
   private async createAdmittedSession(input: CreateRuntimeSessionInput): Promise<RuntimeSessionHandle> {
     this.assertOpen();
     const sessionId = input.sessionId ?? this.id<SessionId>("session");
+    if (this.options.sessionAccess === "child") {
+      throw new RuntimeSessionAccessError(sessionId, "Child Agents must be created atomically through Agent control");
+    }
     if (this.creatingSessions.has(sessionId)) {
       throw new RuntimeSessionAlreadyExistsError(sessionId);
     }
@@ -484,13 +483,6 @@ export class RuntimeService {
       ) {
         throw new RuntimeSessionAlreadyExistsError(sessionId);
       }
-      if (
-        !this.options.allowSubagentSessions
-        && await this.isSubagentSessionOwned(sessionId)
-      ) {
-        throw new RuntimeSubagentSessionAccessError(sessionId);
-      }
-
       const identity = await this.options.executionIdentityResolver?.(cwd);
       const atomicStore = this.atomicSessionStore("creation");
       let creationClaimId: string | undefined;
@@ -502,15 +494,14 @@ export class RuntimeService {
           sessionId,
           claimId,
           cwd,
-          owner: this.options.allowSubagentSessions ? "child" : "root",
           time: Date.now(),
           leaseDurationMs: this.sessionClaimLeaseMs,
         });
         if (claimed.status === "already_exists") {
           throw new RuntimeSessionAlreadyExistsError(sessionId);
         }
-        if (claimed.status === "subagent") {
-          throw new RuntimeSubagentSessionAccessError(sessionId);
+        if (claimed.status === "forbidden") {
+          throw new RuntimeSessionAccessError(sessionId);
         }
         creationClaimId = claimId;
         if (atomicStore.renewSessionCreation) {
@@ -565,11 +556,11 @@ export class RuntimeService {
         assertCreationClaimCurrent();
         return { sessionId };
       } catch (error) {
-        if (error instanceof SessionReservedForSubagentError || (
-          error instanceof Error && error.name === "SessionReservedForSubagentError"
+        if (error instanceof SessionAccessError || (
+          error instanceof Error && error.name === "SessionAccessError"
         )) {
-          throw new RuntimeSubagentSessionAccessError(
-            (error as SessionReservedForSubagentError).sessionId ?? sessionId,
+          throw new RuntimeSessionAccessError(
+            (error as SessionAccessError).sessionId ?? sessionId,
           );
         }
         if (
@@ -655,16 +646,13 @@ export class RuntimeService {
   private async assertSessionAccessAllowed(sessionId: SessionId, requireActive: boolean): Promise<void> {
     const sessions = await this.options.store.sessions();
     const session = sessions.find((candidate) => candidate.id === sessionId);
-    if (this.options.allowSubagentSessions) {
-      if (!session) throw new RuntimeSessionNotFoundError(sessionId);
-      if (session.source === "subagent" && !session.agent) {
-        throw new RuntimeSubagentSessionAccessError(sessionId);
-      }
-    } else {
-      if (session?.source === "subagent") {
-        throw new RuntimeSubagentSessionAccessError(sessionId);
-      }
-      if (!session) throw new RuntimeSessionNotFoundError(sessionId);
+    if (!session) throw new RuntimeSessionNotFoundError(sessionId);
+    if (session.readOnly) {
+      if (!requireActive) return;
+      throw new RuntimeSessionAccessError(sessionId, "Historical Session is read-only");
+    }
+    if (Boolean(session.agent) !== (this.options.sessionAccess === "child")) {
+      throw new RuntimeSessionAccessError(sessionId);
     }
     if (requireActive && session.status !== "active") {
       throw new RuntimeSessionInactiveError(sessionId, session.status);
@@ -741,10 +729,6 @@ export class RuntimeService {
         }
       });
     })();
-  }
-
-  private async isSubagentSessionOwned(sessionId: SessionId): Promise<boolean> {
-    return (await this.options.store.sessions()).some((session) => session.id === sessionId && session.source === "subagent");
   }
 
   async listModels(input: { provider?: string } = {}): Promise<RuntimeModelDescriptor[]> {
@@ -1074,7 +1058,7 @@ export class RuntimeService {
           if (!error.status) throw new RuntimeSessionNotFoundError(input.sessionId);
           throw new RuntimeSessionInactiveError(input.sessionId, error.status);
         }
-        if (error instanceof SessionReservedForSubagentError) throw new RuntimeSubagentSessionAccessError(input.sessionId);
+        if (error instanceof SessionAccessError) throw new RuntimeSessionAccessError(input.sessionId);
         throw error;
       }
       this.inputBackgroundError = onError ?? this.inputBackgroundError;
@@ -1116,7 +1100,7 @@ export class RuntimeService {
 
   private mutateSessionInputs(input: SessionInputMutation) {
     const store = this.inputStore();
-    return store?.mutateSessionInputs(input, { allowSubagentSessions: this.options.allowSubagentSessions === true });
+    return store?.mutateSessionInputs(input, { sessionAccess: this.options.sessionAccess ?? "root" });
   }
 
   inputQueue(sessionId: SessionId): RuntimeInputQueue {
@@ -1179,7 +1163,7 @@ export class RuntimeService {
     if (!store) return;
     for (const session of await this.options.store.sessions()) {
       if (session.status !== "active" || this.running.has(session.id)) continue;
-      if (this.options.allowSubagentSessions ? !session.agent : session.source === "subagent") continue;
+      if (session.readOnly || Boolean(session.agent) !== (this.options.sessionAccess === "child")) continue;
       if (store.sessionInputQueue(session.id).items.some((item) => item.state === "claimed"
         || (options.includePending !== false && item.state === "pending"))) {
         this.assertControlOwner(session.id);
@@ -1947,7 +1931,7 @@ export class RuntimeService {
     const messageId = this.id<MessageId>("msg");
     const partId = this.id<PartId>("part");
     const time = this.now();
-    const messageCreated: Extract<ChiliEvent, { type: "message.created" }> = {
+    const messageCreated: Extract<RuntimeEvent, { type: "message.created" }> = {
       id: this.id("event"),
       type: "message.created",
       time,
@@ -1958,7 +1942,7 @@ export class RuntimeService {
         turnId: failedResult.turnId,
       },
     };
-    const partAdded: Extract<ChiliEvent, { type: "message.part_added" }> = {
+    const partAdded: Extract<RuntimeEvent, { type: "message.part_added" }> = {
       id: this.id("event"),
       type: "message.part_added",
       time,
@@ -2354,6 +2338,9 @@ export class RuntimeService {
   async interrupt(sessionId: SessionId, reason = "user_interrupt", expectedExecutionRef?: string): Promise<boolean> {
     return this.withMutationAdmission(async () => {
       this.assertControlOwner(sessionId);
+      // A local run already passed identity admission. Preserve synchronous
+      // cancellation of its controller while validating idle control targets.
+      if (!this.running.has(sessionId)) await this.assertSessionAccessAllowed(sessionId, true);
       if (this.options.executionIdentityResolver && !this.running.has(sessionId)) await this.assertSessionIdentity(sessionId);
       if (expectedExecutionRef !== undefined) this.assertExecutionRef(sessionId, expectedExecutionRef);
       const steering = reason === "desktop_steer" || reason === "steer";
@@ -2485,14 +2472,14 @@ export class RuntimeService {
       const claimed = atomicStore.claimSessionRun({
         sessionId: input.sessionId,
         claimId,
-        allowSubagentSessions: this.options.allowSubagentSessions === true,
+        sessionAccess: this.options.sessionAccess ?? "root",
         time: Date.now(),
         leaseDurationMs: this.sessionClaimLeaseMs,
         respectDispatch: purpose === "goal",
       });
       if (claimed.status === "busy") throw new RuntimeBusyError(input.sessionId);
       if (claimed.status === "not_found") throw new RuntimeSessionNotFoundError(input.sessionId);
-      if (claimed.status === "subagent") throw new RuntimeSubagentSessionAccessError(input.sessionId);
+      if (claimed.status === "forbidden") throw new RuntimeSessionAccessError(input.sessionId);
       if (claimed.status === "inactive") {
         throw new RuntimeSessionInactiveError(input.sessionId, claimed.sessionStatus ?? "inactive");
       }
@@ -2879,7 +2866,7 @@ export class RuntimeService {
     await this.append(input, "session.status_changed", payload, options);
   }
 
-  private async append<TType extends ChiliEvent["type"], TPayload>(
+  private async append<TType extends RuntimeEvent["type"], TPayload>(
     input: { sessionId: SessionId },
     type: TType,
     payload: TPayload,
@@ -2892,7 +2879,7 @@ export class RuntimeService {
       sessionId: input.sessionId,
       payload,
     };
-    await this.options.store.append(event as ChiliEvent, options);
+    await this.options.store.append(event as RuntimeEvent, options);
   }
 
   private id<T extends string>(prefix: string): T {
@@ -3271,11 +3258,11 @@ function isRuntimeSessionBoundaryError(error: Error): boolean {
     || error instanceof RuntimeSessionIdentityError
     || error.name === "RuntimeSessionIdentityError"
     || error instanceof RuntimeSessionInactiveError
-    || error instanceof RuntimeSubagentSessionAccessError
+    || error instanceof RuntimeSessionAccessError
     || error instanceof RuntimeSessionNotFoundError
     || error.name === "RuntimeServiceClosedError"
     || error.name === "RuntimeSessionInactiveError"
-    || error.name === "RuntimeSubagentSessionAccessError"
+    || error.name === "RuntimeSessionAccessError"
     || error.name === "RuntimeSessionNotFoundError";
 }
 

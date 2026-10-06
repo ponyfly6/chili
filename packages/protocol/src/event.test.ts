@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
-import type { AgentMessageQueuedPayload, AgentPath, SessionId } from "./index.js";
+import type { AgentPath, SessionId } from "./index.js";
+import type { AgentMessageQueuedPayload } from "./legacy-workflow-events.js";
 
-test("agent mailbox payload names its destination as the recipient session", () => {
+test("historical agent mailbox payload names its destination as the recipient session", () => {
   const payload: AgentMessageQueuedPayload = {
     path: "/root/reviewer" as AgentPath,
     from: "/root" as AgentPath,

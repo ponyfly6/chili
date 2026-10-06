@@ -212,25 +212,31 @@ export function goalProgress(tokensUsed: number, tokenBudget?: number): number |
 export function canResumeTask(
   sessionStatus: RuntimeSessionStatus | "unknown" | undefined,
   goalStatus: SessionGoalStatus | undefined,
-  archived: boolean,
+  readOnly: boolean,
   dispatchPaused = false,
 ): boolean {
-  if (dispatchPaused) return !archived && goalStatus !== "budgetLimited" && sessionStatus !== "running" && sessionStatus !== "cancelling" && sessionStatus !== "waiting_for_approval";
-  return !archived
+  if (dispatchPaused) return !readOnly && goalStatus !== "budgetLimited" && sessionStatus !== "running" && sessionStatus !== "cancelling" && sessionStatus !== "waiting_for_approval";
+  return !readOnly
     && (goalStatus === "active" || goalStatus === "paused")
     && (sessionStatus === "cancelled" || sessionStatus === "failed");
 }
 
-export function canExposeTaskActions(status: RuntimeSessionSummary["status"]): boolean {
-  return status === "active";
+export function isSessionReadOnly(
+  session: Pick<RuntimeSessionSummary, "status" | "readOnly"> | undefined,
+): boolean {
+  return session?.status === "archived" || session?.readOnly === true;
+}
+
+export function canExposeTaskActions(session: Pick<RuntimeSessionSummary, "status" | "readOnly">): boolean {
+  return session.status === "active" && !isSessionReadOnly(session);
 }
 
 export function canReloadSessionMcp(
   sessionId: string | undefined,
-  archived: boolean,
+  readOnly: boolean,
   actionsDisabled: boolean,
 ): boolean {
-  return Boolean(sessionId) && !archived && !actionsDisabled;
+  return Boolean(sessionId) && !readOnly && !actionsDisabled;
 }
 
 export function goalResumeBudgetMinimum(goal: Pick<SessionGoal, "tokenBudget" | "tokensUsed">): number {

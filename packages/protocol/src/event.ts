@@ -1,17 +1,14 @@
+import { isLegacyWorkflowEvent, type LegacyWorkflowEvent } from "./legacy-workflow-events.js";
 import type {
-  AgentRunId,
   ApprovalId,
   MessageId,
   SessionId,
-  TaskId,
-  TeamId,
   TimestampMs,
   SnapshotId,
   ToolCallId,
   TurnId,
   UserInputId,
 } from "./ids.js";
-import type { AgentPath } from "./agent-path.js";
 import type { SessionAgentMetadata } from "./session-agent.js";
 import type { SessionGoal, SessionGoalUpdateReason, SessionGoalUsageDelta } from "./goal.js";
 import type { Message, MessagePart } from "./message.js";
@@ -41,7 +38,8 @@ export interface EventEnvelope<TType extends string = string, TPayload = unknown
 export type SessionScopedEventEnvelope<TType extends string, TPayload> =
   EventEnvelope<TType, TPayload> & { sessionId: SessionId };
 
-export type ChiliEvent =
+/** Events emitted by the current Session-based runtime. */
+export type RuntimeEvent =
   | SessionEvent
   | TurnEvent
   | MessageEvent
@@ -50,9 +48,16 @@ export type ChiliEvent =
   | UserInputEvent
   | GoalEvent
   | RecoveryEvent
-  | AgentEvent
-  | TeamEvent
   | McpEvent;
+
+/** Storage/read transport union. Historical workflow events are never new writes. */
+export type ChiliEvent = RuntimeEvent | LegacyWorkflowEvent;
+export type { LegacyWorkflowEvent } from "./legacy-workflow-events.js";
+export { isLegacyWorkflowEvent } from "./legacy-workflow-events.js";
+
+export function isRuntimeEvent(event: ChiliEvent): event is RuntimeEvent {
+  return !isLegacyWorkflowEvent(event);
+}
 
 export function isTransientEvent(event: Pick<EventEnvelope, "type">): boolean {
   return event.type === "tool.output_delta";
@@ -72,6 +77,9 @@ export function compactRuntimeMessage(message: Message): Message {
 }
 
 /** Keep the audit record in storage while transporting only its stable reference. */
+export function compactRuntimeEvent(event: RuntimeEvent): RuntimeEvent;
+export function compactRuntimeEvent(event: LegacyWorkflowEvent): LegacyWorkflowEvent;
+export function compactRuntimeEvent(event: ChiliEvent): ChiliEvent;
 export function compactRuntimeEvent(event: ChiliEvent): ChiliEvent {
   if (event.type === "message.part_added" && event.payload.part.type === "tool_result") {
     const { structuredData, ...part } = event.payload.part;
@@ -326,310 +334,3 @@ export type McpEvent =
   | EventEnvelope<"mcp.resources_changed", McpResourcesChangedPayload>
   | EventEnvelope<"mcp.diagnostic", McpDiagnosticPayload>
   | EventEnvelope<"mcp.progress", McpProgressPayload>;
-
-export type AgentTaskStatus = "pending" | "running" | "completed" | "incomplete" | "failed" | "cancelled";
-export type AgentTaskMode = "one_shot" | "resumable" | "background";
-export type TaskCompletionPolicy = "join" | "notify" | "detached" | "supervised";
-export type AgentMailboxStatus = "queued" | "delivering" | "consumed" | "discarded";
-
-export interface AgentTaskCreatedPayload {
-  taskId: TaskId;
-  /** Stable identity used to make crash-retried task creation idempotent. */
-  dispatchId?: string;
-  /** Run id reserved by the dispatcher before the task is durably created. */
-  reservedRunId?: AgentRunId;
-  path: AgentPath;
-  parentPath: AgentPath;
-  parentSessionId: SessionId;
-  childSessionId: SessionId;
-  taskName: string;
-  cwd: string;
-  prompt: string;
-  mode?: AgentTaskMode;
-  workerPolicy?: Record<string, unknown>;
-  sourceCallId?: ToolCallId;
-  batchId?: string;
-  batchIndex?: number;
-  expectedBatchSize?: number;
-  completionPolicy?: TaskCompletionPolicy;
-  maxConcurrency?: number;
-}
-
-export interface AgentSpawnedPayload {
-  runId: AgentRunId;
-  path: AgentPath;
-  taskName: string;
-  generation?: number;
-  parentPath?: AgentPath;
-  taskId?: TaskId;
-  parentSessionId?: SessionId;
-  childSessionId?: SessionId;
-  cwd?: string;
-  mode?: AgentTaskMode;
-  workerPolicy?: Record<string, unknown>;
-  sourceCallId?: ToolCallId;
-  batchId?: string;
-  batchIndex?: number;
-  expectedBatchSize?: number;
-  completionPolicy?: TaskCompletionPolicy;
-  maxConcurrency?: number;
-}
-
-export type AgentMailboxPayload =
-  | { role?: "system" | "user" | "assistant" | "tool"; content: string; metadata?: Record<string, unknown> }
-  | { role?: "system" | "user" | "assistant" | "tool"; parts: MessagePart[]; metadata?: Record<string, unknown> };
-
-export interface AgentMessageQueuedPayload {
-  path: AgentPath;
-  from: AgentPath;
-  triggerTurn: boolean;
-  taskId?: TaskId;
-  recipientSessionId?: SessionId;
-  message?: AgentMailboxPayload;
-}
-
-export interface AgentMessageConsumedPayload {
-  messageId: string;
-  path?: AgentPath;
-  taskId?: TaskId;
-  consumedBy?: AgentPath;
-}
-
-export interface AgentMessageClaimedPayload {
-  messageId: string;
-  path?: AgentPath;
-  taskId?: TaskId;
-  claimedBy?: AgentPath;
-}
-
-export interface AgentMessageRequeuedPayload {
-  messageId: string;
-  path?: AgentPath;
-  taskId?: TaskId;
-  error?: string;
-}
-
-export interface AgentMessageDiscardedPayload {
-  messageId: string;
-  path?: AgentPath;
-  taskId?: TaskId;
-  discardedBy?: AgentPath;
-  reason: string;
-}
-
-export interface AgentCompleteTaskPayload {
-  taskId: TaskId;
-  path: AgentPath;
-  status: Exclude<AgentTaskStatus, "pending" | "running">;
-  runId?: AgentRunId;
-  generation?: number;
-  summary?: string;
-  error?: string;
-  metadata?: Record<string, unknown>;
-}
-
-export interface AgentCompletedPayload {
-  runId: AgentRunId;
-  path: AgentPath;
-  status: Exclude<AgentTaskStatus, "pending" | "running">;
-  taskId?: TaskId;
-  generation?: number;
-  summary?: string;
-  error?: string;
-}
-
-export type AgentEvent =
-  | EventEnvelope<"agent.task_created", AgentTaskCreatedPayload>
-  | EventEnvelope<"agent.spawned", AgentSpawnedPayload>
-  | EventEnvelope<"agent.message_queued", AgentMessageQueuedPayload>
-  | EventEnvelope<"agent.message_claimed", AgentMessageClaimedPayload>
-  | EventEnvelope<"agent.message_requeued", AgentMessageRequeuedPayload>
-  | EventEnvelope<"agent.message_discarded", AgentMessageDiscardedPayload>
-  | EventEnvelope<"agent.message_consumed", AgentMessageConsumedPayload>
-  | EventEnvelope<"agent.task_completed", AgentCompleteTaskPayload>
-  | EventEnvelope<"agent.completed", AgentCompletedPayload>;
-
-export type TeamMemberStatus = "idle" | "running" | "waiting" | "blocked" | "closed";
-export type TeamTaskStatus = "pending" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
-export type TeamMessageKind = "text" | "task_assignment" | "system";
-export type TeamMessageDelivery = "queueOnly" | "triggerTurn";
-export type TeamMessageDeliveryStatus = "queued" | "delivering" | "delivered" | "failed";
-
-export interface TeamCreatedPayload {
-  teamId: TeamId;
-  name: string;
-  leadPath: AgentPath;
-  description?: string;
-}
-
-export interface TeamOwnerSessionBoundPayload {
-  teamId: TeamId;
-  ownerSessionId: SessionId;
-}
-
-export interface TeamMemberAddedPayload {
-  teamId: TeamId;
-  path: AgentPath;
-  name: string;
-  role: string;
-  status?: TeamMemberStatus;
-  childSessionId?: SessionId;
-  model?: string;
-  toolScope?: string[];
-  writeScope?: string[];
-}
-
-export interface TeamMemberStatusChangedPayload {
-  teamId: TeamId;
-  path: AgentPath;
-  status: TeamMemberStatus;
-  taskId?: TaskId;
-  reason?: string;
-}
-
-export interface TeamTaskCreatedPayload {
-  teamId: TeamId;
-  taskId: TaskId;
-  title?: string;
-  description?: string;
-  createdBy?: AgentPath;
-  ownerPath?: AgentPath;
-  dependsOn?: TaskId[];
-  status?: TeamTaskStatus;
-  metadata?: Record<string, unknown>;
-}
-
-export interface TeamTaskAssignedPayload {
-  teamId: TeamId;
-  taskId: TaskId;
-  ownerPath: AgentPath;
-  assignedBy?: AgentPath;
-  previousOwnerPath?: AgentPath;
-  messageId?: string;
-}
-
-export interface TeamTaskClaimedPayload {
-  teamId: TeamId;
-  taskId: TaskId;
-  ownerPath: AgentPath;
-  claimedBy?: AgentPath;
-  /** Scheduler-owned metadata committed atomically with the claim. */
-  metadata?: Record<string, unknown>;
-}
-
-export interface TeamTaskUpdatedPayload {
-  teamId: TeamId;
-  taskId: TaskId;
-  status?: TeamTaskStatus;
-  ownerPath?: AgentPath;
-  title?: string;
-  description?: string;
-  dependsOn?: TaskId[];
-  summary?: string;
-  error?: string;
-  metadata?: Record<string, unknown>;
-}
-
-/**
- * Team task metadata owned by the scheduler/runtime rather than a scoped
- * worker. Scoped progress updates must neither replace nor remove these
- * fields. Aliases are included because dispatch policy readers accept them.
- */
-export const TEAM_TASK_RUNTIME_METADATA_KEYS = [
-  "verification",
-  "merge",
-  "worktree",
-  "chiliTeamDispatch",
-  "writeScope",
-  "write_scope",
-  "writeScopes",
-  "write_scopes",
-  "executeScope",
-  "execute_scope",
-  "executionScope",
-  "execution_scope",
-  "requiredTools",
-  "required_tools",
-  "toolScope",
-  "tool_scope",
-  "suggestedTestCommands",
-  "suggested_test_commands",
-  "priority",
-] as const;
-
-export interface TeamMessageSentPayload {
-  teamId: TeamId;
-  messageId: string;
-  from: AgentPath;
-  to: AgentPath | "*";
-  content: string;
-  kind?: TeamMessageKind;
-  delivery?: TeamMessageDelivery;
-  taskId?: TaskId;
-  summary?: string;
-  metadata?: Record<string, unknown>;
-}
-
-export type TeamRunStopReason = "drained" | "once" | "max_cycles" | "timeout" | "aborted" | "team_inactive";
-export type TeamRunLifecyclePhase = "reconcile" | "load" | "verify" | "merge" | "dispatch" | "wait" | "drain";
-
-export interface TeamRunSummaryCounts {
-  dispatched: number;
-  completed: number;
-  accepted: number;
-  reopened: number;
-  merged: number;
-  mergeFailed: number;
-  mergeConflicted: number;
-  mergeSkipped: number;
-  failed: number;
-  blocked: number;
-  skipped: number;
-  stillRunning: number;
-  errors: number;
-}
-
-export interface TeamRunStartedPayload {
-  teamId: TeamId;
-  runId: string;
-  mode: AgentTaskMode;
-  once: boolean;
-  maxCycles: number;
-  timeoutMs: number;
-  pollIntervalMs: number;
-  maxConcurrentDispatches?: number;
-  maxConcurrentVerifications?: number;
-}
-
-export interface TeamRunProgressPayload {
-  teamId: TeamId;
-  runId: string;
-  cycle: number;
-  phase: TeamRunLifecyclePhase;
-  counts: TeamRunSummaryCounts;
-  stopReason?: TeamRunStopReason;
-}
-
-export interface TeamRunCompletedPayload {
-  teamId: TeamId;
-  runId: string;
-  cycles: number;
-  stopReason: TeamRunStopReason;
-  startedAt: number;
-  endedAt: number;
-  counts: TeamRunSummaryCounts;
-}
-
-export type TeamEvent =
-  | EventEnvelope<"team.created", TeamCreatedPayload>
-  | EventEnvelope<"team.owner_session_bound", TeamOwnerSessionBoundPayload>
-  | EventEnvelope<"team.member_added", TeamMemberAddedPayload>
-  | EventEnvelope<"team.member_status_changed", TeamMemberStatusChangedPayload>
-  | EventEnvelope<"team.task_created", TeamTaskCreatedPayload>
-  | EventEnvelope<"team.task_assigned", TeamTaskAssignedPayload>
-  | EventEnvelope<"team.task_claimed", TeamTaskClaimedPayload>
-  | EventEnvelope<"team.task_updated", TeamTaskUpdatedPayload>
-  | EventEnvelope<"team.message_sent", TeamMessageSentPayload>
-  | EventEnvelope<"team.run_started", TeamRunStartedPayload>
-  | EventEnvelope<"team.run_progress", TeamRunProgressPayload>
-  | EventEnvelope<"team.run_completed", TeamRunCompletedPayload>;

@@ -10,7 +10,7 @@ import {
   RuntimeSessionIdentityError,
   RuntimeForeignOwnerError,
   RuntimeSessionNotFoundError,
-  RuntimeSubagentSessionAccessError,
+  RuntimeSessionAccessError,
   type RuntimeSessionOperation,
   type SubmitPromptInput,
 } from "@chili/core";
@@ -25,9 +25,9 @@ import { ObservableEventStore, SqliteEventStore, UnknownEventCursorError } from 
 import { HttpRuntimeClient, type RuntimeSessionEventWindow } from "@chili/sdk";
 import type {
   AgentPath,
-  AgentRunId,
   ApprovalDecisionAction,
   ChiliEvent,
+  RuntimeEvent,
   DelegationPolicy,
   DelegationPolicySource,
   EventEnvelope,
@@ -563,7 +563,7 @@ test("request audit snapshots stay complete in storage while SSE and replay deli
     const service = new FakeRuntimeService(store);
     const { sessionId } = await service.createSession({ cwd: "/workspace" });
     const contentVersion = "prepared-content-version";
-    const requestEvent: ChiliEvent = {
+    const requestEvent: RuntimeEvent = {
       id: "event_request_snapshot", type: "model.request_prepared", time: 2 as TimestampMs, sessionId,
       payload: {
         turnId: "turn_request_snapshot" as TurnId, requestId: "request_snapshot", attempt: 1, contentVersion,
@@ -598,7 +598,7 @@ test("request audit snapshots stay complete in storage while SSE and replay deli
     const messageId = "message_program_result" as MessageId;
     await store.append({ id: "event_program_message", type: "message.created", sessionId, time: 3 as TimestampMs,
       payload: { messageId, role: "assistant" } });
-    const resultEvent: ChiliEvent = { id: "event_program_result", type: "message.part_added", sessionId, time: 4 as TimestampMs,
+    const resultEvent: RuntimeEvent = { id: "event_program_result", type: "message.part_added", sessionId, time: 4 as TimestampMs,
       payload: { messageId, part: {
         id: "part_program_result" as PartId, messageId, sessionId, type: "tool_result", callId: "call_program" as ToolCallId,
         output: "Concise model and display output", structuredData: { internal: "PROGRAM_DATA_CANARY", rows: [1, 2, 3] },
@@ -657,7 +657,7 @@ test("SSE serializes a normalized 5 MiB escape-heavy error within a deterministi
     cause: { secret: "SSE_CAUSE_SECRET_MUST_NOT_LEAK" },
   });
   const normalized = normalizePersistedError(source);
-  const event: ChiliEvent = {
+  const event: RuntimeEvent = {
     id: "event_sse_bounded_error",
     type: "tool.call_finished",
     time: 1 as TimestampMs,
@@ -712,14 +712,14 @@ test("emits a bounded resync cursor for a legacy event above the 4 MB transport 
     time: 1 as TimestampMs,
     sessionId,
     payload: { sessionId, status: "failed", reason: "x".repeat(4_100_000) },
-  } as ChiliEvent);
+  } as RuntimeEvent);
   baseStore.items.push({
     id: "event_sse_after_oversized",
     type: "session.renamed",
     time: 2 as TimestampMs,
     sessionId,
     payload: { sessionId, title: "after poison" },
-  } as ChiliEvent);
+  } as RuntimeEvent);
   const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
   const response = await handler(new Request(`http://chili.test/events?sessionId=${sessionId}`));
   const reader = response.body?.getReader();
@@ -744,14 +744,14 @@ test("streams and resumes a worst legal tool result that remains replayable besi
   const store = new ObservableEventStore(baseStore);
   const sessionId = "session_sse_legal_tool_result" as SessionId;
   const messageId = "message_sse_legal_tool_result";
-  const sessionCreated: ChiliEvent = {
+  const sessionCreated: RuntimeEvent = {
     id: "event_sse_legal_session_created",
     type: "session.created",
     time: 0 as TimestampMs,
     sessionId,
     payload: { sessionId, cwd: "/repo" },
   };
-  const created: ChiliEvent = {
+  const created: RuntimeEvent = {
     id: "event_sse_legal_message_created",
     type: "message.created",
     time: 1 as TimestampMs,
@@ -759,7 +759,7 @@ test("streams and resumes a worst legal tool result that remains replayable besi
     payload: { messageId: messageId as never, role: "assistant" },
   };
   const escapedArtifactId = "\\\"".repeat(256);
-  const partAdded: ChiliEvent = {
+  const partAdded: RuntimeEvent = {
     id: "event_sse_legal_tool_result",
     type: "message.part_added",
     time: 2 as TimestampMs,
@@ -1204,7 +1204,7 @@ test("serves a full-envelope bounded replayable event window and clamps its even
     sessionId,
     payload: { sessionId, cwd: "/repo" },
   });
-  await baseStore.appendMany(Array.from({ length: 6_000 }, (_, index): ChiliEvent => ({
+  await baseStore.appendMany(Array.from({ length: 6_000 }, (_, index): RuntimeEvent => ({
     id: `event_replayable_${index}`,
     type: "session.renamed",
     time: (2 + index) as TimestampMs,
@@ -1279,7 +1279,7 @@ test("replayable windows preserve durable rollback order and same-time causal an
         },
       },
     },
-  ] as ChiliEvent[]);
+  ] as RuntimeEvent[]);
   const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
   const response = await handler(new Request(
     `http://chili.test/sessions/${sessionId}/events?window=replayable`,
@@ -1321,14 +1321,14 @@ test("authoritative pending approvals survive when their event anchors predate s
         patterns: ["bun test"],
       },
     },
-    ...Array.from({ length: 40 }, (_, index): ChiliEvent => ({
+    ...Array.from({ length: 40 }, (_, index): RuntimeEvent => ({
       id: `event_approval_flood_${index}`,
       type: "session.renamed",
       time: (4 + index) as TimestampMs,
       sessionId,
       payload: { sessionId, title: `flood-${index}` },
     })),
-  ] as ChiliEvent[]);
+  ] as RuntimeEvent[]);
   baseStore.approvalRows.push(
     {
       id: "__proto__",
@@ -1389,7 +1389,7 @@ test("replayable windows pin an active tool with its recovered start across an u
       sessionId,
       payload: { turnId: "turn_active", callId: "call_active", toolName: "bash", input: {} },
     },
-    ...Array.from({ length: 100 }, (_, index): ChiliEvent => ({
+    ...Array.from({ length: 100 }, (_, index): RuntimeEvent => ({
       id: `event_active_flood_${index}`,
       type: "session.renamed",
       time: (3 + index) as TimestampMs,
@@ -1403,7 +1403,7 @@ test("replayable windows pin an active tool with its recovered start across an u
       sessionId,
       payload: { callId: "call_active", stream: "stdout", delta: "still running", sequence: 1 },
     },
-  ] as ChiliEvent[]);
+  ] as RuntimeEvent[]);
   const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
   const response = await handler(new Request(
     `http://chili.test/sessions/${sessionId}/events?window=replayable&limit=10`,
@@ -1482,7 +1482,7 @@ test("event backlog stays bounded and oversized resume cursors require a tail re
         sessionId,
         payload: { sessionId, cwd: "/repo" },
       },
-      ...Array.from({ length: 5 }, (_, index): ChiliEvent => ({
+      ...Array.from({ length: 5 }, (_, index): RuntimeEvent => ({
         id: `event_tail_started_${index}`,
         type: "turn.started",
         time: (2 + index) as TimestampMs,
@@ -1562,7 +1562,7 @@ test("event backlog stays bounded and oversized resume cursors require a tail re
 test("SSE de-duplicates a committed backlog event whose observable emit arrives late", async () => {
   const store = new DelayedEmitEventStore();
   const sessionId = "session_sse_commit_emit_race" as SessionId;
-  const event: ChiliEvent = {
+  const event: RuntimeEvent = {
     id: "event_sse_commit_emit_race",
     type: "session.created",
     time: 1 as TimestampMs,
@@ -1599,7 +1599,7 @@ test("SSE de-duplicates a committed backlog event whose observable emit arrives 
 test("SSE keeps backlog identity after many live events and drops an extremely late emit", async () => {
   const store = new DelayedEmitEventStore();
   const sessionId = "session_sse_lifetime_dedupe" as SessionId;
-  const committed: ChiliEvent = {
+  const committed: RuntimeEvent = {
     id: "event_sse_lifetime_committed",
     type: "session.created",
     time: 1 as TimestampMs,
@@ -1622,7 +1622,7 @@ test("SSE keeps backlog identity after many live events and drops an extremely l
   await reader.read();
 
   for (let index = 0; index < 300; index += 1) {
-    const event: ChiliEvent = {
+    const event: RuntimeEvent = {
       id: `event_sse_live_${index}`,
       type: "session.status_changed",
       time: (index + 2) as TimestampMs,
@@ -1650,7 +1650,7 @@ test("SSE keeps backlog identity after many live events and drops an extremely l
 test("SSE rotates at a durable cursor and resumes without loss or late-emit duplicates", async () => {
   const store = new DelayedEmitEventStore();
   const sessionId = "session_sse_rotation" as SessionId;
-  const events = Array.from({ length: 4 }, (_, index): ChiliEvent => ({
+  const events = Array.from({ length: 4 }, (_, index): RuntimeEvent => ({
     id: `event_sse_rotation_${index + 1}`,
     type: "session.status_changed",
     time: (index + 1) as TimestampMs,
@@ -2242,7 +2242,7 @@ test("canonicalizes a persisted legacy workspace for command catalogs and execut
   }
 });
 
-test("rejects direct HTTP prompts, commands, controls, and lifecycle mutations for subagent sessions", async () => {
+test("rejects direct HTTP prompts, commands, controls, and lifecycle mutations for sessions outside the runtime access scope", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
   const service = new FakeRuntimeService(store);
@@ -2251,7 +2251,7 @@ test("rejects direct HTTP prompts, commands, controls, and lifecycle mutations f
   const session = await service.createSession({
     sessionId: "session_http_child" as SessionId,
   });
-  service.blockedSubagentSessions.add(session.sessionId);
+  service.blockedSessionAccess.add(session.sessionId);
 
   const requests = [
     new Request(`http://chili.test/sessions/${session.sessionId}/prompt`, {
@@ -2335,14 +2335,51 @@ test("rejects direct HTTP prompts, commands, controls, and lifecycle mutations f
 
   for (const request of requests) {
     const response = await handler(request);
-    expect(response.status).toBe(409);
+    expect(response.status).toBe(403);
     expect(await response.json()).toMatchObject({
-      error: { message: expect.stringContaining("Use agent_resume for this Agent") },
+      error: { message: expect.stringContaining("Session identity is not admitted by this runtime") },
     });
   }
   expect(service.lastPrompt).toBeUndefined();
   expect(service.goal).toBeUndefined();
   expect(commands.lastRun).toBeUndefined();
+});
+
+test("read-only historical sessions remain readable but reject execution and root Agent control", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const sessionId = "session_http_history" as SessionId;
+  await service.createSession({ sessionId });
+  baseStore.sessionRows.set(sessionId, { ...baseStore.sessionRows.get(sessionId)!, readOnly: true });
+  const handler = createRuntimeHttpHandler({ service: Object.assign(service, {
+    inputQueue: () => ({ sessionId, paused: true, revision: 0, pendingCount: 0, interruptedCount: 0, items: [] }),
+  }), store, commands: new FakePromptCommandControl() });
+  const client = new HttpRuntimeClient({ baseUrl: "http://chili.test", fetch: ((input, init) => handler(new Request(input, init))) as typeof fetch });
+  expect((await client.listSessions())[0]).toMatchObject({ id: sessionId, readOnly: true });
+  expect(await client.messages(sessionId)).toEqual([]);
+  expect((await handler(new Request(`http://chili.test/sessions/${sessionId}/events`))).status).toBe(200);
+  expect((await handler(new Request(`http://chili.test/sessions/${sessionId}/agents`))).status).toBe(403);
+  for (const [action, body] of [
+    ["prompt", { text: "not executable" }],
+    ["prompt_async", { text: "not executable" }],
+    ["command_async", { commandId: "prompt.project.joke" }],
+    ["resume_inputs", {}],
+    ["interrupt", {}],
+    ["goal", { objective: "not executable" }],
+    ["model", { modelSelection: { provider: "fake", model: "fake" } }],
+    ["delegation", { policy: "proactive" }],
+    ["rename", { title: "not mutable" }],
+    ["archive", {}],
+    ["agents", { name: "child", prompt: "not executable" }],
+  ] as const) {
+    const response = await handler(new Request(`http://chili.test/sessions/${sessionId}/${action}`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    }));
+    expect(response.status).toBe(403);
+  }
+  expect(service.lastPrompt).toBeUndefined();
+  expect(service.goal).toBeUndefined();
 });
 
 test("rejects prompt and mutation routes after a session is archived", async () => {
@@ -2397,7 +2434,7 @@ test("rejects a known pending child over HTTP before its session row exists", as
   const commands = new FakePromptCommandControl();
   const handler = createRuntimeHttpHandler({ service, store, commands });
   const sessionId = "session_http_pending_child" as SessionId;
-  service.blockedSubagentSessions.add(sessionId);
+  service.blockedSessionAccess.add(sessionId);
 
   const requests = [
     new Request(`http://chili.test/sessions/${sessionId}/prompt_async`, {
@@ -2425,9 +2462,9 @@ test("rejects a known pending child over HTTP before its session row exists", as
   expect(await store.sessions()).toEqual([]);
   for (const request of requests) {
     const response = await handler(request);
-    expect(response.status).toBe(409);
+    expect(response.status).toBe(403);
     expect(await response.json()).toMatchObject({
-      error: { message: expect.stringContaining("Use agent_resume for this Agent") },
+      error: { message: expect.stringContaining("Session identity is not admitted by this runtime") },
     });
   }
   expect(service.lastPrompt).toBeUndefined();
@@ -2669,7 +2706,7 @@ test("keeps archived MCP reads project-scoped while connection mutations remain 
         sessionId: childId,
         payload: { sessionId: childId, cwd: workspaceAlias },
       });
-      service.blockedSubagentSessions.add(childId);
+      service.blockedSessionAccess.add(childId);
     }
     await store.append({
       id: "event_session_mcp_archived_child_archived",
@@ -2688,18 +2725,18 @@ test("keeps archived MCP reads project-scoped while connection mutations remain 
         `/mcp/github/tools?${childQuery}`,
       ]) {
         const response = await handler(new Request(`http://chili.test${path}`));
-        expect(response.status).toBe(409);
+        expect(response.status).toBe(403);
         expect(await response.json()).toEqual({
           error: {
-            message: expect.stringContaining(`Session ${childId} belongs to a subagent`),
+            message: expect.stringContaining(`Session identity is not admitted by this runtime: ${childId}`),
           },
         });
       }
       for (const path of ["reload", "github/connect", "github/disconnect"]) {
         const response = await handler(new Request(`http://chili.test/mcp/${path}?${childQuery}`, { method: "POST" }));
-        expect(response.status).toBe(409);
+        expect(response.status).toBe(403);
         expect(await response.json()).toEqual({
-          error: { message: expect.stringContaining(`Session ${childId} belongs to a subagent`) },
+          error: { message: expect.stringContaining(`Session identity is not admitted by this runtime: ${childId}`) },
         });
       }
     }
@@ -3021,9 +3058,9 @@ test("does not return 202 when an async prompt claim loses a session boundary ra
       createError: (sessionId: SessionId) => new RuntimeSessionInactiveError(sessionId, "archived"),
     },
     {
-      name: "subagent",
-      status: 409,
-      createError: (sessionId: SessionId) => new RuntimeSubagentSessionAccessError(sessionId),
+      name: "forbidden",
+      status: 403,
+      createError: (sessionId: SessionId) => new RuntimeSessionAccessError(sessionId),
     },
     {
       name: "not-found",
@@ -3204,7 +3241,7 @@ class FakeRuntimeService implements RuntimeHttpService {
   delegationSource: DelegationPolicySource = "default";
   lastPrompt: SubmitPromptInput | undefined;
   goal: SessionGoal | undefined;
-  readonly blockedSubagentSessions = new Set<SessionId>();
+  readonly blockedSessionAccess = new Set<SessionId>();
   readonly busySessionOperations = new Set<SessionId>();
   readonly sessionOperationIds: SessionId[] = [];
 
@@ -3231,14 +3268,15 @@ class FakeRuntimeService implements RuntimeHttpService {
   async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
     await this.assertSessionReadAllowed(sessionId);
     const session = (await this.store.sessions()).find((candidate) => candidate.id === sessionId);
+    if (session?.readOnly) throw new RuntimeSessionAccessError(sessionId, "Historical Session is read-only");
     if (session && session.status !== "active") {
       throw new RuntimeSessionInactiveError(sessionId, session.status);
     }
   }
 
   async assertSessionReadAllowed(sessionId: SessionId): Promise<void> {
-    if (this.blockedSubagentSessions.has(sessionId)) {
-      throw new RuntimeSubagentSessionAccessError(sessionId);
+    if (this.blockedSessionAccess.has(sessionId)) {
+      throw new RuntimeSessionAccessError(sessionId);
     }
   }
 
@@ -3357,7 +3395,9 @@ class FakeRuntimeService implements RuntimeHttpService {
     this.lastPrompt = input;
   }
 
-  async interrupt(): Promise<boolean> {
+  async interrupt(sessionId: SessionId): Promise<boolean> {
+    const session = (await this.store.sessions()).find((candidate) => candidate.id === sessionId);
+    if (session?.readOnly) throw new RuntimeSessionAccessError(sessionId, "Historical Session is read-only");
     return true;
   }
 
@@ -3643,11 +3683,11 @@ function abortError(message: string): Error {
 }
 
 class MemoryEventStore implements EventStore {
-  readonly items: ChiliEvent[] = [];
+  readonly items: RuntimeEvent[] = [];
   readonly sessionRows = new Map<string, SessionRow>();
   readonly approvalRows: ApprovalRow[] = [];
 
-  async append(event: ChiliEvent): Promise<void> {
+  async append(event: RuntimeEvent): Promise<void> {
     this.items.push(event);
     if (event.type === "session.created") {
       this.sessionRows.set(event.payload.sessionId, {
@@ -3671,7 +3711,7 @@ class MemoryEventStore implements EventStore {
     }
   }
 
-  async appendMany(events: readonly ChiliEvent[]): Promise<void> {
+  async appendMany(events: readonly RuntimeEvent[]): Promise<void> {
     for (const event of events) await this.append(event);
   }
 
@@ -3723,14 +3763,14 @@ class CountingEventStore extends MemoryEventStore implements EventPublisher {
 }
 
 class DelayedEmitEventStore extends MemoryEventStore implements EventPublisher {
-  private readonly listeners = new Set<(event: ChiliEvent) => void>();
+  private readonly listeners = new Set<(event: RuntimeEvent) => void>();
 
-  subscribe(listener: (event: ChiliEvent) => void): () => void {
+  subscribe(listener: (event: RuntimeEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
 
-  emit(event: ChiliEvent): void {
+  emit(event: RuntimeEvent): void {
     for (const listener of this.listeners) listener(event);
   }
 }
@@ -3786,7 +3826,7 @@ test("Agent HTTP control rejects child and archived callers before invoking the 
   const row = base.sessionRows.get(sessionId)!;
   const handler = createRuntimeHttpHandler({ service, store, agents });
   const child = { parentSessionId: "session_parent" as SessionId, name: "worker", path: "/root/worker" as AgentPath, policy: {} };
-  for (const invalid of [{ ...row, agent: child }, { ...row, source: "subagent" as const }, { ...row, status: "archived" as const }]) {
+  for (const invalid of [{ ...row, agent: child }, { ...row, readOnly: true as const }, { ...row, status: "archived" as const }]) {
     base.sessionRows.set(sessionId, invalid);
     for (const [method, suffix] of [["GET", ""], ["POST", ""], ["POST", "/another/send"], ["POST", "/another/wait"], ["POST", "/another/stop"], ["POST", "/another/resume"]] as const) {
       const response = await handler(new Request(`http://chili.test/sessions/${sessionId}/agents${suffix}`, { method }));

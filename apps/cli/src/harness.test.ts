@@ -9,7 +9,7 @@ import {
   type ModelStreamInput,
   type PromptFragment,
 } from "@chili/core";
-import type { AgentPath, ApprovalId, ChiliEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { AgentPath, ApprovalId, ChiliEvent, RuntimeEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { SkillRegistry, type Skill } from "@chili/skills";
 import { SqliteEventStore } from "@chili/store";
 import {
@@ -76,7 +76,7 @@ test("CLI harness close interrupts and settles an active root prompt before clos
       expect(persisted.claimSessionRun({
         sessionId,
         claimId: "claim_after_graceful_close",
-        allowSubagentSessions: false,
+        sessionAccess: "root",
         time: Date.now(),
         leaseDurationMs: 1_000,
       })).toEqual({ status: "claimed" });
@@ -273,7 +273,7 @@ test("CLI harness retries stale-turn reconciliation after a crashed run claim le
       expect(crashed.claimSessionRun({
         sessionId,
         claimId: "claim_harness_crashed_process",
-        allowSubagentSessions: false,
+        sessionAccess: "root",
         time: now,
         leaseDurationMs: 60,
       })).toEqual({ status: "claimed" });
@@ -887,7 +887,7 @@ test("CLI harness approval resolver denies agents whose parent session is archiv
 
     const beforeArchive = await harness.events.sessions();
     expect(beforeArchive.find((session) => session.id === childSessionId)).toMatchObject({
-      source: "subagent",
+      agent: { parentSessionId: rootSessionId, name: "active-child" },
       status: "active",
     });
     await harness.service.archiveSession(rootSessionId);
@@ -1335,7 +1335,7 @@ async function writeWorkspaceModelEvent(
 ): Promise<void> {
   const sessionId = "session_previous_model" as SessionId;
   const store = new SqliteEventStore(join(repo, ".chili", "chili.sqlite"));
-  const events: ChiliEvent[] = [
+  const events: RuntimeEvent[] = [
     {
       id: "event_previous_session",
       type: "session.created",

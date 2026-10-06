@@ -286,7 +286,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "agents" || route.name === "agentSpawn" || route.name === "agentSend" || route.name === "agentWait" || route.name === "agentStop" || route.name === "agentResume") {
         await options.service.assertSessionReadAllowed(route.sessionId);
         const caller = await requireSession(options.store, route.sessionId);
-        if (caller.status !== "active" || caller.agent || caller.source === "subagent") {
+        if (caller.status !== "active" || caller.agent || caller.readOnly) {
           return jsonError(403, "Agent control requires an active root session");
         }
         if (!options.agents) return jsonError(501, "No agent control service is configured");
@@ -2401,8 +2401,8 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "RuntimeBusyError" || err.name === "RuntimeForeignOwnerError" || err.name === "SessionInputConflictError") {
     return { status: 409, message: err.message };
   }
-  if (err.name === "RuntimeSubagentSessionAccessError") {
-    return { status: 409, message: err.message };
+  if (err.name === "RuntimeSessionAccessError" || err.name === "SessionAccessError") {
+    return { status: 403, message: err.message };
   }
   if (
     err.name === "RuntimeSessionAlreadyExistsError" ||

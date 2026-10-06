@@ -996,7 +996,6 @@ class ClaimTrackingEventStore implements EventStore {
     this.sessionRows.push({
       id: sessionId,
       cwd: "/repo",
-      source: "interactive",
       status: "active",
       createdAt: 1,
       updatedAt: 1,
@@ -1006,16 +1005,16 @@ class ClaimTrackingEventStore implements EventStore {
   claimSessionRun(input: {
     sessionId: SessionId;
     claimId: string;
-    allowSubagentSessions: boolean;
+    sessionAccess?: "root" | "child";
     time: number;
     leaseDurationMs: number;
-  }): { status: "claimed" | "busy" | "inactive" | "not_found" | "subagent"; sessionStatus?: string } {
+  }): { status: "claimed" | "busy" | "inactive" | "not_found" | "forbidden"; sessionStatus?: string } {
     this.claimAttempts.push(input.sessionId);
     this.claimLeaseDurations.push(input.leaseDurationMs);
     const session = this.sessionRows.find((candidate) => candidate.id === input.sessionId);
     if (!session) return { status: "not_found" };
     if (session.status !== "active") return { status: "inactive", sessionStatus: session.status };
-    if (!input.allowSubagentSessions && session.source === "subagent") return { status: "subagent" };
+    if (session.readOnly || Boolean(session.agent) !== (input.sessionAccess === "child")) return { status: "forbidden" };
     if (this.claims.has(input.sessionId)) return { status: "busy" };
     this.claims.set(input.sessionId, input.claimId);
     return { status: "claimed" };

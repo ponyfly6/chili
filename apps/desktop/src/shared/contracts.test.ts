@@ -15,6 +15,19 @@ import {
 } from "./contracts.js";
 
 describe("desktop IPC contracts", () => {
+  test("preserves strict read-only history flags and identifies child sessions only through metadata", () => {
+    const row = { id: "session_1", cwd: "/repo", status: "active", createdAt: 1, updatedAt: 2 };
+    const agent = { parentSessionId: "root", name: "child", path: "/root/child", policy: {} };
+    expect<unknown>(parseDesktopResponse({ type: "sessions.list" }, [row, { ...row, id: "history", readOnly: true }, { ...row, id: "child", agent }]))
+      .toEqual([row, { ...row, id: "history", readOnly: true }, { ...row, id: "child", agent }]);
+    expect<unknown>(parseDesktopResponse({ type: "sessions.list" }, [{ ...row, readOnly: false }])).toEqual([{ ...row, readOnly: false }]);
+    for (const readOnly of [null, "true", 1, {}]) {
+      expect(() => parseDesktopResponse({ type: "sessions.list" }, [{ ...row, readOnly }])).toThrow("readOnly");
+    }
+    expect(() => parseDesktopResponse({ type: "sessions.list" }, [{ ...row, agent: { ...agent, parentSessionId: "__proto__" } }])).toThrow();
+    expect(() => parseDesktopResponse({ type: "sessions.list" }, [{ ...row, agent: { ...agent, name: "other" } }])).toThrow();
+  });
+
   test("accepts compact model audit references and rejects malformed resolved identities", () => {
     const prepared = runtimeEnvelope("model.request_prepared", {
       turnId: "turn_1", requestId: "request_1", attempt: 1, contentVersion: "sha256:content",
@@ -377,7 +390,7 @@ describe("desktop IPC contracts", () => {
     const created = runtimeEnvelope("session.created", { sessionId: "session_1", cwd: "/repo", agent }, "created_agent");
     expect(parseDesktopEvent({ type: "runtime.event", event: created })).toMatchObject({ event: { payload: { agent } } });
     expect(() => parseDesktopEvent({ type: "runtime.event", event: { ...created, payload: { ...created.payload, agent: { ...agent, parentSessionId: "__proto__" } } } })).toThrow("prototype property name");
-    expect(() => parseDesktopEvent({ type: "runtime.event", event: { ...created, payload: { ...created.payload, agent: { ...agent, policy: { allowSubagentSessions: true } } } } })).toThrow();
+    expect(() => parseDesktopEvent({ type: "runtime.event", event: { ...created, payload: { ...created.payload, agent: { ...agent, policy: { sessionAccess: "child" } } } } })).toThrow();
     const receipt = { inputId: "input_1", submissionId: "submission_1", sessionId: "session_1", mode: "queue", state: "settled", revision: 3, sequence: 1, text: "inspect", acceptedAt: 1, updatedAt: 2, outcome: "completed", resultMessageId: "message_result" };
     const queue = { sessionId: "session_1", paused: false, revision: 3, pendingCount: 0, interruptedCount: 0, items: [receipt] };
     const queueEvent = runtimeEnvelope("session.input_queue_changed", queue, "queue_event");

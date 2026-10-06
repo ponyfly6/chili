@@ -38,6 +38,20 @@ test("composer is immutable while a request, resync, load, or outage is active",
   ]) expect(canEditComposer(blocked)).toBe(false);
 });
 
+test("read-only history can be opened while its composer remains immutable", () => {
+  const ready = {
+    selectedId: "session_history",
+    healthy: true,
+    resyncing: false,
+    loadingSession: false,
+    working: false,
+    readOnly: true,
+  };
+  expect(canOpenSession(ready)).toBe(true);
+  expect(canEditComposer(ready)).toBe(false);
+  expect(canEditComposer({ ...ready, readOnly: false })).toBe(true);
+});
+
 test("draft scope changes on either workspace or session identity", () => {
   const current = { workspace: "/repo-a", sessionId: "session-a" };
   expect(draftScopeChanged(current, { ...current })).toBe(false);

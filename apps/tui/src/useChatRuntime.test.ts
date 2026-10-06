@@ -699,7 +699,6 @@ function sessionSummary(id: SessionId, cwd = "/workspace"): RuntimeSessionSummar
   return {
     id,
     cwd,
-    source: "interactive",
     status: "active",
     createdAt: 1,
     updatedAt: 1,

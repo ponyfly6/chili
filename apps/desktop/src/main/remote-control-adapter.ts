@@ -28,6 +28,7 @@ export type RemoteDesktopSessionSummary = {
   id: string;
   title: string;
   status: "active" | "archived";
+  readOnly?: true;
   updatedAt: number;
 };
 
@@ -182,6 +183,7 @@ function projectSessionSummary(row: RuntimeSessionSummary): RemoteDesktopSession
     id: String(row.id),
     title: truncateJsonText(row.title || "Untitled task", MAX_TITLE_JSON_BYTES),
     status: row.status === "archived" ? "archived" : "active",
+    ...(row.readOnly === true ? { readOnly: true as const } : {}),
     updatedAt: finiteNumber(row.updatedAt),
   };
 }

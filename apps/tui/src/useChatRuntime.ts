@@ -1299,8 +1299,11 @@ function requireResumableSession(
   if (session.status !== "active") {
     throw new Error(`Session ${sessionId} is archived and cannot be resumed.`);
   }
-  if (session.source === "subagent") {
+  if (session.agent) {
     throw new Error(`Session ${sessionId} belongs to an agent and cannot be resumed directly.`);
+  }
+  if (session.readOnly === true) {
+    throw new Error(`Session ${sessionId} is read-only and cannot be resumed.`);
   }
   return session;
 }

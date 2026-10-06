@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChiliEvent, MessageId, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { RuntimeEvent, MessageId, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { inspectSqliteEventStore } from "./sqlite-diagnostics.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 import { sqliteJournalPolicy } from "./sqlite-journal-policy.js";
@@ -46,7 +46,7 @@ test("inspectSqliteEventStore reports files and the largest storage rows", async
           output: "x".repeat(2_048),
         },
       }),
-    ] as ChiliEvent[]);
+    ] as RuntimeEvent[]);
 
     const report = await inspectSqliteEventStore(dbPath);
 
@@ -97,17 +97,17 @@ test("inspectSqliteEventStore reports files and the largest storage rows", async
   }
 });
 
-function event<TType extends ChiliEvent["type"]>(
+function event<TType extends RuntimeEvent["type"]>(
   id: string,
   type: TType,
   sessionId: SessionId,
-  payload: Extract<ChiliEvent, { type: TType }>["payload"],
-): Extract<ChiliEvent, { type: TType }> {
+  payload: Extract<RuntimeEvent, { type: TType }>["payload"],
+): Extract<RuntimeEvent, { type: TType }> {
   return {
     id,
     type,
     time: 1 as TimestampMs,
     sessionId,
     payload,
-  } as Extract<ChiliEvent, { type: TType }>;
+  } as Extract<RuntimeEvent, { type: TType }>;
 }

@@ -5,7 +5,7 @@ import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act, useState, type Dispatch, type SetStateAction } from "react";
 import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type RuntimeSessionSummary } from "@chili/sdk";
-import type { ApprovalId, ChiliEvent, MessageId, PartId, RuntimeCommandCatalog, RuntimeModelDescriptor, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { ApprovalId, ChiliEvent, MessageId, PartId, RuntimeCommandCatalog, RuntimeModelDescriptor, SessionAgentMetadata, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import type { ClipboardAccess } from "./clipboard.js";
 import { CONVERSATION_INTERRUPTED_NOTICE, CTRL_C_EXIT_CONFIRM_MS, ChatShellApp, ChatShellSurface, isWithinCtrlCExitWindow, type ChatShellExitInfo } from "./ChatShellApp.js";
 import { PROMPT_PLACEHOLDER } from "./chat/PromptComposer.js";
@@ -230,10 +230,16 @@ for (const scenario of [
     error: "Session session_archived is archived and cannot be resumed.",
   },
   {
-    name: "subagent",
-    sessionId: "session_subagent" as SessionId,
-    sessions: [runtimeSessionSummary("session_subagent" as SessionId, { source: "subagent" as const })],
-    error: "Session session_subagent belongs to an agent and cannot be resumed directly.",
+    name: "child agent",
+    sessionId: "session_child" as SessionId,
+    sessions: [runtimeSessionSummary("session_child" as SessionId, { agent: agentMetadata() })],
+    error: "Session session_child belongs to an agent and cannot be resumed directly.",
+  },
+  {
+    name: "read-only",
+    sessionId: "session_read_only" as SessionId,
+    sessions: [runtimeSessionSummary("session_read_only" as SessionId, { readOnly: true })],
+    error: "Session session_read_only is read-only and cannot be resumed.",
   },
 ] as const) {
   test(`exact resume rejects a ${scenario.name} session before hydration`, async () => {
@@ -3383,7 +3389,6 @@ test("/session resume opens a searchable project-scoped picker and switches sess
       cwd: "/repo/chili",
       title: "Fix resume flow",
       preview: "Wire the saved conversation picker",
-      source: "interactive" as const,
       status: "active" as const,
       createdAt: 2,
       updatedAt: 3,
@@ -3392,7 +3397,6 @@ test("/session resume opens a searchable project-scoped picker and switches sess
       id: "session_other" as SessionId,
       cwd: "/repo/other",
       title: "Other project",
-      source: "interactive" as const,
       status: "active" as const,
       createdAt: 2,
       updatedAt: 4,
@@ -3401,10 +3405,19 @@ test("/session resume opens a searchable project-scoped picker and switches sess
       id: "session_worker" as SessionId,
       cwd: "/repo/chili",
       title: "Internal worker",
-      source: "subagent" as const,
+      agent: agentMetadata(),
       status: "active" as const,
       createdAt: 2,
       updatedAt: 5,
+    },
+    {
+      id: "session_history" as SessionId,
+      cwd: "/repo/chili",
+      title: "Read-only history",
+      readOnly: true,
+      status: "active" as const,
+      createdAt: 2,
+      updatedAt: 6,
     },
   ];
   const app = await mountShell(runtimeFixture(), {
@@ -3446,11 +3459,13 @@ test("/session resume opens a searchable project-scoped picker and switches sess
     expect(frame).toContain("Fix resume flow");
     expect(frame).not.toContain("Other project");
     expect(frame).not.toContain("Internal worker");
+    expect(frame).not.toContain("Read-only history");
 
     await press(app, () => app.mockInput.pressKey("a", { ctrl: true }));
     frame = app.captureCharFrame();
     expect(frame).toContain("Other project");
     expect(frame).not.toContain("Internal worker");
+    expect(frame).not.toContain("Read-only history");
 
     await typeText(app, "Fix resume");
     await press(app, () => app.mockInput.pressEnter());
@@ -4946,7 +4961,7 @@ function sessionSummariesFromEvents(events: readonly ChiliEvent[]): RuntimeSessi
     sessions.set(event.payload.sessionId, {
       id: event.payload.sessionId,
       cwd: event.payload.cwd,
-      source: "interactive",
+      ...(event.payload.agent ? { agent: event.payload.agent } : {}),
       status: "active",
       createdAt: Number(event.time),
       updatedAt: Number(event.time),
@@ -4962,7 +4977,6 @@ function runtimeSessionSummary(
   return {
     id,
     cwd: "/repo/chili",
-    source: "interactive",
     status: "active",
     createdAt: 1,
     updatedAt: 1,
@@ -5094,4 +5108,13 @@ async function waitForAbort(signal: AbortSignal | undefined): Promise<void> {
   await new Promise<void>((resolve) => {
     signal.addEventListener("abort", () => resolve(), { once: true });
   });
+}
+
+function agentMetadata(): SessionAgentMetadata {
+  return {
+    parentSessionId: "session_current" as SessionId,
+    name: "worker",
+    path: "/root/worker",
+    policy: {},
+  };
 }

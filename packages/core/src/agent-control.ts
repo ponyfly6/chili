@@ -62,7 +62,7 @@ export class AgentControlService implements AgentToolController {
   forSession(sessionId: SessionId, options: { signal?: AbortSignal } = {}): SessionAgentController {
     const rootCaller = async (): Promise<void> => {
       const root = await this.activeSession(sessionId);
-      if (root.agent || root.source === "subagent") throw new AgentControlAuthorizationError("Agent HTTP control requires a root session");
+      if (root.agent) throw new AgentControlAuthorizationError("Agent HTTP control requires a root session");
     };
     const call = <T>(fn: (caller: Caller) => Promise<T>): Promise<T> =>
       this.options.rootRuntime.withSessionControl(sessionId, async (operation) => {
@@ -240,7 +240,7 @@ export class AgentControlService implements AgentToolController {
   private async activeSession(sessionId: SessionId): Promise<SessionRow> {
     const session = await this.options.store.session(sessionId);
     if (!session || session.status !== "active") throw new AgentControlAuthorizationError(`Active Agent session not found: ${sessionId}`);
-    if (session.source === "subagent" && !session.agent) throw new AgentControlAuthorizationError("Legacy worker sessions cannot be activated through Agent control");
+    if (session.readOnly) throw new AgentControlAuthorizationError("Historical Sessions are read-only and cannot be activated through Agent control");
     return session;
   }
 
@@ -339,7 +339,7 @@ export class AgentControlService implements AgentToolController {
     if (caller.operation) this.assertClaim(caller.sessionId, caller.operation);
     else if (caller.trustedRootRead) {
       const root = await this.activeSession(caller.sessionId);
-      if (root.agent || root.source === "subagent") throw new AgentControlAuthorizationError("Agent HTTP control requires a root session");
+      if (root.agent) throw new AgentControlAuthorizationError("Agent HTTP control requires a root session");
     } else throw new AgentControlAuthorizationError("Agent control requires a trusted caller");
     if (workAction) {
       const root = (await this.ancestry(await this.activeSession(caller.sessionId))).at(-1)!;

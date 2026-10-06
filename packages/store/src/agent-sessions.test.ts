@@ -3,7 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentPath, MessageId, SessionId, TaskId, TimestampMs } from "@chili/protocol";
+import type { MessageId, SessionId, TimestampMs } from "@chili/protocol";
 import { ObservableEventStore } from "./observable-event-store.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 import type { CreateChildSessionInput } from "./types.js";
@@ -12,7 +12,7 @@ const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { while (cleanup.length) await cleanup.pop()!(); });
 const rootId = "session_root" as SessionId;
 const childId = "session_child" as SessionId;
-const trusted = { allowSubagentSessions: true };
+const trusted = { sessionAccess: "child" as const };
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "chili-agents-"));
@@ -20,7 +20,7 @@ async function fixture() {
   const store = new SqliteEventStore(path);
   cleanup.push(async () => { store.close(); await rm(root, { recursive: true, force: true }); });
   await store.append({ id: "created", type: "session.created", sessionId: rootId, time: Date.now() as TimestampMs, payload: { sessionId: rootId, cwd: root } });
-  expect(store.claimSessionRun({ sessionId: rootId, claimId: "parent_claim", allowSubagentSessions: false, time: Date.now(), leaseDurationMs: 60_000 }).status).toBe("claimed");
+  expect(store.claimSessionRun({ sessionId: rootId, claimId: "parent_claim", sessionAccess: "root", time: Date.now(), leaseDurationMs: 60_000 }).status).toBe("claimed");
   const input: CreateChildSessionInput = {
     sessionId: childId, parentSessionId: rootId, name: "research", cwd: root,
     policy: { allowedTools: ["read", "code_mode"], writeScope: [], executeScope: [] },
@@ -87,17 +87,21 @@ test("only trusted queue operations execute new Agent Sessions; payload does not
   const claim = { kind: "claim" as const, sessionId: childId, claimId: "child_claim", executionRef: "child_execution", leaseDurationMs: 60_000 };
   expect(() => store.mutateSessionInputs(claim)).toThrow();
   expect(store.mutateSessionInputs(claim, trusted).input?.state).toBe("claimed");
-  expect(() => store.mutateSessionInputs({ kind: "accept", sessionId: childId, submissionId: "spoof", inputId: "spoof", mode: "queue", payload: '{"allowSubagentSessions":true}', text: "spoof", source: "local" })).toThrow();
+  expect(() => store.mutateSessionInputs({ kind: "accept", sessionId: childId, submissionId: "spoof", inputId: "spoof", mode: "queue", payload: '{"sessionAccess":true}', text: "spoof", source: "local" })).toThrow();
 });
 
 test("legacy task child sessions stay read-only even for the trusted new queue", async () => {
-  const { store, input } = await fixture();
-  await store.append({ id: "legacy_task", type: "agent.task_created", sessionId: rootId, time: Date.now() as TimestampMs,
-    payload: { taskId: "legacy_task" as TaskId, parentSessionId: rootId, childSessionId: childId,
-      parentPath: "/root" as AgentPath, path: "/root/legacy" as AgentPath, taskName: "legacy", cwd: input.cwd, prompt: "old pending action" } });
+  const { path, store, input } = await fixture();
   await store.append({ id: "legacy_child", type: "session.created", sessionId: childId, time: Date.now() as TimestampMs, payload: { sessionId: childId, cwd: input.cwd } });
+  const db = new Database(path);
+  try {
+    db.query("insert into events (seq, id, type, time, session_id, payload_json) values ((select coalesce(max(seq), 0) + 1 from events), ?, ?, ?, ?, ?)")
+      .run("legacy_task", "agent.task_created", Date.now(), rootId, JSON.stringify({ taskId: "legacy_task", parentSessionId: rootId, childSessionId: childId, parentPath: "/root", path: "/root/legacy", taskName: "legacy", cwd: input.cwd, prompt: "old pending action" }));
+  } finally { db.close(); }
+  expect(await store.session(childId)).toMatchObject({ readOnly: true });
   expect((await store.session(childId))?.agent).toBeUndefined();
   expect(() => store.mutateSessionInputs({ ...input.initialInput, kind: "accept", sessionId: childId }, trusted)).toThrow();
+  expect(store.claimSessionRun({ sessionId: childId, claimId: "legacy_claim", sessionAccess: "child", time: Date.now(), leaseDurationMs: 60_000 }).status).toBe("forbidden");
   expect(store.sessionInputQueue(childId).pendingCount).toBe(0);
   expect(await store.events({ type: "agent.task_created" })).toHaveLength(1);
 });

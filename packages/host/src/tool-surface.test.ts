@@ -44,11 +44,16 @@ test("Host recovers six Agent controls from durable session identities without T
     expect(textOf(a.result as Message)).toBe("answer:first");
     expect(textOf(b.result as Message)).toBe("answer:second");
     expect(a.input.inputId).not.toBe(b.input.inputId);
+    const child = await host.store.session(first.agentId as SessionId);
+    expect(child?.agent?.parentSessionId).toBe(root);
+    expect(child).not.toHaveProperty("source");
+    const callsBeforeDirectPrompt = captured.length;
+    await expect(host.service.submitPrompt({ sessionId: first.agentId as SessionId, text: "bypass Agent access" })).rejects.toThrow();
+    expect(captured).toHaveLength(callsBeforeDirectPrompt);
     await host.service.submitPrompt({sessionId:root,text:"inspect agents"});
     const names=captured.at(-1)!.tools.map((tool)=>tool.name);
     expect(names).toEqual(expect.arrayContaining([...AGENT_CONTROL_TOOLS]));
     expect(names.some((name)=>name.startsWith("team_")||name==="complete_task")).toBe(false);
-    expect(await host.store.agentTasks({parentSessionId:root})).toEqual([]);
     expect(await host.store.childSessions(root)).toHaveLength(1);
   } finally {await host.close();await rm(options.cwd,{recursive:true,force:true});}
 });

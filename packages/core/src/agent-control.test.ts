@@ -35,7 +35,7 @@ async function fixture(options: {
   await store.append({ id: crypto.randomUUID(), type: "session.created", sessionId: rootId,
     time: Date.now() as TimestampMs, payload: { sessionId: rootId, cwd } });
   const root = new RuntimeService({ store, runtime: runner, cwd });
-  const runtime = new RuntimeService({ store, runtime: runner, cwd, allowSubagentSessions: true });
+  const runtime = new RuntimeService({ store, runtime: runner, cwd, sessionAccess: "child" });
   const agents = new AgentControlService({ store, runtime, rootRuntime: root,
     ...(options.maxChildren !== undefined ? { maxChildren: options.maxChildren } : {}),
     ...(options.maxDepth !== undefined ? { maxDepth: options.maxDepth } : {}),

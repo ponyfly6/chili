@@ -2689,7 +2689,7 @@ function filteredResumeSessions(
 ): RuntimeSessionSummary[] {
   const normalizedQuery = query.trim().toLowerCase();
   return sessions
-    .filter(isInteractiveSession)
+    .filter(isResumableRootSession)
     .filter((session) => session.status === "active")
     .filter((session) => showAll || samePath(session.cwd, cwd))
     .filter((session) => {
@@ -2705,7 +2705,7 @@ function resolveResumeTarget(
   target: string,
 ): RuntimeSessionSummary | string {
   const normalized = target.trim().toLowerCase();
-  const active = sessions.filter((session) => session.status === "active" && isInteractiveSession(session));
+  const active = sessions.filter((session) => session.status === "active" && isResumableRootSession(session));
   const exactId = active.find((session) => String(session.id).toLowerCase() === normalized);
   if (exactId) return exactId;
   const exactTitles = active.filter((session) => session.title?.toLowerCase() === normalized);
@@ -2717,9 +2717,8 @@ function resolveResumeTarget(
   return `Saved chat not found: ${target}`;
 }
 
-function isInteractiveSession(session: RuntimeSessionSummary): boolean {
-  // Older runtimes do not expose source; preserve their previous interactive behavior.
-  return session.source !== "subagent";
+function isResumableRootSession(session: RuntimeSessionSummary): boolean {
+  return !session.agent && session.readOnly !== true;
 }
 
 function sessionDisplayTitle(session: RuntimeSessionSummary): string {

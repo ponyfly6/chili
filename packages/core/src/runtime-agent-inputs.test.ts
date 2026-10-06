@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentRunId, MessageId, PartId, PersistedToolPolicy, SessionId, TimestampMs, TurnId } from "@chili/protocol";
+import type { MessageId, PartId, PersistedToolPolicy, SessionId, TimestampMs, TurnId } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import type { AgentRunner, RunTurnInput, RunTurnResult } from "./runner.js";
 import { AgentControlService } from "./agent-control.js";
@@ -42,14 +43,14 @@ async function fixture(options: {
         text: "Inspect the implementation", source: "agent", identity: "initial" },
     });
   });
-  const create = () => new RuntimeService({ store, runtime: runner, cwd: directory, allowSubagentSessions: true,
+  const create = () => new RuntimeService({ store, runtime: runner, cwd: directory, sessionAccess: "child",
     ...(options.runInput ? { runInput: options.runInput } : {}) });
   let service = create();
   cleanups.push(async () => { await service.shutdown(); await root.shutdown(); await store.flushInputMirrors(); store.close(); await rm(directory, { recursive: true, force: true }); });
   return {
     get store() { return store; },
     get service() { return service; },
-    root, turns,
+    root, turns, database,
     start: () => service.submitPromptAsync({ sessionId: childId, text: "Inspect the implementation",
       submissionId: "initial", mode: "queue", inputSource: "agent", requestIdentity: "initial" }),
     restart: async () => { await service.shutdown(); await store.flushInputMirrors(); store.close(); store = new SqliteEventStore(database); service = create(); },
@@ -105,6 +106,21 @@ test("initial and later Agent inputs share admission, execution hook and durable
   expect((await f.store.messages(childId)).filter((message) => message.role === "user")).toHaveLength(2);
 });
 
+test("root and child runtimes admit only their persisted identity class", async () => {
+  const f = await fixture();
+  await expect(f.root.assertSessionTurnAllowed(childId)).rejects.toThrow();
+  await expect(f.service.assertSessionTurnAllowed(rootId)).rejects.toThrow();
+  await expect(f.root.assertSessionReadAllowed(childId)).rejects.toThrow();
+  await expect(f.service.assertSessionReadAllowed(rootId)).rejects.toThrow();
+  expect(() => f.root.submitPromptAsync({ sessionId: childId, text: "wrong runtime" })).toThrow();
+  expect(() => f.service.submitPromptAsync({ sessionId: rootId, text: "wrong runtime" })).toThrow();
+  await expect(f.root.interrupt(childId)).rejects.toThrow();
+  await expect(f.service.interrupt(rootId)).rejects.toThrow();
+  await expect(f.service.createSession({ sessionId: "unparented_child" as SessionId })).rejects.toThrow("atomically");
+  expect((await f.store.sessions()).map((session) => session.id).sort()).toEqual([rootId, childId].sort());
+  expect(f.turns).toHaveLength(0);
+});
+
 test("Stop survives restart and Resume reuses the interrupted input and conversation", async () => {
   const f = await fixture({ run: (input, index, store) => index === 1 ? aborted(input) : complete(store, input) });
   f.start();
@@ -128,7 +144,7 @@ test("Stop survives restart and Resume reuses the interrupted input and conversa
 
 test("restart recovery pauses an orphaned child claim without dispatch and keeps its input identity", async () => {
   const f = await fixture();
-  const trusted = { allowSubagentSessions: true };
+  const trusted = { sessionAccess: "child" as const };
   f.store.mutateSessionInputs({ kind: "claim", sessionId: childId, claimId: "lost_child_owner",
     executionRef: "lost_execution", leaseDurationMs: 60_000 }, trusted);
   f.store.mutateSessionInputs({ kind: "promote", sessionId: childId, inputId: "initial_input", claimId: "lost_child_owner", text: "Inspect the implementation" }, trusted);
@@ -223,7 +239,7 @@ test("trusted local control can join a busy Agent without granting authority to 
   expect(f.store.sessionRunClaim(childId)?.claimId).toBe(originalClaim);
 
   const peer = new RuntimeService({ store: f.store, runtime: {} as AgentRunner,
-    cwd: "/unused", allowSubagentSessions: true });
+    cwd: "/unused", sessionAccess: "child" });
   try {
     expect(() => peer.withSessionControl(childId, () => undefined)).toThrow();
     expect(() => peer.requireActiveSessionOperation(childId)).toThrow();
@@ -274,13 +290,31 @@ test("root recovery leaves child queues to their trusted runtime and never reviv
   const legacyId = "legacy_child" as SessionId;
   await f.store.append({ id: crypto.randomUUID(), type: "session.created", sessionId: legacyId,
     time: Date.now() as TimestampMs, payload: { sessionId: legacyId, cwd: "/legacy" } });
-  // Old Agent ownership is retained for history, but does not supply a current persisted policy.
-  await f.store.append({ id: crypto.randomUUID(), type: "agent.spawned", sessionId: rootId,
-    time: Date.now() as TimestampMs, payload: { runId: "legacy_run" as AgentRunId, parentSessionId: rootId,
-      childSessionId: legacyId, taskName: "legacy", path: "/root/legacy" } });
-  await expect(f.service.assertSessionTurnAllowed(legacyId)).rejects.toThrow();
+  f.store.mutateSessionInputs({ kind: "accept", sessionId: legacyId, submissionId: "legacy_input", inputId: "legacy_input",
+    mode: "queue", payload: JSON.stringify({ sessionId: legacyId, text: "old pending work" }), text: "old pending work", source: "local" });
+  // Seed an old database projection directly: current event writers cannot create old Agent identities.
+  const database = new Database(f.database);
+  try {
+    database.query("insert into events (id, type, time, session_id, payload_json) values (?, ?, ?, ?, ?)")
+      .run("legacy_run_event", "agent.spawned", 1, rootId, JSON.stringify({
+        runId: "legacy_run", path: "/root/legacy", taskName: "legacy", childSessionId: legacyId,
+      }));
+  } finally { database.close(); }
+  expect((await f.store.session(legacyId))?.readOnly).toBe(true);
+  const before = await f.store.events({ sessionId: legacyId });
+  for (const service of [f.root, f.service]) {
+    await expect(service.assertSessionReadAllowed(legacyId)).resolves.toBeUndefined();
+    await expect(service.assertSessionTurnAllowed(legacyId)).rejects.toThrow("read-only");
+    await expect(service.setGoal({ sessionId: legacyId, objective: "Cannot continue old work" })).rejects.toThrow();
+    expect(() => service.submitPromptAsync({ sessionId: legacyId, text: "Cannot activate history" })).toThrow();
+    await expect(service.resumeInputs(legacyId)).rejects.toThrow();
+    await expect(service.interrupt(legacyId)).rejects.toThrow();
+  }
+  await f.root.recoverInputs();
   await f.service.recoverInputs();
   expect(f.service.isRunning(legacyId)).toBe(false);
+  expect(f.service.getInput(legacyId, "legacy_input")?.state).toBe("pending");
+  expect(await f.store.events({ sessionId: legacyId })).toEqual(before);
 });
 
 test("periodic recovery does not pause fresh accepted work before dispatch", async () => {

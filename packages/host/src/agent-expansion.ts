@@ -21,8 +21,8 @@ export async function resolveAgentAncestry(
     visited.add(current);
     const session = sessions.get(current);
     if (!session || session.status !== "active") throw new Error(`Agent session is not active: ${current}`);
+    if (session.readOnly) throw new Error(`Agent session is read-only: ${current}`);
     if (!session.agent) {
-      if (session.source === "subagent") throw new Error(`Legacy Agent sessions are read-only: ${current}`);
       return { path: sessions.get(sessionId)?.agent?.path ?? ROOT_AGENT_PATH, depth, rootSessionId: current };
     }
     current = session.agent.parentSessionId;

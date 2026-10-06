@@ -1,8 +1,7 @@
 import type {
-  AgentRunId,
   AssistantMessagePhase,
   ChiliEvent,
-  EventEnvelope,
+  RuntimeEvent,
   Message,
   ModelSelection,
   ModelUsage as ProtocolModelUsage,
@@ -31,12 +30,12 @@ export interface RuntimeServices {
 }
 
 export interface EventSink {
-  publish<T extends ChiliEvent>(event: T): Promise<void>;
+  publish<T extends RuntimeEvent>(event: T): Promise<void>;
   subscribe(listener: (event: ChiliEvent) => void): () => void;
 }
 
 export interface SessionStore {
-  append(event: EventEnvelope): Promise<void>;
+  append(event: RuntimeEvent): Promise<void>;
   messages(sessionId: SessionId): Promise<Message[]>;
 }
 
@@ -172,12 +171,4 @@ export interface ModelErrorEvent {
   error: unknown;
   responseId?: string;
   usage?: ModelUsage;
-}
-
-export interface SpawnAgentInput {
-  parentRunId?: AgentRunId;
-  taskName: string;
-  prompt: string;
-  mode: "one_shot" | "resumable" | "background";
-  fork: "none" | "last_turn" | "all";
 }

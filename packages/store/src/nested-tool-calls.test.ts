@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import type { ChiliEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { RuntimeEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 
 for (const existingColumn of [undefined, "provider_call_id", "parent_call_id"] as const) {
@@ -24,7 +24,7 @@ for (const existingColumn of [undefined, "provider_call_id", "parent_call_id"] a
     const turnId = "turn_nested_tools" as TurnId;
     const parentCallId = "call_script" as ToolCallId;
     const callId = "call_read" as ToolCallId;
-    const events: ChiliEvent[] = [
+    const events: RuntimeEvent[] = [
       {
         id: "event_script_started", type: "tool.call_started", time: 2 as TimestampMs, sessionId,
         payload: { turnId, callId: parentCallId, providerCallId: "provider_script", toolName: "code_mode", input: { code: "await tools.read({filePath:'README.md'})" } },
@@ -78,7 +78,7 @@ test("provider identifiers can repeat while nested internal identities remain fe
   const turnId = "turn_a" as TurnId;
   const parentCallId = "parent_a" as ToolCallId;
   const callId = "child_a" as ToolCallId;
-  const first: Extract<ChiliEvent, { type: "tool.call_started" }> = {
+  const first: Extract<RuntimeEvent, { type: "tool.call_started" }> = {
     id: "start_child_a", type: "tool.call_started", time: 2 as TimestampMs, sessionId,
     payload: { turnId, callId, parentCallId, providerCallId: "provider_reused", toolName: "read", input: {} },
   };

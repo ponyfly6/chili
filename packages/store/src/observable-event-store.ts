@@ -1,37 +1,6 @@
-import type { ChiliEvent, EventEnvelope, Message, SessionId, TaskId } from "@chili/protocol";
+import type { RuntimeEvent, EventEnvelope, Message, SessionId } from "@chili/protocol";
 import type { SessionInputMutation, SessionInputMutationOptions, SessionInputStore } from "./session-inputs.js";
 import type {
-  AgentMailboxQuery,
-  AgentMailboxRow,
-  AgentMailboxCapabilityStore,
-  AgentMailboxClaimInput,
-  AgentMailboxConsumeInput,
-  AgentMailboxDiscardInput,
-  AgentMailboxDeliveryStore,
-  AgentMailboxMutationResult,
-  AgentMailboxRequeueInput,
-  AgentMailboxStoreCapability,
-  AgentRunQuery,
-  AgentRunRow,
-  AgentTaskCloseCasInput,
-  AgentTaskAdmissionInput,
-  AgentTaskAdmissionResult,
-  AgentTaskAdmissionStore,
-  AgentTaskBeginRunCasInput,
-  AgentTaskBeginRunResult,
-  AgentTaskCapabilityStore,
-  AgentTaskStoreCapability,
-  AgentTaskCompleteCasInput,
-  AgentTaskFinalizationResult,
-  AgentTaskFinalizationStore,
-  AgentTaskLeaseClaimInput,
-  AgentTaskLeaseReleaseInput,
-  AgentTaskLeaseRenewInput,
-  AgentTaskLeaseResult,
-  AgentTaskLeaseStore,
-  AgentTaskRunClaimStore,
-  AgentTaskQuery,
-  AgentTaskRow,
   ApprovalRow,
   EventQuery,
   EventAppendOptions,
@@ -49,40 +18,16 @@ import type {
   CreateChildSessionResult,
   StaleTurnRecoveryInput,
   StaleTurnRecoveryStore,
-  SubagentProjectionStore,
-  TeamMemberQuery,
-  TeamMemberRow,
-  TeamMessageDeliveryQuery,
-  TeamMessageDeliveryRow,
-  TeamMessageQuery,
-  TeamMessageRow,
-  TeamOwnerSessionBindInput,
-  TeamOwnerSessionBindResult,
-  TeamOwnerSessionBindStore,
-  TeamProjectionStore,
-  TeamQuery,
-  TeamRow,
-  TeamTaskClaimInput,
-  TeamTaskClaimStore,
-  TeamTaskAgentSyncInput,
-  TeamTaskAgentSyncResult,
-  TeamTaskAgentSyncStore,
-  TeamTaskMutationResult,
-  TeamTaskQuery,
-  TeamTaskRow,
-  TeamTaskVerificationClaimInput,
-  TeamTaskVerificationClaimResult,
-  TeamTaskVerificationClaimStore,
   SessionGoalQuery,
   SessionGoalRow,
 } from "./types.js";
 
 export interface EventPublisher {
-  subscribe(listener: (event: ChiliEvent) => void): () => void;
+  subscribe(listener: (event: RuntimeEvent) => void): () => void;
 }
 
 export interface ObservableEventStoreOptions {
-  onListenerError?: (error: unknown, event: ChiliEvent) => void;
+  onListenerError?: (error: unknown, event: RuntimeEvent) => void;
 }
 
 export class ObservableEventStore
@@ -93,29 +38,16 @@ export class ObservableEventStore
     StaleTurnRecoveryStore,
     GoalMutationCapabilityStore,
     GoalMutationStore,
-    GoalProjectionStore,
-    SubagentProjectionStore,
-    AgentTaskLeaseStore,
-    AgentTaskCapabilityStore,
-    AgentTaskRunClaimStore,
-    AgentTaskAdmissionStore,
-    AgentTaskFinalizationStore,
-    AgentMailboxCapabilityStore,
-    AgentMailboxDeliveryStore,
-    TeamProjectionStore,
-    TeamOwnerSessionBindStore,
-    TeamTaskClaimStore,
-    TeamTaskAgentSyncStore,
-    TeamTaskVerificationClaimStore
+    GoalProjectionStore
 {
-  private readonly listeners = new Set<(event: ChiliEvent) => void>();
+  private readonly listeners = new Set<(event: RuntimeEvent) => void>();
 
   constructor(
     private readonly inner: EventStore,
     private readonly options: ObservableEventStoreOptions = {},
   ) {}
 
-  async append(event: ChiliEvent, options?: EventAppendOptions): Promise<void> {
+  async append(event: RuntimeEvent, options?: EventAppendOptions): Promise<void> {
     await this.appendCommitted(event, options);
   }
 
@@ -159,7 +91,8 @@ export class ObservableEventStore
     return result;
   }
 
-  async appendCommitted(event: ChiliEvent, options?: EventAppendOptions): Promise<boolean> {
+  async appendCommitted(event: RuntimeEvent, options?: EventAppendOptions): Promise<boolean> {
+    assertCurrentEvent(event);
     const aware = this.inner as EventStore & Partial<EventCommitAwareStore>;
     const committed = aware.appendCommitted
       ? await aware.appendCommitted(event, options)
@@ -169,16 +102,17 @@ export class ObservableEventStore
   }
 
   async appendMany(
-    events: readonly ChiliEvent[],
+    events: readonly RuntimeEvent[],
     options?: EventAppendOptions,
   ): Promise<void> {
     await this.appendManyCommitted(events, options);
   }
 
   async appendManyCommitted(
-    events: readonly ChiliEvent[],
+    events: readonly RuntimeEvent[],
     options?: EventAppendOptions,
-  ): Promise<readonly ChiliEvent[]> {
+  ): Promise<readonly RuntimeEvent[]> {
+    for (const event of events) assertCurrentEvent(event);
     const aware = this.inner as EventStore & Partial<EventCommitAwareStore>;
     const committed = aware.appendManyCommitted
       ? await aware.appendManyCommitted(events, options)
@@ -187,7 +121,7 @@ export class ObservableEventStore
     return committed;
   }
 
-  async reconcileStaleTurns(input: StaleTurnRecoveryInput): Promise<ChiliEvent[]> {
+  async reconcileStaleTurns(input: StaleTurnRecoveryInput): Promise<RuntimeEvent[]> {
     const recovery = this.inner as EventStore & Partial<StaleTurnRecoveryStore>;
     if (!recovery.reconcileStaleTurns) return [];
     const events = await recovery.reconcileStaleTurns(input);
@@ -244,163 +178,12 @@ export class ObservableEventStore
     return result;
   }
 
-  agentTasks(query?: AgentTaskQuery): Promise<AgentTaskRow[]> {
-    return this.subagentStore()?.agentTasks(query) ?? Promise.resolve([]);
-  }
-
-  agentTask(taskId: TaskId): Promise<AgentTaskRow | undefined> {
-    return this.subagentStore()?.agentTask(taskId) ?? Promise.resolve(undefined);
-  }
-
-  agentRuns(query?: AgentRunQuery): Promise<AgentRunRow[]> {
-    return this.subagentStore()?.agentRuns(query) ?? Promise.resolve([]);
-  }
-
-  agentMailbox(query?: AgentMailboxQuery): Promise<AgentMailboxRow[]> {
-    return this.subagentStore()?.agentMailbox(query) ?? Promise.resolve([]);
-  }
-
-  teams(query?: TeamQuery): Promise<TeamRow[]> {
-    return this.teamProjectionStore()?.teams(query) ?? Promise.resolve([]);
-  }
-
-  teamMembers(query?: TeamMemberQuery): Promise<TeamMemberRow[]> {
-    return this.teamProjectionStore()?.teamMembers(query) ?? Promise.resolve([]);
-  }
-
-  teamTasks(query?: TeamTaskQuery): Promise<TeamTaskRow[]> {
-    return this.teamProjectionStore()?.teamTasks(query) ?? Promise.resolve([]);
-  }
-
-  teamMessages(query?: TeamMessageQuery): Promise<TeamMessageRow[]> {
-    return this.teamProjectionStore()?.teamMessages(query) ?? Promise.resolve([]);
-  }
-
-  teamMessageDeliveries(query?: TeamMessageDeliveryQuery): Promise<TeamMessageDeliveryRow[]> {
-    return this.teamProjectionStore()?.teamMessageDeliveries(query) ?? Promise.resolve([]);
-  }
-
-  claimAgentTaskLease(input: AgentTaskLeaseClaimInput): Promise<AgentTaskLeaseResult> {
-    return this.leaseStore()?.claimAgentTaskLease(input) ?? Promise.resolve({ acquired: false });
-  }
-
-  renewAgentTaskLease(input: AgentTaskLeaseRenewInput): Promise<AgentTaskLeaseResult> {
-    return this.leaseStore()?.renewAgentTaskLease(input) ?? Promise.resolve({ acquired: false });
-  }
-
-  releaseAgentTaskLease(input: AgentTaskLeaseReleaseInput): Promise<boolean> {
-    return this.leaseStore()?.releaseAgentTaskLease(input) ?? Promise.resolve(false);
-  }
-
-  supportsAgentTaskCapability(capability: AgentTaskStoreCapability): boolean {
-    const inner = this.inner as EventStore & Partial<AgentTaskCapabilityStore>;
-    if (inner.supportsAgentTaskCapability) {
-      return inner.supportsAgentTaskCapability(capability);
-    }
-    if (capability === "lease") return this.leaseStore() !== undefined;
-    if (capability === "run-claim") return this.runClaimStore() !== undefined;
-    if (capability === "admission") return this.admissionStore() !== undefined;
-    return this.finalizationStore() !== undefined;
-  }
-
-  supportsAgentMailboxCapability(capability: AgentMailboxStoreCapability): boolean {
-    const inner = this.inner as EventStore & Partial<AgentMailboxCapabilityStore>;
-    if (inner.supportsAgentMailboxCapability) {
-      return inner.supportsAgentMailboxCapability(capability);
-    }
-    return capability === "delivery" && this.mailboxDeliveryStore() !== undefined;
-  }
-
-  async completeAgentTaskCas(input: AgentTaskCompleteCasInput): Promise<AgentTaskFinalizationResult> {
-    const result = await (this.finalizationStore()?.completeAgentTaskCas(input) ??
-      Promise.resolve({ applied: false, events: [] }));
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
-  async admitAgentTask(input: AgentTaskAdmissionInput): Promise<AgentTaskAdmissionResult> {
-    const result = await (this.admissionStore()?.admitAgentTask(input) ??
-      Promise.resolve({ applied: false, events: [] }));
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
-  async beginAgentTaskRunCas(input: AgentTaskBeginRunCasInput): Promise<AgentTaskBeginRunResult> {
-    const result = await (this.runClaimStore()?.beginAgentTaskRunCas(input) ??
-      Promise.resolve({ applied: false, events: [] }));
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
-  async closeAgentTaskCas(input: AgentTaskCloseCasInput): Promise<AgentTaskFinalizationResult> {
-    const result = await (this.finalizationStore()?.closeAgentTaskCas(input) ??
-      Promise.resolve({ applied: false, events: [] }));
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
-  async claimAgentMailboxMessage(input: AgentMailboxClaimInput): Promise<AgentMailboxMutationResult> {
-    const result = await (this.mailboxDeliveryStore()?.claimAgentMailboxMessage(input) ??
-      Promise.resolve({ applied: false, events: [] }));
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
-  async consumeAgentMailboxMessage(input: AgentMailboxConsumeInput): Promise<AgentMailboxMutationResult> {
-    const result = await (this.mailboxDeliveryStore()?.consumeAgentMailboxMessage(input) ??
-      Promise.resolve({ applied: false, events: [] }));
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
-  async requeueAgentMailboxMessage(input: AgentMailboxRequeueInput): Promise<AgentMailboxMutationResult> {
-    const result = await (this.mailboxDeliveryStore()?.requeueAgentMailboxMessage(input) ??
-      Promise.resolve({ applied: false, events: [] }));
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
-  async discardAgentMailboxMessage(input: AgentMailboxDiscardInput): Promise<AgentMailboxMutationResult> {
-    const result = await (this.mailboxDeliveryStore()?.discardAgentMailboxMessage(input) ??
-      Promise.resolve({ applied: false, events: [] }));
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
-  async claimTeamTask(input: TeamTaskClaimInput): Promise<TeamTaskMutationResult> {
-    const result = await (this.teamTaskClaimStore()?.claimTeamTask(input) ??
-      Promise.resolve({ applied: false, reason: "not_found" as const, events: [] }));
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
-  async bindTeamOwnerSession(input: TeamOwnerSessionBindInput): Promise<TeamOwnerSessionBindResult> {
-    const result = await (this.teamOwnerSessionBindStore()?.bindTeamOwnerSession(input) ??
-      Promise.resolve({ applied: false, reason: "not_found" as const, events: [] }));
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
-  async claimTeamTaskVerification(input: TeamTaskVerificationClaimInput): Promise<TeamTaskVerificationClaimResult> {
-    const result = await (this.teamTaskVerificationClaimStore()?.claimTeamTaskVerification(input) ??
-      Promise.resolve({ applied: false, reason: "not_found" as const, events: [] }));
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
-  async syncTeamTaskFromAgentCas(input: TeamTaskAgentSyncInput): Promise<TeamTaskAgentSyncResult> {
-    const result = await (this.teamTaskAgentSyncStore()?.syncTeamTaskFromAgentCas(input) ??
-      Promise.resolve({ applied: false, reason: "not_found" as const, events: [] }));
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
-  subscribe(listener: (event: ChiliEvent) => void): () => void {
+  subscribe(listener: (event: RuntimeEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
 
-  private emit(event: ChiliEvent): void {
+  private emit(event: RuntimeEvent): void {
     for (const listener of this.listeners) {
       try {
         listener(event);
@@ -413,14 +196,6 @@ export class ObservableEventStore
         }
       }
     }
-  }
-
-  private subagentStore(): SubagentProjectionStore | undefined {
-    const inner = this.inner as EventStore & Partial<SubagentProjectionStore>;
-    if (inner.agentTasks && inner.agentTask && inner.agentRuns && inner.agentMailbox) {
-      return inner as SubagentProjectionStore;
-    }
-    return undefined;
   }
 
   private goalStore(): GoalProjectionStore | undefined {
@@ -439,85 +214,10 @@ export class ObservableEventStore
     return inner as EventStore & GoalMutationStore;
   }
 
-  private leaseStore(): AgentTaskLeaseStore | undefined {
-    const inner = this.inner as EventStore & Partial<AgentTaskLeaseStore>;
-    if (inner.claimAgentTaskLease && inner.renewAgentTaskLease && inner.releaseAgentTaskLease) {
-      return inner as EventStore & AgentTaskLeaseStore;
-    }
-    return undefined;
-  }
+}
 
-  private admissionStore(): AgentTaskAdmissionStore | undefined {
-    const inner = this.inner as EventStore & Partial<AgentTaskAdmissionStore> & Partial<AgentTaskCapabilityStore>;
-    if (inner.supportsAgentTaskCapability?.("admission") === false) return undefined;
-    return inner.admitAgentTask ? inner as EventStore & AgentTaskAdmissionStore : undefined;
-  }
-
-  private runClaimStore(): AgentTaskRunClaimStore | undefined {
-    const inner = this.inner as EventStore & Partial<AgentTaskRunClaimStore>;
-    if (inner.beginAgentTaskRunCas) return inner as EventStore & AgentTaskRunClaimStore;
-    return undefined;
-  }
-
-  private finalizationStore(): AgentTaskFinalizationStore | undefined {
-    const inner = this.inner as EventStore & Partial<AgentTaskFinalizationStore>;
-    if (inner.completeAgentTaskCas && inner.closeAgentTaskCas) {
-      return inner as EventStore & AgentTaskFinalizationStore;
-    }
-    return undefined;
-  }
-
-  private mailboxDeliveryStore(): AgentMailboxDeliveryStore | undefined {
-    const inner = this.inner as EventStore
-      & Partial<AgentMailboxDeliveryStore>
-      & Partial<AgentMailboxCapabilityStore>;
-    if (inner.supportsAgentMailboxCapability?.("delivery") === false) return undefined;
-    if (
-      inner.claimAgentMailboxMessage &&
-      inner.consumeAgentMailboxMessage &&
-      inner.requeueAgentMailboxMessage &&
-      inner.discardAgentMailboxMessage
-    ) {
-      return inner as EventStore & AgentMailboxDeliveryStore;
-    }
-    return undefined;
-  }
-
-  private teamProjectionStore(): TeamProjectionStore | undefined {
-    const inner = this.inner as EventStore & Partial<TeamProjectionStore>;
-    if (inner.teams && inner.teamMembers && inner.teamTasks && inner.teamMessages && inner.teamMessageDeliveries) {
-      return inner as EventStore & TeamProjectionStore;
-    }
-    return undefined;
-  }
-
-  private teamTaskClaimStore(): TeamTaskClaimStore | undefined {
-    const inner = this.inner as EventStore & Partial<TeamTaskClaimStore>;
-    if (inner.claimTeamTask) {
-      return inner as EventStore & TeamTaskClaimStore;
-    }
-    return undefined;
-  }
-
-  private teamOwnerSessionBindStore(): TeamOwnerSessionBindStore | undefined {
-    const inner = this.inner as EventStore & Partial<TeamOwnerSessionBindStore>;
-    if (inner.bindTeamOwnerSession) return inner as EventStore & TeamOwnerSessionBindStore;
-    return undefined;
-  }
-
-  private teamTaskVerificationClaimStore(): TeamTaskVerificationClaimStore | undefined {
-    const inner = this.inner as EventStore & Partial<TeamTaskVerificationClaimStore>;
-    if (inner.claimTeamTaskVerification) {
-      return inner as EventStore & TeamTaskVerificationClaimStore;
-    }
-    return undefined;
-  }
-
-  private teamTaskAgentSyncStore(): TeamTaskAgentSyncStore | undefined {
-    const inner = this.inner as EventStore & Partial<TeamTaskAgentSyncStore>;
-    if (inner.syncTeamTaskFromAgentCas) {
-      return inner as EventStore & TeamTaskAgentSyncStore;
-    }
-    return undefined;
+function assertCurrentEvent(event: RuntimeEvent): void {
+  if (event.type.startsWith("agent.") || event.type.startsWith("team.")) {
+    throw new Error("Legacy workflow events are read-only");
   }
 }

@@ -132,6 +132,26 @@ describe("desktop prompt controls", () => {
     expect(submits).toBe(1);
   });
 
+  test("read-only session admission failures propagate without receipt recovery or mutation retries", async () => {
+    let receiptReads = 0;
+    let resumes = 0;
+    const forbidden = new RuntimeHttpError(403, "Read-only sessions cannot execute");
+    const client = {
+      listSessions: async () => [{ id: "history", cwd: "/repo", status: "active", createdAt: 1, updatedAt: 1, readOnly: true }],
+      submitPromptAsync: async () => { throw forbidden; },
+      interruptSession: async () => { throw forbidden; },
+      getInput: async () => { receiptReads++; return undefined; },
+      resumeInputs: async () => { resumes++; return emptyInputQueue("history"); },
+    } as unknown as RuntimeClient;
+    const service = serviceFor(client);
+    for (const mode of ["queue", "steer"] as const) {
+      await expect(service.invoke({ type: "session.send", sessionId: "history", text: "continue", mode })).rejects.toBe(forbidden);
+    }
+    await expect(service.invoke({ type: "session.stop", sessionId: "history" })).rejects.toBe(forbidden);
+    await expect(service.invoke({ type: "session.resume", sessionId: "history" })).rejects.toThrow("Read-only");
+    expect({ receiptReads, resumes }).toEqual({ receiptReads: 0, resumes: 0 });
+  });
+
   test("healthy-state hydration cannot recursively trigger itself", async () => {
     let reads = 0;
     let emissions = 0;
@@ -837,18 +857,18 @@ describe("desktop session projections", () => {
       .toEqual(["session_new"]);
   });
 
-  test("hides child Agent identities while keeping interactive sessions", async () => {
+  test("hides metadata-bearing child Agents while keeping root and read-only history sessions", async () => {
     const client = {
       listSessions: async () => [
         { id: "legacy", cwd: "/repo", status: "active", createdAt: 1, updatedAt: 1 },
-        { id: "interactive", cwd: "/repo", source: "interactive", status: "active", createdAt: 2, updatedAt: 2 },
+        { id: "root", cwd: "/repo", status: "active", createdAt: 2, updatedAt: 2 },
         { id: "child", cwd: "/repo", agent: { parentSessionId: "root", name: "child", path: "/root/child", policy: {} }, status: "active", createdAt: 3, updatedAt: 3 },
-        { id: "historical_child", cwd: "/repo", source: "subagent", status: "active", createdAt: 3, updatedAt: 3 },
+        { id: "historical_worker", cwd: "/repo", readOnly: true, status: "active", createdAt: 3, updatedAt: 3 },
       ],
     } as unknown as RuntimeClient;
 
     const sessions = await serviceFor(client).invoke({ type: "sessions.list" });
-    expect(sessions.map((session) => String(session.id))).toEqual(["legacy", "interactive"]);
+    expect(sessions.map((session) => String(session.id))).toEqual(["legacy", "root", "historical_worker"]);
   });
 
   test("preserves durable order for same-millisecond message creation and part events", async () => {
@@ -1256,7 +1276,6 @@ function sessionSummary(id: string, status: "active" | "archived" = "active") {
   return {
     id,
     cwd: "/repo",
-    source: "interactive",
     status,
     createdAt: 1,
     updatedAt: 1,

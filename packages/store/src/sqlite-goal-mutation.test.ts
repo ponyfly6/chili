@@ -152,7 +152,7 @@ test("goal mutation preserves run claim identity and the connection owner fence"
     const now = Date.now();
     await store.append({ id: "event_goal_run_session", type: "session.created", time: now as TimestampMs,
       sessionId, payload: { sessionId, cwd: "/repo" } });
-    expect(store.claimSessionRun({ sessionId, claimId, allowSubagentSessions: false,
+    expect(store.claimSessionRun({ sessionId, claimId, sessionAccess: "root",
       time: now, leaseDurationMs: 120_000 })).toEqual({ status: "claimed" });
     const event = goalUpdated("event_goal_run_authorized", sessionId, 0, now, "set");
     const decision = () => ({ value: true, event });
@@ -181,7 +181,7 @@ test("goal mutation preserves creation claim identity and the connection owner f
     const sessionId = "session_goal_creation_fence" as SessionId;
     const claimId = "creation_claim_goal_mutation";
     const now = Date.now();
-    expect(store.claimSessionCreation({ sessionId, claimId, cwd: "/repo", owner: "root",
+    expect(store.claimSessionCreation({ sessionId, claimId, cwd: "/repo",
       time: now, leaseDurationMs: 120_000 })).toEqual({ status: "claimed" });
     const event = goalUpdated("event_goal_creation_authorized", sessionId, 0, now, "set");
     const decision = () => ({ value: true, event });

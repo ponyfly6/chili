@@ -2,6 +2,7 @@ export interface RemoteTask {
   id: string;
   title: string;
   status: "active" | "archived";
+  readOnly?: true;
   updatedAt: string;
 }
 
@@ -159,10 +160,12 @@ export function errorMessage(error: unknown): string {
 function readTask(value: unknown): RemoteTask {
   const task = record(value);
   if (task.status !== "active" && task.status !== "archived") invalidResult();
+  if (task.readOnly !== undefined && typeof task.readOnly !== "boolean") invalidResult();
   return {
     id: boundedString(task.id, 128),
     title: boundedString(task.title, 1024),
     status: task.status,
+    ...(task.readOnly === true ? { readOnly: true as const } : {}),
     updatedAt: timestamp(task.updatedAt),
   };
 }

@@ -38,7 +38,7 @@ import {
 } from "@chili/mcp";
 import { normalizePersistedError } from "@chili/protocol";
 import type {
-  ChiliEvent,
+  RuntimeEvent,
   RuntimeMcpAddServerRequest,
   RuntimeMcpAuthRequest,
   RuntimeMcpAuthResponse,
@@ -78,7 +78,7 @@ export interface HostMcpRuntimeOptions {
   userInputQueue?: DeferredUserInputQueue;
   oauthFetch?: typeof fetch;
   registries: readonly MutableToolRegistry[];
-  events?: { publish(event: ChiliEvent): Promise<void> };
+  events?: { publish(event: RuntimeEvent): Promise<void> };
   createId?: (prefix: string) => string;
   deferConnect?: boolean;
   connectMode?: "eager" | "background" | "manual";
@@ -883,9 +883,9 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
     });
   }
 
-  private publish<TType extends ChiliEvent["type"]>(
+  private publish<TType extends RuntimeEvent["type"]>(
     type: TType,
-    payload: Extract<ChiliEvent, { type: TType }>["payload"],
+    payload: Extract<RuntimeEvent, { type: TType }>["payload"],
   ): void {
     if (!this.options.events || this.lifecycle !== "open") return;
     const event = {
@@ -893,12 +893,12 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
       type,
       time: Date.now() as TimestampMs,
       payload,
-    } as Extract<ChiliEvent, { type: TType }>;
+    } as Extract<RuntimeEvent, { type: TType }>;
     const settlement = createDeferred<void>();
     this.eventPublications.add(settlement.promise);
     let publication: Promise<void>;
     try {
-      publication = Promise.resolve(this.options.events.publish(event as ChiliEvent));
+      publication = Promise.resolve(this.options.events.publish(event as RuntimeEvent));
     } catch {
       publication = Promise.resolve();
     }
@@ -1855,7 +1855,7 @@ function toRuntimeStatus(status: McpServerState["status"]): RuntimeMcpServerStat
   return "error";
 }
 
-function protocolStatus(status: McpServerState["status"]): Extract<ChiliEvent, { type: "mcp.server_status_changed" }>["payload"]["status"] {
+function protocolStatus(status: McpServerState["status"]): Extract<RuntimeEvent, { type: "mcp.server_status_changed" }>["payload"]["status"] {
   if (status === "disabled") return "disabled";
   if (status === "disconnected") return "stopped";
   if (status === "connecting") return "starting";
@@ -1863,8 +1863,8 @@ function protocolStatus(status: McpServerState["status"]): Extract<ChiliEvent, {
   return "failed";
 }
 
-function serverConfigSummary(server: McpServerConfig): NonNullable<Extract<ChiliEvent, { type: "mcp.server_status_changed" }>["payload"]["config"]> {
-  const summary: NonNullable<Extract<ChiliEvent, { type: "mcp.server_status_changed" }>["payload"]["config"]> = {
+function serverConfigSummary(server: McpServerConfig): NonNullable<Extract<RuntimeEvent, { type: "mcp.server_status_changed" }>["payload"]["config"]> {
+  const summary: NonNullable<Extract<RuntimeEvent, { type: "mcp.server_status_changed" }>["payload"]["config"]> = {
     name: safeIdentity(server.name, "MCP server name", MCP_DESCRIPTOR_LIMITS.identityBytes),
     enabled: server.enabled,
     transport: server.type,

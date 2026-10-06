@@ -31,7 +31,7 @@ test("HTTP Agent API uses real session receipts and lists the root separately fr
     },
   };
   const rootRuntime = new RuntimeService({ store, runtime: runner, cwd });
-  const childRuntime = new RuntimeService({ store, runtime: runner, cwd, allowSubagentSessions: true });
+  const childRuntime = new RuntimeService({ store, runtime: runner, cwd, sessionAccess: "child" });
   const agents = new AgentControlService({ store, runtime: childRuntime, rootRuntime });
   try {
     for (const sessionId of [rootId, otherRootId]) {
@@ -72,7 +72,9 @@ test("HTTP Agent API uses real session receipts and lists the root separately fr
 
     await expect(client.sendAgent({ sessionId: otherRootId, agentId: first.agentId, text: "cross root" })).rejects.toMatchObject({ status: 403 });
     await expect(client.waitAgent({ sessionId: otherRootId, ...first, timeoutMs: 0 })).rejects.toMatchObject({ status: 403 });
-    await expect(client.listAgents({ sessionId: first.agentId as SessionId })).rejects.toMatchObject({ status: 409 });
+    await expect(client.listAgents({ sessionId: first.agentId as SessionId })).rejects.toMatchObject({ status: 403 });
+    await expect(client.submitPromptAsync({ sessionId: first.agentId as SessionId, text: "bypass Agent admission" })).rejects.toMatchObject({ status: 403 });
+    await expect(client.interruptSession({ sessionId: first.agentId as SessionId })).rejects.toMatchObject({ status: 403 });
     await expect(client.stopAgent({ sessionId: rootId, agentId: rootId })).rejects.toMatchObject({ status: 403 });
     await client.stopAgent({ sessionId: rootId, agentId: second.agentId });
     expect((await client.listAgents({ sessionId: rootId })).find((record) => record.agentId === second.agentId)?.state).toBe("paused");

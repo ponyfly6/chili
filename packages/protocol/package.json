@@ -7,6 +7,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./legacy-workflow-events": {
+      "types": "./dist/legacy-workflow-events.d.ts",
+      "default": "./dist/legacy-workflow-events.js"
     }
   },
   "scripts": {

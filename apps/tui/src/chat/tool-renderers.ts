@@ -626,7 +626,8 @@ function agentSummary(input: ToolRenderInput): string | undefined {
   }
   if (name === "agent_list") {
     if (!Array.isArray(output.agents)) return undefined;
-    const agents = output.agents.map(recordValue).filter((agent) => agent !== undefined);
+    const agents = output.agents.map(recordValue).filter((agent) => agent !== undefined)
+      .filter((agent) => typeof agent.parentAgentId === "string" && agent.parentAgentId.length > 0);
     const counts = ["running", "paused", "idle"].map((state) => {
       const count = agents.filter((agent) => agent.state === state).length;
       return count > 0 ? `${count} ${state}` : undefined;

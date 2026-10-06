@@ -1,4 +1,4 @@
-import type { ChiliEvent, EventEnvelope, SessionId, SnapshotId, TimestampMs } from "@chili/protocol";
+import type { RuntimeEvent, EventEnvelope, SessionId, SnapshotId, TimestampMs } from "@chili/protocol";
 import { boundPersistedJsonValue, normalizePersistedError, timestampNow } from "@chili/protocol";
 import type { EventAppendOptions, EventStore, SessionRow } from "@chili/store";
 import type { SnapshotProvider, SnapshotRevertResult } from "@chili/tools";
@@ -86,8 +86,8 @@ export class SnapshotRecoveryService {
     if (session.status !== "active") {
       throw new Error(`Session is not active: ${sessionId} (${session.status})`);
     }
-    if (session.source === "subagent") {
-      throw new Error(`Snapshot recovery is not allowed for subagent session: ${sessionId}`);
+    if (session.readOnly || session.agent) {
+      throw new Error(`Snapshot recovery requires a writable root Session: ${sessionId}`);
     }
     return session;
   }
@@ -115,7 +115,7 @@ export class SnapshotRecoveryService {
     }
   }
 
-  private async append<TType extends ChiliEvent["type"], TPayload>(
+  private async append<TType extends RuntimeEvent["type"], TPayload>(
     input: RevertSnapshotInput,
     type: TType,
     payload: TPayload,
@@ -128,7 +128,7 @@ export class SnapshotRecoveryService {
       sessionId: input.sessionId,
       payload,
     };
-    await this.options.store.append(event as ChiliEvent, options);
+    await this.options.store.append(event as RuntimeEvent, options);
   }
 
   private id<T extends string>(prefix: string): T {

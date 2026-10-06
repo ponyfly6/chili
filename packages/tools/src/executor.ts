@@ -2,7 +2,7 @@ import type {
   ApprovalDecision,
   ApprovalId,
   ApprovalScope,
-  ChiliEvent,
+  RuntimeEvent,
   EventEnvelope,
   SessionId,
   TimestampMs,
@@ -931,7 +931,7 @@ export class ToolExecutor {
     return { status: "cancelled", callId, error: normalizedError };
   }
 
-  private async publish<TType extends ChiliEvent["type"], TPayload>(
+  private async publish<TType extends RuntimeEvent["type"], TPayload>(
     type: TType,
     input: ExecuteToolInput,
     payload: TPayload,
@@ -944,7 +944,7 @@ export class ToolExecutor {
       payload,
     };
     try {
-      await this.options.events.publish(event as ChiliEvent);
+      await this.options.events.publish(event as RuntimeEvent);
     } catch (error) {
       const normalizedError = toError(error);
       this.eventPublishFailures.add(normalizedError);

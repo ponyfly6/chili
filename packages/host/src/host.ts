@@ -15,7 +15,7 @@ import {
   type PromptFragment,
   type RuntimePromptTurnContext,
 } from "@chili/core";
-import type { ChiliEvent, ExecutionIdentity, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId } from "@chili/protocol";
+import type { ChiliEvent, ExecutionIdentity, ModelSelection, RuntimeEvent, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId } from "@chili/protocol";
 import { compactRuntimeEvent } from "@chili/protocol";
 import { HostOwnerClaim, ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
 import {
@@ -347,13 +347,16 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       if (session.status !== "active") {
         throw new Error(`Session is not active: ${request.sessionId} (${session.status})`);
       }
+      if (session.readOnly) {
+        throw new Error(`Session is read-only: ${request.sessionId}`);
+      }
       const rootSession = sessions.find((candidate) => candidate.id === rootSessionId);
       if (!rootSession) throw new Error(`Approval root session not found: ${rootSessionId}`);
       if (rootSession.status !== "active") {
         throw new Error(`Approval root session is not active: ${rootSessionId} (${rootSession.status})`);
       }
-      if (rootSession.source === "subagent") {
-        throw new Error(`Approval root session cannot be a subagent: ${rootSessionId}`);
+      if (rootSession.readOnly || rootSession.agent) {
+        throw new Error(`Approval root session must be a writable root: ${rootSessionId}`);
       }
       const sessionCwd = await canonicalSkillWorkspace(session.cwd);
       const sessionConfig = await loadHostConfig(sessionCwd, { chiliHome });
@@ -388,7 +391,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     if (options.userInputQueue) {
       const userInputTool = createRequestUserInputTool(
         options.userInputQueue,
-        { publish: (event) => eventStore.append(event) },
+        { publish: (event: RuntimeEvent) => eventStore.append(event) },
         createId,
       );
       registry.register(userInputTool);
@@ -433,7 +436,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     const childToolExecutor = new ToolExecutor({
       registry: childRegistry,
       executionContext: (operation) => withProcessOwner(owner.token, operation),
-      events: { publish: (event: ChiliEvent) => eventStore.append(event) },
+      events: { publish: (event: RuntimeEvent) => eventStore.append(event) },
       approvals: createApprovalBroker({ ...options, chiliHome }, config, approvalState, permissions, approvalRulesetsForRequest),
       policyResolver: combinedChildToolPolicyResolver,
       snapshotProvider,
@@ -478,7 +481,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
       ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
       onModelChanged: persistUserModelSelection,
-      allowSubagentSessions: true,
+      sessionAccess: "child",
       stopSessionResources: (sessionId, reason) => processes.stopSession(sessionId, reason),
       runInput: async (sessionId, signal, run) => {
         const permit = await childRunLimiter.acquireRun(sessionId, signal);
@@ -491,7 +494,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     const toolExecutor = new ToolExecutor({
       registry,
       executionContext: (operation) => withProcessOwner(owner.token, operation),
-      events: { publish: (event) => eventStore.append(event) },
+      events: { publish: (event: RuntimeEvent) => eventStore.append(event) },
       approvals: createApprovalBroker({ ...options, chiliHome }, config, approvalState, permissions, approvalRulesetsForRequest),
       policyResolver: rootToolPolicyResolver,
       snapshotProvider,
@@ -590,7 +593,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
         if (event.type === "started") owner.registerGuardian(event.pid);
         else owner.unregisterGuardian(event.pid);
       },
-      events: { publish: (event: ChiliEvent) => eventStore.append(event) },
+      events: { publish: (event: RuntimeEvent) => eventStore.append(event) },
       createId,
       connectMode: options.mcpConnectMode ?? (options.deferMcpConnect === true ? "background" : "eager"),
     }, baseCommands);
@@ -746,8 +749,8 @@ function registerMcpResourceTools(registry: InMemoryToolRegistry, runtime: HostM
 function createSessionToolPolicyResolver(store: ObservableEventStore): ToolAccessPolicyResolver {
   return { async resolve(context) {
     const session = await store.session(context.sessionId);
-    if (session?.source === "subagent" && !session.agent) {
-      throw new Error("Legacy Agent sessions are read-only");
+    if (session?.readOnly) {
+      throw new Error(`Session is read-only: ${context.sessionId}`);
     }
     return session?.agent?.policy;
   } };
@@ -956,7 +959,7 @@ function chiliChildRuntimeBasePromptFragment(): PromptFragment {
     lifecycle: "stable",
     trust: "system",
     content:
-      "You are a local Chili subagent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
+      "You are a local Chili Agent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
   };
 }
 

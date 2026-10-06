@@ -498,6 +498,20 @@ test("rejects malformed JSON response shapes and unexpected no-content responses
   expect(await empty.getGoal({ sessionId: "session_1" as SessionId })).toBeUndefined();
 });
 
+test("session summaries preserve the read-only history flag and reject non-boolean values", async () => {
+  const summary = { id: "history" as SessionId, cwd: "/repo", status: "active" as const, createdAt: 1, updatedAt: 1 };
+  for (const readOnly of [true, false]) {
+    const client = new HttpRuntimeClient({ baseUrl: "http://chili.test",
+      fetch: (async () => Response.json([{ ...summary, readOnly }])) as unknown as typeof fetch });
+    expect(await client.listSessions()).toEqual([{ ...summary, readOnly }]);
+  }
+  for (const readOnly of ["true", "false", 0, 1, null, {}]) {
+    const client = new HttpRuntimeClient({ baseUrl: "http://chili.test",
+      fetch: (async () => Response.json([{ ...summary, readOnly }])) as unknown as typeof fetch });
+    await expect(client.listSessions()).rejects.toThrow("response[0].readOnly");
+  }
+});
+
 test("rejects malformed and nested-invalid SSE without reflecting hostile JSON", async () => {
   for (const frame of [
     "event: chili.event\ndata: {HOSTILE_CANARY\n\n",

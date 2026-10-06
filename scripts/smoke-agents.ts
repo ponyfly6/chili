@@ -132,7 +132,11 @@ await withWorkspace("max_children = 1\nmax_depth = 1\nmax_concurrent = 1", async
     assert.equal((await runtime.host.store.childSessions(sessionId)).length, 1);
     await assert.rejects(runtime.client.spawnAgent({ sessionId, name: "extra", prompt: "over capacity" }), /child|limit|maximum/i);
     assert.equal((await runtime.client.listAgents({ sessionId })).find((agent) => agent.agentId === first.agentId)?.state, "idle");
-    assert.deepEqual(await runtime.host.store.agentTasks({ parentSessionId: sessionId }), [], "New Agents do not create business Tasks");
+    assert.equal((await runtime.host.store.events()).some((event) => /^(agent|team)\./.test(event.type)), false,
+      "New Agents must not emit legacy workflow events");
+    for (const session of await runtime.host.store.sessions()) {
+      assert.equal("source" in session, false, "Session identity must not retain the old interactive/subagent classification");
+    }
     for (const path of ["teams", "teams/old/tasks", "teams/old/run_loop", "tasks", "tasks/old/followup", "tasks/reconcile_stale", "agents/tree", "agent_runs", "mailbox"]) {
       for (const method of ["GET", "POST"]) {
         assert.equal((await fetch(new URL(path, runtime.url), { method })).status, 404, `${method} ${path} must be retired`);

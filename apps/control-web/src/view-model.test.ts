@@ -9,6 +9,16 @@ const snapshot = {
 };
 
 describe("mobile public projection", () => {
+  test("preserves read-only history in summaries and snapshots without accepting malformed flags", () => {
+    expect(readTaskList({ sessions: [{ ...task, readOnly: true }] }).sessions[0]?.readOnly).toBe(true);
+    expect(readTaskSnapshot({ ...snapshot, session: { ...snapshot.session, readOnly: true } }).session.readOnly).toBe(true);
+    expect(readTaskList({ sessions: [task] }).sessions[0]?.readOnly).toBeUndefined();
+    for (const invalid of ["false", "true", 0, 1, null, {}]) {
+      expect(() => readTaskList({ sessions: [{ ...task, readOnly: invalid }] })).toThrow();
+      expect(() => readTaskSnapshot({ ...snapshot, session: { ...snapshot.session, readOnly: invalid } })).toThrow();
+    }
+  });
+
   test("only copies allowlisted summary and snapshot fields for display", () => {
     const list = readTaskList({ sessions: [{ ...task, cwd: "/private/workspace", children: ["child_1"] }], truncated: true });
     expect(list).toEqual({ sessions: [{ id: task.id, title: task.title, status: "active", updatedAt: "2023-11-14T22:13:20.000Z" }], truncated: true });

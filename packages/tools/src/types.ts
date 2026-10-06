@@ -2,7 +2,7 @@ import type {
   ApprovalDecision,
   ApprovalId,
   ApprovalScope,
-  ChiliEvent,
+  RuntimeEvent,
   EventEnvelope,
   SessionId,
   SnapshotId,
@@ -149,7 +149,7 @@ export interface MutableToolRegistry extends ToolRegistry {
 }
 
 export interface ToolEventSink {
-  publish(event: ChiliEvent): Promise<void>;
+  publish(event: RuntimeEvent): Promise<void>;
 }
 
 export interface ApprovalBrokerRequest {
@@ -314,7 +314,7 @@ export type SnapshotPolicy = (input: {
 
 export type ToolContextFactory = (tool: ChiliToolDefinition, input: ExecuteToolInput, callId: ToolCallId) => ToolExecutionContext;
 
-export type ToolEventFactory<TType extends ChiliEvent["type"], TPayload> = (
+export type ToolEventFactory<TType extends RuntimeEvent["type"], TPayload> = (
   type: TType,
   payload: TPayload,
-) => Extract<ChiliEvent, EventEnvelope<TType, TPayload>>;
+) => Extract<RuntimeEvent, EventEnvelope<TType, TPayload>>;

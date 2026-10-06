@@ -142,7 +142,7 @@ describe("real desktop remote adapter boundary", () => {
     fixture.adapter.revoke();
   });
 
-  test.each(["child", "foreign", "archived", "missing"] as const)("a denied %s Stop cannot mutate or cancel a later desktop send", async (kind) => {
+  test.each(["child", "foreign", "archived", "readOnly", "missing"] as const)("a denied %s Stop cannot mutate or cancel a later desktop send", async (kind) => {
     const membership = deferred<RuntimeSessionSummary[]>();
     const fixture = harness({ listSessions: () => membership.promise });
     const stopping = invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } })
@@ -152,6 +152,7 @@ describe("real desktop remote adapter boundary", () => {
       ...(kind === "child" ? { agent: { parentSessionId: "parent" as never, name: "child", path: "/root/child" as never, policy: {} } } : {}),
       ...(kind === "foreign" ? { cwd: "/other" } : {}),
       ...(kind === "archived" ? { status: "archived" as const } : {}),
+      ...(kind === "readOnly" ? { readOnly: true } : {}),
     }]);
     expect(await stopping).toBeInstanceOf(Error);
     expect(await sending).toEqual({ status: "accepted" });
@@ -181,7 +182,6 @@ describe("real desktop remote adapter boundary", () => {
 
   test("lists only existing root tasks in the enabled workspace and never searches hidden paths", async () => {
     const legacy = summary("legacy");
-    delete legacy.source;
     const fixture = harness({ listSessions: async () => [
       summary("root"),
       legacy,
@@ -221,6 +221,23 @@ describe("real desktop remote adapter boundary", () => {
     await expect(invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "archived" } }))
       .rejects.toThrow("Archived");
     expect(targetReads).toBe(0);
+    expect(fixture.submitted).toEqual([]);
+    expect(fixture.interrupts).toEqual([]);
+    fixture.adapter.revoke();
+  });
+
+  test("read-only history stays listable and readable while remote send and stop are rejected", async () => {
+    const fixture = harness({ listSessions: async () => [{ ...summary("history"), readOnly: true }] });
+    expect(await invoke(fixture.adapter, { operation: "sessions.list", payload: {} }))
+      .toMatchObject({ sessions: [{ id: "history", readOnly: true }] });
+    expect(await invoke(fixture.adapter, { operation: "session.snapshot", payload: { sessionId: "history" } }))
+      .toMatchObject({ session: { id: "history", readOnly: true }, messages: [] });
+    for (const mode of ["queue", "steer"] as const) {
+      await expect(invoke(fixture.adapter, { operation: "session.send", payload: { sessionId: "history", text: "resume", mode } }))
+        .rejects.toThrow("Read-only");
+    }
+    await expect(invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "history" } }))
+      .rejects.toThrow("Read-only");
     expect(fixture.submitted).toEqual([]);
     expect(fixture.interrupts).toEqual([]);
     fixture.adapter.revoke();
@@ -447,6 +464,22 @@ describe("real desktop remote adapter boundary", () => {
 });
 
 describe("remote snapshot whitelist and complete serialization budget", () => {
+  test("exports only the read-only marker for historical session metadata", () => {
+    const history = { ...summary("history"), readOnly: true, cwd: "/SECRET/path", preview: "SECRET_PREVIEW" };
+    const projected = projectRemoteSessionList([history, { ...summary("root"), readOnly: false }]);
+    expect(projected.sessions).toEqual([
+      { id: "history", title: "Root task", status: "active", readOnly: true, updatedAt: 2 },
+      { id: "root", title: "Root task", status: "active", updatedAt: 2 },
+    ]);
+    const snapshot = projectRemoteSnapshot({ ...rootSnapshot([]), session: history });
+    expect(snapshot.session.readOnly).toBe(true);
+    expect(Object.keys(snapshot.session).sort()).toEqual([
+      "deliveryUnknown", "id", "needsDesktop", "queuedCount", "readOnly", "runStatus", "status", "title", "updatedAt",
+    ]);
+    expect(JSON.stringify([projected, snapshot])).not.toContain("SECRET");
+    assertFitsWire(snapshot);
+  });
+
   test("exports only root user/assistant text and desktop-attention flags", () => {
     const events = [
       ...messageEvents("user", "hello"),
@@ -517,7 +550,7 @@ describe("remote snapshot whitelist and complete serialization budget", () => {
 });
 
 function summary(id: string): RuntimeSessionSummary {
-  return { id: id as SessionId, cwd: "/repo", title: "Root task", source: "interactive", status: "active", createdAt: 1, updatedAt: 2 };
+  return { id: id as SessionId, cwd: "/repo", title: "Root task", status: "active", createdAt: 1, updatedAt: 2 };
 }
 
 function rootSnapshot(events: ChiliEvent[]): DesktopRemoteRootSnapshot {
