@@ -5,8 +5,6 @@ import {
   jsonEventArrayUtf8Bytes,
   ReplayableRuntimeEventWindowAccumulator,
   retainReplayableRuntimeEvents,
-  runtimeEventProvides,
-  runtimeEventRequires,
 } from "./replay-window.js";
 
 test("retains the session Agent identity with its queue state", () => {
@@ -27,23 +25,6 @@ test("retains the session Agent identity with its queue state", () => {
   expect(runtimeSessionAgents(reduceRuntimeEvents(result.events))[0]).toMatchObject({
     agentId: "session_1", parentSessionId: "session_root", name: "worker", state: "paused",
   });
-});
-
-test("historical Team and AgentTask events have no live replay dependencies", () => {
-  const history = [
-    event("team.task_updated", { teamId: "old_team", taskId: "old_task", status: "completed" }, 1),
-    event("agent.task_completed", { taskId: "old_agent_task", status: "completed" }, 2),
-    event("agent.completed", { runId: "old_run", path: "/root/old", status: "completed" }, 3),
-  ];
-  for (const item of history) {
-    expect(runtimeEventProvides(item)).toEqual([]);
-    expect(runtimeEventRequires(item)).toEqual([]);
-  }
-  const result = retainReplayableRuntimeEvents(history, { maxEvents: 10, maxBytes: 10_000 });
-  expect(result.events).toEqual(history);
-  expect(result.missingDependencies).toEqual([]);
-  expect(runtimeSessionAgents(reduceRuntimeEvents(result.events))).toEqual([]);
-  expect(reduceRuntimeEvents(result.events).lastEventId).toBe(history.at(-1)!.id);
 });
 
 test("keeps message anchors and a visible newest delta inside an exact JSON-array budget", () => {
@@ -358,7 +339,7 @@ test("replayed preview snapshots remain deduplicated and preserve durable order 
 });
 
 function event(
-  type: string,
+  type: ChiliEvent["type"],
   payload: unknown,
   time: number,
   id = `event_${time}`,

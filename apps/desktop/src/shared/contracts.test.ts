@@ -292,10 +292,13 @@ describe("desktop IPC contracts", () => {
       type: "runtime.event",
       event: {
         id: "event_3",
-        type: "team.task_updated",
+        type: "message.part_added",
         time: 1,
         sessionId: "session_1",
-        payload: { teamId: "team_1", taskId: "__proto__", dependsOn: ["task_1"] },
+        payload: { messageId: "message_1", part: {
+          id: "part_compaction", messageId: "message_1", sessionId: "session_1", type: "compaction",
+          boundaryMessageId: "message_boundary", reason: "manual", sourceMessageIds: ["__proto__"],
+        } },
       },
     })).toThrow("prototype property name");
     expect(() => parseDesktopEvent({
@@ -399,10 +402,25 @@ describe("desktop IPC contracts", () => {
     expect(() => parseDesktopEvent({ type: "runtime.event", event: { ...queueEvent, payload: { ...queue, items: [{ ...receipt, sessionId: "session_other" }] } } })).toThrow();
   });
 
-  test("historical Team events remain readable without the old live task snapshot", () => {
-    const historical = runtimeEnvelope("team.task_updated", { teamId: "team_old", taskId: "task_old", status: "completed" }, "historical_team");
-    const request = parseDesktopRequest({ type: "session.snapshot", sessionId: "session_1" });
-    expect(parseDesktopResponse(request, { sessionId: "session_1", events: [historical], agents: [], pendingApprovals: [], pendingInputs: [] })).toMatchObject({ events: [historical], agents: [] });
+  test("rejects retired workflow events while preserving ordinary message history", () => {
+    const request = { type: "session.snapshot", sessionId: "session_1" } as const;
+    const snapshot = { sessionId: "session_1", agents: [], pendingApprovals: [], pendingInputs: [] };
+    for (const retired of [
+      runtimeEnvelope("agent.spawned", { runId: "run_old", path: "/root/worker", taskName: "worker" }, "retired_agent"),
+      runtimeEnvelope("team.task_updated", { teamId: "team_old", taskId: "task_old", status: "completed" }, "retired_team"),
+    ]) {
+      expect(() => parseDesktopEvent({ type: "runtime.event", event: retired })).toThrow("Unsupported runtime event type");
+      expect(() => parseDesktopResponse(request, { ...snapshot, events: [retired] })).toThrow("Unsupported runtime event type");
+    }
+    const ordinary = [
+      runtimeEnvelope("session.created", { sessionId: "session_1", cwd: "/repo" }, "created"),
+      runtimeEnvelope("message.created", { messageId: "message_1", role: "assistant" }, "message"),
+      runtimeEnvelope("message.part_added", { messageId: "message_1", part: {
+        id: "part_1", messageId: "message_1", sessionId: "session_1", type: "text", text: "Saved result remains readable",
+      } }, "part"),
+    ];
+    const parsed = parseDesktopResponse(request, { ...snapshot, events: ordinary });
+    expect(presentSession(parsed).runtime.messages.message_1?.parts).toMatchObject([{ type: "text", text: "Saved result remains readable" }]);
   });
 
   test("validates authoritative pending approvals without requiring event anchors", () => {
@@ -505,8 +523,6 @@ describe("desktop IPC contracts", () => {
       ["approval patterns", runtimeEnvelope("approval.requested", { approvalId: "approval_1", permission: "read", patterns: {} }, "bad_approval")],
       ["input questions", runtimeEnvelope("user_input.requested", { inputId: "input_1", callId: "call_1", questions: "question" }, "bad_input")],
       ["goal objective", runtimeEnvelope("goal.updated", { goal: { sessionId: "session_1", objective: {}, status: "active", tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 } }, "bad_goal")],
-      ["agent task name", runtimeEnvelope("agent.spawned", { runId: "run_1", path: "/root/worker", taskName: {}, status: "running" }, "bad_agent")],
-      ["team counts", runtimeEnvelope("team.run_progress", { teamId: "team_1", runId: "run_1", cycle: 1, phase: "load", counts: { dispatched: "one" } }, "bad_team")],
       ["mcp status", runtimeEnvelope("mcp.progress", { serverName: "server", operation: "connect", status: "unknown" }, "bad_mcp")],
     ];
 

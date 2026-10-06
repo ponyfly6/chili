@@ -66,22 +66,6 @@ test("projects one stable Agent identity from its session and input queue", () =
   expect(runtimeSessionAgents(view)[0]).toMatchObject({ agentId, state: "idle", status: "idle" });
 });
 
-test("ignores historical Team and AgentTask state while retaining chat and cursor", () => {
-  const sessionId = "session_legacy" as SessionId;
-  const view = createRuntimeView();
-  for (const type of ["team.created", "team.task_created", "team.task_updated", "agent.spawned", "agent.task_created", "agent.task_completed"]) {
-    applyRuntimeEvent(view, { id: type, type, time: 1 as TimestampMs, sessionId, payload: { taskId: "legacy", teamId: "legacy", path: "/root/legacy", runId: "legacy", taskName: "Legacy", status: "running" } });
-    expect(view.lastEventId).toBe(type);
-  }
-  expect(view.sessionIds).toEqual([]);
-  expect(runtimeSessionAgents(view)).toEqual([]);
-  expect(Object.hasOwn(view, "tasks")).toBe(false);
-  expect(Object.hasOwn(view, "teams")).toBe(false);
-  applyRuntimeEvent(view, { id: "chat", type: "message.created", time: 2 as TimestampMs, sessionId, payload: { messageId: "message_legacy" as MessageId, role: "user" } });
-  expect(sessionMessages(view, sessionId)).toHaveLength(1);
-  expect(view.lastEventId).toBe("chat");
-});
-
 test("rejects mismatched Agent identity and input queue session envelopes", () => {
   const sessionId = "session_good" as SessionId;
   const foreignId = "session_foreign" as SessionId;

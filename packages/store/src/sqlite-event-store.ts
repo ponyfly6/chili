@@ -629,7 +629,10 @@ export class SqliteEventStore
     if (query.afterEventId && query.beforeEventId) {
       throw new TypeError("Event queries cannot combine afterEventId and beforeEventId");
     }
-    const clauses: string[] = [];
+    // Retired workflow records stay in the ledger for identity protection, but
+    // never occupy a page or reach current event decoders. Cursors below still
+    // resolve against the complete ledger, including these hidden records.
+    const clauses: string[] = ["type not glob 'agent.*'", "type not glob 'team.*'"];
     const params: Record<string, unknown> = {};
 
     if (query.sessionId) {
@@ -2504,71 +2507,6 @@ function canonicalizeLegacyEventPayload(
   if (type.startsWith("session.") && sessionId) {
     output.sessionId = sessionId;
   }
-  const canonicalizeIdentity = (
-    legacyKey: "parentThreadId" | "childThreadId" | "recipientThreadId",
-    sessionKey: "parentSessionId" | "childSessionId" | "recipientSessionId",
-  ): void => {
-    const legacyId = output[legacyKey];
-    delete output[legacyKey];
-    if (typeof legacyId !== "string") return;
-    const resolved = resolveLegacySessionId(legacyId);
-    const existing = output[sessionKey];
-    if (typeof existing === "string") {
-      if (resolved && existing !== resolved) {
-        throw new Error(
-          `Cannot replay legacy event payload: ${legacyKey} maps to ${resolved}, not ${existing}.`,
-        );
-      }
-      return;
-    }
-    if (!resolved) {
-      throw new Error(
-        `Cannot replay legacy event payload: ${legacyKey} value ${legacyId} has no SessionId mapping.`,
-      );
-    }
-    output[sessionKey] = resolved;
-  };
-
-  canonicalizeIdentity("parentThreadId", "parentSessionId");
-  if (type === "agent.message_queued") {
-    const legacyChildId = output.childThreadId;
-    const previousRecipientId = output.childSessionId;
-    const currentRecipientId = output.recipientSessionId;
-    delete output.childThreadId;
-    delete output.childSessionId;
-    if (
-      typeof previousRecipientId === "string"
-      && typeof currentRecipientId === "string"
-      && previousRecipientId !== currentRecipientId
-    ) {
-      throw new Error(
-        `Cannot replay legacy mailbox payload: child session ${previousRecipientId} conflicts with recipient session ${currentRecipientId}.`,
-      );
-    }
-    const mappedRecipientId = typeof legacyChildId === "string"
-      ? resolveLegacySessionId(legacyChildId)
-      : undefined;
-    const recipientId = typeof currentRecipientId === "string"
-      ? currentRecipientId
-      : typeof previousRecipientId === "string"
-        ? previousRecipientId
-        : mappedRecipientId;
-    if (mappedRecipientId && recipientId && mappedRecipientId !== recipientId) {
-      throw new Error(
-        `Cannot replay legacy mailbox payload: child identity maps to ${mappedRecipientId}, not ${recipientId}.`,
-      );
-    }
-    if (typeof legacyChildId === "string" && !recipientId) {
-      throw new Error(
-        `Cannot replay legacy mailbox payload: childThreadId value ${legacyChildId} has no SessionId mapping.`,
-      );
-    }
-    if (recipientId) output.recipientSessionId = recipientId;
-  } else {
-    canonicalizeIdentity("childThreadId", "childSessionId");
-  }
-  canonicalizeIdentity("recipientThreadId", "recipientSessionId");
-
   const canonicalGoal = (value: unknown): unknown => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return value;
     const goal = { ...(value as Record<string, unknown>) };

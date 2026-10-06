@@ -309,6 +309,8 @@ describe("resync coordinator", () => {
   test("rehydrates again when an authoritative frame arrives during post-release queries", async () => {
     const completing = deferred<{ status: "completed" }>();
     const secondSnapshot = deferred<Snapshot>();
+    const sessionCreated = event("session_created", "root", "session.created");
+    const inputQueueChanged = event("input_queue_changed", "root", "session.input_queue_changed");
     let snapshotCalls = 0;
     const published: Projection[] = [];
     const coordinator = createCoordinator({
@@ -319,29 +321,31 @@ describe("resync coordinator", () => {
           sessionId,
           events: snapshotCalls === 1
             ? []
-            : [event("agent_1", "root", "agent.started"), event("agent_2", "root", "agent.updated")],
+            : [sessionCreated, inputQueueChanged],
         };
       },
-      frameRequiresRehydrate: (value) => value.type === "event" && value.event.type.startsWith("agent."),
+      frameRequiresRehydrate: (value) => value.type === "event"
+        && (value.event.type === "session.created" || value.event.type === "session.input_queue_changed"),
       publish: (projection) => published.push(projection),
       complete: () => completing.promise,
     });
 
     const recovery = coordinator.barrier({ sequence: 30, barrierId: "barrier_30", preferredSessionId: "root" });
     await eventually(() => expect(published).toHaveLength(1));
-    coordinator.recordFrame(frame(31, { type: "event", event: event("agent_1", "root", "agent.started") }));
+    coordinator.recordFrame(frame(31, { type: "event", event: sessionCreated }));
     completing.resolve({ status: "completed" });
     await eventually(() => expect(snapshotCalls).toBe(2));
-    coordinator.recordFrame(frame(32, { type: "event", event: event("agent_2", "root", "agent.updated") }));
+    coordinator.recordFrame(frame(32, { type: "event", event: inputQueueChanged }));
+    expect(coordinator.status()).toMatchObject({ syncing: true, actionsDisabled: true });
     secondSnapshot.resolve({
       sessionId: "root",
-      events: [event("agent_1", "root", "agent.started")],
+      events: [sessionCreated],
     });
 
     expect(await recovery).toBe("completed");
     expect(snapshotCalls).toBe(3);
     expect(published).toHaveLength(2);
-    expect(published.at(-1)?.snapshot?.events.map((row) => row.id)).toEqual(["agent_1", "agent_2"]);
+    expect(published.at(-1)?.snapshot?.events).toEqual([sessionCreated, inputQueueChanged]);
     expect(coordinator.status().syncing).toBe(false);
   });
 

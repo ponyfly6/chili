@@ -310,9 +310,6 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
   normalizeRuntimeViewIndexes(view);
   if (!isTransientEvent(inputEvent)) view.lastEventId = inputEvent.id;
 
-  // Historical agent.task_*/agent.spawned and team.* events remain parseable,
-  // but do not create a second active Agent or business-task projection.
-
   const event = inputEvent as ChiliEvent;
   switch (event.type) {
     case "session.created": {

@@ -40,9 +40,6 @@
       "@chili/protocol": [
         "packages/protocol/src/index.ts"
       ],
-      "@chili/protocol/legacy-workflow-events": [
-        "packages/protocol/src/legacy-workflow-events.ts"
-      ],
       "@chili/providers": [
         "packages/providers/src/index.ts"
       ],

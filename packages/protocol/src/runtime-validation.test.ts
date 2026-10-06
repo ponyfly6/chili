@@ -92,8 +92,6 @@ test("all event families reject a known type with a wrong-shaped payload", () =>
     ["user_input.requested", "session_1"],
     ["goal.updated", "session_1"],
     ["snapshot.created", undefined],
-    ["agent.spawned", undefined],
-    ["team.created", undefined],
     ["mcp.progress", undefined],
   ] as const) {
     expect(() => parseChiliEvent({

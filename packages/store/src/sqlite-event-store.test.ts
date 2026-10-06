@@ -7,6 +7,7 @@ import type {
   AgentPath,
   ApprovalId,
   ChiliEvent,
+  EventEnvelope,
   RuntimeEvent,
   MessageId,
   PartId,
@@ -15,7 +16,6 @@ import type {
   ToolCallId,
   TurnId,
 } from "@chili/protocol";
-import type { LegacyWorkflowEvent, TaskId, TeamId } from "@chili/protocol/legacy-workflow-events";
 import { ObservableEventStore } from "./observable-event-store.js";
 import {
   SessionAccessError,
@@ -406,7 +406,10 @@ test("legacy task child sessions remain readable and reject both run access mode
     expect(await store.session(parentSessionId)).not.toHaveProperty("readOnly");
     expect(await store.session(childSessionId)).toMatchObject({ id: childSessionId, readOnly: true });
     expect(await store.session(childSessionId)).not.toHaveProperty("agent");
-    expect(await store.events({ sessionId: parentSessionId, type: "agent.task_created" })).toEqual([legacyEvent]);
+    expect(await store.events({ sessionId: parentSessionId, type: "agent.task_created" })).toEqual([]);
+    expect(sqliteDatabase(store).query<{ payload_json: string }, [string]>(
+      "select payload_json from events where id = ?",
+    ).get(legacyEvent.id)).toEqual({ payload_json: JSON.stringify(legacyEvent.payload) });
     for (const sessionAccess of ["root", "child"] as const) {
       expect(store.claimSessionRun({
         sessionId: childSessionId, claimId: `legacy_${sessionAccess}`, sessionAccess,
@@ -456,7 +459,7 @@ test("legacy team workers are read-only while the original lead remains a root s
   const store = new SqliteEventStore(":memory:");
   const rootSessionId = "session_team_root" as SessionId;
   const workerSessionId = "session_team_worker" as SessionId;
-  const teamId = "team_legacy" as TeamId;
+  const teamId = "team_legacy";
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
 
@@ -485,11 +488,11 @@ test("legacy team workers are read-only while the original lead remains a root s
         values (?, ?, ?, ?, 'running', ?, 4, 4)`).run(teamId, path, role, role, childSessionId);
     }
 
-    const notice: Extract<LegacyWorkflowEvent, { type: "agent.message_queued" }> = {
+    const notice = {
       id: "event_team_completion_notice", type: "agent.message_queued", time: 5 as TimestampMs,
       sessionId: rootSessionId,
       payload: {
-        taskId: "task_legacy_worker" as TaskId, path: leadPath, from: workerPath,
+        taskId: "task_legacy_worker", path: leadPath, from: workerPath,
         recipientSessionId: rootSessionId, triggerTurn: false,
         message: { role: "user", content: "The historical worker completed" },
       },
@@ -505,7 +508,10 @@ test("legacy team workers are read-only while the original lead remains a root s
 
     expect(await store.session(rootSessionId)).not.toHaveProperty("readOnly");
     expect(await store.session(workerSessionId)).toMatchObject({ readOnly: true });
-    expect((await store.events({ sessionId: rootSessionId, type: "team.member_added" })).length).toBe(2);
+    expect(await store.events({ sessionId: rootSessionId, type: "team.member_added" })).toEqual([]);
+    expect(db.query<{ count: number }, []>(
+      "select count(*) as count from events where type = 'team.member_added'",
+    ).get()).toEqual({ count: 2 });
     expect(store.claimSessionRun({
       sessionId: rootSessionId, claimId: "team_lead_root", time: Date.now(), leaseDurationMs: 60_000,
     })).toEqual({ status: "claimed" });
@@ -526,10 +532,10 @@ test("legacy workflow appends reject the entire batch before persistence or obse
   const sessionId = "session_legacy_append" as SessionId;
   const emitted: ChiliEvent[] = [];
   const unsubscribe = store.subscribe((event) => { emitted.push(event); });
-  const legacyEvents: LegacyWorkflowEvent[] = [
+  const legacyEvents = [
     legacyTaskEvent(sessionId, "session_rejected_child" as SessionId),
     { id: "event_rejected_team", type: "team.created", time: 1 as TimestampMs, sessionId,
-      payload: { teamId: "team_rejected" as TeamId, name: "rejected", leadPath: "/root" as AgentPath } },
+      payload: { teamId: "team_rejected", name: "rejected", leadPath: "/root" as AgentPath } },
   ];
 
   try {
@@ -644,6 +650,63 @@ test("orders event replay and forward/backward cursors by insertion sequence", a
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("workflow filtering preserves current event limits and cursors through historical rows", async () => {
+  const store = new SqliteEventStore(":memory:");
+  const sessionId = "session_filtered_history" as SessionId;
+  const messageId = "message_filtered_history" as MessageId;
+  const partId = "part_filtered_history" as PartId;
+  const currentEvents: RuntimeEvent[] = [
+    sessionEvent("event_current_session", sessionId, 1 as TimestampMs),
+    { id: "event_current_message", type: "message.created", time: 2 as TimestampMs, sessionId,
+      payload: { messageId, role: "assistant" } },
+    { id: "event_current_part", type: "message.part_added", time: 3 as TimestampMs, sessionId,
+      payload: { messageId, part: { id: partId, messageId, sessionId, type: "text", text: "Hello" } } },
+    { id: "event_current_delta", type: "message.part_delta", time: 4 as TimestampMs, sessionId,
+      payload: { messageId, partId, field: "text", delta: "!" } },
+  ];
+  const historicalIds = ["event_old_prefix", "event_old_gap", "event_old_middle", "event_old_tail"];
+
+  try {
+    for (const [index, event] of currentEvents.entries()) {
+      // Deliberately opaque legacy payloads must never reach the current decoder.
+      insertLegacyEvent(store, {
+        id: historicalIds[index]!, type: index % 2 === 0 ? "agent.task_created" : "team.created",
+        time: event.time, sessionId, payload: { opaqueHistoricalData: index },
+      });
+      await store.append(event);
+    }
+    insertLegacyEvent(store, {
+      id: "event_old_end", type: "agent.completed", time: 5 as TimestampMs,
+      sessionId, payload: { opaqueHistoricalData: "last" },
+    });
+
+    expect(await store.events({ sessionId, limit: 2 })).toEqual(currentEvents.slice(0, 2));
+    expect(await store.events({ limit: 4 })).toEqual(currentEvents);
+    expect(await store.events({ sessionId, afterEventId: "event_old_middle", limit: 1 }))
+      .toEqual(currentEvents.slice(2, 3));
+    expect(await store.events({ sessionId, beforeEventId: "event_old_middle", limit: 2 }))
+      .toEqual(currentEvents.slice(0, 2));
+    expect(await store.events({ sessionId, beforeEventId: "event_old_middle", tail: true, limit: 1 }))
+      .toEqual(currentEvents.slice(1, 2));
+    expect(await store.events({ sessionId, tail: true, limit: 2 })).toEqual(currentEvents.slice(2));
+    expect(await store.events({ sessionId, afterEventId: "event_old_end", limit: 1 })).toEqual([]);
+    expect(await store.events({ sessionId, beforeEventId: "event_old_prefix", tail: true, limit: 1 })).toEqual([]);
+    for (const type of ["agent.task_created", "agent.completed", "team.created"]) {
+      expect(await store.events({ sessionId, type, limit: 1 })).toEqual([]);
+    }
+    expect(await store.events({ sessionId, type: "message.part_added", afterEventId: "event_old_middle", limit: 1 }))
+      .toEqual(currentEvents.slice(2, 3));
+    expect((await store.messages(sessionId))[0]?.parts).toEqual([
+      { id: partId, messageId, sessionId, type: "text", text: "Hello!" },
+    ]);
+    expect(sqliteDatabase(store).query<{ id: string }, []>(
+      "select id from events where type like 'agent.%' or type like 'team.%' order by seq",
+    ).all()).toEqual([...historicalIds, "event_old_end"].map((id) => ({ id })));
+  } finally {
+    store.close();
   }
 });
 
@@ -2128,8 +2191,11 @@ test("migrates the complete legacy thread schema to canonical session-only stora
         time: 2 as TimestampMs,
         sessionId,
         payload: {
+          parentThreadId: "thread_legacy_parent",
           parentSessionId: "session_legacy_parent",
+          childThreadId: "thread_legacy_child",
           childSessionId: "session_legacy_child",
+          recipientThreadId: "thread_legacy_recipient",
           recipientSessionId: "session_legacy_recipient",
           reason: "external",
           goal: {
@@ -2150,9 +2216,9 @@ test("migrates the complete legacy thread schema to canonical session-only stora
         time: 3 as TimestampMs,
         sessionId,
         payload: {
-          parentSessionId: "session_legacy_parent",
-          childSessionId: "session_legacy_child",
-          recipientSessionId: "session_legacy_recipient",
+          parentThreadId: "thread_legacy_parent",
+          childThreadId: "thread_legacy_child",
+          recipientThreadId: "thread_legacy_recipient",
           sessionId,
           reason: "external",
           previousGoal: {
@@ -2165,20 +2231,6 @@ test("migrates the complete legacy thread schema to canonical session-only stora
             createdAt: 1,
             updatedAt: 2,
           },
-        },
-      },
-      {
-        id: "event_legacy_mailbox",
-        type: "agent.message_queued",
-        time: 4 as TimestampMs,
-        sessionId,
-        payload: {
-          taskId: "task_legacy_mailbox" as TaskId,
-          path: "/root/legacy-recipient" as AgentPath,
-          from: "/root" as AgentPath,
-          recipientSessionId: "session_legacy_recipient" as SessionId,
-          triggerTurn: true,
-          message: { role: "user", content: "legacy mailbox message" },
         },
       },
     ]);
@@ -2301,7 +2353,7 @@ test("adds and backfills missing replacement session columns before dropping leg
   const dir = await mkdtemp(join(tmpdir(), "chili-store-session-only-missing-replacement-"));
   const dbPath = join(dir, "events.sqlite");
   const sessionId = "session_missing_replacement" as SessionId;
-  const taskId = "task_missing_replacement" as TaskId;
+  const taskId = "task_missing_replacement";
   let store = new SqliteEventStore(dbPath);
   store.close();
 
@@ -2912,18 +2964,18 @@ function sessionEvent(id: string, sessionId: SessionId, time: TimestampMs): Runt
   };
 }
 
-function insertLegacyEvent(store: SqliteEventStore, event: LegacyWorkflowEvent): void {
+function insertLegacyEvent(store: SqliteEventStore, event: EventEnvelope<string, Record<string, unknown>>): void {
   sqliteDatabase(store).query(
     "insert into events (id, type, time, session_id, payload_json) values (?, ?, ?, ?, ?)",
   ).run(event.id, event.type, event.time, event.sessionId ?? null, JSON.stringify(event.payload));
 }
 
-function legacyTaskEvent(parentSessionId: SessionId, childSessionId: SessionId): Extract<LegacyWorkflowEvent, { type: "agent.task_created" }> {
+function legacyTaskEvent(parentSessionId: SessionId, childSessionId: SessionId) {
   return {
     id: `event_task_${childSessionId}`, type: "agent.task_created", time: 3 as TimestampMs,
     sessionId: parentSessionId,
     payload: {
-      taskId: `task_${childSessionId}` as TaskId, path: `/root/${childSessionId}` as AgentPath,
+      taskId: `task_${childSessionId}`, path: `/root/${childSessionId}` as AgentPath,
       parentPath: "/root" as AgentPath, parentSessionId, childSessionId,
       taskName: "legacy worker", cwd: "/repo", prompt: "inspect the repository",
     },

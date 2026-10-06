@@ -71,14 +71,7 @@ test("agent metadata requires complete stable child identity and a policy", () =
   expect(() => parseChiliEvent({ ...event, payload: { ...event.payload, agent: { ...metadata, parentSessionId: event.sessionId } } })).toThrow("parentSessionId");
 });
 
-test("legacy session and Team events remain readable without agent metadata", () => {
-  const legacySession = { ...event, payload: { sessionId: event.sessionId, cwd: "/tmp/project" } };
-  expect<unknown>(parseChiliEvent(legacySession)).toEqual(legacySession);
-  const legacyTeam = {
-    id: "event_team_created",
-    type: "team.created",
-    time: 1,
-    payload: { teamId: "team_old", name: "existing team", leadPath: "/root" },
-  };
-  expect<unknown>(parseChiliEvent(legacyTeam)).toEqual(legacyTeam);
+test("root session events do not require agent metadata", () => {
+  const rootSession = { ...event, payload: { sessionId: event.sessionId, cwd: "/tmp/project" } };
+  expect<unknown>(parseChiliEvent(rootSession)).toEqual(rootSession);
 });

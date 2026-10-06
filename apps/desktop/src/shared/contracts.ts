@@ -1499,14 +1499,6 @@ function assertRuntimePayloadSchema(type: string, payload: Record<string, unknow
     return;
   }
 
-  if (type.startsWith("agent.")) {
-    assertAgentEventPayload(type, payload);
-    return;
-  }
-  if (type.startsWith("team.")) {
-    assertTeamEventPayload(type, payload);
-    return;
-  }
   if (type.startsWith("mcp.")) {
     assertMcpEventPayload(type, payload);
     return;
@@ -1586,206 +1578,6 @@ function assertMessagePartSchema(part: Record<string, unknown>, field: string): 
     return;
   }
   throw new TypeError(`Unsupported message part type: ${type}`);
-}
-
-function assertAgentEventPayload(type: string, payload: Record<string, unknown>): void {
-  if (type === "agent.task_created") {
-    for (const key of ["taskId", "path", "parentPath", "parentSessionId", "childSessionId", "taskName", "cwd", "prompt"] as const) {
-      requirePayloadString(payload[key], `event.payload.${key}`, key === "prompt");
-    }
-    optionalPayloadString(payload.dispatchId, "event.payload.dispatchId");
-    optionalPayloadString(payload.reservedRunId, "event.payload.reservedRunId");
-    optionalPayloadString(payload.sourceCallId, "event.payload.sourceCallId");
-    optionalPayloadString(payload.batchId, "event.payload.batchId");
-    optionalNonNegativeNumber(payload.batchIndex, "event.payload.batchIndex");
-    optionalNonNegativeNumber(payload.expectedBatchSize, "event.payload.expectedBatchSize");
-    optionalNonNegativeNumber(payload.maxConcurrency, "event.payload.maxConcurrency");
-    if (payload.mode !== undefined) requireAgentTaskMode(payload.mode, "event.payload.mode");
-    if (payload.completionPolicy !== undefined) requireEnum(payload.completionPolicy, ["join", "notify", "detached", "supervised"], "event.payload.completionPolicy");
-    if (payload.workerPolicy !== undefined) requireRecord(payload.workerPolicy, "event.payload.workerPolicy");
-    return;
-  }
-  if (type === "agent.spawned") {
-    requirePayloadString(payload.runId, "event.payload.runId");
-    requirePayloadString(payload.path, "event.payload.path");
-    requirePayloadString(payload.taskName, "event.payload.taskName");
-    for (const key of ["parentPath", "taskId", "parentSessionId", "childSessionId", "cwd", "sourceCallId", "batchId"] as const) {
-      optionalPayloadString(payload[key], `event.payload.${key}`, key === "cwd");
-    }
-    optionalNonNegativeNumber(payload.generation, "event.payload.generation");
-    optionalNonNegativeNumber(payload.batchIndex, "event.payload.batchIndex");
-    optionalNonNegativeNumber(payload.expectedBatchSize, "event.payload.expectedBatchSize");
-    optionalNonNegativeNumber(payload.maxConcurrency, "event.payload.maxConcurrency");
-    if (payload.mode !== undefined) requireAgentTaskMode(payload.mode, "event.payload.mode");
-    if (payload.completionPolicy !== undefined) requireEnum(payload.completionPolicy, ["join", "notify", "detached", "supervised"], "event.payload.completionPolicy");
-    if (payload.workerPolicy !== undefined) requireRecord(payload.workerPolicy, "event.payload.workerPolicy");
-    return;
-  }
-  if (type === "agent.message_queued") {
-    requirePayloadString(payload.path, "event.payload.path");
-    requirePayloadString(payload.from, "event.payload.from");
-    requireBoolean(payload.triggerTurn, "event.payload.triggerTurn");
-    optionalPayloadString(payload.taskId, "event.payload.taskId");
-    optionalPayloadString(payload.recipientSessionId, "event.payload.recipientSessionId");
-    if (payload.message !== undefined) assertAgentMailboxPayload(requireRecord(payload.message, "event.payload.message"));
-    return;
-  }
-  if (type === "agent.message_claimed" || type === "agent.message_consumed") {
-    requirePayloadString(payload.messageId, "event.payload.messageId");
-    optionalPayloadString(payload.path, "event.payload.path");
-    optionalPayloadString(payload.taskId, "event.payload.taskId");
-    optionalPayloadString(
-      type === "agent.message_claimed" ? payload.claimedBy : payload.consumedBy,
-      type === "agent.message_claimed" ? "event.payload.claimedBy" : "event.payload.consumedBy",
-    );
-    return;
-  }
-  if (type === "agent.message_requeued") {
-    requirePayloadString(payload.messageId, "event.payload.messageId");
-    optionalPayloadString(payload.path, "event.payload.path");
-    optionalPayloadString(payload.taskId, "event.payload.taskId");
-    optionalPayloadString(payload.error, "event.payload.error", true);
-    return;
-  }
-  if (type === "agent.message_discarded") {
-    requirePayloadString(payload.messageId, "event.payload.messageId");
-    requirePayloadString(payload.reason, "event.payload.reason", true);
-    optionalPayloadString(payload.path, "event.payload.path");
-    optionalPayloadString(payload.taskId, "event.payload.taskId");
-    optionalPayloadString(payload.discardedBy, "event.payload.discardedBy");
-    return;
-  }
-  if (type === "agent.task_completed") {
-    requirePayloadString(payload.taskId, "event.payload.taskId");
-    requirePayloadString(payload.path, "event.payload.path");
-    requireEnum(payload.status, ["completed", "incomplete", "failed", "cancelled"], "event.payload.status");
-    optionalPayloadString(payload.runId, "event.payload.runId");
-    optionalNonNegativeNumber(payload.generation, "event.payload.generation");
-    optionalPayloadString(payload.summary, "event.payload.summary", true);
-    optionalPayloadString(payload.error, "event.payload.error", true);
-    if (payload.metadata !== undefined) requireRecord(payload.metadata, "event.payload.metadata");
-    return;
-  }
-  if (type === "agent.completed") {
-    requirePayloadString(payload.runId, "event.payload.runId");
-    requirePayloadString(payload.path, "event.payload.path");
-    requireEnum(payload.status, ["completed", "incomplete", "failed", "cancelled"], "event.payload.status");
-    optionalPayloadString(payload.taskId, "event.payload.taskId");
-    optionalNonNegativeNumber(payload.generation, "event.payload.generation");
-    optionalPayloadString(payload.summary, "event.payload.summary", true);
-    optionalPayloadString(payload.error, "event.payload.error", true);
-    return;
-  }
-  throw new TypeError(`Unsupported runtime event type: ${type}`);
-}
-
-function assertTeamEventPayload(type: string, payload: Record<string, unknown>): void {
-  requirePayloadString(payload.teamId, "event.payload.teamId");
-  if (type === "team.created") {
-    requirePayloadString(payload.name, "event.payload.name");
-    requirePayloadString(payload.leadPath, "event.payload.leadPath");
-    optionalPayloadString(payload.description, "event.payload.description", true);
-    return;
-  }
-  if (type === "team.owner_session_bound") {
-    requirePayloadString(payload.ownerSessionId, "event.payload.ownerSessionId");
-    return;
-  }
-  if (type === "team.member_added") {
-    requirePayloadString(payload.path, "event.payload.path");
-    requirePayloadString(payload.name, "event.payload.name");
-    requirePayloadString(payload.role, "event.payload.role");
-    if (payload.status !== undefined) requireTeamMemberStatus(payload.status, "event.payload.status");
-    optionalPayloadString(payload.childSessionId, "event.payload.childSessionId");
-    optionalPayloadString(payload.model, "event.payload.model", true);
-    if (payload.toolScope !== undefined) requirePayloadStringArray(payload.toolScope, "event.payload.toolScope", false);
-    if (payload.writeScope !== undefined) requirePayloadStringArray(payload.writeScope, "event.payload.writeScope", false);
-    return;
-  }
-  if (type === "team.member_status_changed") {
-    requirePayloadString(payload.path, "event.payload.path");
-    requireTeamMemberStatus(payload.status, "event.payload.status");
-    optionalPayloadString(payload.taskId, "event.payload.taskId");
-    optionalPayloadString(payload.reason, "event.payload.reason", true);
-    return;
-  }
-  if (type === "team.task_created") {
-    requirePayloadString(payload.taskId, "event.payload.taskId");
-    optionalPayloadString(payload.title, "event.payload.title", true);
-    optionalPayloadString(payload.description, "event.payload.description", true);
-    optionalPayloadString(payload.createdBy, "event.payload.createdBy");
-    optionalPayloadString(payload.ownerPath, "event.payload.ownerPath");
-    if (payload.dependsOn !== undefined) requirePayloadStringArray(payload.dependsOn, "event.payload.dependsOn", true);
-    if (payload.status !== undefined) requireTeamTaskStatus(payload.status, "event.payload.status");
-    if (payload.metadata !== undefined) requireRecord(payload.metadata, "event.payload.metadata");
-    return;
-  }
-  if (type === "team.task_assigned") {
-    requirePayloadString(payload.taskId, "event.payload.taskId");
-    requirePayloadString(payload.ownerPath, "event.payload.ownerPath");
-    optionalPayloadString(payload.assignedBy, "event.payload.assignedBy");
-    optionalPayloadString(payload.previousOwnerPath, "event.payload.previousOwnerPath");
-    optionalPayloadString(payload.messageId, "event.payload.messageId");
-    return;
-  }
-  if (type === "team.task_claimed") {
-    requirePayloadString(payload.taskId, "event.payload.taskId");
-    requirePayloadString(payload.ownerPath, "event.payload.ownerPath");
-    optionalPayloadString(payload.claimedBy, "event.payload.claimedBy");
-    if (payload.metadata !== undefined) requireRecord(payload.metadata, "event.payload.metadata");
-    return;
-  }
-  if (type === "team.task_updated") {
-    requirePayloadString(payload.taskId, "event.payload.taskId");
-    if (payload.status !== undefined) requireTeamTaskStatus(payload.status, "event.payload.status");
-    optionalPayloadString(payload.ownerPath, "event.payload.ownerPath");
-    optionalPayloadString(payload.title, "event.payload.title", true);
-    optionalPayloadString(payload.description, "event.payload.description", true);
-    if (payload.dependsOn !== undefined) requirePayloadStringArray(payload.dependsOn, "event.payload.dependsOn", true);
-    optionalPayloadString(payload.summary, "event.payload.summary", true);
-    optionalPayloadString(payload.error, "event.payload.error", true);
-    if (payload.metadata !== undefined) requireRecord(payload.metadata, "event.payload.metadata");
-    return;
-  }
-  if (type === "team.message_sent") {
-    requirePayloadString(payload.messageId, "event.payload.messageId");
-    requirePayloadString(payload.from, "event.payload.from");
-    requirePayloadString(payload.to, "event.payload.to");
-    requirePayloadString(payload.content, "event.payload.content", true);
-    if (payload.kind !== undefined) requireEnum(payload.kind, ["text", "task_assignment", "system"], "event.payload.kind");
-    if (payload.delivery !== undefined) requireEnum(payload.delivery, ["queueOnly", "triggerTurn"], "event.payload.delivery");
-    optionalPayloadString(payload.taskId, "event.payload.taskId");
-    optionalPayloadString(payload.summary, "event.payload.summary", true);
-    if (payload.metadata !== undefined) requireRecord(payload.metadata, "event.payload.metadata");
-    return;
-  }
-  if (type === "team.run_started") {
-    requirePayloadString(payload.runId, "event.payload.runId");
-    requireAgentTaskMode(payload.mode, "event.payload.mode");
-    requireBoolean(payload.once, "event.payload.once");
-    for (const key of ["maxCycles", "timeoutMs", "pollIntervalMs"] as const) requireNonNegativeNumber(payload[key], `event.payload.${key}`);
-    optionalNonNegativeNumber(payload.maxConcurrentDispatches, "event.payload.maxConcurrentDispatches");
-    optionalNonNegativeNumber(payload.maxConcurrentVerifications, "event.payload.maxConcurrentVerifications");
-    return;
-  }
-  if (type === "team.run_progress") {
-    requirePayloadString(payload.runId, "event.payload.runId");
-    requireNonNegativeNumber(payload.cycle, "event.payload.cycle");
-    requireEnum(payload.phase, ["reconcile", "load", "verify", "merge", "dispatch", "wait", "drain"], "event.payload.phase");
-    assertTeamRunCounts(requireRecord(payload.counts, "event.payload.counts"));
-    if (payload.stopReason !== undefined) requireTeamRunStopReason(payload.stopReason, "event.payload.stopReason");
-    return;
-  }
-  if (type === "team.run_completed") {
-    requirePayloadString(payload.runId, "event.payload.runId");
-    requireNonNegativeNumber(payload.cycles, "event.payload.cycles");
-    requireTeamRunStopReason(payload.stopReason, "event.payload.stopReason");
-    requireNonNegativeNumber(payload.startedAt, "event.payload.startedAt");
-    requireNonNegativeNumber(payload.endedAt, "event.payload.endedAt");
-    assertTeamRunCounts(requireRecord(payload.counts, "event.payload.counts"));
-    return;
-  }
-  throw new TypeError(`Unsupported runtime event type: ${type}`);
 }
 
 function assertMcpEventPayload(type: string, payload: Record<string, unknown>): void {
@@ -1922,45 +1714,8 @@ function requireGoalUpdateReason(value: unknown, field: string): void {
   requireEnum(value, ["set", "replace", "pause", "resume", "clear", "complete", "budget_limited", "usage", "external"], field);
 }
 
-function assertAgentMailboxPayload(value: Record<string, unknown>): void {
-  if (value.role !== undefined) requireEnum(value.role, ["system", "user", "assistant", "tool"], "event.payload.message.role");
-  if (value.content !== undefined) {
-    requirePayloadString(value.content, "event.payload.message.content", true);
-  } else if (Array.isArray(value.parts)) {
-    value.parts.forEach((part, index) => assertMessagePartSchema(requireRecord(part, `event.payload.message.parts[${index}]`), `event.payload.message.parts[${index}]`));
-  } else {
-    throw new TypeError("event.payload.message must contain content or parts");
-  }
-  if (value.metadata !== undefined) requireRecord(value.metadata, "event.payload.message.metadata");
-}
-
-function assertTeamRunCounts(value: Record<string, unknown>): void {
-  for (const key of [
-    "dispatched", "completed", "accepted", "reopened", "merged", "mergeFailed", "mergeConflicted",
-    "mergeSkipped", "failed", "blocked", "skipped", "stillRunning", "errors",
-  ] as const) {
-    requireNonNegativeNumber(value[key], `event.payload.counts.${key}`);
-  }
-}
-
 function requireToolCallStatus(value: unknown, field: string): void {
   requireEnum(value, ["pending", "validating", "waiting_for_approval", "running", "completed", "failed", "cancelled"], field);
-}
-
-function requireAgentTaskMode(value: unknown, field: string): void {
-  requireEnum(value, ["one_shot", "resumable", "background"], field);
-}
-
-function requireTeamMemberStatus(value: unknown, field: string): void {
-  requireEnum(value, ["idle", "running", "waiting", "blocked", "closed"], field);
-}
-
-function requireTeamTaskStatus(value: unknown, field: string): void {
-  requireEnum(value, ["pending", "in_progress", "blocked", "completed", "failed", "cancelled"], field);
-}
-
-function requireTeamRunStopReason(value: unknown, field: string): void {
-  requireEnum(value, ["drained", "once", "max_cycles", "timeout", "aborted", "team_inactive"], field);
 }
 
 function requireMcpStatus(value: unknown, field: string): void {
@@ -2045,33 +1800,7 @@ const RUNTIME_EVENT_ID_FIELDS: Readonly<Record<string, readonly string[]>> = {
   "goal.cleared": ["sessionId"],
   "snapshot.created": ["snapshotId", "callId"],
   "snapshot.reverted": ["snapshotId"],
-  "agent.task_created": ["taskId", "dispatchId", "reservedRunId", "parentSessionId", "childSessionId", "sourceCallId", "batchId"],
-  "agent.spawned": ["runId", "taskId", "parentSessionId", "childSessionId", "sourceCallId", "batchId"],
-  "agent.message_queued": ["taskId", "recipientSessionId"],
-  "agent.message_claimed": ["messageId", "taskId"],
-  "agent.message_requeued": ["messageId", "taskId"],
-  "agent.message_discarded": ["messageId", "taskId"],
-  "agent.message_consumed": ["messageId", "taskId"],
-  "agent.task_completed": ["taskId", "runId"],
-  "agent.completed": ["runId", "taskId"],
-  "team.created": ["teamId"],
-  "team.owner_session_bound": ["teamId", "ownerSessionId"],
-  "team.member_added": ["teamId", "childSessionId"],
-  "team.member_status_changed": ["teamId", "taskId"],
-  "team.task_created": ["teamId", "taskId"],
-  "team.task_assigned": ["teamId", "taskId", "messageId"],
-  "team.task_claimed": ["teamId", "taskId"],
-  "team.task_updated": ["teamId", "taskId"],
-  "team.message_sent": ["teamId", "messageId", "taskId"],
-  "team.run_started": ["teamId", "runId"],
-  "team.run_progress": ["teamId", "runId"],
-  "team.run_completed": ["teamId", "runId"],
   "mcp.progress": ["operationId"],
-};
-
-const RUNTIME_EVENT_ID_ARRAY_FIELDS: Readonly<Record<string, readonly string[]>> = {
-  "team.task_created": ["dependsOn"],
-  "team.task_updated": ["dependsOn"],
 };
 
 function assertRuntimePayloadIdentifiers(type: string, payload: Record<string, unknown>): void {
@@ -2079,7 +1808,6 @@ function assertRuntimePayloadIdentifiers(type: string, payload: Record<string, u
     payload,
     "event.payload",
     RUNTIME_EVENT_ID_FIELDS[type] ?? [],
-    RUNTIME_EVENT_ID_ARRAY_FIELDS[type] ?? [],
   );
 }
 

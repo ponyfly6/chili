@@ -103,7 +103,7 @@ test("legacy task child sessions stay read-only even for the trusted new queue",
   expect(() => store.mutateSessionInputs({ ...input.initialInput, kind: "accept", sessionId: childId }, trusted)).toThrow();
   expect(store.claimSessionRun({ sessionId: childId, claimId: "legacy_claim", sessionAccess: "child", time: Date.now(), leaseDurationMs: 60_000 }).status).toBe("forbidden");
   expect(store.sessionInputQueue(childId).pendingCount).toBe(0);
-  expect(await store.events({ type: "agent.task_created" })).toHaveLength(1);
+  expect(await store.events({ type: "agent.task_created" })).toHaveLength(0);
 });
 
 test("result pointers belong to this input execution, survive restart, and resume keeps the input identity", async () => {

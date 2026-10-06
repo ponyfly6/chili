@@ -512,6 +512,21 @@ test("session summaries preserve the read-only history flag and reject non-boole
   }
 });
 
+test("session event responses and streams reject removed workflow events", async () => {
+  for (const type of ["agent.spawned", "agent.task_created", "team.created", "team.task_updated"]) {
+    const event = { id: "removed", sessionId: "session_1", type, time: 1, payload: {} };
+    const jsonClient = new HttpRuntimeClient({ baseUrl: "http://chili.test",
+      fetch: (async () => Response.json([event])) as unknown as typeof fetch });
+    await expect(jsonClient.sessionEvents({ sessionId: "session_1" as SessionId })).rejects.toThrow("type");
+
+    const streamClient = new HttpRuntimeClient({ baseUrl: "http://chili.test",
+      fetch: (async () => new Response(`event: chili.event\ndata: ${JSON.stringify(event)}\n\n`, {
+        headers: { "content-type": "text/event-stream" },
+      })) as unknown as typeof fetch });
+    await expect(streamClient.streamEvents()[Symbol.asyncIterator]().next()).rejects.toThrow("type");
+  }
+});
+
 test("rejects malformed and nested-invalid SSE without reflecting hostile JSON", async () => {
   for (const frame of [
     "event: chili.event\ndata: {HOSTILE_CANARY\n\n",

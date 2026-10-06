@@ -1,4 +1,3 @@
-import { LEGACY_WORKFLOW_EVENT_TYPES, isLegacyWorkflowEvent, isLegacyWorkflowEventType, type LegacyWorkflowEvent } from "./legacy-workflow-events.js";
 import {
   parseUserInputAnswers,
   parseUserInputQuestions,
@@ -660,8 +659,6 @@ const RUNTIME_EVENT_TYPES = [
   "mcp.progress",
 ] as const satisfies readonly RuntimeEvent["type"][];
 
-const CHILI_EVENT_TYPES = [...RUNTIME_EVENT_TYPES, ...LEGACY_WORKFLOW_EVENT_TYPES] as const;
-
 const SESSION_SCOPED_EVENT_TYPES = new Set<ChiliEvent["type"]>([
   "session.tools_loaded",
   "session.created",
@@ -688,7 +685,7 @@ const SESSION_SCOPED_EVENT_TYPES = new Set<ChiliEvent["type"]>([
 export function parseChiliEvent(value: unknown, path = "event"): ChiliEvent {
   const record = parseRuntimeRecord(value, path);
   const id = parseRuntimeIdentifier(record.id, `${path}.id`);
-  const type = parseRuntimeEnum(record.type, CHILI_EVENT_TYPES, `${path}.type`);
+  const type = parseRuntimeEnum(record.type, RUNTIME_EVENT_TYPES, `${path}.type`);
   parseRuntimeNonNegativeInteger(record.time, `${path}.time`);
   const sessionId = record.sessionId === undefined
     ? undefined
@@ -697,8 +694,7 @@ export function parseChiliEvent(value: unknown, path = "event"): ChiliEvent {
     throw new RuntimeValidationError(`${path}.sessionId`, "is required for this event type");
   }
   const payload = parseRuntimeRecord(record.payload, `${path}.payload`);
-  if (isLegacyWorkflowEventType(type)) validateLegacyWorkflowEventPayload(type, payload, `${path}.payload`);
-  else validateRuntimeEventPayload(type, payload, `${path}.payload`, sessionId, id);
+  validateRuntimeEventPayload(type, payload, `${path}.payload`, sessionId, id);
   if (type === "model.request_prepared" && payload.contentVersion === undefined) {
     const request = parseRuntimeRecord(payload.request, `${path}.payload.request`);
     return { ...record, payload: { ...payload, contentVersion: request.contentVersion } } as unknown as ChiliEvent;
@@ -706,13 +702,8 @@ export function parseChiliEvent(value: unknown, path = "event"): ChiliEvent {
   return record as unknown as ChiliEvent;
 }
 
-/** Decode an event eligible for current runtime writes, excluding retired workflows. */
 export function parseRuntimeEvent(value: unknown, path = "event"): RuntimeEvent {
-  const event = parseChiliEvent(value, path);
-  if (isLegacyWorkflowEvent(event)) {
-    throw new RuntimeValidationError(`${path}.type`, "is a historical workflow event and cannot be written by the runtime");
-  }
-  return event;
+  return parseChiliEvent(value, path);
 }
 
 export function parseRuntimeExecutionIdentity(value: unknown, path = "identity"): ExecutionIdentity {
@@ -1254,271 +1245,6 @@ function validateToolResultExecutionContext(value: unknown, path: string): void 
   optionalEventBoolean(context.aborted, `${path}.aborted`);
   if (context.signal !== undefined && context.signal !== null) {
     parseRuntimeString(context.signal, `${path}.signal`, { allowEmpty: true });
-  }
-}
-
-/** Strict read-only decoder for the retired wire schemas; never a mutation dispatcher. */
-function validateLegacyWorkflowEventPayload(
-  type: LegacyWorkflowEvent["type"],
-  payload: Record<string, unknown>,
-  path: string,
-): void {
-  switch (type) {
-    case "agent.task_created":
-      parseRuntimeIdentifier(payload.taskId, `${path}.taskId`);
-      validateAgentPath(payload.path, `${path}.path`);
-      validateAgentPath(payload.parentPath, `${path}.parentPath`);
-      parseRuntimeIdentifier(payload.parentSessionId, `${path}.parentSessionId`);
-      parseRuntimeIdentifier(payload.childSessionId, `${path}.childSessionId`);
-      parseRuntimeString(payload.taskName, `${path}.taskName`);
-      parseRuntimeString(payload.cwd, `${path}.cwd`);
-      parseRuntimeString(payload.prompt, `${path}.prompt`, { allowEmpty: true });
-      validateAgentSchedulingFields(payload, path);
-      return;
-    case "agent.spawned":
-      parseRuntimeIdentifier(payload.runId, `${path}.runId`);
-      validateAgentPath(payload.path, `${path}.path`);
-      parseRuntimeString(payload.taskName, `${path}.taskName`);
-      optionalEventNonNegativeInteger(payload.generation, `${path}.generation`);
-      if (payload.parentPath !== undefined) validateAgentPath(payload.parentPath, `${path}.parentPath`);
-      optionalEventIdentifier(payload.taskId, `${path}.taskId`);
-      optionalEventIdentifier(payload.parentSessionId, `${path}.parentSessionId`);
-      optionalEventIdentifier(payload.childSessionId, `${path}.childSessionId`);
-      optionalEventString(payload.cwd, `${path}.cwd`);
-      validateAgentSchedulingFields(payload, path);
-      return;
-    case "agent.message_queued":
-      validateAgentPath(payload.path, `${path}.path`);
-      validateAgentPath(payload.from, `${path}.from`);
-      parseRuntimeBoolean(payload.triggerTurn, `${path}.triggerTurn`);
-      optionalEventIdentifier(payload.taskId, `${path}.taskId`);
-      optionalEventIdentifier(payload.recipientSessionId, `${path}.recipientSessionId`);
-      if (payload.message !== undefined) validateAgentMailboxPayload(payload.message, `${path}.message`);
-      return;
-    case "agent.message_claimed":
-    case "agent.message_consumed":
-      parseRuntimeIdentifier(payload.messageId, `${path}.messageId`);
-      if (payload.path !== undefined) validateAgentPath(payload.path, `${path}.path`);
-      optionalEventIdentifier(payload.taskId, `${path}.taskId`);
-      if (payload.claimedBy !== undefined) validateAgentPath(payload.claimedBy, `${path}.claimedBy`);
-      if (payload.consumedBy !== undefined) validateAgentPath(payload.consumedBy, `${path}.consumedBy`);
-      return;
-    case "agent.message_requeued":
-      parseRuntimeIdentifier(payload.messageId, `${path}.messageId`);
-      if (payload.path !== undefined) validateAgentPath(payload.path, `${path}.path`);
-      optionalEventIdentifier(payload.taskId, `${path}.taskId`);
-      optionalEventString(payload.error, `${path}.error`);
-      return;
-    case "agent.message_discarded":
-      parseRuntimeIdentifier(payload.messageId, `${path}.messageId`);
-      if (payload.path !== undefined) validateAgentPath(payload.path, `${path}.path`);
-      optionalEventIdentifier(payload.taskId, `${path}.taskId`);
-      if (payload.discardedBy !== undefined) validateAgentPath(payload.discardedBy, `${path}.discardedBy`);
-      parseRuntimeString(payload.reason, `${path}.reason`);
-      return;
-    case "agent.task_completed":
-      parseRuntimeIdentifier(payload.taskId, `${path}.taskId`);
-      validateAgentPath(payload.path, `${path}.path`);
-      validateTerminalAgentStatus(payload.status, `${path}.status`);
-      optionalEventIdentifier(payload.runId, `${path}.runId`);
-      optionalEventNonNegativeInteger(payload.generation, `${path}.generation`);
-      optionalEventString(payload.summary, `${path}.summary`);
-      optionalEventString(payload.error, `${path}.error`);
-      if (payload.metadata !== undefined) parseRuntimeRecord(payload.metadata, `${path}.metadata`);
-      return;
-    case "agent.completed":
-      parseRuntimeIdentifier(payload.runId, `${path}.runId`);
-      validateAgentPath(payload.path, `${path}.path`);
-      validateTerminalAgentStatus(payload.status, `${path}.status`);
-      optionalEventIdentifier(payload.taskId, `${path}.taskId`);
-      optionalEventNonNegativeInteger(payload.generation, `${path}.generation`);
-      optionalEventString(payload.summary, `${path}.summary`);
-      optionalEventString(payload.error, `${path}.error`);
-      return;
-    case "team.created":
-      parseRuntimeIdentifier(payload.teamId, `${path}.teamId`);
-      parseRuntimeString(payload.name, `${path}.name`);
-      validateAgentPath(payload.leadPath, `${path}.leadPath`);
-      optionalEventString(payload.description, `${path}.description`);
-      return;
-    case "team.owner_session_bound":
-      parseRuntimeIdentifier(payload.teamId, `${path}.teamId`);
-      parseRuntimeIdentifier(payload.ownerSessionId, `${path}.ownerSessionId`);
-      return;
-    case "team.member_added":
-      parseRuntimeIdentifier(payload.teamId, `${path}.teamId`);
-      validateAgentPath(payload.path, `${path}.path`);
-      parseRuntimeString(payload.name, `${path}.name`);
-      parseRuntimeString(payload.role, `${path}.role`);
-      optionalTeamMemberStatus(payload.status, `${path}.status`);
-      optionalEventIdentifier(payload.childSessionId, `${path}.childSessionId`);
-      optionalEventString(payload.model, `${path}.model`);
-      if (payload.toolScope !== undefined) parseRuntimeStringArray(payload.toolScope, `${path}.toolScope`);
-      if (payload.writeScope !== undefined) parseRuntimeStringArray(payload.writeScope, `${path}.writeScope`);
-      return;
-    case "team.member_status_changed":
-      parseRuntimeIdentifier(payload.teamId, `${path}.teamId`);
-      validateAgentPath(payload.path, `${path}.path`);
-      optionalTeamMemberStatus(payload.status, `${path}.status`, true);
-      optionalEventIdentifier(payload.taskId, `${path}.taskId`);
-      optionalEventString(payload.reason, `${path}.reason`);
-      return;
-    case "team.task_created":
-    case "team.task_updated":
-      parseRuntimeIdentifier(payload.teamId, `${path}.teamId`);
-      parseRuntimeIdentifier(payload.taskId, `${path}.taskId`);
-      optionalEventString(payload.title, `${path}.title`);
-      optionalEventString(payload.description, `${path}.description`);
-      if (payload.createdBy !== undefined) validateAgentPath(payload.createdBy, `${path}.createdBy`);
-      if (payload.ownerPath !== undefined) validateAgentPath(payload.ownerPath, `${path}.ownerPath`);
-      if (payload.dependsOn !== undefined) {
-        parseRuntimeArray(payload.dependsOn, (item, itemPath) => parseRuntimeIdentifier(item, itemPath), `${path}.dependsOn`);
-      }
-      optionalTeamTaskStatus(payload.status, `${path}.status`);
-      optionalEventString(payload.summary, `${path}.summary`);
-      optionalEventString(payload.error, `${path}.error`);
-      if (payload.metadata !== undefined) parseRuntimeRecord(payload.metadata, `${path}.metadata`);
-      return;
-    case "team.task_assigned":
-      parseRuntimeIdentifier(payload.teamId, `${path}.teamId`);
-      parseRuntimeIdentifier(payload.taskId, `${path}.taskId`);
-      validateAgentPath(payload.ownerPath, `${path}.ownerPath`);
-      if (payload.assignedBy !== undefined) validateAgentPath(payload.assignedBy, `${path}.assignedBy`);
-      if (payload.previousOwnerPath !== undefined) validateAgentPath(payload.previousOwnerPath, `${path}.previousOwnerPath`);
-      optionalEventIdentifier(payload.messageId, `${path}.messageId`);
-      return;
-    case "team.task_claimed":
-      parseRuntimeIdentifier(payload.teamId, `${path}.teamId`);
-      parseRuntimeIdentifier(payload.taskId, `${path}.taskId`);
-      validateAgentPath(payload.ownerPath, `${path}.ownerPath`);
-      if (payload.claimedBy !== undefined) validateAgentPath(payload.claimedBy, `${path}.claimedBy`);
-      if (payload.metadata !== undefined) parseRuntimeRecord(payload.metadata, `${path}.metadata`);
-      return;
-    case "team.message_sent":
-      parseRuntimeIdentifier(payload.teamId, `${path}.teamId`);
-      parseRuntimeIdentifier(payload.messageId, `${path}.messageId`);
-      validateAgentPath(payload.from, `${path}.from`);
-      if (payload.to !== "*") validateAgentPath(payload.to, `${path}.to`);
-      parseRuntimeString(payload.content, `${path}.content`);
-      if (payload.kind !== undefined) parseRuntimeEnum(payload.kind, ["text", "task_assignment", "system"] as const, `${path}.kind`);
-      if (payload.delivery !== undefined) parseRuntimeEnum(payload.delivery, ["queueOnly", "triggerTurn"] as const, `${path}.delivery`);
-      optionalEventIdentifier(payload.taskId, `${path}.taskId`);
-      optionalEventString(payload.summary, `${path}.summary`);
-      if (payload.metadata !== undefined) parseRuntimeRecord(payload.metadata, `${path}.metadata`);
-      return;
-    case "team.run_started":
-      parseRuntimeIdentifier(payload.teamId, `${path}.teamId`);
-      parseRuntimeIdentifier(payload.runId, `${path}.runId`);
-      parseRuntimeEnum(payload.mode, ["one_shot", "resumable", "background"] as const, `${path}.mode`);
-      parseRuntimeBoolean(payload.once, `${path}.once`);
-      parseRuntimePositiveInteger(payload.maxCycles, `${path}.maxCycles`);
-      parseRuntimePositiveInteger(payload.timeoutMs, `${path}.timeoutMs`);
-      parseRuntimeNonNegativeInteger(payload.pollIntervalMs, `${path}.pollIntervalMs`);
-      optionalEventPositiveInteger(payload.maxConcurrentDispatches, `${path}.maxConcurrentDispatches`);
-      optionalEventPositiveInteger(payload.maxConcurrentVerifications, `${path}.maxConcurrentVerifications`);
-      return;
-    case "team.run_progress":
-      parseRuntimeIdentifier(payload.teamId, `${path}.teamId`);
-      parseRuntimeIdentifier(payload.runId, `${path}.runId`);
-      parseRuntimeNonNegativeInteger(payload.cycle, `${path}.cycle`);
-      parseRuntimeEnum(payload.phase, ["reconcile", "load", "verify", "merge", "dispatch", "wait", "drain"] as const, `${path}.phase`);
-      validateTeamRunCounts(payload.counts, `${path}.counts`);
-      optionalTeamRunStopReason(payload.stopReason, `${path}.stopReason`);
-      return;
-    case "team.run_completed":
-      parseRuntimeIdentifier(payload.teamId, `${path}.teamId`);
-      parseRuntimeIdentifier(payload.runId, `${path}.runId`);
-      parseRuntimeNonNegativeInteger(payload.cycles, `${path}.cycles`);
-      optionalTeamRunStopReason(payload.stopReason, `${path}.stopReason`, true);
-      parseRuntimeNonNegativeInteger(payload.startedAt, `${path}.startedAt`);
-      parseRuntimeNonNegativeInteger(payload.endedAt, `${path}.endedAt`);
-      validateTeamRunCounts(payload.counts, `${path}.counts`);
-      return;
-  }
-}
-
-function validateAgentSchedulingFields(payload: Record<string, unknown>, path: string): void {
-  optionalEventIdentifier(payload.dispatchId, `${path}.dispatchId`);
-  optionalEventIdentifier(payload.reservedRunId, `${path}.reservedRunId`);
-  if (payload.mode !== undefined) {
-    parseRuntimeEnum(payload.mode, ["one_shot", "resumable", "background"] as const, `${path}.mode`);
-  }
-  if (payload.workerPolicy !== undefined) parseRuntimeRecord(payload.workerPolicy, `${path}.workerPolicy`);
-  optionalEventIdentifier(payload.sourceCallId, `${path}.sourceCallId`);
-  optionalEventIdentifier(payload.batchId, `${path}.batchId`);
-  optionalEventNonNegativeInteger(payload.batchIndex, `${path}.batchIndex`);
-  optionalEventPositiveInteger(payload.expectedBatchSize, `${path}.expectedBatchSize`);
-  if (payload.completionPolicy !== undefined) {
-    parseRuntimeEnum(payload.completionPolicy, ["join", "notify", "detached", "supervised"] as const, `${path}.completionPolicy`);
-  }
-  optionalEventPositiveInteger(payload.maxConcurrency, `${path}.maxConcurrency`);
-}
-
-function validateAgentMailboxPayload(value: unknown, path: string): void {
-  const message = parseRuntimeRecord(value, path);
-  if (message.role !== undefined) {
-    parseRuntimeEnum(message.role, ["system", "user", "assistant", "tool"] as const, `${path}.role`);
-  }
-  const hasContent = message.content !== undefined;
-  const hasParts = message.parts !== undefined;
-  if (hasContent === hasParts) {
-    throw new RuntimeValidationError(path, "must contain exactly one of content or parts");
-  }
-  if (hasContent) parseRuntimeString(message.content, `${path}.content`, { allowEmpty: true });
-  if (hasParts) {
-    parseRuntimeArray(message.parts, (item, itemPath) => {
-      validateMessagePart(item, itemPath);
-      return item;
-    }, `${path}.parts`);
-  }
-  if (message.metadata !== undefined) parseRuntimeRecord(message.metadata, `${path}.metadata`);
-}
-
-function validateAgentPath(value: unknown, path: string): void {
-  const agentPath = parseRuntimeIdentifier(value, path);
-  if (!agentPath.startsWith("/")) throw new RuntimeValidationError(path, "must be an absolute agent path");
-}
-
-function validateTerminalAgentStatus(value: unknown, path: string): void {
-  parseRuntimeEnum(value, ["completed", "incomplete", "failed", "cancelled"] as const, path);
-}
-
-function optionalTeamMemberStatus(value: unknown, path: string, required = false): void {
-  if (value === undefined && !required) return;
-  parseRuntimeEnum(value, ["idle", "running", "waiting", "blocked", "closed"] as const, path);
-}
-
-function optionalTeamTaskStatus(value: unknown, path: string): void {
-  if (value !== undefined) {
-    parseRuntimeEnum(value, ["pending", "in_progress", "blocked", "completed", "failed", "cancelled"] as const, path);
-  }
-}
-
-const TEAM_RUN_STOP_REASONS = ["drained", "once", "max_cycles", "timeout", "aborted", "team_inactive"] as const;
-
-function optionalTeamRunStopReason(value: unknown, path: string, required = false): void {
-  if (value === undefined && !required) return;
-  parseRuntimeEnum(value, TEAM_RUN_STOP_REASONS, path);
-}
-
-function validateTeamRunCounts(value: unknown, path: string): void {
-  const counts = parseRuntimeRecord(value, path);
-  for (const key of [
-    "dispatched",
-    "completed",
-    "accepted",
-    "reopened",
-    "merged",
-    "mergeFailed",
-    "mergeConflicted",
-    "mergeSkipped",
-    "failed",
-    "blocked",
-    "skipped",
-    "stillRunning",
-    "errors",
-  ] as const) {
-    parseRuntimeNonNegativeInteger(counts[key], `${path}.${key}`);
   }
 }
 

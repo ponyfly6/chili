@@ -1,4 +1,3 @@
-import { isLegacyWorkflowEvent, type LegacyWorkflowEvent } from "./legacy-workflow-events.js";
 import type {
   ApprovalId,
   MessageId,
@@ -50,14 +49,7 @@ export type RuntimeEvent =
   | RecoveryEvent
   | McpEvent;
 
-/** Storage/read transport union. Historical workflow events are never new writes. */
-export type ChiliEvent = RuntimeEvent | LegacyWorkflowEvent;
-export type { LegacyWorkflowEvent } from "./legacy-workflow-events.js";
-export { isLegacyWorkflowEvent } from "./legacy-workflow-events.js";
-
-export function isRuntimeEvent(event: ChiliEvent): event is RuntimeEvent {
-  return !isLegacyWorkflowEvent(event);
-}
+export type ChiliEvent = RuntimeEvent;
 
 export function isTransientEvent(event: Pick<EventEnvelope, "type">): boolean {
   return event.type === "tool.output_delta";
@@ -77,9 +69,6 @@ export function compactRuntimeMessage(message: Message): Message {
 }
 
 /** Keep the audit record in storage while transporting only its stable reference. */
-export function compactRuntimeEvent(event: RuntimeEvent): RuntimeEvent;
-export function compactRuntimeEvent(event: LegacyWorkflowEvent): LegacyWorkflowEvent;
-export function compactRuntimeEvent(event: ChiliEvent): ChiliEvent;
 export function compactRuntimeEvent(event: ChiliEvent): ChiliEvent {
   if (event.type === "message.part_added" && event.payload.part.type === "tool_result") {
     const { structuredData, ...part } = event.payload.part;

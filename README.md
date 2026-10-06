@@ -94,9 +94,9 @@ Agent 管理统一使用六个操作：`agent_spawn` 创建、`agent_list` 查�
 
 所有 Agent 默认可使用 Code Mode，六个 Agent 操作也可在脚本中组合调用。创建多个 Agent 可用 `Promise.all` 并行调用单个 `agent_spawn`。每次工具调用仍检查当前 Agent 的工具权限、资源范围和审批要求，Code Mode 与创建子 Agent 都不会扩大权限。
 
-默认 delegation 策略为 `proactive`：对能改善速度或质量的独立工作主动分工，并遵守用户明确指定的分工、范围和限制。历史 Team/Task 记录仅保留为只读历史，不再提供执行或恢复入口。
+默认 delegation 策略为 `proactive`：对能改善速度或质量的独立工作主动分工，并遵守用户明确指定的分工、范围和限制。
 
-会话不再使用 `source: interactive | subagent` 分类；父子关系只由 `agent.parentSessionId` 表达。旧工作流会话以 `readOnly` 标记隔离，新 Agent 不依赖旧任务、租约或邮箱数据模型。旧事件解码只用于读取历史，不能作为新运行事件写入。
+会话父子关系只由 `agent.parentSessionId` 表达。旧工作流会话以 `readOnly` 标记隔离，普通会话消息仍可读取；旧 Team/Task 专属事件不再解析或展示。数据库中的原始记录不会被删除。
 
 通过配置中的 `[agents]` 设置 `max_children`（每个 Agent 的直接子 Agent 数量）、`max_depth`（主 Agent 为第 0 层的最大深度）和 `max_concurrent`（共享并发数量），控制横向与纵向扩展。[配置示例](packages/host/AGENT_CONFIG.md)。
 
