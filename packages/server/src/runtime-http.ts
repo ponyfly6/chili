@@ -415,13 +415,14 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "mcpAuth") {
         const mcp = requireMcpControl(options);
         if (!mcp.auth) return jsonError(501, "No MCP auth controller is configured");
-        return json(await mcp.auth(route.server, mcpAuthInput(await readJson<McpAuthBody>(request, ["callbackUrl", "scopes"]))));
+        const input = mcpAuthInput(await readJson<McpAuthBody>(request, ["callbackUrl", "scopes"]));
+        return json(await withMcpMutationScope(options, url, (scope) => mcp.auth!(route.server, input, scope)));
       }
 
       if (route.name === "mcpLogout") {
         const mcp = requireMcpControl(options);
         if (!mcp.logout) return jsonError(501, "No MCP logout controller is configured");
-        return json(await mcp.logout(route.server));
+        return json(await withMcpMutationScope(options, url, (scope) => mcp.logout!(route.server, scope)));
       }
 
       if (route.name === "listTasks") {

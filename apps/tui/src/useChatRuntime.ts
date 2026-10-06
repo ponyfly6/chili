@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   chatSessionView,
@@ -639,10 +640,29 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     mcpStatusEpochRef.current += 1;
     setChatFeedback({ status: "pending", message: "authenticating MCP server" });
     try {
-      const result = await withAbort(async (signal) => client.authMcpServer({ server, ...request, signal }));
+      const result = await withAbort(async (signal) => client.authMcpServer({ server, ...request, ...(scope.sessionId ? { sessionId: scope.sessionId } : {}), signal }));
       if (!isMcpScopeCurrent(scope)) return undefined;
       setChatFeedback({ status: "success", message: result.status === "pending" ? "MCP auth pending" : `MCP auth ${result.status}` });
       void refreshMcpStatusForScope(scope);
+      if (result.status === "pending") {
+        void withAbort(async (signal) => {
+          const deadline = Date.now() + 305_000;
+          while (isMcpScopeCurrent(scope) && Date.now() < deadline) {
+            await delay(1_000, undefined, { signal });
+            if (!isMcpScopeCurrent(scope)) return;
+            const state = await client.mcpServer({ server, ...(scope.sessionId ? { sessionId: scope.sessionId } : {}), signal });
+            if (!isMcpScopeCurrent(scope)) return;
+            if (state.auth?.error) throw new Error(state.auth.error);
+            if (state.auth?.authenticated) {
+              await refreshMcpStatusForScope(scope);
+              if (isMcpScopeCurrent(scope)) setChatFeedback({ status: "success", message: `MCP ${server} authenticated` });
+              return;
+            }
+          }
+        }).catch((error: unknown) => {
+          if (!isAbortError(error) && isMcpScopeCurrent(scope)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+        });
+      }
       return result;
     } catch (error) {
       if (!isAbortError(error) && isMcpScopeCurrent(scope)) {
@@ -657,7 +677,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     mcpStatusEpochRef.current += 1;
     setChatFeedback({ status: "pending", message: "logging out MCP server" });
     try {
-      const result = await withAbort(async (signal) => client.logoutMcpServer({ server, signal }));
+      const result = await withAbort(async (signal) => client.logoutMcpServer({ server, ...(scope.sessionId ? { sessionId: scope.sessionId } : {}), signal }));
       if (!isMcpScopeCurrent(scope)) return undefined;
       setChatFeedback({ status: "success", message: result.loggedOut ? "MCP server logged out" : "MCP server had no auth session" });
       void refreshMcpStatusForScope(scope);

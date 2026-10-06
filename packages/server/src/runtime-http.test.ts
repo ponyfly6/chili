@@ -3896,6 +3896,8 @@ test("scopes MCP catalog views to the persisted canonical session workspace", as
     expect((await handler(new Request(`http://chili.test/mcp/reload?${query}`, { method: "POST" }))).status).toBe(200);
     expect((await handler(new Request(`http://chili.test/mcp/github/connect?${query}`, { method: "POST" }))).status).toBe(200);
     expect((await handler(new Request(`http://chili.test/mcp/github/disconnect?${query}`, { method: "POST" }))).status).toBe(200);
+    expect((await handler(new Request(`http://chili.test/mcp/github/auth?${query}`, { method: "POST", body: "{}", headers: { "content-type": "application/json" } }))).status).toBe(200);
+    expect((await handler(new Request(`http://chili.test/mcp/github/logout?${query}`, { method: "POST" }))).status).toBe(200);
 
     const canonicalWorkspace = await realpath(workspace);
     expect(mcp.scopeInputs).toEqual([
@@ -3906,8 +3908,10 @@ test("scopes MCP catalog views to the persisted canonical session workspace", as
       { operation: "reload", cwd: canonicalWorkspace },
       { operation: "connect", cwd: canonicalWorkspace },
       { operation: "disconnect", cwd: canonicalWorkspace },
+      { operation: "auth", cwd: canonicalWorkspace },
+      { operation: "logout", cwd: canonicalWorkspace },
     ]);
-    expect(service.sessionOperationIds).toEqual([sessionId, sessionId, sessionId]);
+    expect(service.sessionOperationIds).toEqual([sessionId, sessionId, sessionId, sessionId, sessionId]);
 
     const callCount = mcp.scopeInputs.length;
     const missing = await handler(new Request("http://chili.test/mcp/status?sessionId=session_missing"));
@@ -3964,8 +3968,8 @@ test("keeps archived MCP reads project-scoped while connection mutations remain 
     });
     expect(mcp.scopeInputs).toEqual([]);
 
-    for (const action of ["connect", "disconnect"]) {
-      const response = await handler(new Request(`http://chili.test/mcp/github/${action}?sessionId=${sessionId}`, { method: "POST" }));
+    for (const action of ["connect", "disconnect", "auth", "logout"]) {
+      const response = await handler(new Request(`http://chili.test/mcp/github/${action}?sessionId=${sessionId}`, { method: "POST", body: "{}", headers: { "content-type": "application/json" } }));
       expect(response.status).toBe(409);
     }
     expect(mcp.scopeInputs).toEqual([]);
@@ -4039,7 +4043,7 @@ test("keeps archived MCP reads project-scoped while connection mutations remain 
     }
     expect(mcp.scopeInputs).toHaveLength(4);
     expect(service.sessionOperationIds).toEqual([
-      sessionId, sessionId, sessionId,
+      sessionId, sessionId, sessionId, sessionId, sessionId,
       activeChildId, activeChildId, activeChildId,
       archivedChildId, archivedChildId, archivedChildId,
     ]);
@@ -4820,7 +4824,7 @@ class FakePromptCommandControl implements PromptCommandControl {
 class FakeMcpControlService implements RuntimeMcpControlService {
   added: Parameters<NonNullable<RuntimeMcpControlService["add"]>>[0] | undefined;
   authInput: Parameters<NonNullable<RuntimeMcpControlService["auth"]>>[1] | undefined;
-  readonly scopeInputs: Array<{ operation: "list" | "reload" | "tools" | "connect" | "disconnect"; cwd?: string }> = [];
+  readonly scopeInputs: Array<{ operation: "list" | "reload" | "tools" | "connect" | "disconnect" | "auth" | "logout"; cwd?: string }> = [];
 
   async connect(server: string, input: RuntimeMcpScopeInput = {}): Promise<Awaited<ReturnType<NonNullable<RuntimeMcpControlService["connect"]>>>> {
     this.scopeInputs.push({ operation: "connect", ...input });
@@ -4880,8 +4884,10 @@ class FakeMcpControlService implements RuntimeMcpControlService {
   async auth(
     server: string,
     input?: Parameters<NonNullable<RuntimeMcpControlService["auth"]>>[1],
+    scope: RuntimeMcpScopeInput = {},
   ): Promise<Awaited<ReturnType<NonNullable<RuntimeMcpControlService["auth"]>>>> {
     this.authInput = input;
+    this.scopeInputs.push({ operation: "auth", ...scope });
     return {
       server,
       status: "pending",
@@ -4889,7 +4895,8 @@ class FakeMcpControlService implements RuntimeMcpControlService {
     };
   }
 
-  async logout(server: string): Promise<Awaited<ReturnType<NonNullable<RuntimeMcpControlService["logout"]>>>> {
+  async logout(server: string, scope: RuntimeMcpScopeInput = {}): Promise<Awaited<ReturnType<NonNullable<RuntimeMcpControlService["logout"]>>>> {
+    this.scopeInputs.push({ operation: "logout", ...scope });
     return { server, loggedOut: true };
   }
 }

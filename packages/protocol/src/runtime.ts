@@ -288,8 +288,8 @@ export interface RuntimeMcpControlService {
   add?(input: RuntimeMcpAddServerRequest): Promise<RuntimeMcpServerDescriptor>;
   remove?(server: string): Promise<RuntimeMcpRemoveServerResponse>;
   tools?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpToolsResponse>;
-  auth?(server: string, input?: RuntimeMcpAuthRequest): Promise<RuntimeMcpAuthResponse>;
-  logout?(server: string): Promise<RuntimeMcpLogoutResponse>;
+  auth?(server: string, input?: RuntimeMcpAuthRequest, scope?: RuntimeMcpScopeInput): Promise<RuntimeMcpAuthResponse>;
+  logout?(server: string, scope?: RuntimeMcpScopeInput): Promise<RuntimeMcpLogoutResponse>;
 }
 
 export type RuntimeCommand =

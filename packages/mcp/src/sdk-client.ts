@@ -1,3 +1,4 @@
+import type { AuthProvider, OAuthClientProvider } from "@modelcontextprotocol/client";
 import type { McpStdioGuardianOwner } from "./stdio-guardian.js";
 import { Client, SSEClientTransport, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import type { Transport, RequestOptions } from "@modelcontextprotocol/client";
@@ -42,6 +43,7 @@ import {
 } from "./stdio-client-transport.js";
 
 export interface SdkMcpClientOptions {
+  authProvider?: AuthProvider | OAuthClientProvider;
   stdioGuardian?: McpStdioGuardianOwner;
   clientInfo?: McpClientInfo;
   capabilities?: McpClientCapabilities;
@@ -50,6 +52,7 @@ export interface SdkMcpClientOptions {
 }
 
 export interface SdkMcpTransportOptions {
+  authProvider?: AuthProvider | OAuthClientProvider;
   stdioGuardian?: McpStdioGuardianOwner;
   fetch?: typeof fetch;
   ingressLimits?: Partial<McpHttpIngressLimits>;
@@ -143,6 +146,7 @@ export class SdkMcpClient implements McpClient {
         if (options.signal?.aborted) onAbort();
         let transport: Transport;
         transport = createSdkMcpTransport(this.server, {
+          ...(this.options.authProvider ? { authProvider: this.options.authProvider } : {}),
           ...(this.options.stdioGuardian ? { stdioGuardian: this.options.stdioGuardian } : {}),
           // Auto-discovery precedes the SDK's normal connection ownership.
           // Bind its HTTP probe to cancellation and explicit close as well.
@@ -323,6 +327,8 @@ export function createSdkMcpTransport(server: McpServerConfig, options: SdkMcpTr
   if (server.type === "http") {
     return new StreamableHTTPClientTransport(new URL(server.url), {
       fetch: boundedFetch,
+      ...(options.authProvider ? { authProvider: options.authProvider } : {}),
+      onInsufficientScope: "throw",
       requestInit: { headers: server.headers },
     }) as unknown as Transport;
   }
@@ -330,6 +336,7 @@ export function createSdkMcpTransport(server: McpServerConfig, options: SdkMcpTr
   const sseFetch = fetchWithHeaders(server.headers, boundedFetch);
   return new SSEClientTransport(new URL(server.url), {
     fetch: sseFetch,
+    ...(options.authProvider ? { authProvider: options.authProvider } : {}),
     eventSourceInit: { fetch: sseFetch },
     requestInit: { headers: server.headers },
   }) as unknown as Transport;

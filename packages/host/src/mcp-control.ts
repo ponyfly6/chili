@@ -15,6 +15,7 @@ import {
 } from "@chili/commands";
 import {
   McpClientManager,
+  McpOAuthManager,
   McpStdioGuardianOwner,
   type McpGuardianLifecycleEvent,
   createMcpChiliTools,
@@ -70,6 +71,7 @@ import type { PromptCommandControl, PromptCommandRunResult } from "@chili/comman
 export interface HostMcpRuntimeOptions {
   cwd: string;
   chiliHome: string;
+  oauthFetch?: typeof fetch;
   registries: readonly MutableToolRegistry[];
   events?: { publish(event: ChiliEvent): Promise<void> };
   createId?: (prefix: string) => string;
@@ -121,6 +123,7 @@ export class HostMcpRuntimeClosedError extends Error {
 }
 
 class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, McpResourcesController, McpPromptController {
+  private readonly oauth: McpOAuthManager;
   private userScope: McpManagerScope | undefined;
   private stdioGuardian: McpStdioGuardianOwner | undefined;
   private readonly projectScopes = new Map<string, Promise<McpManagerScope>>();
@@ -136,7 +139,25 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
   constructor(
     private readonly options: HostMcpRuntimeOptions,
     private readonly baseCommands: PromptCommandControl,
-  ) {}
+  ) {
+    this.oauth = new McpOAuthManager({
+      directory: join(options.chiliHome, "mcp-auth"),
+      ...(options.oauthFetch ? { fetch: options.oauthFetch } : {}),
+      onAuthenticated: async (server, assertCurrent) => {
+        this.assertOpen();
+        for (const scope of this.liveScopes) {
+          if (!scope.active) continue;
+          for (const state of scope.manager.listStates()) {
+            if (mcpServerIdentity(state.server) !== mcpServerIdentity(server)) continue;
+            assertCurrent();
+            await scope.manager.disconnect(state.server.name);
+            assertCurrent();
+            if (scope.active && state.server.enabled) await scope.manager.connect(state.server.name);
+          }
+        }
+      },
+    });
+  }
 
   get control(): RuntimeMcpControlService {
     return this;
@@ -177,6 +198,7 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
     for (const scope of scopes) scope.active = false;
 
     const cleanups: Promise<unknown>[] = [
+      this.oauth.close(),
       ...this.options.registries.map((registry) => invokeObserved(() => {
         registry.unregisterContextualSource(MCP_TOOL_SOURCE);
       })),
@@ -205,7 +227,7 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
   async list(input: McpScopeInput = {}): Promise<RuntimeMcpListResponse> {
     const view = await this.scopeView(input.cwd);
     this.assertOpen();
-    return { servers: boundedServerDescriptors(scopedStates(view)) };
+    return { servers: await this.authDescriptors(scopedStates(view)) };
   }
 
   async status(input: McpScopeInput = {}): Promise<RuntimeMcpStatusResponse> {
@@ -217,7 +239,7 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
     const view = await this.scopeView(input.cwd);
     this.assertOpen();
     const state = scopedState(view, server);
-    return state ? toRuntimeServerDescriptor(state) : undefined;
+    return state ? this.authDescriptor(state) : undefined;
   }
 
   async reload(input: McpScopeInput = {}): Promise<RuntimeMcpReloadResponse> {
@@ -228,7 +250,7 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
       this.assertOpen();
       return {
         reloaded: true,
-        servers: boundedServerDescriptors(scopedStates(view)),
+        servers: await this.authDescriptors(scopedStates(view)),
         errors: scopedLoadErrors(view),
       };
     });
@@ -242,7 +264,7 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
       await manager.connect(server);
       this.assertOpen();
       if (manager === view.user.manager) this.publishUserScopeSnapshot(view.user);
-      return toRuntimeServerDescriptor(manager.getState(server)!);
+      return this.authDescriptor(manager.getState(server)!);
     });
   }
 
@@ -254,7 +276,7 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
       await manager.disconnect(server);
       this.assertOpen();
       if (manager === view.user.manager) this.publishUserScopeSnapshot(view.user);
-      return toRuntimeServerDescriptor(manager.getState(server)!);
+      return this.authDescriptor(manager.getState(server)!);
     });
   }
 
@@ -277,12 +299,17 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
   async remove(server: string): Promise<RuntimeMcpRemoveServerResponse> {
     return this.enqueueMutation(async () => {
       const safeServer = safeIdentity(server, "MCP server name", MCP_DESCRIPTOR_LIMITS.identityBytes);
+      const removedState = this.userScope?.manager.getState(server);
       const removed = await this.trackPersistentMutation(
         () => removeUserMcpServer(this.options.chiliHome, server),
       );
       this.assertOpen();
       await this.reloadUserScope();
       await this.invalidateProjectScopes();
+      if (removed && removedState && ![...this.liveScopes].some((scope) => scope.active && scope.manager.listStates()
+        .some((state) => mcpServerIdentity(state.server) === mcpServerIdentity(removedState.server)))) {
+        await this.oauth.logout(removedState.server);
+      }
       return { server: safeServer, removed };
     });
   }
@@ -304,22 +331,48 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
     };
   }
 
-  auth(server: string, _input?: RuntimeMcpAuthRequest): Promise<RuntimeMcpAuthResponse> {
+  async auth(server: string, input: RuntimeMcpAuthRequest = {}, scope: McpScopeInput = {}): Promise<RuntimeMcpAuthResponse> {
+    const view = await this.scopeView(scope.cwd);
     this.assertOpen();
-    const safeServer = safeIdentity(server, "MCP server name", MCP_DESCRIPTOR_LIMITS.identityBytes);
-    return Promise.resolve({
-      server: safeServer,
-      status: "unsupported",
-      message: "OAuth authorization flow is not wired yet for Chili MCP servers.",
-    });
+    const state = scopedState(view, server);
+    if (!state) throw new Error("MCP server not found");
+    const provider = this.oauth.provider(state.server);
+    if (!provider) return { server, status: "unsupported", message: "stdio MCP servers use local configuration, not OAuth." };
+    const result = await provider.begin(input);
+    this.assertOpen();
+    return { server, ...result, ...(result.status === "pending" ? { message: "Open this URL to sign in. Waiting for the browser callback (5 minutes)." } : {}) };
   }
 
-  logout(server: string): Promise<RuntimeMcpLogoutResponse> {
+  async logout(server: string, scope: McpScopeInput = {}): Promise<RuntimeMcpLogoutResponse> {
+    const view = await this.scopeView(scope.cwd);
     this.assertOpen();
-    return Promise.resolve({
-      server: safeIdentity(server, "MCP server name", MCP_DESCRIPTOR_LIMITS.identityBytes),
-      loggedOut: false,
-    });
+    const state = scopedState(view, server);
+    if (!state) throw new Error("MCP server not found");
+    const identity = mcpServerIdentity(state.server);
+    const loggedOut = await this.oauth.logout(state.server);
+    for (const scope of this.liveScopes) {
+      for (const current of scope.manager.listStates()) {
+        if (mcpServerIdentity(current.server) === identity) await scope.manager.disconnect(current.server.name);
+      }
+    }
+    return { server, loggedOut };
+  }
+
+  private async authDescriptor(state: McpServerState): Promise<RuntimeMcpServerDescriptor> {
+    const descriptor = toRuntimeServerDescriptor(state);
+    const provider = this.oauth.provider(state.server);
+    if (provider) {
+      const auth = await provider.status();
+      descriptor.auth = { ...descriptor.auth, required: auth.required, authenticated: auth.authenticated, ...(auth.error ? { error: auth.error } : {}) };
+      if (auth.required && !auth.authenticated && state.status === "failed") descriptor.status = "auth_required";
+      if (auth.error) descriptor.error = auth.error;
+    }
+    return descriptor;
+  }
+
+  private async authDescriptors(states: readonly McpServerState[]): Promise<RuntimeMcpServerDescriptor[]> {
+    boundedServerDescriptors(states);
+    return Promise.all(states.map((state) => this.authDescriptor(state)));
   }
 
   async listResources(
@@ -492,6 +545,8 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
       }
     }
     this.assertOpen();
+    await this.oauth.reset();
+    this.assertOpen();
     const loaded = await loadUserMcpConfig(this.options.chiliHome);
     this.assertOpen();
     const next = await this.createScope("user", loaded);
@@ -635,7 +690,11 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
       createClient: (server) => {
         if (this.options.createClient) return this.options.createClient(server);
         if (server.type === "stdio" && !this.stdioGuardian) throw new Error("Managed MCP stdio is unavailable on this host");
-        return createSdkMcpClient(server, this.stdioGuardian ? { stdioGuardian: this.stdioGuardian } : {});
+        const authProvider = this.oauth.provider(server);
+        return createSdkMcpClient(server, {
+          ...(this.stdioGuardian ? { stdioGuardian: this.stdioGuardian } : {}),
+          ...(authProvider ? { authProvider: authProvider.transportAuth() } : {}),
+        });
       },
       onDiagnostic: (diagnostic) => {
         if (!scope.active || this.lifecycle !== "open") return;

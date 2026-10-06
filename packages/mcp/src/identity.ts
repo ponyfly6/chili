@@ -9,6 +9,7 @@ export function mcpServerIdentity(server: McpServerConfig): string {
     ? { type: server.type, command: resolvedCommand(server), args: server.args, cwd: canonicalPath(server.cwd ?? process.cwd()), env: server.env ?? {} }
     : { type: server.type, url: canonicalUrl(server.url), oauth: server.oauth ? {
       clientId: server.oauth.clientId ?? null,
+      ...(server.oauth.clientMetadataUrl ? { clientMetadataUrl: server.oauth.clientMetadataUrl } : {}),
       authorizationUrl: server.oauth.authorizationUrl ?? null,
       tokenUrl: server.oauth.tokenUrl ?? null,
       redirectUri: server.oauth.redirectUri ?? null,

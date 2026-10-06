@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { waitForMcpAuthorization } from "./mcp-auth.js";
 import { stat } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -120,7 +121,7 @@ async function main(): Promise<void> {
     }
 
     if (args.command === "mcp") {
-      await handleMcpCommand(harness, args);
+      await handleMcpCommand(harness, args, signalLifecycle.signal);
       return;
     }
 
@@ -769,13 +770,14 @@ interface CliMcpControl {
   reload?(input?: { cwd?: string }): Promise<RuntimeMcpReloadResponse>;
   add?(input: RuntimeMcpAddServerRequest): Promise<RuntimeMcpServerDescriptor>;
   remove?(server: string): Promise<RuntimeMcpRemoveServerResponse>;
-  auth?(server: string, input?: RuntimeMcpAuthRequest): Promise<RuntimeMcpAuthResponse>;
-  logout?(server: string): Promise<RuntimeMcpLogoutResponse>;
+  auth?(server: string, input?: RuntimeMcpAuthRequest, scope?: { cwd?: string }): Promise<RuntimeMcpAuthResponse>;
+  logout?(server: string, scope?: { cwd?: string }): Promise<RuntimeMcpLogoutResponse>;
 }
 
 async function handleMcpCommand(
   harness: Awaited<ReturnType<typeof createCliHarness>>,
   args: ReturnType<typeof parseArgs>,
+  signal: AbortSignal,
 ): Promise<void> {
   const control = mcpControl(harness);
   const action = args.mcpAction ?? "list";
@@ -823,14 +825,18 @@ async function handleMcpCommand(
   if (action === "auth") {
     if (!args.mcpServer) throw new Error("mcp auth requires a server name");
     if (!control.auth) throw new Error("MCP auth is not supported by the configured manager");
-    const result = await control.auth(args.mcpServer, mcpAuthInput(args));
+    const result = await control.auth(args.mcpServer, mcpAuthInput(args), { cwd: harness.cwd });
     printMcpMutation("auth", result, args.json);
+    if (result.status === "pending") {
+      await waitForMcpAuthorization(control, args.mcpServer, harness.cwd, signal);
+      printMcpMutation("auth", { server: args.mcpServer, status: "authenticated" }, args.json);
+    }
     return;
   }
   if (action === "logout") {
     if (!args.mcpServer) throw new Error("mcp logout requires a server name");
     if (!control.logout) throw new Error("MCP logout is not supported by the configured manager");
-    const result = await control.logout(args.mcpServer);
+    const result = await control.logout(args.mcpServer, { cwd: harness.cwd });
     printMcpMutation("logout", result, args.json);
   }
 }

@@ -6,3 +6,4 @@ export * from "./sdk-client.js";
 export * from "./tool-adapter.js";
 export * from "./identity.js";
 export * from "./stdio-guardian.js";
+export * from "./oauth.js";

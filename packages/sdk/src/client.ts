@@ -328,11 +328,13 @@ export interface ListMcpToolsRequest {
 
 export interface AuthMcpServerRequest extends RuntimeMcpAuthRequest {
   server: string;
+  sessionId?: SessionId;
   signal?: AbortSignal;
 }
 
 export interface LogoutMcpServerRequest {
   server: string;
+  sessionId?: SessionId;
   signal?: AbortSignal;
 }
 
@@ -1241,12 +1243,12 @@ export class HttpRuntimeClient implements RuntimeClient {
   }
 
   authMcpServer(input: AuthMcpServerRequest): Promise<RuntimeMcpAuthResponse> {
-    const { server, signal, ...body } = input;
-    return this.post(`mcp/${encodeURIComponent(server)}/auth`, body, signal, parseRuntimeMcpAuthResponse);
+    const { server, signal, sessionId, ...body } = input;
+    return this.post(sessionScopedRequestPath(`mcp/${encodeURIComponent(server)}/auth`, sessionId), body, signal, parseRuntimeMcpAuthResponse);
   }
 
   logoutMcpServer(input: LogoutMcpServerRequest): Promise<RuntimeMcpLogoutResponse> {
-    return this.post(`mcp/${encodeURIComponent(input.server)}/logout`, {}, input.signal, parseRuntimeMcpLogoutResponse);
+    return this.post(sessionScopedRequestPath(`mcp/${encodeURIComponent(input.server)}/logout`, input.sessionId), {}, input.signal, parseRuntimeMcpLogoutResponse);
   }
 
   submitPrompt(input: SubmitPromptRequest): Promise<RuntimePromptResult> {

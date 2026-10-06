@@ -49,6 +49,7 @@ export interface McpSseTransportConfig {
 }
 
 export interface McpOAuthConfig {
+  clientMetadataUrl?: string;
   clientId?: string;
   clientSecret?: string;
   scopes?: string[];
@@ -234,6 +235,7 @@ function readOAuth(raw: unknown, entry: RawServerEntry, diagnostics: McpDiagnost
   }
 
   const oauth: McpOAuthConfig = {};
+  assignOptionalString(oauth, "clientMetadataUrl", raw.clientMetadataUrl ?? raw.client_metadata_url, entry, "oauth.clientMetadataUrl", diagnostics);
   assignOptionalString(oauth, "clientId", raw.clientId ?? raw.client_id, entry, "oauth.clientId", diagnostics);
   assignOptionalString(oauth, "clientSecret", raw.clientSecret ?? raw.client_secret, entry, "oauth.clientSecret", diagnostics);
   assignOptionalArray(oauth, "scopes", raw.scopes, entry, "oauth.scopes", diagnostics);

@@ -221,6 +221,8 @@ test("MCP catalog requests carry the selected session scope", async () => {
         return Response.json({ servers: [], summary: { total: 0, running: 0, disabled: 0, authRequired: 0, errored: 0 } });
       }
       if (path.endsWith("/tools")) return Response.json({ server: "github/issues", tools: [] });
+      if (path.endsWith("/auth")) return Response.json({ server: "github/issues", status: "pending" });
+      if (path.endsWith("/logout")) return Response.json({ server: "github/issues", loggedOut: true });
       if (path.endsWith("/reload")) return Response.json({ reloaded: true, servers: [], errors: [] });
       if (path.endsWith("/connect") || path.endsWith("/disconnect")) {
         return Response.json({ name: "github/issues", status: path.endsWith("/connect") ? "running" : "stopped", enabled: true });
@@ -239,6 +241,8 @@ test("MCP catalog requests carry the selected session scope", async () => {
   await client.reloadMcp({ sessionId });
   await client.connectMcpServer({ server: "github/issues", sessionId });
   await client.disconnectMcpServer({ server: "github/issues", sessionId });
+  await client.authMcpServer({ server: "github/issues", sessionId });
+  await client.logoutMcpServer({ server: "github/issues", sessionId });
 
   expect(requests.map((request) => {
     const url = new URL(request.url);
@@ -251,6 +255,8 @@ test("MCP catalog requests carry the selected session scope", async () => {
     ["POST", "/api/mcp/reload", sessionId],
     ["POST", "/api/mcp/github%2Fissues/connect", sessionId],
     ["POST", "/api/mcp/github%2Fissues/disconnect", sessionId],
+    ["POST", "/api/mcp/github%2Fissues/auth", sessionId],
+    ["POST", "/api/mcp/github%2Fissues/logout", sessionId],
   ]);
 });
 
