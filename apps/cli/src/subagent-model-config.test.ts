@@ -24,10 +24,15 @@ test("CLI initial child and followup use the same resolved session model configu
     async *stream(input): AsyncIterable<ModelStreamEvent> {
       inputs.push(input);
       if (input.sessionId === sessionId && !delegated) {
+        if (!input.tools.some((tool) => tool.name === "agent_spawn")) {
+          yield { type: "tool_call", name: "tool_search", input: { query: "select:agent_spawn" } };
+          yield { type: "finish", reason: "tool_use" };
+          return;
+        }
         delegated = true;
         yield {
           type: "tool_call",
-          name: "task",
+          name: "agent_spawn",
           input: { description: "check configuration", prompt: "Confirm the task configuration.", mode: "resumable" },
         };
         yield { type: "finish", reason: "tool_use" };
@@ -74,7 +79,7 @@ test("CLI initial child and followup use the same resolved session model configu
         reasoningLevel: "high",
         serviceTier: "fast",
       });
-      expect(input.tools.some((tool) => tool.name === "task")).toBe(false);
+      expect(input.tools.some((tool) => tool.name === "agent_spawn")).toBe(false);
     }
   } finally {
     await harness?.close();

@@ -18,6 +18,9 @@ const DENIED_INPUTS: Readonly<Record<(typeof DELEGATION_OFF_DENIED_TOOL_NAMES)[n
   task: { description: "delegate", prompt: "work", mode: "background" },
   task_batch: { tasks: [{ description: "delegate", prompt: "work", mode: "background" }] },
   task_followup: { taskId: "task_existing", prompt: "continue" },
+  agent_spawn: { description: "delegate", prompt: "work", mode: "background" },
+  agent_resume: { taskId: "task_existing", prompt: "continue" },
+  agent_send: { to: "/root/member", content: "wake" },
   team_create: { name: "delegation test" },
   team_member_add: { teamId: "team_1", path: "/root/member", name: "member", role: "worker" },
   team_task_create: { teamId: "team_1", title: "work" },
@@ -40,6 +43,10 @@ test("off hides and rejects root delegation tools while preserving settlement an
     });
     const executor = rootToolExecutor(fixture.harness);
     const visible = await visibleToolNames(executor, handle.sessionId, fixture.repo);
+    const registry = (executor as unknown as { options: { registry: ToolRegistry } }).options.registry;
+    for (const toolName of ["agent_spawn", "agent_send", "agent_resume"]) {
+      expect(registry.get(toolName)).toBeDefined();
+    }
 
     for (const toolName of DELEGATION_OFF_DENIED_TOOL_NAMES) {
       expect(visible.has(toolName)).toBe(false);
@@ -50,21 +57,22 @@ test("off hides and rejects root delegation tools while preserving settlement an
         DENIED_INPUTS[toolName],
       ));
       expect(result.status).toBe("failed");
-      if (result.status === "failed") expect(result.error.name).toBe("ToolDeniedError");
+      if (result.status === "failed") {
+        expect(result.error.name).toBe(registry.get(toolName) ? "ToolDeniedError" : "UnknownToolError");
+      }
     }
 
     for (const allowed of [
       "delegation_status",
       "delegation_set",
-      "task_list",
-      "task_wait",
-      "task_close",
+      "agent_list",
+      "agent_wait",
+      "agent_stop",
       "team_list",
       "team_snapshot",
       "team_task_sync",
       "team_task_reconcile",
       "team_message_list",
-      "agent_message_list",
       "write",
     ]) {
       expect(visible.has(allowed)).toBe(true);
@@ -82,7 +90,7 @@ test("off hides and rejects root delegation tools while preserving settlement an
       DENIED_INPUTS.task,
     ));
     expect(aliasResult.status).toBe("failed");
-    if (aliasResult.status === "failed") expect(aliasResult.error.name).toBe("ToolDeniedError");
+    if (aliasResult.status === "failed") expect(aliasResult.error.name).toBe("UnknownToolError");
   } finally {
     await fixture.close();
   }
@@ -98,20 +106,21 @@ test("child ToolExecutor inherits root off without losing the worker policy", as
       rootSessionId,
       childSessionId,
     }));
+    await fixture.harness.runtime.createSession({ sessionId: childSessionId, cwd: fixture.repo });
     await fixture.harness.service.setDelegationPolicy({
       sessionId: rootSessionId,
       policy: "off",
     });
     const executor = childToolExecutor(fixture.harness);
     const visibleOff = await visibleToolNames(executor, childSessionId, fixture.repo);
-    expect(visibleOff.has("agent_message_send")).toBe(false);
+    expect(visibleOff.has("agent_send")).toBe(false);
     expect(visibleOff.has("complete_task")).toBe(true);
     expect(visibleOff.has("write")).toBe(false);
 
     const denied = await executor.execute(toolInput(
       childSessionId,
       fixture.repo,
-      "agent_message_send",
+      "agent_send",
       { to: "parent", content: "wake" },
     ));
     expect(denied.status).toBe("failed");
@@ -122,7 +131,7 @@ test("child ToolExecutor inherits root off without losing the worker policy", as
       policy: "proactive",
     });
     const visibleEnabled = await visibleToolNames(executor, childSessionId, fixture.repo);
-    expect(visibleEnabled.has("agent_message_send")).toBe(true);
+    expect(visibleEnabled.has("agent_send")).toBe(true);
     expect(visibleEnabled.has("write")).toBe(false);
   } finally {
     await fixture.close();

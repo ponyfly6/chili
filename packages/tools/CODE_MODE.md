@@ -1,6 +1,9 @@
 # Code mode in Chili
 
 Chili exposes `code_mode` alongside its direct tools in CLI, TUI, and Desktop hosts.
+It is a baseline tool for both the main agent and every child agent, including
+scoped Team workers and resumed workers with older allowlists. They all use the
+same implementation; each agent receives its own authorized tool catalog.
 The model supplies `{ "code": "...", "timeoutMs": 30000 }`. JavaScript runs once in
 an isolated QuickJS worker. It can compose the explicitly enabled tools; it cannot
 access Node, Bun, files, network, imports, or timers directly.
@@ -30,14 +33,22 @@ envelope must also fit the narrower 1 MiB script bridge budget.
 
 `ALL_TOOLS` lists the callable names and descriptions. Use `tool_search` with a
 capability query or `select:read,bash` to inspect parameter and result schemas.
+This catalog includes authorized deferred tools even when their direct definitions
+have not been loaded. It contains short descriptions, not parameter declarations.
+Inside a script, `await tools.tool_search({ query: "select:exact-name" })` returns
+complete contracts in `.structuredData.tools` without loading direct definitions.
+Pass `load: true` only when subsequent direct model calls need those definitions.
+Knowing a tool's contract is sufficient for a script call; search is not an
+execution prerequisite. Direct `tool_search` calls load definitions for the next
+model request, with the selection recorded durably for that session.
 Names are preserved exactly, including MCP punctuation: use `tools["exact-name"]`.
 Tool search describes the schema of `.structuredData`, not the outer envelope.
 TypeScript syntax is not accepted; schemas describe the JavaScript contract.
 
-File tools, shell and managed-process tools, Git tools, and ordinary MCP tools
-opt in to code mode. Image reads and interactive/agent-control tools remain
-direct calls. A scoped agent must already be allowed to call `code_mode`; each
-child tool also retains its own allowlist, scope and approval checks.
+File tools, shell and managed-process tools, Git tools, the six `agent_*` controls,
+and ordinary MCP tools opt in to code mode. Image reads, user input, and Team
+controls remain direct calls. Explicit denials of `code_mode` are still respected;
+each nested tool retains its own allowlist, scope and approval checks.
 The wrapper declares an internal resource policy because it has no direct file
 or process capability. This permits composition under resource restrictions;
 it does not grant its children additional access.

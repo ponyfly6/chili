@@ -369,7 +369,7 @@ export class RuntimeSubagentSessionAccessError extends Error {
   constructor(readonly sessionId: SessionId) {
     super(
       `Session ${sessionId} belongs to a subagent and cannot be run through the root runtime. ` +
-      "Use task_followup for the owning task so child tool policy and lifecycle concurrency limits are preserved.",
+      "Use agent_resume for the owning task so child tool policy and lifecycle concurrency limits are preserved.",
     );
     this.name = "RuntimeSubagentSessionAccessError";
   }
@@ -3330,11 +3330,13 @@ function legacyDelegationTurnActivity(message: Message): DelegationTurnActivity 
       "task_followup",
       "followup_task",
       "agent_followup",
+      "agent_resume",
     ].includes(name);
-    const isFollowup = ["task_followup", "followup_task", "agent_followup"].includes(name);
-    const isBatch = ["task_batch", "agent_batch", "spawn_tasks", "spawn_agents"].includes(name);
+    const isFollowup = ["task_followup", "followup_task", "agent_followup", "agent_resume"].includes(name);
+    const isBatch = ["task_batch", "agent_batch", "spawn_tasks", "spawn_agents"].includes(name)
+      || (name === "agent_spawn" && Array.isArray(input.tasks));
     if (isBatch && policy === "supervised") activity.supervisedObserved = true;
-    const isSingle = ["task", "agent"].includes(name);
+    const isSingle = ["task", "agent"].includes(name) || (name === "agent_spawn" && !isBatch);
     const singleMode = optionalString(input.mode ?? input.subagent_type ?? input.subagentType)?.toLowerCase();
 
     if (isWaitOrFollowup || ["team_run_loop", "team_run"].includes(name)) {
@@ -3397,7 +3399,7 @@ function legacyDelegationTurnActivity(message: Message): DelegationTurnActivity 
       }
     }
     if (
-      ["task_wait_batch", "wait_tasks", "agent_wait_batch"].includes(name)
+      ["task_wait_batch", "wait_tasks", "agent_wait_batch", "agent_wait"].includes(name)
       && (optionalString(input.waitFor ?? input.wait_for)?.toLowerCase() ?? "all") === "all"
       && lifecycleTaskStates.length > 0
       && lifecycleTaskStates.every((task) => isFinalDelegatedTaskStatus(task.status))
@@ -3524,15 +3526,20 @@ function decodeDelegatedTaskStates(
 }
 
 function expectedDelegatedTaskCount(name: string, input: Record<string, unknown>): number | undefined {
-  if (["task_batch", "agent_batch", "spawn_tasks", "spawn_agents"].includes(name)) {
+  if (["task_batch", "agent_batch", "spawn_tasks", "spawn_agents"].includes(name)
+    || (name === "agent_spawn" && Array.isArray(input.tasks))) {
     return Array.isArray(input.tasks) ? input.tasks.length : undefined;
   }
-  if (["task_wait_batch", "wait_tasks", "agent_wait_batch"].includes(name)) {
-    const taskIds = input.taskIds ?? input.task_ids;
-    return Array.isArray(taskIds) ? taskIds.length : undefined;
+  if (["task_wait_batch", "wait_tasks", "agent_wait_batch", "agent_wait"].includes(name)) {
+    const taskIds = input.taskIds ?? input.task_ids ?? input.ids;
+    // The wait validator trims and deduplicates IDs before dispatch. Match that
+    // cardinality when only legacy tool messages are available for supervision.
+    return Array.isArray(taskIds)
+      ? new Set(taskIds.map((id) => typeof id === "string" ? id.trim() : id)).size
+      : name === "agent_wait" ? 1 : undefined;
   }
   if ([
-    "task", "agent", "task_wait", "wait_task", "agent_wait", "task_followup", "followup_task", "agent_followup",
+    "task", "agent", "agent_spawn", "task_wait", "wait_task", "task_followup", "followup_task", "agent_followup", "agent_resume",
   ].includes(name)) return 1;
   return undefined;
 }
@@ -3597,15 +3604,15 @@ function openDelegationBatchRepairPrompt(taskIds: readonly string[]): string {
   return [
     `Required delegated work is still nonterminal: ${taskIds.join(", ")}.`,
     "Do not give a final answer or merely report that agents are running.",
-    "For supervised collaboration, call task_wait_batch with wait_for=any on the remaining IDs, inspect each newly terminal summary, and use task_followup for gaps or corrections.",
-    "Repeat until a final task_wait_batch with wait_for=all confirms every required task is terminal, then verify material claims and integrate one substantive answer to the original request.",
+    "For supervised collaboration, call agent_wait with waitFor=any on the remaining IDs, inspect each newly terminal summary, and use agent_resume for gaps or corrections.",
+    "Repeat until a final agent_wait with waitFor=all confirms every required task is terminal, then verify material claims and integrate one substantive answer to the original request.",
   ].join(" ");
 }
 
 function supervisedAllConfirmationRepairPrompt(taskIds: readonly string[]): string {
   return [
     "The supervised tasks observed so far are terminal, but the required all-task closure check has not been performed.",
-    `Call task_wait_batch with wait_for=all for these still-unconfirmed supervised task IDs before the final answer: ${taskIds.join(", ")}.`,
+    `Call agent_wait with waitFor=all for these still-unconfirmed supervised task IDs before the final answer: ${taskIds.join(", ")}.`,
     "Then read every summary, verify or follow up on any gap, and integrate one substantive answer to the original request.",
   ].join(" ");
 }

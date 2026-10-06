@@ -1433,9 +1433,9 @@ test("CLI agent message controllers bind senders, list descendants, and isolate 
         };
       };
     }).options.runtime?.options.runtime.options.toolRegistry;
-    const rootSend = rootRegistry.get("agent_message_send");
-    const rootList = rootRegistry.get("agent_message_list");
-    const childSend = childRegistry?.get("agent_message_send");
+    const rootSend = rootRegistry.get("agent_send");
+    const rootList = rootRegistry.get("agent_list");
+    const childSend = childRegistry?.get("agent_send");
     expect(rootSend).toBeDefined();
     expect(rootList).toBeDefined();
     expect(childSend).toBeDefined();
@@ -1480,7 +1480,7 @@ test("CLI agent message controllers bind senders, list descendants, and isolate 
         message: { role: "user", content: "corrupt mixed ownership metadata" },
       },
     });
-    const listed = await rootList?.execute({}, agentMessageToolContext(repo, rootSessionId));
+    const listed = await rootList?.execute({ view: "messages" }, agentMessageToolContext(repo, rootSessionId));
     const listedOutput = JSON.parse(listed?.output ?? "{}") as {
       count?: number;
       messages?: Array<{ message_id?: string; to_path?: string }>;
@@ -2086,7 +2086,7 @@ test("CLI runPrompt leaves system prompt selection to the harness service", asyn
   expect(submitted[0]).not.toHaveProperty("system");
 });
 
-test("CLI exact-session resume rejects a subagent session and points to task_followup", async () => {
+test("CLI exact-session resume rejects a subagent session and points to agent_resume", async () => {
   const root = await mkdtempName();
   const repo = join(root, "repo");
   let harness: CliHarness | undefined;
@@ -2131,7 +2131,7 @@ test("CLI exact-session resume rejects a subagent session and points to task_fol
       sessionId: childSessionId,
       prompt: "resume by raw child session id",
       maxTurns: 1,
-    })).rejects.toThrow("Use task_followup for the owning task");
+    })).rejects.toThrow("Use agent_resume for the owning task");
 
     await harness.events.append({
       id: "event_task_cli_child_terminal",
@@ -2190,7 +2190,7 @@ test("CLI exact-session resume rejects a pending child before session creation",
       sessionId: childSessionId,
       prompt: "resume the capacity-queued child directly",
       maxTurns: 1,
-    })).rejects.toThrow("Use task_followup for the owning task");
+    })).rejects.toThrow("Use agent_resume for the owning task");
   } finally {
     await harness?.close();
     await rm(root, { recursive: true, force: true });

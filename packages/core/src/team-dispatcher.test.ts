@@ -587,7 +587,7 @@ test("applies one concurrent background sync and fences stale sync after verifie
       taskId: task.id,
       memberPath: workerPath,
       childSessionId: dispatchedAgentTask.childSessionId,
-      allowedTools: expect.arrayContaining(["read", "complete_task", "team_task_update"]),
+      allowedTools: expect.arrayContaining(["read", "complete_task", "team_task_update", "agent_send", "agent_list"]),
       writeScope: [],
       executeScope: [],
     });
@@ -1118,7 +1118,7 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
               allowed: true,
               writeScope: ["packages/core/src"],
               requiredTools: ["edit"],
-              allowedTools: expect.arrayContaining(["read", "edit", "complete_task", "team_task_update"]),
+              allowedTools: expect.arrayContaining(["read", "edit", "code_mode", "complete_task", "team_task_update"]),
               checkedAt: 240,
             },
           },
@@ -1130,7 +1130,7 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
       taskId: scopedWriteTask.id,
       memberPath: workerPath,
       writeScope: ["packages/core/src"],
-      allowedTools: expect.arrayContaining(["read", "edit", "complete_task", "team_task_update"]),
+      allowedTools: expect.arrayContaining(["read", "edit", "code_mode", "complete_task", "team_task_update"]),
     });
 
     const existingWriter = await teams.createTask({

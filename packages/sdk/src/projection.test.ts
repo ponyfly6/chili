@@ -3137,7 +3137,42 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
   expect(chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId })).toEqual(once);
 });
 
-test("projects a single task as an expected-one card with initial generation two", () => {
+test.each([
+  { input: { description: "Review", prompt: "Inspect the change." }, expected: 1, completionPolicy: "join" },
+  { input: { description: "Review", prompt: "Inspect the change.", mode: "background" }, expected: 1, completionPolicy: "notify" },
+  { input: { tasks: [{ description: "Review", prompt: "Inspect the change." }, { description: "Test", prompt: "Run tests." }] }, expected: 2, completionPolicy: "join" },
+])("projects agent_spawn before task events arrive: $expected agents with $completionPolicy completion", ({ input, expected, completionPolicy }) => {
+  const sessionId = "session_spawn_pending" as SessionId;
+  const callId = "call_spawn_pending" as ToolCallId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_spawn_pending_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_spawn_pending_call",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      payload: { turnId: "turn_spawn_pending" as TurnId, callId, toolName: "agent_spawn", input },
+    },
+  ], createRuntimeView());
+
+  expect(chatAgentBatches(view, { sessionId })).toEqual([
+    expect.objectContaining({
+      callId,
+      expected,
+      tracked: 0,
+      terminal: false,
+      integration: expect.objectContaining({ completionPolicy }),
+    }),
+  ]);
+});
+
+test.each(["task", "agent_spawn"])("projects a single %s as an expected-one card with initial generation two", (toolName) => {
   const sessionId = "session_inline_single" as SessionId;
   const callId = "call_inline_single" as ToolCallId;
   const taskId = "task_inline_single_hash" as TaskId;
@@ -3158,7 +3193,7 @@ test("projects a single task as an expected-one card with initial generation two
       payload: {
         turnId: "turn_inline_single" as TurnId,
         callId,
-        toolName: "task",
+        toolName,
         input: { description: "Friendly reviewer", prompt: "Read the actual long prompt body.", mode: "background", completionPolicy: "detached" },
       },
     },
@@ -3558,7 +3593,7 @@ test("associates cross-turn join continuation but rejects an unrelated later use
   });
 });
 
-test("uses an exact terminal task_followup result to associate a later tool continuation", () => {
+test.each(["task_followup", "agent_resume"])("uses an exact terminal %s result to associate a later tool continuation", (followupToolName) => {
   const sessionId = "session_inline_followup_integration" as SessionId;
   const callId = "call_inline_followup_origin" as ToolCallId;
   const taskId = "task_inline_followup_integration" as TaskId;
@@ -3652,7 +3687,7 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       payload: {
         turnId: "turn_inline_followup_tool" as TurnId,
         callId: "call_inline_followup_exact" as ToolCallId,
-        toolName: "task_followup",
+        toolName: followupToolName,
         input: { taskId: inputTaskId, prompt: "Recheck the edge case." },
       },
     },
@@ -3955,7 +3990,10 @@ test("associates one continuation response with overlapping batches from the sam
   ]);
 });
 
-test("requires a supervised wait-all to cover every task before integration can proceed", () => {
+test.each([
+  { spawn: "task_batch", wait: "task_wait_batch", resume: "task_followup", singleWait: "task_wait", singleReady: false },
+  { spawn: "agent_spawn", wait: "agent_wait", resume: "agent_resume", singleWait: "agent_wait", singleReady: true },
+])("requires a supervised $wait wait-all to cover every task before integration can proceed", (toolNames) => {
   const sessionId = "session_inline_supervised" as SessionId;
   const callId = "call_inline_supervised" as ToolCallId;
   const taskIds = ["task_inline_supervised_a", "task_inline_supervised_b"] as TaskId[];
@@ -3973,7 +4011,7 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      payload: { turnId: "turn_inline_supervised" as TurnId, callId, toolName: "task_batch", input: { batchId, completionPolicy: "supervised", tasks: [{}, {}] } },
+      payload: { turnId: "turn_inline_supervised" as TurnId, callId, toolName: toolNames.spawn, input: { batchId, completionPolicy: "supervised", tasks: [{}, {}] } },
     },
     ...taskIds.flatMap((taskId, index) => [
       ...inlineTaskStartEvents({
@@ -4026,7 +4064,7 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_started",
       time: 9 as TimestampMs,
       sessionId,
-      payload: { turnId: "turn_inline_supervised_partial_wait" as TurnId, callId: "call_inline_supervised_partial_wait" as ToolCallId, toolName: "task_wait_batch", input: { batchId, taskIds: [taskIds[0]], waitFor: "all" } },
+      payload: { turnId: "turn_inline_supervised_partial_wait" as TurnId, callId: "call_inline_supervised_partial_wait" as ToolCallId, toolName: toolNames.wait, input: { batchId, taskIds: [taskIds[0]], waitFor: "all" } },
     },
     {
       id: "event_inline_supervised_partial_wait_done",
@@ -4044,7 +4082,7 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_started",
       time: 11 as TimestampMs,
       sessionId,
-      payload: { turnId: "turn_inline_supervised_full_wait" as TurnId, callId: "call_inline_supervised_full_wait" as ToolCallId, toolName: "task_wait_batch", input: { batchId, taskIds, waitFor: "all" } },
+      payload: { turnId: "turn_inline_supervised_full_wait" as TurnId, callId: "call_inline_supervised_full_wait" as ToolCallId, toolName: toolNames.wait, input: { batchId, taskIds, waitFor: "all" } },
     },
     {
       id: "event_inline_supervised_full_wait_done",
@@ -4070,7 +4108,7 @@ test("requires a supervised wait-all to cover every task before integration can 
       payload: {
         turnId: "turn_inline_supervised_followup" as TurnId,
         callId: "call_inline_supervised_followup" as ToolCallId,
-        toolName: "task_followup",
+        toolName: toolNames.resume,
         input: { taskId: taskIds[0], prompt: "Recheck the first result." },
       },
     },
@@ -4132,7 +4170,7 @@ test("requires a supervised wait-all to cover every task before integration can 
       payload: {
         turnId: "turn_inline_supervised_reconfirmed_wait" as TurnId,
         callId: "call_inline_supervised_reconfirmed_wait" as ToolCallId,
-        toolName: "task_wait_batch",
+        toolName: toolNames.wait,
         input: { batchId, taskIds, waitFor: "all" },
       },
     },
@@ -4175,7 +4213,7 @@ test("requires a supervised wait-all to cover every task before integration can 
       payload: {
         turnId: "turn_inline_supervised_single" as TurnId,
         callId: singleCallId,
-        toolName: "task_batch",
+        toolName: toolNames.spawn,
         input: { completionPolicy: "supervised", tasks: [{ description: "single", prompt: "supervise single" }] },
       },
     },
@@ -4219,20 +4257,20 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_started",
       time: 7 as TimestampMs,
       sessionId: singleSessionId,
-      payload: { turnId: "turn_inline_supervised_single_wait" as TurnId, callId: "call_inline_supervised_single_wait" as ToolCallId, toolName: "task_wait", input: { taskId: singleTaskId } },
+      payload: { turnId: "turn_inline_supervised_single_wait" as TurnId, callId: "call_inline_supervised_single_wait" as ToolCallId, toolName: toolNames.singleWait, input: { taskId: singleTaskId } },
     },
     {
       id: "event_inline_supervised_single_wait_done",
       type: "tool.call_finished",
       time: 8 as TimestampMs,
       sessionId: singleSessionId,
-      payload: { callId: "call_inline_supervised_single_wait" as ToolCallId, status: "completed", output: JSON.stringify({ taskId: singleTaskId, status: "completed" }) },
+      payload: { callId: "call_inline_supervised_single_wait" as ToolCallId, status: "completed", output: JSON.stringify(toolNames.singleReady ? { tasks: [{ taskId: singleTaskId, status: "completed" }] } : { taskId: singleTaskId, status: "completed" }) },
     },
   ], createRuntimeView());
   expect(chatAgentBatches(singleView, { sessionId: singleSessionId })[0]?.integration).toMatchObject({
     completionPolicy: "supervised",
-    status: "pending",
-    evidence: "results_ready",
+    status: toolNames.singleReady ? "ready" : "pending",
+    evidence: toolNames.singleReady ? "tool_result" : "results_ready",
   });
 });
 

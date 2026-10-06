@@ -210,17 +210,17 @@ test("expanded batches render a shared completion message only once", () => {
   expect(expanded.split("Shared completion evidence")).toHaveLength(2);
 });
 
-test("task_batch tool cell is replaced by lifecycle card instead of hidden JSON output", () => {
+test.each(["task_batch", "agent_spawn"])("%s tool cell is replaced by lifecycle card instead of hidden JSON output", (toolName) => {
   const callId = "call_agents" as ToolCallId;
   const item: ChatTranscriptItem = {
     id: callId,
     kind: "tool",
-    toolName: "task_batch",
+    toolName,
     status: "completed",
     displayStatus: "succeeded",
     waitingForApproval: false,
     updatedAt: 20,
-    inputSummary: { title: "task_batch" },
+    inputSummary: { title: toolName },
     input: { tasks: [{ description: "Map routes", prompt: "Inspect routes" }] },
     output: JSON.stringify({ tasks: [{ status: "completed", summary: "Found routes" }] }),
   };

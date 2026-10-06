@@ -16,11 +16,12 @@ export const SCOPED_WORKER_BASE_TOOLS = [
   "glob",
   "grep",
   "git_diff",
+  "code_mode",
   "tool_search",
   "activate_skill",
   "complete_task",
-  "agent_message_send",
-  "agent_message_list",
+  "agent_send",
+  "agent_list",
   "team_snapshot",
   "team_task_list",
   "team_task_update",
@@ -45,8 +46,19 @@ export function completeWorkerToolPolicy(
 ): WorkerToolPolicy {
   return {
     ...template,
+    // Composition is a baseline capability; nested calls still use this policy.
+    ...(template.allowedTools ? { allowedTools: [...new Set([...normalizeWorkerMessagingTools(template.allowedTools), "code_mode"])] } : {}),
+    ...(template.deniedTools ? { deniedTools: normalizeWorkerMessagingTools(template.deniedTools) } : {}),
     childSessionId,
   };
+}
+
+function normalizeWorkerMessagingTools(tools: readonly string[]): string[] {
+  return [...new Set(tools.map((tool) => {
+    if (tool === "agent_message_send") return "agent_send";
+    if (tool === "agent_message_list") return "agent_list";
+    return tool;
+  }))];
 }
 
 export function workerPolicySystemSummary(policy: WorkerToolPolicy): string {

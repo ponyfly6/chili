@@ -1,0 +1,56 @@
+# Tool discovery and model exposure
+
+The Host starts root coding sessions with these fourteen tools when available:
+`read`, `glob`, `grep`, `edit`, `write`, `apply_patch`, `bash`, `process`,
+`git_status`, `git_diff`, `code_mode`, `tool_search`, `activate_skill`, and
+`request_user_input`. Headless Hosts without an input queue omit the last tool.
+Worker sessions additionally advertise their completion and messaging controls,
+subject to worker policy. Registered tools remain implemented independently.
+Embedders using `SingleAgentRuntime` directly opt in with `toolExposure`; without
+that configuration their supplied catalog stays exposed, including when they do
+not install a discovery tool.
+
+There are three views of one registry:
+
+- The authorized catalog is filtered by the current session/worker policy. Tool
+  discovery and code mode use this catalog, not the list of model definitions.
+- The model surface contains eager tools, tools explicitly loaded in the session,
+  and control tools required by durable Goal, Agent, and Team state.
+- The script catalog contains authorized tools that opt in with `codeMode: true`.
+  Orchestrators and direct-only tools remain excluded.
+
+`tool_search` ranks names, aliases, descriptions and search hints using BM25, with
+exact names/aliases taking priority. Unicode tokenization supports Chinese
+metadata. `select:name1,name2` resolves exact names or aliases, including already
+loaded tools. Search returns complete input/output contracts and the JavaScript
+access expression, with a maximum of 20 matches per request.
+
+Direct search loads matching definitions and related control tools for subsequent
+model requests. Loading appends `session.tools_loaded` with canonical names to the
+event store. These additive selections survive compaction and reopening the
+database and never leak to another session. Selecting a tool does not register it
+or authorize it. A removed or newly denied tool is absent from all current views.
+An unloaded direct call, including an alias, returns guidance to search first;
+loading and calling it in the same model response does not change that response's
+advertised tool snapshot.
+
+Scripts may call authorized deferred tools without searching first. A script's
+search defaults to inspection (`load: false`), so querying a contract does not
+inflate subsequent direct model requests. `ALL_TOOLS` remains a lightweight
+name/description directory. Use `tool_search` to obtain complete parameter schemas.
+All actual calls still go through the existing Executor, current authorization,
+catalog validation, effect scheduler and event recording.
+
+Searching an Agent, Goal or Team tool loads its related control group. The Host
+also reconstructs required groups from persisted domain projections for sessions
+created before discovery existed or work created through the API. Completed
+agents retain inspection/resume controls. These groups are filtered again by the
+current policy; they cannot enable disabled delegation or grant worker access.
+
+The ad-hoc Agent group contains six canonical tools: `agent_spawn`, `agent_list`,
+`agent_send`, `agent_wait`, `agent_stop`, and `agent_resume`. They can also be called
+through code mode without direct loading. See [Agent tools](AGENT_TOOLS.md) for
+the merged single/batch interface and lifecycle semantics. Domain services,
+permission defaults and Memory write semantics remain unchanged. Loaded definitions are retained for the
+session; there is no usage-based eviction yet. Evaluate definition size, search
+round trips and tool/argument errors before changing the default surface.

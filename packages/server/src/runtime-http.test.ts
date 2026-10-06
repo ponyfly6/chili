@@ -3675,7 +3675,7 @@ test("rejects direct HTTP prompts, commands, controls, and lifecycle mutations f
     const response = await handler(request);
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({
-      error: { message: expect.stringContaining("Use task_followup for the owning task") },
+      error: { message: expect.stringContaining("Use agent_resume for the owning task") },
     });
   }
   expect(service.lastPrompt).toBeUndefined();
@@ -3765,7 +3765,7 @@ test("rejects a known pending child over HTTP before its session row exists", as
     const response = await handler(request);
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({
-      error: { message: expect.stringContaining("Use task_followup for the owning task") },
+      error: { message: expect.stringContaining("Use agent_resume for the owning task") },
     });
   }
   expect(service.lastPrompt).toBeUndefined();

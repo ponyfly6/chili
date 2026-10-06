@@ -207,26 +207,29 @@ const taskRenderer: ToolRenderer = {
   name: "task",
   match: (toolName) => {
     const name = normalizeToolName(toolName);
-    return name === "task" || name === "agent" || name === "complete_task" || name.startsWith("task_") || name.startsWith("agent_message_");
+    return name === "task" || name === "agent" || name === "complete_task" || name.startsWith("task_") || name.startsWith("agent_");
   },
-  mode: (input) => (normalizeToolName(input.toolName) === "task_batch" || normalizeToolName(input.toolName) === "task_wait_batch") && !input.showToolDetails ? "inline" : defaultToolMode(input),
+  mode: (input) => (isAgentBatchSpawn(input) || normalizeToolName(input.toolName) === "task_wait_batch" || normalizeToolName(input.toolName) === "agent_wait") && !input.showToolDetails ? "inline" : defaultToolMode(input),
   summary: (input) => {
     const name = normalizeToolName(input.toolName);
-    if (name === "task_batch") return taskBatchSummary(input.output);
-    if (name === "task_wait_batch") return taskWaitBatchSummary(input.output);
+    if (isAgentBatchSpawn(input)) return taskBatchSummary(input.output);
+    if (name === "task_wait_batch" || name === "agent_wait") return taskWaitBatchSummary(input.output);
     return defaultSummary(input);
   },
   label: (input) => {
     const name = normalizeToolName(input.toolName);
-    if (name === "task" || name === "agent") return labelWithTarget(statusVerb(input.displayStatus, "Started ad-hoc agent", "Starting ad-hoc agent"), stringFromInput(input.input, "description") ?? input.inputSummary.detail);
-    if (name === "task_batch") return taskBatchLabel(input);
+    if (isAgentBatchSpawn(input)) return taskBatchLabel(input);
+    if (name === "task" || name === "agent" || name === "agent_spawn") return labelWithTarget(statusVerb(input.displayStatus, "Started ad-hoc agent", "Starting ad-hoc agent"), stringFromInput(input.input, "description") ?? input.inputSummary.detail);
     if (name === "complete_task") return labelWithTarget(statusVerb(input.displayStatus, "Completed task", "Completing task"), taskIdTarget(input));
-    if (name === "task_list") return labelWithTarget(statusVerb(input.displayStatus, "Listed ad-hoc agents", "Listing ad-hoc agents"), stringFromInput(input.input, "status") ?? input.inputSummary.detail);
-    if (name === "task_wait") return labelWithTarget(statusVerb(input.displayStatus, "Waited for ad-hoc agent", "Waiting for ad-hoc agent"), taskIdTarget(input));
-    if (name === "task_wait_batch") return labelWithTarget(statusVerb(input.displayStatus, "Waited for", "Waiting for"), taskWaitBatchTarget(input.input));
+    if (name === "agent_list" && stringFromInput(input.input, "view") === "messages") return labelWithTarget(statusVerb(input.displayStatus, "Listed agent messages", "Listing agent messages"), stringFromInput(input.input, "status", "path", "from"));
+    if (name === "task_list" || name === "agent_list") return labelWithTarget(statusVerb(input.displayStatus, "Listed ad-hoc agents", "Listing ad-hoc agents"), stringFromInput(input.input, "status") ?? input.inputSummary.detail);
+    if (name === "task_wait" || (name === "agent_wait" && stringFromInput(input.input, "taskId", "task_id"))) return labelWithTarget(statusVerb(input.displayStatus, "Waited for ad-hoc agent", "Waiting for ad-hoc agent"), taskIdTarget(input));
+    if (name === "task_wait_batch" || name === "agent_wait") return labelWithTarget(statusVerb(input.displayStatus, "Waited for", "Waiting for"), taskWaitBatchTarget(input.input));
     if (name === "task_followup") return labelWithTarget(statusVerb(input.displayStatus, "Sent agent follow-up", "Sending agent follow-up"), taskIdTarget(input));
+    if (name === "agent_resume") return labelWithTarget(statusVerb(input.displayStatus, "Resumed ad-hoc agent", "Resuming ad-hoc agent"), taskIdTarget(input));
     if (name === "task_close") return labelWithTarget(statusVerb(input.displayStatus, "Closed ad-hoc agent", "Closing ad-hoc agent"), taskIdTarget(input));
-    if (name === "agent_message_send") return labelWithTarget(statusVerb(input.displayStatus, "Sent agent message to", "Sending agent message to"), stringFromInput(input.input, "to", "target"));
+    if (name === "agent_stop") return labelWithTarget(statusVerb(input.displayStatus, "Stopped ad-hoc agent", "Stopping ad-hoc agent"), taskIdTarget(input));
+    if (name === "agent_message_send" || name === "agent_send") return labelWithTarget(statusVerb(input.displayStatus, "Sent agent message to", "Sending agent message to"), stringFromInput(input.input, "to", "target"));
     if (name === "agent_message_list") return labelWithTarget(statusVerb(input.displayStatus, "Listed agent messages", "Listing agent messages"), stringFromInput(input.input, "status", "path", "from"));
     return labelWithTarget(statusVerb(input.displayStatus, `Ran ${input.inputSummary.title}`, `Running ${input.inputSummary.title}`), taskIdTarget(input) ?? input.inputSummary.detail);
   },
@@ -645,6 +648,11 @@ function pathListTarget(input: ToolRenderInput): string | undefined {
 
 function taskIdTarget(input: ToolRenderInput): string | undefined {
   return stringFromInput(input.input, "taskId", "task_id") ?? input.inputSummary.detail ?? input.inputSummary.scope;
+}
+
+function isAgentBatchSpawn(input: ToolRenderInput): boolean {
+  const name = normalizeToolName(input.toolName);
+  return name === "task_batch" || (name === "agent_spawn" && Array.isArray(recordValue(input.input)?.tasks));
 }
 
 function taskBatchTarget(input: unknown): string {

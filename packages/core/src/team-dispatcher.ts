@@ -1330,14 +1330,17 @@ function normalizeToolName(tool: string): string {
   if (normalized === "read_file") return "read";
   if (normalized === "write_file") return "write";
   if (normalized === "patch") return "apply_patch";
+  if (normalized === "agent_message_send") return "agent_send";
+  if (normalized === "agent_message_list") return "agent_list";
   return normalized;
 }
 
 function isEssentialWorkerTool(tool: string): boolean {
   return (
     tool === "complete_task" ||
-    tool === "agent_message_send" ||
-    tool === "agent_message_list" ||
+    tool === "agent_send" ||
+    tool === "agent_list" ||
+    tool === "code_mode" ||
     tool === "tool_search" ||
     tool === "team_snapshot" ||
     tool === "team_task_list" ||

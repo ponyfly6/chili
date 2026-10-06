@@ -33,10 +33,10 @@ import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.
 import { RuntimeService } from "./runtime-service.js";
 import { SingleAgentRuntime } from "./single-agent-runtime.js";
 
-test("join task_batch repairs a launch-only parent response and integrates terminal summaries", async () => {
+test.each(["task_batch", "agent_spawn"])("join %s repairs a launch-only parent response and integrates terminal summaries", async (spawnName) => {
   const fixture = await createFixture("join");
   const controller = new JoinedBatchController();
-  fixture.registry.register(createTaskBatchTool(controller, controller));
+  fixture.registry.register({ ...createTaskBatchTool(controller, controller), name: spawnName });
   let modelCalls = 0;
   const model: ModelRouter = {
     async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
@@ -44,7 +44,7 @@ test("join task_batch repairs a launch-only parent response and integrates termi
       if (modelCalls === 1) {
         yield {
           type: "tool_call",
-          name: "task_batch",
+          name: spawnName,
           input: {
             tasks: [
               { description: "auth", prompt: "inspect auth" },
@@ -151,12 +151,15 @@ test("notify completion wake repairs a completion-only response before the paren
   }
 });
 
-test("supervised batch keeps the parent turn open through wait-any, follow-up, wait-all, and integration", async () => {
+test.each([
+  ["task_batch", "task_wait_batch", "task_followup"],
+  ["agent_spawn", "agent_wait", "agent_resume"],
+])("supervised %s keeps the parent turn open through wait-any, resume, wait-all, and integration", async (spawnName, waitName, resumeName) => {
   const fixture = await createFixture("supervised");
   const controller = new JoinedBatchController();
-  fixture.registry.register(createTaskBatchTool(controller, controller));
-  fixture.registry.register(createTaskWaitBatchTool(controller));
-  fixture.registry.register(createTaskFollowupTool(controller));
+  fixture.registry.register({ ...createTaskBatchTool(controller, controller), name: spawnName });
+  fixture.registry.register({ ...createTaskWaitBatchTool(controller), name: waitName });
+  fixture.registry.register({ ...createTaskFollowupTool(controller), name: resumeName });
   let modelCalls = 0;
   const model: ModelRouter = {
     async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
@@ -164,7 +167,7 @@ test("supervised batch keeps the parent turn open through wait-any, follow-up, w
       if (modelCalls === 1) {
         yield {
           type: "tool_call",
-          name: "task_batch",
+          name: spawnName,
           input: {
             completion_policy: "supervised",
             tasks: [
@@ -184,10 +187,10 @@ test("supervised batch keeps the parent turn open through wait-any, follow-up, w
         return;
       }
       if (modelCalls === 3) {
-        expect(input.developer?.join("\n")).toContain("task_wait_batch with wait_for=any");
+        expect(input.developer?.join("\n")).toContain("agent_wait with waitFor=any");
         yield {
           type: "tool_call",
-          name: "task_wait_batch",
+          name: waitName,
           input: { task_ids: ["task_1", "task_2"], wait_for: "any", batch_id: "supervised_review" },
         };
         yield { type: "finish", reason: "tool_use" };
@@ -196,7 +199,7 @@ test("supervised batch keeps the parent turn open through wait-any, follow-up, w
       if (modelCalls === 4) {
         yield {
           type: "tool_call",
-          name: "task_followup",
+          name: resumeName,
           input: { task_id: "task_1", prompt: "verify the retry fence and give exact evidence" },
         };
         yield { type: "finish", reason: "tool_use" };
@@ -205,8 +208,10 @@ test("supervised batch keeps the parent turn open through wait-any, follow-up, w
       if (modelCalls === 5) {
         yield {
           type: "tool_call",
-          name: "task_wait_batch",
-          input: { task_ids: ["task_1", "task_2"], batch_id: "supervised_review" },
+          name: waitName,
+          input: waitName === "agent_wait"
+            ? { ids: ["task_1", " task_2 ", "task_1"], batch_id: "supervised_review" }
+            : { task_ids: ["task_1", "task_2"], batch_id: "supervised_review" },
         };
         yield { type: "finish", reason: "tool_use" };
         return;

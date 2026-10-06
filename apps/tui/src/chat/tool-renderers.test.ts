@@ -522,6 +522,51 @@ test("team renderers label batched tasks and summarize run loop output", () => {
   });
 });
 
+test.each([
+  { toolName: "agent_spawn", input: { description: "inspect API", prompt: "inspect" }, label: "Started ad-hoc agent inspect API" },
+  { toolName: "agent_list", input: { status: "running" }, label: "Listed ad-hoc agents running" },
+  { toolName: "agent_list", input: { view: "messages", status: "queued" }, label: "Listed agent messages queued" },
+  { toolName: "agent_send", input: { to: "/root/reader", content: "inspect API" }, label: "Sent agent message to /root/reader" },
+  { toolName: "agent_wait", input: { taskId: "task_a" }, label: "Waited for ad-hoc agent task_a" },
+  { toolName: "agent_stop", input: { taskId: "task_a" }, label: "Stopped ad-hoc agent task_a" },
+  { toolName: "agent_resume", input: { taskId: "task_a", prompt: "continue" }, label: "Resumed ad-hoc agent task_a" },
+])("unified $toolName renderer exposes its lifecycle action", ({ toolName, input, label }) => {
+  expect(renderToolActivity(toolInput({
+    toolName,
+    inputSummary: { title: toolName },
+    input,
+  })).label).toBe(label);
+});
+
+test("unified agent spawn and wait retain batch summaries", () => {
+  const tasks = [
+    { taskId: "task_a", status: "completed" },
+    { taskId: "task_b", status: "running" },
+  ];
+  const spawned = renderToolActivity(toolInput({
+    toolName: "agent_spawn",
+    inputSummary: { title: "agent_spawn" },
+    input: { tasks: [{ description: "API" }, { description: "TUI" }], maxConcurrency: 2 },
+    output: JSON.stringify({ count: 2, maxConcurrency: 2, tasks }),
+  }));
+  const waited = renderToolActivity(toolInput({
+    toolName: "agent_wait",
+    inputSummary: { title: "agent_wait" },
+    input: { taskIds: ["task_a", "task_b"], waitFor: "any" },
+    output: JSON.stringify({ count: 2, waitFor: "any", timedOut: false, tasks }),
+  }));
+  expect(spawned).toMatchObject({
+    label: "Started 2 ad-hoc agents",
+    mode: "inline",
+    summary: "agents=2, fanout=2, running=1, completed=1",
+  });
+  expect(waited).toMatchObject({
+    label: "Waited for 2 ad-hoc agents (any)",
+    mode: "inline",
+    summary: "wait=any, agents=2, timed_out=false, running=1, completed=1",
+  });
+});
+
 test("agent and team renderers distinguish ad-hoc work from persistent teams", () => {
   const batch = renderToolActivity(toolInput({
     toolName: "task_batch",

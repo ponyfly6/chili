@@ -86,7 +86,11 @@ bun run smoke:desktop
 
 在桌面 Phone 面板选择本机私网地址和端口，再通过原生对话框选择证书及私钥；保存后单独开启，无需启动环境变量。配置会保留，启用状态与手机授权不会保留。网络与证书配置、浏览器自动化入口和五分钟手机检查清单见 [私网手机 Alpha 验收指南](docs/private-mobile-alpha-acceptance.md)。当前已有真实浏览器到桌面/runtime 的自动化验证，**iPhone / Android 真机验收尚未执行**。此 Alpha 不包含公网 relay、账号、原生手机 App 或后台 daemon。
 
-运行时会话现在只使用 `session-id` 标识；旧的 `--thread` 参数不再支持。`--resume` 只接受已存在且活跃的交互式 session，子代理 session 请通过 `task_followup` 继续。多代理任务仍以 `task-id` 作为用户可见标识，每个子代理对应唯一的 child session，后续消息会复用同一个 `task-id` 和 child session。邮箱工具输出中的接收方字段已从 `child_session_id` / `childSessionId` 更名为 `recipient_session_id` / `recipientSessionId`。
+运行时会话现在只使用 `session-id` 标识；旧的 `--thread` 参数不再支持。`--resume` 只接受已存在且活跃的交互式 session，子代理 session 请通过 `agent_resume` 继续。多代理任务仍以 `task-id` 作为用户可见标识，每个子代理对应唯一的 child session，后续消息会复用同一个 `task-id` 和 child session。邮箱工具输出中的接收方字段已从 `child_session_id` / `childSessionId` 更名为 `recipient_session_id` / `recipientSessionId`。
+
+Agent 管理统一使用 `agent_spawn`、`agent_list`、`agent_send`、`agent_wait`、`agent_stop`、`agent_resume`，支持按需加载和 code mode。[参数与生命周期说明](packages/tools/AGENT_TOOLS.md)。
+
+通过配置中的 `[agents]` 设置 `max_children`（每个 Agent 的直接子 Agent 数量）、`max_depth`（主 Agent 为第 0 层的最大深度）和 `max_concurrent`（共享并发数量），控制横向与纵向扩展。[配置示例](packages/host/AGENT_CONFIG.md)。
 
 身份职责保持正交：`SessionId` 标识可恢复的对话上下文，`TaskId` 标识逻辑代理任务，`AgentRunId` 标识该任务的一次执行尝试，`TurnId` 只标识一次模型轮次。Follow-up 会复用 `TaskId + SessionId`，同时创建新的 `AgentRunId` 并递增 generation。
 

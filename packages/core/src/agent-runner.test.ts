@@ -116,17 +116,17 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
   );
   await expect(root.submitPrompt(input)).rejects.toMatchObject({
     name: "RuntimeSubagentSessionAccessError",
-    message: expect.stringContaining("Use task_followup for the owning task"),
+    message: expect.stringContaining("Use agent_resume for the owning task"),
   });
   const asyncError = new Promise<unknown>((resolve) => {
     root.submitPromptAsync({ ...input, text: "async bypass" }, resolve);
   });
   await expect(asyncError).resolves.toMatchObject({
     name: "RuntimeSubagentSessionAccessError",
-    message: expect.stringContaining("Use task_followup for the owning task"),
+    message: expect.stringContaining("Use agent_resume for the owning task"),
   });
   expect(root.isRunning(sessionId)).toBe(false);
-  await expect(root.appendUserMessage(input)).rejects.toThrow("Use task_followup for the owning task");
+  await expect(root.appendUserMessage(input)).rejects.toThrow("Use agent_resume for the owning task");
   await expect(root.compactSession({ sessionId })).rejects.toBeInstanceOf(
     RuntimeSubagentSessionAccessError,
   );

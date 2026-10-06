@@ -1,4 +1,5 @@
 import { mkdir, realpath } from "node:fs/promises";
+import { createHostToolExposure } from "./tool-surface.js";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   AgentRunnerSubagentRunner,
@@ -6,7 +7,6 @@ import {
   AgentTreeControlService,
   AgentTaskControlService,
   DelegationPolicyGate,
-  DEFAULT_LOCAL_SUBAGENT_MAX_ACTIVE_RUNS,
   LocalSubagentConcurrencyLimiter,
   LocalSubagentManager,
   RuntimeService,
@@ -20,6 +20,7 @@ import {
   TeamWorktreeService,
   buildChiliMemoryPromptFragments,
   chiliBasePromptFragment,
+  completeWorkerToolPolicy,
   createMemoryTool,
   defaultScopedWorkerPolicy,
   type ModelRouter,
@@ -35,6 +36,7 @@ import {
   DeferredApprovalQueue,
   DeferredUserInputQueue,
   DELEGATION_OFF_DENIED_TOOL_NAMES,
+  CODING_TOOL_GROUPS,
   FileSystemSnapshotProvider,
   InMemoryToolRegistry,
   ManagedProcessManager,
@@ -50,15 +52,17 @@ import {
   ToolExecutor,
   createApplyPatchTool,
   createActivateSkillTool,
-  createAgentMessageListTool,
-  createAgentMessageSendTool,
+  createAgentSpawnTool,
+  createAgentListTool,
+  createAgentSendTool,
+  createAgentWaitTool,
+  createAgentStopTool,
+  createAgentResumeTool,
   createBashTool,
   createCodeModeTool,
   createProcessTool,
   createDelegationSetTool,
   createDelegationStatusTool,
-  createMailboxConsumeTool,
-  createMailboxListTool,
   createCompleteTaskTool,
   createEditTool,
   createGitBranchTool,
@@ -74,13 +78,6 @@ import {
   createReadFileTool,
   createReadImageTool,
   createRequestUserInputTool,
-  createTaskCloseTool,
-  createTaskBatchTool,
-  createTaskFollowupTool,
-  createTaskListTool,
-  createTaskTool,
-  createTaskWaitBatchTool,
-  createTaskWaitTool,
   createTeamCreateTool,
   createTeamListTool,
   createTeamMemberAddTool,
@@ -102,6 +99,7 @@ import {
   createToolSearchTool,
   createWriteFileTool,
   type BashRunner,
+  type ChiliToolDefinition,
   type BashRunRequest,
   type DelegationToolController,
   type GoalToolController,
@@ -151,7 +149,8 @@ import {
   type ApprovalRulesetResolver,
 } from "./approval.js";
 import { createHostBashRunner } from "./bash-runner.js";
-import { loadHostConfig, type HostConfig } from "./config.js";
+import { loadHostConfig, DEFAULT_HOST_AGENT_CONFIG, type HostConfig, type HostAgentConfig } from "./config.js";
+import { createAgentExpansionController, recursiveWorkerPolicy, resolveAgentAncestry } from "./agent-expansion.js";
 import { createIdFactory } from "./id.js";
 import type { HostModelName, HostReasoningLevel } from "./model.js";
 import { createHostModel, resolveHostRuntimeModelSelection } from "./model.js";
@@ -359,12 +358,17 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       }, staleTurnRecoveryIntervalMs);
       (staleTurnRecoveryTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
     };
-    const childToolPolicyResolver = createWorkerToolPolicyResolver(eventStore, Boolean(options.userInputQueue));
+    const config = await loadHostConfig(cwd, { chiliHome });
+    const childToolPolicyResolver = createWorkerToolPolicyResolver(eventStore, Boolean(options.userInputQueue), config.agents);
     let delegationPolicyGate: DelegationPolicyGate | undefined;
     const delegationToolPolicyResolver = createDelegationToolPolicyResolver(() => delegationPolicyGate);
+    const rootToolPolicyResolver = combineToolAccessPolicyResolvers(
+      createAgentExpansionToolPolicyResolver(eventStore, config.agents),
+      delegationToolPolicyResolver,
+    );
     const combinedChildToolPolicyResolver = combineToolAccessPolicyResolvers(
       childToolPolicyResolver,
-      delegationToolPolicyResolver,
+      rootToolPolicyResolver,
     );
     const assertDelegationEnabled = (input: { sessionId: SessionId; action: string }): Promise<void> => {
       if (!delegationPolicyGate) throw new Error("Delegation policy gate is not initialized");
@@ -394,7 +398,6 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       return discoverSkills({ cwd: canonicalCwd, chiliHome, projectRoot: current.projectRoot });
     };
     await skillRegistryForCwd(cwd);
-    const config = await loadHostConfig(cwd, { chiliHome });
     const approvalState = new PolicyApprovalState();
     const approvalRootBySession = new Map<SessionId, SessionId>();
     const sandboxedShell = options.bashRunner === undefined && process.platform === "darwin";
@@ -457,8 +460,9 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
           allowHostSandboxEscape: false,
           resolveResourceDenials,
         });
+    const childRunLimiter = new LocalSubagentConcurrencyLimiter(config.agents.maxConcurrent);
     const registry = createToolRegistry(skillRegistryForCwd, bashRunner, processes, memoryOptions);
-    const childRegistry = createChildToolRegistry(skillRegistryForCwd, childBashRunner, memoryOptions);
+    const childRegistry = createChildToolRegistry(skillRegistryForCwd, childBashRunner, memoryOptions, childRunLimiter);
     if (options.userInputQueue) {
       const userInputTool = createRequestUserInputTool(
         options.userInputQueue,
@@ -488,7 +492,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
         targetPaths: await targetPathsForSession(eventStore, context.sessionId, context.cwd),
         skillRegistry: await skillRegistryForCwd(context.cwd),
         ...(context.turn ? { turn: context.turn } : {}),
-      });
+      }).then((fragments) => [...fragments, agentExpansionPromptFragment(config.agents)]);
     const childPromptFragments = async (context: { sessionId: SessionId; cwd: string; turn?: RuntimePromptTurnContext }) =>
       buildHostChildPromptFragments({
         cwd: context.cwd,
@@ -499,7 +503,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
         skillRegistry: await skillRegistryForCwd(context.cwd),
         store: eventStore,
         ...(context.turn ? { turn: context.turn } : {}),
-      });
+      }).then((fragments) => [...fragments, agentExpansionPromptFragment(config.agents)]);
     const subagentPromptFragments = async (context: { cwd: string }) => buildHostPromptFragments({
       cwd: context.cwd,
       ...(await memoryOptionsForCwd(context.cwd)),
@@ -530,6 +534,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       model,
       toolRegistry: childRegistry,
       toolExecutor: childToolExecutor,
+      toolExposure: createHostToolExposure(eventStore, "child"),
       toolPolicyResolver: combinedChildToolPolicyResolver,
       createId,
       contextBudget: childContextBudget,
@@ -562,7 +567,6 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       ...(options.sessionClaimHeartbeatMs !== undefined ? { sessionClaimHeartbeatMs: options.sessionClaimHeartbeatMs } : {}),
     });
     initializationDrains.push(() => childService.shutdown("runtime_closed"));
-    const childRunLimiter = new LocalSubagentConcurrencyLimiter(DEFAULT_LOCAL_SUBAGENT_MAX_ACTIVE_RUNS);
     const subagents = new LocalSubagentManager({
       store: eventStore,
       runner: new AgentRunnerSubagentRunner({
@@ -588,14 +592,13 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     });
     initializationDrains.push(() => tasks.shutdown("runtime_closed"));
     const completeTaskController = createCompleteTaskController(tasks, subagents);
-    registry.register(createTaskTool(subagents));
     childRegistry.register(createCompleteTaskTool(completeTaskController));
     const toolExecutor = new ToolExecutor({
       registry,
       executionContext: (operation) => withProcessOwner(owner.token, operation),
       events: { publish: (event) => eventStore.append(event) },
       approvals: createApprovalBroker({ ...options, chiliHome }, config, approvalState, permissions, approvalRulesetsForRequest),
-      policyResolver: delegationToolPolicyResolver,
+      policyResolver: rootToolPolicyResolver,
       snapshotProvider,
       createId,
       maxResultOutputBytes: 256_000,
@@ -610,7 +613,8 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       model,
       toolRegistry: registry,
       toolExecutor,
-      toolPolicyResolver: delegationToolPolicyResolver,
+      toolExposure: createHostToolExposure(eventStore, "root"),
+      toolPolicyResolver: rootToolPolicyResolver,
       createId,
       contextBudget: runtimeContextBudget,
       retryPolicy: {
@@ -728,16 +732,24 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     initializationDrains.push(() => mailboxPump.stop());
     mailboxPump.start();
     const controlController = createSubagentControlController(tasks, agents);
-    registry.register(createTaskBatchTool(subagents, controlController));
-    registry.register(createTaskListTool(controlController));
-    registry.register(createTaskWaitBatchTool(controlController));
-    registry.register(createTaskWaitTool(controlController));
-    registry.register(createTaskFollowupTool(controlController));
-    registry.register(createTaskCloseTool(controlController));
-    registry.register(createMailboxListTool(controlController));
-    registry.register(createMailboxConsumeTool(controlController));
-    registerAgentMessageTools(registry, createAgentMessageToolController(tasks, agents, "root"));
-    registerAgentMessageTools(childRegistry, createAgentMessageToolController(tasks, agents, "child"));
+    const expansionController = createAgentExpansionController({
+      subagents, store: eventStore, limits: config.agents,
+      workerPolicyForSession: (sessionId) => resolveWorkerToolPolicy(eventStore, sessionId, Boolean(options.userInputQueue), config.agents),
+    });
+    const rootMessages = createAgentMessageToolController(tasks, agents, "root");
+    const childMessages = createAgentMessageToolController(tasks, agents, "child");
+    registry.register(suspendAgentTool(createAgentSpawnTool(expansionController, controlController), childRunLimiter));
+    registry.register(createAgentListTool(controlController, rootMessages));
+    registry.register(createAgentSendTool(rootMessages));
+    registry.register(suspendAgentTool(createAgentWaitTool(controlController), childRunLimiter));
+    registry.register(createAgentStopTool(controlController));
+    registry.register(suspendAgentTool(createAgentResumeTool(controlController), childRunLimiter));
+    childRegistry.register(suspendAgentTool(createAgentSpawnTool(expansionController, controlController), childRunLimiter));
+    childRegistry.register(suspendAgentTool(createAgentWaitTool(controlController), childRunLimiter));
+    childRegistry.register(createAgentStopTool(controlController));
+    childRegistry.register(suspendAgentTool(createAgentResumeTool(controlController), childRunLimiter));
+    childRegistry.register(createAgentListTool(controlController, childMessages));
+    childRegistry.register(createAgentSendTool(childMessages));
     registerTeamTools(registry, createTeamToolController(teams, tasks, "root"));
     registerTeamTools(childRegistry, createTeamToolController(teams, tasks, "child"));
     const teamDispatchController = createTeamTaskDispatchToolController(teamDispatcher, teams);
@@ -917,17 +929,58 @@ function registerMcpResourceTools(registry: InMemoryToolRegistry, runtime: HostM
 function createWorkerToolPolicyResolver(
   store: ObservableEventStore,
   allowUserInput = false,
+  agentLimits: HostAgentConfig = DEFAULT_HOST_AGENT_CONFIG,
 ): ToolAccessPolicyResolver {
+  return { resolve: (context) => resolveWorkerToolPolicy(store, context.sessionId, allowUserInput, agentLimits) };
+}
+
+async function resolveWorkerToolPolicy(
+  store: ObservableEventStore,
+  sessionId: SessionId,
+  allowUserInput: boolean,
+  agentLimits: HostAgentConfig,
+): Promise<WorkerToolPolicy> {
+  const policy = await findWorkerToolPolicy(store, sessionId);
+  const resolved = completeWorkerToolPolicy(policy ?? recursiveWorkerPolicy(defaultScopedWorkerPolicy(), agentLimits), sessionId);
+  if (!allowUserInput || !resolved.allowedTools || resolved.allowedTools.includes("request_user_input")) return resolved;
+  return { ...resolved, allowedTools: [...resolved.allowedTools, "request_user_input"] };
+}
+
+function agentExpansionPromptFragment(limits: HostAgentConfig): PromptFragment {
   return {
-    async resolve(context) {
-      const policy = await findWorkerToolPolicy(store, context.sessionId);
-      const resolved = policy ?? defaultScopedWorkerPolicy();
-      if (!allowUserInput || !resolved.allowedTools || resolved.allowedTools.includes("request_user_input")) {
-        return resolved;
-      }
-      return { ...resolved, allowedTools: [...resolved.allowedTools, "request_user_input"] };
-    },
+    id: "chili.agent-expansion", layer: "developer", source: "runtime", priority: 20,
+    lifecycle: "stable", trust: "system",
+    content: `Agent expansion limits: each agent may create at most ${limits.maxChildren} direct child identities in total, including completed or stopped children. Resume an existing agent to reuse its identity. The root is depth 0; the deepest allowed child is depth ${limits.maxDepth}. The Host runs at most ${limits.maxConcurrent} child-agent executions concurrently across all depths, excluding the root and parents waiting for descendants. These limits do not grant tools or override the delegation policy.`,
   };
+}
+
+function suspendAgentTool<Input>(
+  tool: ChiliToolDefinition<Input>,
+  limiter: LocalSubagentConcurrencyLimiter,
+): ChiliToolDefinition<Input> {
+  return { ...tool, execute: (input, context) => {
+    // Background admission returns a handle without waiting for a child. Keep
+    // the parent's slot until it actually waits, so a queued child cannot delay
+    // delivery of its own handle to the parent at max_concurrent=1.
+    if (tool.name === "agent_spawn" && isRecord(input)) {
+      const background = Array.isArray(input.tasks)
+        ? (input.completionPolicy ?? "join") !== "join"
+        : input.mode === "background";
+      if (background) return tool.execute(input, context);
+    }
+    return limiter.suspend(context.sessionId, () => tool.execute(input, context));
+  } };
+}
+
+function createAgentExpansionToolPolicyResolver(
+  store: ObservableEventStore,
+  limits: HostAgentConfig,
+): ToolAccessPolicyResolver {
+  return { async resolve(context) {
+    if (limits.maxChildren === 0 || limits.maxDepth === 0) return { deniedTools: ["agent_spawn"] };
+    const ancestry = await resolveAgentAncestry(store, context.sessionId);
+    return ancestry.depth >= limits.maxDepth ? { deniedTools: ["agent_spawn"] } : undefined;
+  } };
 }
 
 function createDelegationToolPolicyResolver(
@@ -1280,7 +1333,7 @@ function createToolRegistry(
   registry.register(createBashTool({ runner: bashRunner, processes }));
   registry.register(createProcessTool(processes));
   registerGitTools(registry);
-  registry.register(createToolSearchTool(registry));
+  registry.register(createToolSearchTool(registry, { groups: CODING_TOOL_GROUPS }));
   return registry;
 }
 
@@ -1298,9 +1351,19 @@ function createChildToolRegistry(
   skillRegistryForCwd: (cwd: string) => Promise<SkillRegistry>,
   bashRunner: BashRunner | undefined,
   memoryOptions: Parameters<typeof createMemoryTool>[0],
+  runLimiter: LocalSubagentConcurrencyLimiter,
 ): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
-  registry.register(createCodeModeTool());
+  const codeMode = createCodeModeTool();
+  registry.register({ ...codeMode, async execute(input, context) {
+    try {
+      return await codeMode.execute(input, context);
+    } finally {
+      // VM cleanup is bounded. A nested agent wait may still be restoring this
+      // parent's permit; do not let the next model call escape that limit.
+      await runLimiter.waitForResume(context.sessionId);
+    }
+  } });
   registry.register(createReadFileTool({ defaultMaxBytes: DEFAULT_READ_MAX_BYTES, maxBytesLimit: READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
   registry.register(createGlobTool());
@@ -1314,7 +1377,7 @@ function createChildToolRegistry(
     registry.register(createBashTool({ runner: bashRunner, allowEscalation: false }));
   }
   registerGitTools(registry);
-  registry.register(createToolSearchTool(registry));
+  registry.register(createToolSearchTool(registry, { groups: CODING_TOOL_GROUPS }));
   return registry;
 }
 
@@ -1340,11 +1403,6 @@ function registerTeamTools(registry: InMemoryToolRegistry, controller: TeamToolC
   registry.register(createTeamTaskUpdateTool(controller));
   registry.register(createTeamMessageSendTool(controller));
   registry.register(createTeamMessageListTool(controller));
-}
-
-function registerAgentMessageTools(registry: InMemoryToolRegistry, controller: AgentMessageToolController): void {
-  registry.register(createAgentMessageSendTool(controller));
-  registry.register(createAgentMessageListTool(controller));
 }
 
 function registerTeamDispatchTools(registry: InMemoryToolRegistry, controller: TeamTaskDispatchToolController): void {

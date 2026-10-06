@@ -106,7 +106,7 @@ test("team runner auto-verifies worker completion before accepting the task", as
     expect(runner.runs[1]?.prompt).toContain("Worker summary: Implemented Implement verifier target");
     expect(runner.runs[1]?.prompt).toContain("diff --git a/packages/core/src/team.ts b/packages/core/src/team.ts");
     expect(runner.runs[1]?.workerPolicy).toMatchObject({
-      allowedTools: ["read", "glob", "grep", "git_diff", "bash", "complete_task"],
+      allowedTools: ["read", "glob", "grep", "git_diff", "bash", "complete_task", "code_mode"],
       writeScope: [],
       executeScope: ["bun test packages/core/src/team-verifier.test.ts"],
     });

@@ -194,7 +194,7 @@ export class AgentMessageRecipientAmbiguousError extends Error {
 export class AgentMessageRecipientTerminalError extends Error {
   constructor(readonly taskId: TaskId, readonly status: AgentTaskStatus) {
     super(
-      `Agent message cannot trigger a turn for terminal task ${taskId} (${status}); use task_followup to resume it`,
+      `Agent message cannot trigger a turn for terminal task ${taskId} (${status}); use agent_resume to resume it`,
     );
     this.name = "AgentMessageRecipientTerminalError";
   }

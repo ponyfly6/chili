@@ -4,6 +4,23 @@ const GOAL_CONTINUATION_LINE = "Continue working toward the persistent goal. The
 
 export class FakeModelRouter implements ModelRouter {
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+    const discoveryCalls = new Set(input.messages.flatMap((message) => message.parts.flatMap((part) =>
+      part.type === "tool_call" && part.toolName === "tool_search" ? [part.callId] : [])));
+    const messages = input.messages.map((message) => ({ ...message, parts: message.parts.filter((part) =>
+      (part.type !== "tool_call" && part.type !== "tool_result") || !discoveryCalls.has(part.callId)) }))
+      .filter((message) => message.parts.length > 0);
+    for await (const event of this.fixtureStream({ ...input, messages })) {
+      if (event.type === "tool_call" && !input.tools.some((tool) => tool.name === event.name)
+        && input.tools.some((tool) => tool.name === "tool_search")) {
+        yield { type: "tool_call", name: "tool_search", input: { query: `select:${event.name}` } };
+        yield { type: "finish", reason: "tool_use" };
+        return;
+      }
+      yield event;
+    }
+  }
+
+  private async *fixtureStream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
     const lastUserIndex = findLastUserMessageIndex(input.messages);
     const lastUser = lastUserIndex >= 0 ? input.messages[lastUserIndex] : undefined;
     const lastUserText = lastUser?.parts.find((part) => part.type === "text");
@@ -158,14 +175,14 @@ export class FakeModelRouter implements ModelRouter {
     }
 
     if (text.includes("list tasks through tool")) {
-      yield { type: "tool_call", name: "task_list", input: { all: true, limit: 20 } };
+      yield { type: "tool_call", name: "agent_list", input: { all: true, limit: 20 } };
       yield { type: "finish", reason: "tool_use" };
       return;
     }
 
     const waitTask = /wait task\s+(task_[^\s]+)/.exec(text);
     if (waitTask?.[1]) {
-      yield { type: "tool_call", name: "task_wait", input: { task_id: waitTask[1], timeout_ms: 5000 } };
+      yield { type: "tool_call", name: "agent_wait", input: { task_id: waitTask[1], timeout_ms: 5000 } };
       yield { type: "finish", reason: "tool_use" };
       return;
     }
@@ -174,7 +191,7 @@ export class FakeModelRouter implements ModelRouter {
     if (followupTask?.[1]) {
       yield {
         type: "tool_call",
-        name: "task_followup",
+        name: "agent_resume",
         input: { task_id: followupTask[1], text: "continue the task from fake model", max_turns: 3 },
       };
       yield { type: "finish", reason: "tool_use" };
@@ -182,7 +199,7 @@ export class FakeModelRouter implements ModelRouter {
     }
 
     if (text.includes("list mailbox through tool")) {
-      yield { type: "tool_call", name: "mailbox_list", input: { all: true, status: "queued", limit: 20 } };
+      yield { type: "tool_call", name: "agent_list", input: { view: "messages", all: true, status: "queued", limit: 20 } };
       yield { type: "finish", reason: "tool_use" };
       return;
     }
@@ -196,7 +213,7 @@ export class FakeModelRouter implements ModelRouter {
     if (text.includes("delegate background read")) {
       yield {
         type: "tool_call",
-        name: "task",
+        name: "agent_spawn",
         input: {
           description: "Read package through a background subagent",
           prompt: "read package",
@@ -210,7 +227,7 @@ export class FakeModelRouter implements ModelRouter {
     if (text.includes("delegate read")) {
       yield {
         type: "tool_call",
-        name: "task",
+        name: "agent_spawn",
         input: {
           description: "Read package through a subagent",
           prompt: "read package",

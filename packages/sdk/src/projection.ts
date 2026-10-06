@@ -2635,14 +2635,16 @@ function batchTasksUpdatedAt(tasks: readonly RuntimeTaskView[]): number {
   return tasks.reduce((latest, task) => Math.max(latest, task.updatedAt), 0);
 }
 
-function isTaskBatchTool(toolName: string): boolean {
+function isTaskBatchTool(toolName: string, input?: unknown): boolean {
   const normalized = toolName.trim().toLowerCase().split(/[./:]/).at(-1);
-  return normalized === "task_batch" || normalized === "agent_batch" || normalized === "spawn_tasks" || normalized === "spawn_agents";
+  return normalized === "task_batch" || normalized === "agent_batch" || normalized === "spawn_tasks" || normalized === "spawn_agents"
+    || (normalized === "agent_spawn" && Array.isArray(recordObjectValue(input)?.tasks));
 }
 
-function isSingleTaskTool(toolName: string): boolean {
+function isSingleTaskTool(toolName: string, input?: unknown): boolean {
   const normalized = toolName.trim().toLowerCase().split(/[./:]/).at(-1);
-  return normalized === "task" || normalized === "agent";
+  return normalized === "task" || normalized === "agent"
+    || (normalized === "agent_spawn" && !Array.isArray(recordObjectValue(input)?.tasks));
 }
 
 function isTaskDelegationTool(toolName: string): boolean {
@@ -2661,12 +2663,13 @@ function isTaskWaitTool(toolName: string): boolean {
 
 function isTaskFollowupTool(toolName: string): boolean {
   const normalized = toolName.trim().toLowerCase().split(/[./:]/).at(-1);
-  return normalized === "task_followup" || normalized === "followup_task" || normalized === "agent_followup";
+  return normalized === "task_followup" || normalized === "followup_task" || normalized === "agent_followup"
+    || normalized === "agent_resume";
 }
 
 function isSupervisedAllWait(call: RuntimeToolCallView): boolean {
   const normalized = call.toolName.trim().toLowerCase().split(/[./:]/).at(-1);
-  if (normalized !== "task_wait_batch" && normalized !== "wait_tasks" && normalized !== "agent_wait_batch") {
+  if (normalized !== "task_wait_batch" && normalized !== "wait_tasks" && normalized !== "agent_wait_batch" && normalized !== "agent_wait") {
     return false;
   }
   const input = recordObjectValue(call.input);
@@ -2717,7 +2720,7 @@ function completionPolicyFromToolCall(call: RuntimeToolCallView | undefined): Ru
 
 function defaultCompletionPolicy(call: RuntimeToolCallView | undefined): RuntimeTaskCompletionPolicy | undefined {
   if (!call || !isTaskDelegationTool(call.toolName)) return undefined;
-  if (isTaskBatchTool(call.toolName)) return "join";
+  if (isTaskBatchTool(call.toolName, call.input)) return "join";
   const input = recordObjectValue(call.input);
   const mode = stringValue(input?.mode) ?? stringValue(input?.subagent_type);
   return mode === "background" ? "notify" : "join";
@@ -2754,7 +2757,7 @@ function expectedBatchSizeFromToolCall(call: RuntimeToolCallView | undefined): n
     ?? finiteNumberValue(output?.expected_batch_size)
     ?? finiteNumberValue(output?.count)
     ?? inputTasks
-    ?? (isSingleTaskTool(call.toolName) ? 1 : undefined);
+    ?? (isSingleTaskTool(call.toolName, call.input) ? 1 : undefined);
 }
 
 function jsonRecord(value: string | undefined): Record<string, unknown> | undefined {

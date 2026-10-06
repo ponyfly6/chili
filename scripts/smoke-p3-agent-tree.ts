@@ -18,11 +18,11 @@ try {
   assert.match(agents.stdout, new RegExp(`/root/${taskId}\\tcompleted`));
 
   const toolList = await runCli(["--model", "fake", "--yes", "--cwd", workspace, "--resume", sessionId, "list tasks through tool"]);
-  assert.match(toolList.stdout, /\[tool\] task_list/);
+  assert.match(toolList.stdout, /\[tool\] agent_list/);
   assert.match(toolList.stdout, new RegExp(taskId));
 
   const toolWait = await runCli(["--model", "fake", "--yes", "--cwd", workspace, "--resume", sessionId, "wait task", taskId]);
-  assert.match(toolWait.stdout, /\[tool\] task_wait/);
+  assert.match(toolWait.stdout, /\[tool\] agent_wait/);
   assert.match(toolWait.stdout, new RegExp(taskId));
 
   const toolMailbox = await runCli([
@@ -35,7 +35,7 @@ try {
     sessionId,
     "list mailbox through tool",
   ]);
-  assert.match(toolMailbox.stdout, /\[tool\] mailbox_list/);
+  assert.match(toolMailbox.stdout, /\[tool\] agent_list/);
   assert.match(toolMailbox.stdout, /"count":0/);
 
   const toolFollowup = await runCli([
@@ -49,7 +49,7 @@ try {
     "followup task",
     taskId,
   ]);
-  assert.match(toolFollowup.stdout, /\[tool\] task_followup/);
+  assert.match(toolFollowup.stdout, /\[tool\] agent_resume/);
   assert.match(toolFollowup.stdout, new RegExp(`\\[task\\] ${taskId}: completed`));
 
   await runCli(["--model", "fake", "--yes", "--cwd", workspace, "followup", taskId, "continue the task"]);

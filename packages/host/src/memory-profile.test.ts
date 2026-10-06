@@ -12,6 +12,11 @@ class MemoryHostRouter implements ModelRouter {
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
     this.captured.push(JSON.parse(JSON.stringify(input)) as ModelStreamInput);
     if (this.writeMemory && this.captured.length === 1) {
+      yield { type: "tool_call", name: "tool_search", input: { query: "select:memory" } };
+      yield { type: "finish", reason: "tool_use" };
+      return;
+    }
+    if (this.writeMemory && this.captured.length === 2) {
       yield { type: "tool_call", name: "memory", input: { operation: "add", scope: "project", text: "Quartz reconnect uses exponential backoff" } };
       yield { type: "finish", reason: "tool_use" };
       return;
@@ -126,6 +131,11 @@ class MultiProjectMemoryRouter implements ModelRouter {
     const text = input.messages.flatMap((message) => message.role === "user" ? message.parts : [])
       .filter((part) => part.type === "text").map((part) => part.text).at(-1) ?? "";
     if (!this.started.has(input.sessionId)) {
+      if (!input.tools.some((tool) => tool.name === "memory")) {
+        yield { type: "tool_call", name: "tool_search", input: { query: "select:memory" } };
+        yield { type: "finish", reason: "tool_use" };
+        return;
+      }
       this.started.add(input.sessionId);
       yield { type: "tool_call", name: "memory", input: { operation: "add", scope: "project", text: text.includes("project A") ? "Quartz project A preference" : "Quartz project B preference" } };
       yield { type: "finish", reason: "tool_use" };

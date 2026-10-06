@@ -222,6 +222,7 @@ function isAgentSpawnToolName(toolName: string): boolean {
   const name = toolName.toLowerCase().replace(/^tool\./, "");
   return name === "task"
     || name === "agent"
+    || name === "agent_spawn"
     || name === "task_batch"
     || name === "agent_batch"
     || name === "spawn_tasks"
