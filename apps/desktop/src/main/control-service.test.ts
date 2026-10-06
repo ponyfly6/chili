@@ -4,6 +4,7 @@ import { reduceRuntimeEvents, type RuntimeClient } from "@chili/sdk";
 import { acceptedInput, emptyInputQueue } from "./testing/input-receipts.js";
 import { RuntimeHttpError } from "@chili/sdk";
 import { DesktopControlService } from "./control-service.js";
+import { parseDesktopResponse } from "../shared/contracts.js";
 
 describe("desktop prompt controls", () => {
   test("Agent controls preserve caller and target identity and return input receipts", async () => {
@@ -901,6 +902,35 @@ describe("desktop session projections", () => {
     expect(reduceRuntimeEvents(snapshot.events).messages.message_1?.parts).toMatchObject([
       { id: "part_1", type: "text", text: "kept" },
     ]);
+  });
+
+  test("projects pinned history without execution identity paths or losing message dependencies", async () => {
+    const identity = {
+      profileId: "profile_one", profilePath: "/PRIVATE_PROFILE", authPath: "/PRIVATE_PROFILE/auth.json",
+      projectId: "project_one", projectRoot: "/PRIVATE_SOURCE", workspaceId: "workspace_one", workspaceRoot: "/repo",
+    };
+    const sourceEvents = [
+      { id: "created", type: "session.created", sessionId: "root", time: 1, payload: { sessionId: "root", cwd: "/repo", identity } },
+      { id: "bound", type: "session.identity_bound", sessionId: "root", time: 2, payload: { sessionId: "root", identity } },
+      { id: "message", type: "message.created", sessionId: "root", time: 3, payload: { messageId: "message_one", role: "assistant" } },
+      { id: "part", type: "message.part_added", sessionId: "root", time: 4, payload: { messageId: "message_one", part: {
+        id: "part_one", messageId: "message_one", sessionId: "root", type: "text", text: "History remains readable",
+      } } },
+    ];
+    const original = structuredClone(sourceEvents);
+    const client = {
+      ...snapshotClientMethods(),
+      sessionEventWindow: async () => ({ events: sourceEvents, pendingApprovals: [], truncated: false,
+        bytes: Buffer.byteLength(JSON.stringify(sourceEvents)), pinnedEventIds: ["created", "bound", "message"] }),
+    } as unknown as RuntimeClient;
+    const request = { type: "session.snapshot", sessionId: "root" } as const;
+    const snapshot = parseDesktopResponse(request, await serviceFor(client).invoke(request));
+    expect(snapshot.events.map((event) => event.id)).toEqual(["created", "message", "part"]);
+    expect(snapshot.events[0]).toMatchObject({ id: "created", sessionId: "root", payload: { sessionId: "root", cwd: "/repo" } });
+    expect(snapshot.events[0]?.payload).not.toHaveProperty("identity");
+    expect(JSON.stringify(snapshot)).not.toContain("PRIVATE_");
+    expect(sourceEvents).toEqual(original);
+    expect(reduceRuntimeEvents(snapshot.events).messages.message_one?.parts).toMatchObject([{ text: "History remains readable" }]);
   });
 
   test("keeps archived root history readable when Agent control listing is forbidden", async () => {

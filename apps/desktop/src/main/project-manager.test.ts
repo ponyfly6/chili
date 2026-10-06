@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { ChiliEvent } from "@chili/protocol";
+import { parseChiliEvent, type ChiliEvent } from "@chili/protocol";
 import type { DesktopEvent, DesktopRequest, DesktopResponse, DesktopState } from "../shared/contracts.js";
 import { DesktopProjectManager, type DesktopProjectRuntime } from "./project-manager.js";
 import { DesktopProjectSettings } from "./project-settings.js";
@@ -44,6 +44,59 @@ test("background status appears in the project list without entering the active 
     expect(f.events.filter((event) => event.type === "runtime.event")).toMatchObject([{ projectId: b.projectId }]);
     f.manager.observeEvent(a.projectId!, statusEvent("session-a", "idle"));
     expect(f.manager.state().projects?.find((project) => project.id === a.projectId)).toMatchObject({ runningCount: 0, attentionCount: 0 });
+  } finally { await f.close(); }
+});
+
+test("publishes display-safe Agent creation and subsequent status without execution identity events", async () => {
+  const f = await fixture();
+  try {
+    const project = await f.manager.add(f.a);
+    const identity = {
+      profileId: "profile_fixture",
+      profilePath: "/private/chili-profile-canary",
+      authPath: "/private/chili-profile-canary/auth.json",
+      projectId: "project_fixture",
+      projectRoot: "/private/source-checkout-canary",
+      workspaceId: "workspace_fixture",
+      workspaceRoot: f.a,
+    };
+    const agent = { parentSessionId: "session_root", name: "reader", path: "/root/reader", policy: {} };
+    const created = parseChiliEvent({
+      id: "event_agent_created", type: "session.created", sessionId: "session_agent", time: 1,
+      payload: { sessionId: "session_agent", cwd: f.a, identity, agent },
+    });
+    const bound = parseChiliEvent({
+      id: "event_identity_bound", type: "session.identity_bound", sessionId: "session_agent", time: 2,
+      payload: { sessionId: "session_agent", identity },
+    });
+    const status = parseChiliEvent({
+      id: "event_agent_running", type: "session.status_changed", sessionId: "session_agent", time: 3,
+      payload: { sessionId: "session_agent", status: "running" },
+    });
+    const originalCreated = structuredClone(created);
+    const originalBound = structuredClone(bound);
+    f.events.length = 0;
+
+    f.manager.observeEvent(project.projectId!, created);
+    f.manager.observeEvent(project.projectId!, bound);
+    f.manager.observeEvent(project.projectId!, status);
+
+    const published = f.events.filter((event) => event.type === "runtime.event");
+    expect<unknown>(published).toEqual([
+      {
+        type: "runtime.event", projectId: project.projectId!,
+        event: { ...created, payload: { sessionId: "session_agent", cwd: f.a, agent } },
+      },
+      { type: "runtime.event", projectId: project.projectId!, event: status },
+    ]);
+    expect(published[0]?.event.payload).not.toHaveProperty("identity");
+    const rendererEvents = JSON.stringify(f.events);
+    expect(rendererEvents).not.toContain(identity.profilePath);
+    expect(rendererEvents).not.toContain(identity.authPath);
+    expect(rendererEvents).not.toContain(identity.projectRoot);
+    expect(created).toEqual(originalCreated);
+    expect(bound).toEqual(originalBound);
+    expect(created.payload).toHaveProperty("identity", identity);
   } finally { await f.close(); }
 });
 

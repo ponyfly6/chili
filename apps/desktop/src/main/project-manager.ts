@@ -6,6 +6,7 @@ import type { DesktopEvent, DesktopProject, DesktopRequest, DesktopResponse, Des
 import type { DesktopControlService } from "./control-service.js";
 import type { SidecarManager } from "./sidecar-manager.js";
 import { DesktopProjectSettings, type SavedDesktopProject } from "./project-settings.js";
+import { projectRendererRuntimeEvent } from "./renderer-event-projection.js";
 
 export interface DesktopProjectRuntime {
   sidecar: Pick<SidecarManager, "state" | "switchWorkspace" | "stop">;
@@ -112,7 +113,12 @@ export class DesktopProjectManager {
   observeEvent(id: string, event: ChiliEvent): void {
     const entry = this.entries.get(id);
     if (!entry || this.closing) return;
-    if (id === this.activeId) this.options.publish({ type: "runtime.event", projectId: id, event });
+    if (id === this.activeId) {
+      // The sidecar has already advanced its durable cursor. Filter before the
+      // renderer outbox allocates a sequence number, so ACKs stay contiguous.
+      const projected = projectRendererRuntimeEvent(event);
+      if (projected) this.options.publish({ type: "runtime.event", projectId: id, event: projected });
+    }
     if (event.sessionId && event.type === "session.status_changed") {
       const sessionId = String(event.sessionId);
       if (["running", "waiting_for_approval", "cancelling"].includes(event.payload.status)) entry.running.add(sessionId);

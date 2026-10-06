@@ -20,6 +20,7 @@ import { safeDesktopErrorMessage } from "../shared/safe-error.js";
 import { DetachedProcessGroupRegistry } from "./detached-process-group-registry.js";
 import { desktopDiff } from "./git-diff.js";
 import type { SidecarManager } from "./sidecar-manager.js";
+import { projectRendererRuntimeEvent } from "./renderer-event-projection.js";
 
 interface BusySessionState {
   controlEpoch: number;
@@ -1058,7 +1059,12 @@ export class DesktopControlService {
     if (retainedEvents.truncated) warnings.add("timeline events exceeded their desktop snapshot budget");
     const result = {
       sessionId: String(sessionId),
-      events: retainedEvents.events,
+      // Resolve history dependencies and authoritative pins before the display
+      // projection. The remaining event IDs and their durable order are unchanged.
+      events: retainedEvents.events.flatMap((event) => {
+        const projected = projectRendererRuntimeEvent(event);
+        return projected ? [projected] : [];
+      }),
       inputQueue,
       agents: agents.values(),
       pendingApprovals: approvals.values()
