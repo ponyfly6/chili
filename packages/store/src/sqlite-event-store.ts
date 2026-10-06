@@ -24,6 +24,8 @@ import {
 } from "@chili/protocol";
 import { decodeJson, encodeJson } from "./json.js";
 import { SQLITE_SCHEMA } from "./schema.js";
+import { EventPageTooLargeError } from "./types.js";
+import { readRuntimeStateSnapshot } from "./runtime-snapshot.js";
 import {
   sqliteJournalPolicy,
   type SqliteJournalMode,
@@ -34,6 +36,8 @@ import type {
   EventCommitAwareStore,
   EventMirror,
   EventQuery,
+  EventReplayBoundary,
+  EventReplayBoundaryQuery,
   EventStore,
   GoalProjectionStore,
   GoalMutationDecision,
@@ -96,6 +100,8 @@ interface SessionGoalProjectionRow {
 
 export const SQLITE_WAL_AUTO_CHECKPOINT_PAGES = 256;
 export const SQLITE_JOURNAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024;
+/** Never ask SQLite's JSON functions to parse an unbounded legacy audit row. */
+const MAX_BOUNDED_COMPACTION_SOURCE_BYTES = 16 * 1024 * 1024;
 
 export class SqliteJournalModeError extends Error {
   override readonly name = "SqliteJournalModeError";
@@ -624,7 +630,7 @@ export class SqliteEventStore
     }
   }
 
-  async events(query: EventQuery = {}): Promise<EventEnvelope[]> {
+  private eventQueryConditions(query: EventQuery): { where: string; params: Record<string, unknown> } {
     if (query.afterEventId && query.beforeEventId) {
       throw new TypeError("Event queries cannot combine afterEventId and beforeEventId");
     }
@@ -675,9 +681,88 @@ export class SqliteEventStore
       params.beforeEventId = query.beforeEventId;
     }
 
-    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
+    return { where: `where ${clauses.join(" and ")}`, params };
+  }
+
+  async eventReplayBoundary(query: EventReplayBoundaryQuery = {}): Promise<EventReplayBoundary> {
+    const { where, params } = this.eventQueryConditions(query);
+    const limit = query.limit ?? 5_000;
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError("Replay limit must be a positive safe integer");
+    const tail = query.tail && !query.afterEventId;
+    // Fetch only small identity rows. The extra tail identity anchors the
+    // selected window without ever materializing its (possibly huge) bodies.
+    const rows = this.db.query<{ id: string }, any>(
+      `select id from events ${where} order by seq ${tail ? "desc" : "asc"} limit $limit`,
+    ).all({ ...params, limit: tail ? limit + 1 : limit });
+    const afterEventId = tail ? rows[limit]?.id : query.afterEventId;
+    return { ...(afterEventId ? { afterEventId } : {}), count: Math.min(limit, rows.length) };
+  }
+
+  async runtimeSnapshot(query: { sessionId?: SessionId; maxBytes?: number } = {}) {
+    return readRuntimeStateSnapshot(this.db, query);
+  }
+
+  async events(query: EventQuery = {}): Promise<EventEnvelope[]> {
+    const { where, params } = this.eventQueryConditions(query);
     const limit = query.limit ?? 500;
     params.limit = limit;
+
+    const compactPayload = query.compactRequests
+      ? `case when type = 'model.request_prepared' then
+           json_remove(json_set(payload_json, '$.contentVersion',
+             coalesce(json_extract(payload_json, '$.contentVersion'), json_extract(payload_json, '$.request.contentVersion'))), '$.request')
+         when type = 'message.part_added' and json_extract(payload_json, '$.part.type') = 'tool_result'
+           then json_remove(payload_json, '$.part.structuredData')
+         else payload_json end`
+      : "payload_json";
+    const payload = query.maxBytes !== undefined && query.compactRequests
+      ? `case when length(cast(payload_json as blob)) > ${MAX_BOUNDED_COMPACTION_SOURCE_BYTES}
+           then payload_json else ${compactPayload} end`
+      : compactPayload;
+
+    if (query.maxBytes !== undefined) {
+      if (!Number.isSafeInteger(query.maxBytes) || query.maxBytes < 1) {
+        throw new TypeError("Event page maxBytes must be a positive safe integer");
+      }
+      const tail = !!query.tail && !query.afterEventId;
+      const candidates = this.db.prepare<Omit<StoredEventRow, "payload_json"> & { payload_bytes: number }, any>(
+        `select seq, id, type, time, session_id, length(cast(${payload} as blob)) as payload_bytes
+         from events ${where} order by seq ${tail ? "desc" : "asc"} limit $limit`,
+      );
+      const result: EventEnvelope[] = [];
+      let bytes = 0;
+      try {
+        for (const row of candidates.iterate(params)) {
+          const envelope = {
+            id: row.id, type: row.type, time: row.time, payload: {},
+            ...(row.session_id ? { sessionId: row.session_id } : {}),
+          };
+          const estimatedBytes = Buffer.byteLength(JSON.stringify(envelope), "utf8") - 2 + row.payload_bytes;
+          if (bytes + estimatedBytes > query.maxBytes) {
+            if (result.length === 0) throw new EventPageTooLargeError(row.id, estimatedBytes, query.maxBytes);
+            break;
+          }
+          // Only a proven bounded payload crosses from SQLite into JS. Legacy
+          // multi-megabyte rows cannot force an unbounded JSON decode first.
+          const body = this.db.query<{ payload_json: string }, [number]>(
+            `select ${payload} as payload_json from events where seq = ?`,
+          ).get(row.seq)!;
+          const event = this.eventFromRow({ ...row, payload_json: body.payload_json });
+          const eventBytes = Buffer.byteLength(JSON.stringify(event), "utf8");
+          if (bytes + eventBytes > query.maxBytes) {
+            if (result.length === 0) throw new EventPageTooLargeError(row.id, eventBytes, query.maxBytes);
+            break;
+          }
+          result.push(event);
+          bytes += eventBytes;
+        }
+      } finally {
+        // Bun's SQLite iterator does not reset its statement on early break
+        // or throw. Release the read lock before a later write/checkpoint.
+        candidates.finalize();
+      }
+      return tail ? result.reverse() : result;
+    }
 
     const orderAndLimit = query.tail && !query.afterEventId
       ? `from (
@@ -695,14 +780,7 @@ export class SqliteEventStore
 
     const rows = this.db
       .query<StoredEventRow, any>(
-        `select seq, id, type, time, session_id, ${query.compactRequests
-          ? `case when type = 'model.request_prepared' then
-               json_remove(json_set(payload_json, '$.contentVersion',
-                 coalesce(json_extract(payload_json, '$.contentVersion'), json_extract(payload_json, '$.request.contentVersion'))), '$.request')
-             when type = 'message.part_added' and json_extract(payload_json, '$.part.type') = 'tool_result'
-               then json_remove(payload_json, '$.part.structuredData')
-             else payload_json end as payload_json`
-          : "payload_json"}
+        `select seq, id, type, time, session_id, ${payload} as payload_json
          ${orderAndLimit}`,
       )
       .all(params);

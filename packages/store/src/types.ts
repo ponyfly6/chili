@@ -14,6 +14,7 @@ import type {
   PersistedToolPolicy,
   ExecutionIdentity,
   RuntimeInputQueue,
+  RuntimeStateSnapshot,
 } from "@chili/protocol";
 import type { SessionInputAccept, StoredSessionInput } from "./session-inputs.js";
 
@@ -27,6 +28,41 @@ export interface EventQuery {
   beforeEventId?: string;
   limit?: number;
   tail?: boolean;
+  /**
+   * Bound the UTF-8 JSON bytes returned by this page. A forward page is a
+   * continuous prefix; a tail page is a continuous suffix, still in ascending
+   * durable order. An oversized first candidate must fail with its cursor;
+   * implementations must never silently skip it or decode an unbounded row.
+   */
+  maxBytes?: number;
+}
+
+export interface EventReplayBoundaryQuery {
+  sessionId?: SessionId;
+  afterEventId?: string;
+  /** Maximum count to inspect, including the overflow probe for resume. */
+  limit?: number;
+  tail?: boolean;
+}
+
+export interface EventReplayBoundary {
+  /** Cursor immediately before the selected tail, or the supplied resume cursor. */
+  afterEventId?: string;
+  /** Matching event count, capped at the requested limit. */
+  count: number;
+}
+
+/** Optional metadata-only replay sizing; never decodes event bodies. */
+export interface EventReplayBoundaryStore {
+  eventReplayBoundary(query?: EventReplayBoundaryQuery): Promise<EventReplayBoundary>;
+}
+
+export class EventPageTooLargeError extends Error {
+  override readonly name = "EventPageTooLargeError";
+
+  constructor(readonly eventId: string, readonly bytes: number, readonly maxBytes: number) {
+    super(`Event ${eventId} requires ${bytes} bytes, exceeding the ${maxBytes}-byte page budget`);
+  }
 }
 
 export interface SessionRow {
@@ -131,7 +167,17 @@ export interface EventAppendOptions {
 export interface EventStore {
   append(event: RuntimeEvent, options?: EventAppendOptions): Promise<void>;
   appendMany(events: readonly RuntimeEvent[], options?: EventAppendOptions): Promise<void>;
+  /**
+   * Return only committed durable records, in strictly increasing storage
+   * sequence (including tail queries). afterEventId is exclusive and resolves
+   * in the requested Session scope; unknown cursors fail. The sequence and ID
+   * of a committed record never change. Pages never omit matching records in
+   * the selected prefix/suffix. Notifications are wakeups, not replay data.
+   */
   events(query?: EventQuery): Promise<EventEnvelope[]>;
+  eventReplayBoundary?(query?: EventReplayBoundaryQuery): Promise<EventReplayBoundary>;
+  /** Authoritative materialized state and its durable watermark in one read transaction. */
+  runtimeSnapshot?(query?: { sessionId?: SessionId; maxBytes?: number }): Promise<RuntimeStateSnapshot>;
   sessions(): Promise<SessionRow[]>;
   messages(sessionId: SessionId): Promise<Message[]>;
   pendingApprovals(sessionId?: SessionId, limit?: number): Promise<ApprovalRow[]>;

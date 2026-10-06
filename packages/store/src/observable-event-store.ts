@@ -41,11 +41,18 @@ export class ObservableEventStore
     GoalProjectionStore
 {
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
+  readonly eventReplayBoundary?: NonNullable<EventStore["eventReplayBoundary"]>;
+  readonly runtimeSnapshot?: NonNullable<EventStore["runtimeSnapshot"]>;
 
   constructor(
     private readonly inner: EventStore,
     private readonly options: ObservableEventStoreOptions = {},
-  ) {}
+  ) {
+    // Preserve capability absence across wrapper chains so callers can fail
+    // explicitly instead of fabricating an incomplete recovery snapshot.
+    if (inner.eventReplayBoundary) this.eventReplayBoundary = (query) => inner.eventReplayBoundary!(query);
+    if (inner.runtimeSnapshot) this.runtimeSnapshot = (query) => inner.runtimeSnapshot!(query);
+  }
 
   async append(event: RuntimeEvent, options?: EventAppendOptions): Promise<void> {
     await this.appendCommitted(event, options);

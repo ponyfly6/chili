@@ -15,3 +15,4 @@ export * from "./prepared-request.js";
 export * from "./execution-identity.js";
 
 export * from "./runtime-agent.js";
+export * from "./runtime-snapshot.js";
