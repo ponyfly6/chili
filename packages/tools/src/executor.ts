@@ -23,6 +23,9 @@ import { randomUUID } from "node:crypto";
 import { ToolDeniedError, ToolValidationError, UnknownToolError, isAbortError, toError } from "./errors.js";
 import { approvalDecisionWithinScope } from "./approval.js";
 import { FileReadStateStore } from "./file-read-state.js";
+import { ToolDispatchScope } from "./dispatch-scope.js";
+import { StructuredToolDataLimitError, validateStructuredToolData } from "./structured-data.js";
+import { validateToolSchema } from "./input-schema.js";
 import { authorizeToolByPolicy, filterToolsByPolicy, toolPolicyContext } from "./tool-policy.js";
 import {
   persistToolOutput,
@@ -45,6 +48,16 @@ import type {
 } from "./types.js";
 
 type ExecutableApprovalSpec = ToolApprovalSpecWithDefaults & { maxApprovalScope: ApprovalScope };
+
+function catalogFingerprint(tool: ChiliToolDefinition): string {
+  return JSON.stringify({
+    name: tool.name, aliases: tool.aliases, description: tool.description, risk: tool.risk,
+    inputSchema: tool.inputSchema, outputSchema: tool.outputSchema, codeMode: tool.codeMode,
+    isOrchestrator: tool.isOrchestrator,
+    isReadOnly: String(tool.isReadOnly), isConcurrencySafe: String(tool.isConcurrencySafe),
+    isDestructive: String(tool.isDestructive),
+  });
+}
 
 const MAX_TOOL_RESULT_CONTENT_ITEMS = 64;
 // The desktop outbox admits at most 2,000,000 bytes for one retained envelope.
@@ -87,6 +100,13 @@ export class ToolExecutor {
   }
 
   async execute(input: ExecuteToolInput): Promise<ExecuteToolResult> {
+    const dispatchScope = input.dispatchScope ?? new ToolDispatchScope();
+    dispatchScope.throwIfFailed();
+    const signal = AbortSignal.any(input.signal ? [input.signal, dispatchScope.signal] : [dispatchScope.signal]);
+    return this.executeOwned({ ...input, dispatchScope, signal });
+  }
+
+  private async executeOwned(input: ExecuteToolInput): Promise<ExecuteToolResult> {
     const callId = input.callId === undefined
       ? this.id<ToolCallId>("toolcall")
       : normalizeToolCallId(input.callId);
@@ -97,12 +117,14 @@ export class ToolExecutor {
       callId,
       toolName: boundToolEventName(input.toolName),
       input: boundToolEventValue(input.input, "tool input"),
+      ...(input.parentCallId ? { parentCallId: input.parentCallId } : {}),
     });
 
     if (this.activeCallIds.has(activeCallKey)) {
       return this.fail(input, callId, new Error(`Tool call id is already active: ${callId}`));
     }
     this.activeCallIds.add(activeCallKey);
+    let release: (() => void) | undefined;
 
     try {
       if (input.signal?.aborted) {
@@ -110,7 +132,9 @@ export class ToolExecutor {
       }
       let tool: ChiliToolDefinition | undefined;
       try {
-        tool = await this.toolForContext(input.toolName, toolRegistryContext(input));
+        if (input.parentCallId) await input.dispatchScope?.checkNestedCall({ toolName: input.toolName, input: input.input });
+        await this.assertCatalogCurrent(input);
+        tool = input.catalogTool ?? await this.toolForContext(input.toolName, toolRegistryContext(input));
         throwIfAborted(input.signal);
       } catch (error) {
         const normalizedError = input.signal?.aborted
@@ -125,8 +149,17 @@ export class ToolExecutor {
         return await this.fail(input, callId, new UnknownToolError(input.toolName));
       }
       try {
+        if (input.parentCallId && (tool.codeMode !== true || tool.isOrchestrator)) {
+          throw new ToolDeniedError(tool.name, "Tool is not available to code mode.");
+        }
         await this.update(input, callId, "validating");
-        const validated = await this.validate(tool, input.input);
+        const validated = await this.validate(tool, input.input, input.signal);
+        if (!tool.isOrchestrator) {
+          const safe = (await this.resolvePredicate(tool.isConcurrencySafe, validated))
+            ?? (await this.resolvePredicate(tool.isReadOnly, validated)) ?? false;
+          release = await input.dispatchScope!.acquire(safe, input.signal);
+        }
+        await this.assertCatalogCurrent(input);
         const spec = this.approvalSpec(tool, validated);
         for (const policy of await this.policies(input)) {
           await authorizeToolByPolicy({
@@ -174,10 +207,28 @@ export class ToolExecutor {
             throw error;
           }
         };
+        await this.assertCatalogCurrent(input);
+        // Policy may have changed while a child waited for a permit or approval.
+        for (const policy of await this.policies(input)) {
+          await authorizeToolByPolicy({
+            tool, executeInput: input, validatedInput: validated,
+            approvalSpec: spec === false
+              ? { permission: tool.name, patterns: ["*"], maxApprovalScope: "persistent", metadata: {} } : spec,
+            policy,
+            isReadOnly: (definition, toolInput) => this.resolvePredicate(definition.isReadOnly, toolInput),
+          });
+        }
+        if (spec !== false && this.options.approvals.preflight) {
+          const current = await this.preflightApproval(input, callId, tool, spec);
+          if (current.action === "deny") throw new ToolDeniedError(tool.name, current.reason);
+        }
+        await this.assertCatalogCurrent(input);
+        throwIfAborted(input.signal);
         const rawResult = await tool.execute(
           validated,
           this.context(tool, validated, input, callId, outputArtifactId, registerPersistedOutput),
         );
+        input.dispatchScope?.throwIfFailed();
         throwIfAborted(input.signal);
         if (registeredOutput) {
           try {
@@ -192,7 +243,17 @@ export class ToolExecutor {
             registeredOutput = undefined;
           }
         }
-        const result = boundToolResult(await this.processResult(
+        const descriptor = Object.getOwnPropertyDescriptor(rawResult, "structuredData");
+        if (descriptor && !("value" in descriptor)) throw new Error("Structured tool data cannot contain accessors");
+        let structuredData: unknown;
+        let structuredDataUnavailable: string | undefined;
+        try {
+          structuredData = descriptor?.value === undefined ? undefined : validateStructuredToolData(descriptor.value);
+        } catch (error) {
+          if (!(error instanceof StructuredToolDataLimitError)) throw error;
+          structuredDataUnavailable = error.message;
+        }
+        const displayResult = boundToolResult(await this.processResult(
           tool,
           input,
           outputArtifactId,
@@ -200,6 +261,11 @@ export class ToolExecutor {
           registeredOutput,
           invalidRegisteredOutputError,
         ));
+        const result: ToolResult = {
+          ...displayResult,
+          ...(structuredData === undefined ? {} : { structuredData }),
+          ...(structuredDataUnavailable ? { metadata: { ...displayResult.metadata, structuredDataUnavailable } } : {}),
+        };
 
         throwIfAborted(input.signal);
         await this.publish("tool.call_finished", input, {
@@ -211,6 +277,7 @@ export class ToolExecutor {
         return { status: "completed", callId, result };
       } catch (error) {
         if (this.isEventPublishFailure(error)) throw error;
+        input.dispatchScope?.throwIfFailed();
         const normalizedError = input.signal?.aborted
           ? abortReason(input.signal)
           : toError(error);
@@ -220,6 +287,7 @@ export class ToolExecutor {
         return this.fail(input, callId, normalizedError);
       }
     } finally {
+      release?.();
       this.activeCallIds.delete(activeCallKey);
     }
   }
@@ -233,15 +301,39 @@ export class ToolExecutor {
       ? await this.toolForContext(toolName, context)
       : this.options.registry.get(toolName);
     if (!tool) return false;
-    const explicit = await this.resolvePredicate(tool.isConcurrencySafe, input);
+    if (tool.isOrchestrator) return false;
+    let validated: unknown;
+    try {
+      validated = await this.validate(tool, input);
+    } catch (error) {
+      if (error instanceof ToolValidationError) return false;
+      throw error;
+    }
+    const explicit = await this.resolvePredicate(tool.isConcurrencySafe, validated);
     if (explicit !== undefined) return explicit;
-    return (await this.resolvePredicate(tool.isReadOnly, input)) ?? false;
+    return (await this.resolvePredicate(tool.isReadOnly, validated)) ?? false;
   }
 
-  private async validate<Input>(tool: ChiliToolDefinition<Input>, input: unknown): Promise<Input> {
-    if (!tool.validate) return input as Input;
+  private async assertCatalogCurrent(input: ExecuteToolInput): Promise<void> {
+    if (input.catalogRevision !== undefined && input.catalogRevision !== this.options.registry.getRevision?.()) {
+      throw new ToolDeniedError(input.toolName, "Tool catalog changed; start a new code_mode call.");
+    }
+    if (input.catalogTool) {
+      const current = await this.toolForContext(input.toolName, toolRegistryContext(input));
+      if (!current || catalogFingerprint(current) !== catalogFingerprint(input.catalogTool)) {
+        throw new ToolDeniedError(input.toolName, "Tool catalog changed; start a new code_mode call.");
+      }
+    }
+  }
+
+  private async validate<Input>(tool: ChiliToolDefinition<Input>, input: unknown, signal?: AbortSignal): Promise<Input> {
+    if (!tool.validate) {
+      await validateToolSchema(tool, input, signal);
+      return input as Input;
+    }
     const result = await tool.validate(input);
     if (!result.ok) throw new ToolValidationError(tool.name, result.message);
+    await validateToolSchema(tool, result.value, signal);
     return result.value;
   }
 
@@ -473,6 +565,13 @@ export class ToolExecutor {
   ): ChiliToolExecutionContext {
     let outputSequence = 0;
     let streamedOutputBytes = 0;
+    let catalog: Promise<{ tools: ChiliToolDefinition[]; revision: number | undefined }> | undefined;
+    const loadCatalog = () => catalog ??= (async () => {
+      const revision = this.options.registry.getRevision?.();
+      const tools = (await this.visibleTools(input)).map((definition) => ({ ...definition }));
+      if (revision !== this.options.registry.getRevision?.()) throw new Error("Tool catalog changed; start a new code_mode call.");
+      return { tools, revision };
+    })();
     return {
       sessionId: input.sessionId,
       turnId: input.turnId,
@@ -481,7 +580,30 @@ export class ToolExecutor {
       signal: input.signal ?? new AbortController().signal,
       cwd: input.cwd,
       fileReads: this.fileReads,
-      visibleTools: () => this.visibleTools(input),
+      visibleTools: tool.isOrchestrator ? async () => (await loadCatalog()).tools : () => this.visibleTools(input),
+      ...(tool.isOrchestrator ? {
+        invokeTool: async (name: string, childInput: unknown, childSignal?: AbortSignal): Promise<ToolResult> => {
+          input.dispatchScope?.throwIfFailed();
+          const snapshot = await loadCatalog();
+          const child = snapshot.tools.find((candidate) => candidate.name === name);
+          if (!child || child.codeMode !== true || child.isOrchestrator) {
+            throw new ToolDeniedError(name, "Tool is not in this script's callable catalog.");
+          }
+          const signals = [input.signal, childSignal].filter((signal): signal is AbortSignal => signal !== undefined);
+          const signal = AbortSignal.any(signals);
+          signal.throwIfAborted();
+          const result = await this.execute({
+            sessionId: input.sessionId, turnId: input.turnId, cwd: input.cwd,
+            toolName: child.name, input: childInput, parentCallId: callId,
+            ...(input.policy ? { policy: input.policy } : {}),
+            ...(input.dispatchScope ? { dispatchScope: input.dispatchScope } : {}),
+            ...(snapshot.revision === undefined ? {} : { catalogRevision: snapshot.revision }),
+            catalogTool: child, signal,
+          });
+          if (result.status !== "completed") throw Object.assign(result.error, { callId: result.callId });
+          return result.result;
+        },
+      } : {}),
       persistedOutputLimits: {
         ...(this.options.maxPersistedOutputBytes !== undefined
           ? { maxBytes: this.options.maxPersistedOutputBytes }
@@ -725,6 +847,7 @@ export class ToolExecutor {
     } catch (error) {
       const normalizedError = toError(error);
       this.eventPublishFailures.add(normalizedError);
+      input.dispatchScope?.fail(normalizedError);
       throw normalizedError;
     }
   }

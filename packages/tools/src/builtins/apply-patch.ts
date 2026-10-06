@@ -58,6 +58,21 @@ interface AppliedOperation {
 export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
   return {
     name: "apply_patch",
+    codeMode: true,
+    outputSchema: {
+      type: "object",
+      required: ["operations", "changedCount"],
+      properties: {
+        operations: {
+          type: "array",
+          items: { type: "object", required: ["type", "path", "changed", "detail"], properties: {
+            type: { type: "string", enum: ["create", "replace", "delete", "raw_update"] },
+            path: { type: "string" }, changed: { type: "boolean" }, detail: { type: "string" },
+          } },
+        },
+        changedCount: { type: "integer" },
+      },
+    },
     searchHint: "Apply structured create, replace, delete, or raw patch operations to workspace files.",
     description: "Apply structured patch text to files inside the workspace.",
     risk: "write",
@@ -151,6 +166,7 @@ export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
       return {
         title: `patched ${changed.length} file operation(s)`,
         output,
+        structuredData: { operations: applied, changedCount: changed.length },
         metadata: {
           files: [...new Set(applied.map((operation) => operation.path))],
           operationCount: applied.length,

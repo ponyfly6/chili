@@ -12,6 +12,12 @@ export interface WriteFileInput {
 export function createWriteFileTool(): ChiliToolDefinition<WriteFileInput> {
   return {
     name: "write",
+    codeMode: true,
+    outputSchema: {
+      type: "object",
+      required: ["path", "created", "bytes"],
+      properties: { path: { type: "string" }, created: { type: "boolean" }, bytes: { type: "integer" } },
+    },
     aliases: ["write_file"],
     searchHint: "Write full UTF-8 file contents; existing files must be read first.",
     description: "Write full UTF-8 text content to a workspace file.",
@@ -79,6 +85,7 @@ export function createWriteFileTool(): ChiliToolDefinition<WriteFileInput> {
       return {
         title: target.relativePath,
         output: existing === undefined ? "Created file successfully." : "Wrote file successfully.",
+        structuredData: { path: target.relativePath, created: existing === undefined, bytes: Buffer.byteLength(input.content, "utf8") },
         metadata: {
           filePath: target.relativePath,
           created: existing === undefined,

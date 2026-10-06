@@ -49,6 +49,7 @@ import {
   createAgentMessageListTool,
   createAgentMessageSendTool,
   createBashTool,
+  createCodeModeTool,
   createProcessTool,
   createDelegationSetTool,
   createDelegationStatusTool,
@@ -973,6 +974,19 @@ export async function buildHostPromptFragments(input: {
 }): Promise<PromptFragment[]> {
   const context: PromptFragment[] = [
     chiliBasePromptFragment(),
+    {
+      id: "chili.tools.code-mode",
+      layer: "developer",
+      source: "core",
+      priority: 10,
+      lifecycle: "stable",
+      trust: "system",
+      content: [
+        "When code_mode is available, use it to combine tool calls with predictable JavaScript control flow and summarize intermediate results with text(...). Direct tool calls remain available for individual actions.",
+        "Await dependent operations in order. Use Promise.allSettled for independent work and inspect every result; the host enforces tool concurrency limits. Await all work before returning.",
+        "Tool permissions, approvals, and worker scope still apply to every nested call, including writes. A failed script does not roll back completed actions; inspect what ran before retrying.",
+      ].join("\n"),
+    },
     ...(await buildChiliMemoryPromptFragments({
       cwd: input.cwd,
       ...(input.homeDir ? { homeDir: input.homeDir } : {}),
@@ -1148,6 +1162,7 @@ function createToolRegistry(
   processes: ManagedProcessManager,
 ): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
+  registry.register(createCodeModeTool());
   registry.register(createReadFileTool({ defaultMaxBytes: DEFAULT_READ_MAX_BYTES, maxBytesLimit: READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
   registry.register(createGlobTool());
@@ -1179,6 +1194,7 @@ function createChildToolRegistry(
   bashRunner?: BashRunner,
 ): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
+  registry.register(createCodeModeTool());
   registry.register(createReadFileTool({ defaultMaxBytes: DEFAULT_READ_MAX_BYTES, maxBytesLimit: READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
   registry.register(createGlobTool());

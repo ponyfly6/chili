@@ -123,6 +123,7 @@ export interface RuntimeMessageView {
 
 export interface RuntimeToolCallView {
   id: ToolCallId;
+  parentCallId?: ToolCallId;
   status: ToolCallStatus | "completed" | "failed" | "cancelled";
   toolName: string;
   input: unknown;
@@ -962,6 +963,7 @@ type ChatToolInputSummaryDraft = {
 
 export interface ChatToolCallRow {
   id: ToolCallId;
+  parentCallId?: ToolCallId;
   kind: "tool";
   toolName: string;
   status: RuntimeToolCallView["status"];
@@ -1237,6 +1239,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       };
       assignOptional(toolCall, "sessionId", event.sessionId);
       assignOptional(toolCall, "turnId", event.payload.turnId);
+      assignOptional(toolCall, "parentCallId", event.payload.parentCallId);
       view.toolCalls[toolCall.id] = toolCall;
       assignTranscriptOrder(view, "tool", toolCall.id);
       linkToolCallToSession(view, toolCall, event.time);
@@ -2961,6 +2964,7 @@ function chatToolCallRow(
     inputSummary: chatToolInputSummary(toolCall.toolName, toolCall.input, pendingApproval?.patterns ?? latestApproval?.patterns ?? []),
   };
   assignOptional(row, "input", toolCall.input);
+  assignOptional(row, "parentCallId", toolCall.parentCallId);
   assignOptional(row, "output", toolCall.output);
   assignOptional(row, "error", toolCall.error);
   assignOptional(row, "executionContext", executionContext);

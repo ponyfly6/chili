@@ -2,6 +2,7 @@ import { chmod, copyFile, mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 
 const packageRoot = resolve(import.meta.dirname, "..");
+const workspaceRoot = resolve(packageRoot, "../..");
 const buildRoot = process.env.CHILI_DESKTOP_BUILD_ROOT || packageRoot;
 const output = resolve(buildRoot, "resources/chili-sidecar");
 const target = compileTarget(process.platform, process.arch);
@@ -17,11 +18,14 @@ const child = Bun.spawn({
     "build",
     "--compile",
     "--production",
+    `--root=${workspaceRoot}`,
     `--target=${target}`,
     `--outfile=${output}`,
     resolve(packageRoot, "src/sidecar/entry.ts"),
+    resolve(workspaceRoot, "packages/tools/src/code-mode/worker.ts"),
+    resolve(workspaceRoot, "packages/tools/src/input-schema-worker.ts"),
   ],
-  cwd: resolve(packageRoot, "../.."),
+  cwd: workspaceRoot,
   stdout: "inherit",
   stderr: "inherit",
 });

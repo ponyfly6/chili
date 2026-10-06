@@ -12,7 +12,9 @@
   "dependencies": {
     "@chili/policy": "workspace:*",
     "@chili/protocol": "workspace:*",
-    "@chili/skills": "workspace:*"
+    "@chili/skills": "workspace:*",
+    "quickjs-wasi": "3.6.2",
+    "ajv": "8.17.1"
   },
   "scripts": {
     "typecheck": "tsc -b"

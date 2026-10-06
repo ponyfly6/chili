@@ -32,6 +32,19 @@ export function createReadFileTool(options: ReadFileToolOptions = {}): ChiliTool
   }
   return {
     name: "read",
+    codeMode: true,
+    outputSchema: {
+      type: "object",
+      required: ["path", "content", "bytes", "truncated", "offset", "limit"],
+      properties: {
+        path: { type: "string", description: "Workspace-relative file path." },
+        content: { type: "string", description: "Selected UTF-8 text, without display notices." },
+        bytes: { type: "integer", description: "Total file size in bytes, not the selected text size." },
+        truncated: { type: "boolean", description: "Whether the byte limit cut the requested selection." },
+        offset: { type: "integer", description: "First requested line, starting at 1." },
+        limit: { type: ["integer", "null"], description: "Requested line count, or null for no line limit." },
+      },
+    },
     aliases: ["read_file"],
     searchHint: "Read text files with optional line offsets and byte limits.",
     description: "Read a UTF-8 text file within the current workspace.",
@@ -120,6 +133,7 @@ export function createReadFileTool(options: ReadFileToolOptions = {}): ChiliTool
       return {
         title: target.relativePath,
         output: truncated ? `${content}\n[truncated after ${maxBytes} bytes]` : content,
+        structuredData: { path: target.relativePath, content, bytes, truncated, offset: input.offset ?? 1, limit: input.limit ?? null },
         metadata: {
           path: target.relativePath,
           bytes,

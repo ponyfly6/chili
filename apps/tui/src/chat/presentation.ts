@@ -45,6 +45,7 @@ export type ToolActivityTone = "muted" | "pending" | "error";
 export interface ToolActivityDisplay {
   id: string;
   callId: string;
+  parentCallId?: string;
   toolName: string;
   status: string;
   displayStatus: ChatToolDisplayStatus;
@@ -154,7 +155,67 @@ export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], opti
 
   output.sort((left, right) => displayItemTime(left) - displayItemTime(right));
 
-  return options.groupExplorationTools === false ? output : groupExplorationTools(output);
+  const nested = groupNestedTools(output);
+  return options.groupExplorationTools === false ? nested : groupExplorationTools(nested);
+}
+
+function groupNestedTools(items: readonly ChatDisplayItem[]): ChatDisplayItem[] {
+  const calls = new Map(items.flatMap((item) => item.kind === "tool_activity"
+    ? [[item.activity.callId, item] as const] : []));
+  const rootByCall = new Map<string, string>();
+  for (const [callId, item] of calls) {
+    const visited = new Set([callId]);
+    let root = item;
+    while (root.activity.parentCallId) {
+      const parent = calls.get(root.activity.parentCallId);
+      if (!parent) break;
+      if (visited.has(parent.activity.callId)) {
+        root = item;
+        break;
+      }
+      visited.add(parent.activity.callId);
+      root = parent;
+    }
+    rootByCall.set(callId, root.activity.callId);
+  }
+  const children = new Map<string, ToolActivityDisplay[]>();
+  for (const [callId, item] of calls) {
+    const root = rootByCall.get(callId)!;
+    if (root === callId) continue;
+    const group = children.get(root) ?? [];
+    group.push(item.activity);
+    children.set(root, group);
+  }
+
+  const emitted = new Set<string>();
+  const output: ChatDisplayItem[] = [];
+  for (const item of items) {
+    if (item.kind !== "tool_activity") {
+      output.push(item);
+      continue;
+    }
+    const rootId = rootByCall.get(item.activity.callId)!;
+    const nested = children.get(rootId);
+    if (!nested?.length) {
+      output.push(item);
+      continue;
+    }
+    if (emitted.has(rootId)) continue;
+    emitted.add(rootId);
+    const parent = calls.get(rootId)!;
+    const activities = [parent.activity, ...nested];
+    const failures = nested.filter((activity) => activity.tone === "error").length;
+    output.push({
+      kind: "tool_group",
+      id: `tool-group:${rootId}`,
+      label: `${parent.activity.label} · ${nested.length} ${plural(nested.length, "tool call", "tool calls")}${failures ? ` · ${failures} unsuccessful` : ""}`,
+      tone: groupTone(activities),
+      metadata: explorationGroupMetadata(activities),
+      activities,
+      ...(item.time === undefined ? {} : { time: item.time }),
+    });
+  }
+  return output;
 }
 
 function isAgentSpawnToolName(toolName: string): boolean {
@@ -260,7 +321,7 @@ function messageDisplayItems(
 }
 
 function toolActivityFromRow(row: ChatToolCallRow, showToolDetails: boolean, cwd: string): ToolActivityDisplay {
-  return toolActivity({
+  const activity = toolActivity({
     id: row.id,
     callId: row.id,
     toolName: row.toolName,
@@ -276,6 +337,11 @@ function toolActivityFromRow(row: ChatToolCallRow, showToolDetails: boolean, cwd
     ...(row.executionContext === undefined ? {} : { executionContext: row.executionContext }),
     ...(row.liveOutput === undefined ? {} : { liveOutput: row.liveOutput }),
   });
+  if (row.parentCallId) {
+    activity.parentCallId = row.parentCallId;
+    activity.label = `↳ ${activity.label}`;
+  }
+  return activity;
 }
 
 function fallbackToolResultActivity(
@@ -400,6 +466,7 @@ export function groupExplorationTools(items: readonly ChatDisplayItem[]): ChatDi
   for (const item of items) {
     if (
       item.kind === "tool_activity"
+      && item.activity.parentCallId === undefined
       && isExplorationTool(item.activity.toolName)
       && item.activity.displayStatus === "succeeded"
     ) {

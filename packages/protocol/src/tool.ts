@@ -48,6 +48,8 @@ export interface ToolOutputUpdate {
 export interface ToolResult {
   title: string;
   output: string;
+  /** Bounded JSON for programmatic callers; separate from the display preview. */
+  structuredData?: unknown;
   content?: ToolResultContent[];
   metadata?: Record<string, unknown>;
   artifactIds?: ArtifactId[];

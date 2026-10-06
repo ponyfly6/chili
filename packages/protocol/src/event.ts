@@ -83,7 +83,7 @@ export type MessageEvent =
   | EventEnvelope<"message.part_delta", { messageId: MessageId; partId: string; field: string; delta: string }>;
 
 export type ToolEvent =
-  | EventEnvelope<"tool.call_started", { turnId: TurnId; callId: ToolCallId; toolName: string; input: unknown }>
+  | EventEnvelope<"tool.call_started", { turnId: TurnId; callId: ToolCallId; parentCallId?: ToolCallId; toolName: string; input: unknown }>
   | EventEnvelope<"tool.call_updated", { callId: ToolCallId; status: ToolCallStatus; toolName?: string; input?: unknown; metadata?: Record<string, unknown> }>
   | EventEnvelope<"tool.output_delta", { callId: ToolCallId; stream: ToolOutputStream; delta: string; bytes?: number; truncated?: boolean; sequence?: number }>
   | EventEnvelope<"tool.call_finished", { callId: ToolCallId; status: "completed" | "failed" | "cancelled"; output?: string; error?: string; errorDetails?: PersistedErrorDetails; synthetic?: boolean }>;

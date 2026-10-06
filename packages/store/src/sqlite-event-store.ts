@@ -508,6 +508,7 @@ export class SqliteEventStore
       for (const statement of tableStatements) {
         this.db.exec(statement);
       }
+      this.addColumnIfMissing("tool_calls", "parent_call_id", "text");
       this.prepareSessionOnlyReplacementColumns();
       this.migrateMailboxRecipientSessionSchema();
       for (const statement of indexStatements) {
@@ -4353,14 +4354,16 @@ export class SqliteEventStore
       this.db
         .query(
           `insert into tool_calls
-             (id, session_id, turn_id, tool_name, status, input_json, started_at, updated_at)
-           values (?, ?, ?, ?, 'running', ?, ?, ?)
+             (id, parent_call_id, session_id, turn_id, tool_name, status, input_json, started_at, updated_at)
+           values (?, ?, ?, ?, ?, 'running', ?, ?, ?)
            on conflict(id) do update set
              status = excluded.status,
+             parent_call_id = coalesce(excluded.parent_call_id, tool_calls.parent_call_id),
              updated_at = excluded.updated_at`,
         )
         .run(
           event.payload.callId,
+          event.payload.parentCallId ?? null,
           event.sessionId ?? null,
           event.payload.turnId,
           event.payload.toolName,

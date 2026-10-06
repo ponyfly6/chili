@@ -1,5 +1,6 @@
 import { normalizePersistedError, type ToolResultContent, type ToolRisk, type ToolResult } from "@chili/protocol";
 import type { ChiliToolDefinition, ChiliToolExecutionContext, ToolApprovalSpec } from "@chili/tools";
+import { validateStructuredToolData } from "@chili/tools";
 import type { McpServerConfig } from "./config.js";
 import type { McpCallToolResult, McpTool, McpToolAnnotations } from "./client.js";
 import type { McpClientManager } from "./manager.js";
@@ -14,6 +15,7 @@ const MAX_MCP_STRUCTURED_STRING_BYTES = 128_000;
 const MAX_MCP_STRUCTURED_ITEMS = 128;
 const MAX_MCP_STRUCTURED_DEPTH = 12;
 const MAX_MCP_STRUCTURED_NODES = 2_048;
+const MAX_MCP_MACHINE_DATA_BYTES = 1024 * 1024;
 
 export interface McpToolMetadata {
   rawServerName: string;
@@ -43,13 +45,18 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
 
   return {
     name: modelName,
+    codeMode: true,
+    outputSchema: options.tool.outputSchema ?? {
+      description: "Original structuredContent when provided by the MCP server (schema unspecified); otherwise an object with content (original MCP blocks) and isError (boolean). Machine data may be unavailable: inspect metadata.structuredDataUnavailable before relying on a rendered preview.",
+    },
     description: sanitizeMcpToolDescription(
       options.tool.description ?? `MCP tool ${options.server.name}/${options.tool.name}`,
       options.server.name,
       options.tool.name,
-    ),
+    ) + "\n\nCode mode returns complete MCP machine data in .structuredData when it is valid JSON within 1 MiB; otherwise .metadata.structuredDataUnavailable explains why the machine value is absent. Rendered .output may be a bounded preview.",
     risk: inferRisk(annotations),
     inputSchema: options.tool.inputSchema ?? { type: "object" },
+    inputSchemaSource: "external",
     shouldDefer: true,
     isReadOnly,
     isConcurrencySafe,
@@ -83,9 +90,11 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
           error.code = "MCP_TOOL_ERROR";
           throw error;
         }
+        const machineData = mcpMachineData(rawResult);
         return {
           title: `${options.server.name}/${options.tool.name}`,
           output: formatMcpToolOutput(result),
+          ...(machineData.available ? { structuredData: machineData.value } : {}),
           ...optionalContent(mcpToolResultContent(result)),
           metadata: {
             server: options.server.name,
@@ -93,6 +102,7 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
             modelName,
             isError: Boolean(result.isError),
             structuredContent: result.structuredContent,
+            ...(!machineData.available ? { structuredDataUnavailable: machineData.reason } : {}),
           },
         };
       } catch (error) {
@@ -100,6 +110,20 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
       }
     },
   };
+}
+
+function mcpMachineData(result: McpCallToolResult): { available: true; value: unknown } | { available: false; reason: string } {
+  try {
+    const value = validateStructuredToolData(result.structuredContent !== undefined
+      ? result.structuredContent
+      : { content: result.content ?? [], isError: result.isError ?? false });
+    if (Buffer.byteLength(JSON.stringify(value), "utf8") > MAX_MCP_MACHINE_DATA_BYTES) {
+      return { available: false, reason: "Complete MCP machine data exceeds the 1 MiB JSON limit; request a smaller result." };
+    }
+    return { available: true, value };
+  } catch (error) {
+    return { available: false, reason: error instanceof Error ? error.message : "MCP result is not valid bounded JSON data." };
+  }
 }
 
 export function sanitizeMcpToolDescription(description: string, serverName: string, toolName: string): string {
@@ -144,7 +168,8 @@ export function inferRisk(annotations: McpToolAnnotations): ToolRisk {
 
 export function inferConcurrencySafe(annotations: McpToolAnnotations): boolean {
   if (annotations.destructiveHint === true) return false;
-  return annotations.readOnlyHint === true || annotations.idempotentHint === true;
+  // Idempotence does not make differently parameterized writes safe to overlap.
+  return annotations.readOnlyHint === true;
 }
 
 function formatMcpToolOutput(result: McpCallToolResult): string {

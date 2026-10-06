@@ -32,6 +32,7 @@ test("adapts MCP tool approval to Chili mcp permission and raw server/tool patte
   expect(tool.name).toBe("mcp__github_enterprise__issues_search");
   expect(tool.risk).toBe("read");
   expect(tool.shouldDefer).toBe(true);
+  expect(tool.inputSchemaSource).toBe("external");
   expect(tool.isReadOnly).toBe(true);
   expect(tool.isConcurrencySafe).toBe(true);
   expect(tool.mcp).toMatchObject({
@@ -56,7 +57,7 @@ test("infers MCP tool risk and concurrency from annotations", () => {
   expect(inferRisk({})).toBe("network");
 
   expect(inferConcurrencySafe({ destructiveHint: true, idempotentHint: true })).toBe(false);
-  expect(inferConcurrencySafe({ idempotentHint: true })).toBe(true);
+  expect(inferConcurrencySafe({ idempotentHint: true })).toBe(false);
   expect(inferConcurrencySafe({ readOnlyHint: true })).toBe(true);
   expect(inferConcurrencySafe({})).toBe(false);
 });
@@ -263,6 +264,63 @@ test("adds stable suffixes when sanitized MCP tool names collide", () => {
   expect(tools[0]?.name).not.toBe(tools[1]?.name);
   expect(tools[0]?.mcp.modelName).toBe(tools[0]?.name);
   expect(tools[1]?.mcp.modelName).toBe(tools[1]?.name);
+});
+
+test("code mode preserves exact MCP structured data independently of bounded display text", async () => {
+  const original = { records: [{ id: 1, label: "x".repeat(160_000) }] };
+  const schema = { type: "object", properties: { records: { type: "array" } } };
+  const tool = createMcpChiliTool({
+    server,
+    tool: { name: "records", outputSchema: schema },
+    manager: { callTool: async () => ({ content: [{ type: "text", text: "Records" }], structuredContent: original }) },
+  });
+  const result = await tool.execute({}, executionContext());
+  expect(tool.codeMode).toBe(true);
+  expect(tool.outputSchema).toEqual(schema);
+  expect(result.output).toContain("truncated");
+  expect(result.structuredData).toEqual(original);
+  expect(result.structuredData).not.toBe(original);
+  expect(result.metadata?.structuredDataUnavailable).toBeUndefined();
+});
+
+test("code mode reports unavailable MCP machine data rather than substituting a partial value", async () => {
+  const raw = { label: "\u0000".repeat(200_000) };
+  const tool = createMcpChiliTool({
+    server,
+    tool: { name: "escaped_data" },
+    manager: { callTool: async () => ({ content: [], structuredContent: raw }) },
+  });
+  const result = await tool.execute({}, executionContext());
+  expect(result.structuredData).toBeUndefined();
+  expect(result.metadata?.structuredDataUnavailable).toContain("1 MiB JSON limit");
+  expect(result.output).toContain("truncated");
+  expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThan(2_000_000);
+});
+
+test("invalid MCP machine data keeps the native preview usable and records the reason", async () => {
+  const raw: Record<string, unknown> = { label: "item" };
+  raw.self = raw;
+  const tool = createMcpChiliTool({
+    server,
+    tool: { name: "cycle" },
+    manager: { callTool: async () => ({ content: [], structuredContent: raw }) },
+  });
+  const result = await tool.execute({}, executionContext());
+  expect(result.structuredData).toBeUndefined();
+  expect(result.metadata?.structuredDataUnavailable).toContain("cycle");
+  expect(result.output).toContain("circular structured content");
+  expect(() => JSON.stringify(result)).not.toThrow();
+});
+
+test("MCP tools without structured content return original content blocks as machine data", async () => {
+  const content = [{ type: "resource_link", name: "report", uri: "resource://report", description: "A report" }];
+  const tool = createMcpChiliTool({
+    server,
+    tool: { name: "resource" },
+    manager: { callTool: async () => ({ content }) },
+  });
+  const result = await tool.execute({}, executionContext());
+  expect(result.structuredData).toEqual({ content, isError: false });
 });
 
 function executionContext() {

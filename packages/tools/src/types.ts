@@ -15,6 +15,7 @@ import type {
 } from "@chili/protocol";
 import type { PermissionDecision } from "@chili/policy";
 import type { FileReadStateStore } from "./file-read-state.js";
+import type { ToolDispatchScope } from "./dispatch-scope.js";
 
 export type ValidationResult<Input> =
   | { ok: true; value: Input }
@@ -28,6 +29,14 @@ export interface ChiliToolDefinition<Input = any, Output extends ToolResult = To
   shouldDefer?: boolean;
   interruptBehavior?: "cancel" | "block";
   maxResultOutputBytes?: number;
+  /** Explicit host opt-in for calls made by an isolated orchestration script. */
+  codeMode?: boolean;
+  /** Host-assigned trust classification; external schemas validate in a terminable worker. */
+  inputSchemaSource?: "external";
+  /** Describes structuredData, not the human-readable output preview. */
+  outputSchema?: unknown;
+  /** An orchestrator does not hold its child tools' execution permit. */
+  isOrchestrator?: boolean;
   isReadOnly?: ToolBooleanPredicate<Input>;
   isConcurrencySafe?: ToolBooleanPredicate<Input>;
   isDestructive?: ToolBooleanPredicate<Input>;
@@ -61,6 +70,7 @@ export interface ChiliToolExecutionContext extends ToolExecutionContext {
   outputArtifactId: ToolCallId;
   fileReads?: FileReadStateStore;
   visibleTools?: () => Promise<ChiliToolDefinition[]> | ChiliToolDefinition[];
+  invokeTool?: (name: string, input: unknown, signal?: AbortSignal) => Promise<ToolResult>;
   persistedOutputLimits?: {
     maxBytes?: number;
     maxDirectoryBytes?: number;
@@ -98,6 +108,7 @@ export type ContextualToolProvider = (
 ) => Promise<readonly ChiliToolDefinition[]> | readonly ChiliToolDefinition[];
 
 export interface ToolRegistry {
+  getRevision?(): number;
   register(tool: ChiliToolDefinition, options?: ToolRegistryRegisterOptions): void;
   get(name: string): ChiliToolDefinition | undefined;
   list(options?: ToolRegistryListOptions): ChiliToolDefinition[];
@@ -172,6 +183,11 @@ export interface ExecuteToolInput {
   cwd: string;
   policy?: ToolAccessPolicy;
   signal?: AbortSignal;
+  parentCallId?: ToolCallId;
+  dispatchScope?: ToolDispatchScope;
+  /** Trusted catalog snapshot held by the parent orchestration call. */
+  catalogTool?: ChiliToolDefinition;
+  catalogRevision?: number;
 }
 
 export interface ToolPolicyContext {

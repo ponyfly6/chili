@@ -15,6 +15,8 @@ interface RegisteredTool {
 }
 
 export class InMemoryToolRegistry implements MutableToolRegistry {
+  private revision = 0;
+  getRevision(): number { return this.revision; }
   private readonly canonical = new Map<string, RegisteredTool>();
   private readonly lookup = new Map<string, RegisteredTool>();
   private readonly contextualSources = new Map<string, ContextualToolProvider>();
@@ -36,6 +38,7 @@ export class InMemoryToolRegistry implements MutableToolRegistry {
     for (const alias of tool.aliases ?? []) {
       this.lookup.set(alias, registered);
     }
+    this.revision++;
   }
 
   get(name: string): ChiliToolDefinition | undefined {
@@ -126,10 +129,13 @@ export class InMemoryToolRegistry implements MutableToolRegistry {
 
   replaceContextualSource(source: string, provider: ContextualToolProvider): void {
     this.contextualSources.set(source, provider);
+    this.revision++;
   }
 
   unregisterContextualSource(source: string): boolean {
-    return this.contextualSources.delete(source);
+    const removed = this.contextualSources.delete(source);
+    if (removed) this.revision++;
+    return removed;
   }
 
   private sortedEntries(): RegisteredTool[] {
@@ -139,6 +145,7 @@ export class InMemoryToolRegistry implements MutableToolRegistry {
   private remove(name: string): void {
     const existing = this.canonical.get(name);
     if (!existing) return;
+    this.revision++;
     this.canonical.delete(name);
     this.lookup.delete(existing.tool.name);
     for (const alias of existing.tool.aliases ?? []) {

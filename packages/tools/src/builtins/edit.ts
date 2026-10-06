@@ -14,6 +14,12 @@ export interface EditInput {
 export function createEditTool(): ChiliToolDefinition<EditInput> {
   return {
     name: "edit",
+    codeMode: true,
+    outputSchema: {
+      type: "object",
+      required: ["path", "created", "occurrences"],
+      properties: { path: { type: "string" }, created: { type: "boolean" }, occurrences: { type: "integer" } },
+    },
     aliases: ["replace"],
     searchHint: "Replace exact literal text in a workspace file after reading it.",
     description: "Replace exact literal text in a workspace file.",
@@ -101,6 +107,7 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
         return {
           title: target.relativePath,
           output: existing === undefined ? "Created file successfully." : "Replaced file contents successfully.",
+          structuredData: { path: target.relativePath, created: existing === undefined, occurrences: 1 },
           metadata: {
             filePath: target.relativePath,
             created: existing === undefined,
@@ -134,6 +141,7 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
       return {
         title: target.relativePath,
         output: `Edit applied successfully. Replaced ${input.replaceAll ? occurrences : 1} occurrence(s).`,
+        structuredData: { path: target.relativePath, created: false, occurrences: input.replaceAll ? occurrences : 1 },
         metadata: {
           filePath: target.relativePath,
           occurrences: input.replaceAll ? occurrences : 1,
