@@ -1,6 +1,6 @@
 # Chili 产品与架构主线
 
-2026-10-03 最新优先级：**按用户决定，暂缓 UI 与交互扩建，从任务全生命周期打磨底层，不只研究被点名的模块。** 全局复核后，先修执行身份、资源权限和状态归属的不一致：内部调用 ID、跨会话文件观察、规范路径授权、审批政策更新、MCP 目标信任与凭据、同 store 的执行 owner。随后统一会话/工具/模型请求生命周期，在其上完善 Context/Prompt、Memory 和多智能体。已完成的 Host、持久输入、工具执行器和 Task/Run 保证继续复用；实现放在共享 core/store/host，CLI、TUI、Desktop 都是入口。具体证据、取舍与验收见 [基础层全局复核](agent-foundation-review-2026-10-03.md)。本条覆盖此前客户端优先及同日早先上下文优先排序，产品最终标准不变。
+2026-10-03 最新优先级：**按用户决定，暂缓 UI 与交互扩建，从任务全生命周期打磨底层，不只研究被点名的模块。** 全局复核后，先修执行身份、资源权限和状态归属的不一致：内部调用 ID、跨会话文件观察、规范路径授权、审批政策更新、MCP 目标信任与凭据、同 store 的执行 owner。随后统一会话/工具/模型请求生命周期，在其上完善 Context/Prompt、Memory 和多智能体。已完成的 Host、持久输入和工具执行器继续复用；实现放在共享 core/store/host，CLI、TUI、Desktop 都是入口。具体证据、取舍与验收见 [基础层全局复核](agent-foundation-review-2026-10-03.md)。本条覆盖此前客户端优先及同日早先上下文优先排序，产品最终标准不变。
 
 2026-10-03 基础层实施更新：已将身份与权限、工具准备、实际模型请求、Memory 事务、子代理执行和恢复互斥接入共享 Host/Runtime；同 store 第二 Host 明确拒绝，POSIX 外部进程采用 owner 登记后启动与 guardian 清理。具体实现、兼容迁移、行为证据及尚存限制见 [基础层实施记录](agent-foundation-implementation-2026-10-03.md)。真实模型长期任务能力、跨进程 attach、MCP OAuth 与其他平台等价隔离仍不冒充完成；UI、交互和公开分发继续后置。
 
@@ -40,12 +40,12 @@ flowchart LR
 
 ## 当前架构中真正值得推进的缺口
 
-现有多项目 runtime、历史、Goal、Queue / Steer / Stop、工具执行、子代理及团队产物机制继续复用。按新的产品前提，优先级如下。
+现有多项目 runtime、历史、Goal、Queue / Steer / Stop、工具执行和统一 Agent 继续复用。Agent 以 Session 为身份，共用持久输入队列。按新的产品前提，优先级如下。
 
 | 当前接线 | 对自主工作的影响 | 演进方向 |
 | --- | --- | --- |
 | [顶层任务](../apps/desktop/src/main/control-service.ts:743) 一律以项目 cwd 创建，[创建参数](../apps/desktop/src/shared/contracts.ts:138) 没有任务工作区绑定 | 多项独立写任务仍共用代码现场，成果与执行目录的归属不完整 | 宿主为任务分配并记录明确的工作区；常规路径自动选择资源策略 |
-| [RuntimeService](../packages/core/src/runtime-service.ts) 已负责持久输入与 Queue / Steer / Stop；[Host 说明](../packages/host/README.md#durable-root-inputs) 记录恢复边界 | 输入可跨重启保留，但尚无跨进程控制转发及独立驻留 | 验证真实日用恢复，再接最小 owner attach 与成果入口 |
+| [RuntimeService](../packages/core/src/runtime-service.ts) 已负责持久输入与 Queue / Steer / Stop；[Host 说明](../packages/host/README.md#durable-session-inputs) 记录恢复边界 | 输入可跨重启保留，但尚无跨进程控制转发及独立驻留 | 验证真实日用恢复，再接最小 owner attach 与成果入口 |
 | 当前桌面主要围绕 Timeline、Activity 与 Changes 展开，见 [App](../apps/desktop/src/renderer/App.tsx:1246) | 用户容易停留在阅读执行记录，难以直接进入当前成果 | 任务关联可用成果和运行入口，逐步将体验、自然语言反馈与继续执行接通 |
 | [Diff 查询](../apps/desktop/src/main/control-service.ts:711) 固定读取项目目录；权限配置也是项目级状态 | 执行位置、成果观察与配置作用范围尚未统一到任务 | 明确项目身份、任务工作区和有效执行配置，让所有操作跟随同一归属 |
 
@@ -71,7 +71,7 @@ AI 应能读项目、修改文件、安装项目所需依赖、启动程序、�
 
 ### 3. 让并行成为 AI 的执行能力
 
-用户提出几件想完成的事，模型负责拆分、协调和整合。宿主提供子任务、上下文访问、消息、等待、取消、工作区和产物关联，复用已有 Task / Run / lease 与团队产物机制。
+用户提出几件想完成的事，模型负责拆分、协调和整合。宿主提供统一 Agent 的创建、消息、等待、停止与恢复，使用 Session 和持久输入队列记录身份与执行状态。worktree 创建和补丁应用由独立 Git 工具提供。
 
 普通使用不要求配置专家角色、工作流图或并发数。界面主要呈现目标进展、可使用成果及确实需要人的决定。已有代理详情可以保留为按需工具，其扩建不占据主线。
 

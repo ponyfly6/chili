@@ -295,11 +295,14 @@ test("root recovery leaves child queues to their trusted runtime and never reviv
   // Seed an old database projection directly: current event writers cannot create old Agent identities.
   const database = new Database(f.database);
   try {
+    database.query("delete from schema_migrations where name = ?").run("retired_workflows_v1");
     database.query("insert into events (id, type, time, session_id, payload_json) values (?, ?, ?, ?, ?)")
       .run("legacy_run_event", "agent.spawned", 1, rootId, JSON.stringify({
         runId: "legacy_run", path: "/root/legacy", taskName: "legacy", childSessionId: legacyId,
       }));
   } finally { database.close(); }
+  // The upgrade materializes the restriction; runtime reads never inspect old events.
+  new SqliteEventStore(f.database).close();
   expect((await f.store.session(legacyId))?.readOnly).toBe(true);
   const before = await f.store.events({ sessionId: legacyId });
   for (const service of [f.root, f.service]) {

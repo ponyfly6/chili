@@ -95,9 +95,9 @@ remain unimplemented.
 
 Prompt, Stop, Steer, archive and snapshot recovery use the same runtime operation
 ownership. Low-level RuntimeService callers using separate store connections also
-reject control of a foreign live execution. Child first runs, follow-ups and
-mailbox deliveries use the shared child RuntimeService and retain Task/Run
-leases, generations, concurrency limits and completion repair.
+reject control of a foreign live execution. Each Agent is a Session. Creation,
+messages, waiting, Stop and Resume use its durable input queue and session run
+lease. Child model turns share the configured concurrency limit.
 
 ## Tools, context and durable compatibility
 
@@ -133,12 +133,12 @@ The actual budgeted model request is persisted, with sources and omission reason
 [Context](../core/src/context/README.md), [Memory](../core/src/memory/README.md),
 [providers](../providers/README.md), [MCP](../mcp/README.md) and
 [commands](../commands/README.md) document their shared contracts and migrations.
-Existing SQLite/session history is retained. Internal tool IDs are now independent
+Existing conversation history is retained. Internal tool IDs are now independent
 of provider IDs, and old history keeps its protocol mapping. Memory Markdown is
 imported transactionally once into the profile database and is thereafter an
 export format, not a second mutable authority.
 
-## Durable root inputs
+## Durable session inputs
 
 `RuntimeService.submitPromptAsync()` commits the normalized input and its queue
 change event in one SQLite transaction before returning an accepted receipt.
@@ -151,8 +151,8 @@ Modes are `start` (require an idle queue), `queue` (FIFO), and `steer` (priority
 the next turn boundary, interrupting the current turn without stopping managed
 processes). `RuntimeService` arbitrates these inputs with the existing Goal loop.
 Synchronous `submitPrompt()` accepts only `start`; HTTP synchronous routes reject
-queue/steer before admission. Child-agent task admission keeps its existing fenced
-lifecycle rather than entering this root queue.
+queue/steer before admission. Root and child Sessions use the same durable input
+queue. Agent creation commits its child Session and first input together.
 
 An input is `pending`, `claimed`, or `settled`. Claiming atomically acquires the
 existing session run lease and assigns stable execution/message/turn IDs. Creating
@@ -171,13 +171,13 @@ cannot clear a user Stop. Budget-limited Goals require a budget update first.
 On startup and maintenance, recovery leaves live leases alone. Expired claimed
 inputs become interrupted, unknown unfinished tool results become synthetic
 failures, and remaining work is paused. Recovery never replays a tool operation.
-Explicit Resume drains pending inputs first. If only interrupted/failed/stopped
-execution remains, it creates a separate continuation that preserves the original
-model options, materials, skills and tool restrictions. Recovery ancestry keeps
-the original request available across repeated failures; the model is instructed
-to inspect existing effects before continuing. Cancelled never-claimed inputs are
-excluded from recovery. Pending remote inputs require renewed authorization after
-runtime recovery; device/scope revocation cancels their pending input sources.
+Explicit Resume reopens the latest eligible interrupted, failed or cancelled
+input under the same input ID and preserves its model options, materials, skills
+and tool restrictions. That input runs before later pending inputs; the model is
+instructed to inspect existing effects before continuing. Cancelled never-claimed
+inputs are excluded from recovery. Pending remote inputs require renewed
+authorization after runtime recovery; device/scope revocation cancels their pending
+input sources.
 
 HTTP/SSE and `@chili/sdk` expose receipts, queue snapshots, cancellation, Resume,
 and `session.input_queue_changed`. Desktop main caches these projections but owns
@@ -189,8 +189,8 @@ full input content and execution options remain in the store.
 Limits: 128 pending inputs per session, 4,096 globally, 64 MiB of pending payloads,
 and 16 MiB per payload, in addition to existing transport admission limits. New
 schema guards reject older writers trying to claim sessions protected by durable
-input state. Store migrations are additive; JSONL mirroring is a best-effort
-secondary copy and is drained before Host closes SQLite.
+input state. Store migrations preserve conversation history; JSONL mirroring is a
+best-effort secondary copy and is drained before Host closes SQLite.
 
 A second Host is rejected until the current owner and its resources have stopped.
 There is no control forwarding or attach protocol. Stores without durable input

@@ -237,7 +237,6 @@ export class SqliteEventStore
       }
       this.addColumnIfMissing("tool_calls", "parent_call_id", "text");
       this.prepareSessionOnlyReplacementColumns();
-      this.migrateMailboxRecipientSessionSchema();
       for (const statement of indexStatements) {
         this.db.exec(statement);
       }
@@ -252,6 +251,8 @@ export class SqliteEventStore
       this.addColumnIfMissing("sessions", "agent_path", "text");
       this.addColumnIfMissing("sessions", "agent_policy_json", "text");
       this.db.exec("create unique index if not exists sessions_agent_name on sessions(parent_session_id, agent_name) where parent_session_id is not null");
+      this.loadLegacySessionIdentities();
+      this.migrateRetiredWorkflows();
       this.addColumnIfMissing("tool_calls", "provider_call_id", "text");
       this.inputs = new SessionInputRepository(this.db, {
         commit: (events, fence) => { this.writeTransactionEvents(events, fence); },
@@ -260,10 +261,8 @@ export class SqliteEventStore
           if (this.ownedRunClaims.get(sessionId) === claimId) this.ownedRunClaims.delete(sessionId);
         },
         assertSession: (sessionId, options) => {
-          const session = this.db.query<{ status: string; parent_session_id: string | null }, [string]>("select status, parent_session_id from sessions where id = ?").get(sessionId);
-          // Legacy task/team reservations remain read-only. A trusted adapter
-          // may execute only a Session created with the new Agent identity.
-          if ((!session?.parent_session_id && this.legacySessionReservationExists(sessionId))
+          const session = this.db.query<{ status: string; parent_session_id: string | null; read_only: number }, [string]>("select status, parent_session_id, read_only from sessions where id = ?").get(sessionId);
+          if (session?.read_only
             || (session && !!session.parent_session_id !== (options.sessionAccess === "child"))) {
             throw new SessionAccessError(sessionId);
           }
@@ -271,7 +270,6 @@ export class SqliteEventStore
         },
         retry: (operation) => this.runWithWriteRetry(operation),
       });
-      this.loadLegacySessionIdentities();
     } catch (error) {
       try {
         this.db.close();
@@ -325,6 +323,7 @@ export class SqliteEventStore
         policy: input.policy,
       });
       const existing = this.readSession(input.sessionId);
+      if (existing?.readOnly) throw new SessionAccessError(input.sessionId);
       if (existing) {
         if (existing.cwd !== input.cwd || encodeJson(existing.agent) !== encodeJson(agent)) {
           throw new SessionInputConflictError("Agent Session ID already belongs to a different creation");
@@ -337,7 +336,7 @@ export class SqliteEventStore
         }
         return { session: existing, input: initial, queue: this.inputs.queue(existing.id), events: [], duplicate: true };
       }
-      if (this.legacySessionReservationExists(input.sessionId) || this.sessionCreationClaimExists(input.sessionId)) {
+      if (this.sessionCreationClaimExists(input.sessionId)) {
         throw new SessionAccessError(input.sessionId);
       }
       const seen = new Set<SessionId>();
@@ -375,13 +374,13 @@ export class SqliteEventStore
     const row = this.db.query<{
       id: string; cwd: string; title: string | null; status: "active" | "archived";
       created_at: number; updated_at: number; parent_session_id: string | null;
-      agent_name: string | null; agent_path: string | null; agent_policy_json: string | null;
+      agent_name: string | null; agent_path: string | null; agent_policy_json: string | null; read_only: number;
     }, [string]>("select * from sessions where id = ?").get(sessionId);
     if (!row) return undefined;
     return {
       id: row.id as SessionId, cwd: row.cwd, ...(row.title ? { title: row.title } : {}), status: row.status,
       createdAt: row.created_at, updatedAt: row.updated_at,
-      ...(!row.parent_session_id && this.legacySessionReservationExists(sessionId) ? { readOnly: true as const } : {}),
+      ...(row.read_only ? { readOnly: true as const } : {}),
       ...(row.parent_session_id ? { agent: parseSessionAgentMetadata({
         parentSessionId: row.parent_session_id, name: row.agent_name, path: row.agent_path,
         policy: row.agent_policy_json ? decodeJson(row.agent_policy_json, undefined) : undefined,
@@ -453,7 +452,7 @@ export class SqliteEventStore
       // A store connection is the implicit fence for ordinary session-scoped
       // appends. Never replace its claim in place: doing so would let the stale
       // caller's writes pass under the replacement claim stored in this map.
-      if (this.legacySessionReservationExists(input.sessionId)) return { status: "forbidden" as const };
+      if (this.isSessionReadOnly(input.sessionId)) return { status: "forbidden" as const };
       if (this.ownedCreationClaims.has(input.sessionId)) {
         return { status: "already_exists" as const };
       }
@@ -541,7 +540,7 @@ export class SqliteEventStore
       const session = this.db
         .query<{ status: string; parent_session_id: string | null }, [string]>(`select status, parent_session_id from sessions where id = ?`)
         .get(input.sessionId);
-      if (!session?.parent_session_id && this.legacySessionReservationExists(input.sessionId)) return { status: "forbidden" as const };
+      if (this.isSessionReadOnly(input.sessionId)) return { status: "forbidden" as const };
       if (!session) return { status: "not_found" as const };
       if (session.status !== "active") {
         return { status: "inactive" as const, sessionStatus: session.status };
@@ -725,9 +724,10 @@ export class SqliteEventStore
         agent_name: string | null;
         agent_path: string | null;
         agent_policy_json: string | null;
+        read_only: number;
       }, []>(
         `select s.id, s.cwd, s.title, s.status, s.created_at, s.updated_at,
-                s.parent_session_id, s.agent_name, s.agent_path, s.agent_policy_json,
+                s.parent_session_id, s.agent_name, s.agent_path, s.agent_policy_json, s.read_only,
                 (select coalesce(
                           nullif(json_extract(mp.data_json, '$.displayText'), ''),
                           nullif(json_extract(mp.data_json, '$.text'), '')
@@ -748,7 +748,7 @@ export class SqliteEventStore
         cwd: row.cwd,
         ...(row.title ? { title: row.title } : {}),
         ...(row.preview ? { preview: row.preview } : {}),
-        ...(!row.parent_session_id && this.legacySessionReservationExists(row.id as SessionId) ? { readOnly: true as const } : {}),
+        ...(row.read_only ? { readOnly: true as const } : {}),
         status: row.status,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
@@ -980,7 +980,7 @@ export class SqliteEventStore
     for (const id of targets) {
       const sessionId = id as SessionId;
       const session = this.readSession(sessionId);
-      if (session?.readOnly || (!session && this.legacySessionReservationExists(sessionId))) throw new SessionAccessError(sessionId);
+      if (session?.readOnly) throw new SessionAccessError(sessionId);
     }
   }
 
@@ -1438,82 +1438,6 @@ export class SqliteEventStore
     }
   }
 
-  private migrateMailboxRecipientSessionSchema(): void {
-    const migrate = this.db.transaction(() => {
-      this.db.exec(`
-        create table if not exists schema_migrations (
-          name text primary key
-        )
-      `);
-      const marker = "mailbox_recipient_session_v1";
-      const hasChildSessionColumn = this.columnExists("agent_mailbox", "child_session_id");
-      const alreadyMigrated = this.db
-        .query<{ found: number }, [string]>(
-          `select 1 as found from schema_migrations where name = ? limit 1`,
-        )
-        .get(marker);
-      const payloadConflict = this.db
-        .query<{ id: string; child_session_id: string; recipient_session_id: string }, []>(
-          `select id,
-                  json_extract(payload_json, '$.childSessionId') as child_session_id,
-                  json_extract(payload_json, '$.recipientSessionId') as recipient_session_id
-             from events
-            where type = 'agent.message_queued'
-              and json_type(payload_json, '$.childSessionId') = 'text'
-              and json_type(payload_json, '$.recipientSessionId') = 'text'
-              and json_extract(payload_json, '$.childSessionId')
-                    <> json_extract(payload_json, '$.recipientSessionId')
-            limit 1`,
-        )
-        .get();
-      if (payloadConflict) {
-        throw new Error(
-          `Cannot migrate mailbox event ${payloadConflict.id}: child session ${payloadConflict.child_session_id} conflicts with recipient session ${payloadConflict.recipient_session_id}.`,
-        );
-      }
-      if (alreadyMigrated && !hasChildSessionColumn) return;
-
-      if (hasChildSessionColumn) {
-        const conflict = this.db
-          .query<{ id: string; child_session_id: string; recipient_session_id: string }, []>(
-            `select id, child_session_id, recipient_session_id
-               from agent_mailbox
-              where child_session_id is not null
-                and recipient_session_id is not null
-                and child_session_id <> recipient_session_id
-              limit 1`,
-          )
-          .get();
-        if (conflict) {
-          throw new Error(
-            `Cannot migrate mailbox message ${conflict.id}: child session ${conflict.child_session_id} conflicts with recipient session ${conflict.recipient_session_id}.`,
-          );
-        }
-        this.db.exec(`
-          update agent_mailbox
-             set recipient_session_id = coalesce(recipient_session_id, child_session_id)
-           where child_session_id is not null
-        `);
-        const legacyIndexes = this.db
-          .query<{ name: string }, []>(
-            `select name
-               from sqlite_master
-              where type = 'index'
-                and tbl_name = 'agent_mailbox'
-                and sql is not null
-                and lower(sql) like '%child_session_id%'`,
-          )
-          .all();
-        for (const index of legacyIndexes) {
-          this.db.exec(`drop index if exists "${index.name.replaceAll('"', '""')}"`);
-        }
-        this.dropColumnIfPresent("agent_mailbox", "child_session_id");
-      }
-      this.db.query(`insert or ignore into schema_migrations (name) values (?)`).run(marker);
-    });
-    migrate();
-  }
-
   /**
    * One-way compatibility migration for databases created before SessionId
    * became the sole conversation identity. The legacy identifiers are used
@@ -1546,6 +1470,12 @@ export class SqliteEventStore
       this.prepareSessionOnlyReplacementColumns();
       const hasLegacyGoalTable = this.tableExists("thread_goals");
       const hasLegacyColumns = legacyColumns.some(([table, column]) => this.columnExists(table, column));
+      const alreadyMigrated = this.db
+        .query<{ found: number }, [string]>(
+          `select 1 as found from schema_migrations where name = ? limit 1`,
+        )
+        .get(marker);
+      if (alreadyMigrated && !hasLegacyGoalTable && !hasLegacyColumns) return;
       const legacyPayloadIdentityPaths = [
         ["threadId", "$.threadId"],
         ["parentThreadId", "$.parentThreadId"],
@@ -1559,7 +1489,7 @@ export class SqliteEventStore
           select id as event_id, '${field}' as field,
                  json_extract(payload_json, '${path}') as legacy_id
             from events
-           where json_type(payload_json, '${path}') = 'text'`)
+           where json_valid(payload_json) and json_type(payload_json, '${path}') = 'text'`)
         .join(" union all ");
       const hasLegacyPayloads = this.db
         .query<{ found: number }, []>(
@@ -1567,31 +1497,6 @@ export class SqliteEventStore
         )
         .get() !== null;
       const hasLegacySessionIdentities = this.tableExists("legacy_session_identities");
-      const legacyPayloadMappingsAreComplete = !hasLegacyPayloads || (
-        hasLegacySessionIdentities
-        && this.db
-          .query<{ found: number }, []>(
-            `select 1 as found
-               from (${legacyPayloadIdentities}) as payload_identity
-               left join legacy_session_identities as identity
-                 on identity.legacy_id = payload_identity.legacy_id
-              where identity.session_id is null
-              limit 1`,
-          )
-          .get() === null
-      );
-      const alreadyMigrated = this.db
-        .query<{ found: number }, [string]>(
-          `select 1 as found from schema_migrations where name = ? limit 1`,
-        )
-        .get(marker);
-      if (
-        alreadyMigrated
-        && !hasLegacyGoalTable
-        && !hasLegacyColumns
-        && legacyPayloadMappingsAreComplete
-      ) return;
-
       const identityPairs: string[] = [];
       if (hasLegacyGoalTable || hasLegacyColumns || hasLegacyPayloads || hasLegacySessionIdentities) {
         this.db.exec(`
@@ -1626,6 +1531,7 @@ export class SqliteEventStore
       addColumnPair("agent_tasks", "parent_thread_id", "parent_session_id");
       addColumnPair("agent_tasks", "child_thread_id", "child_session_id");
       addColumnPair("agent_mailbox", "child_thread_id", "recipient_session_id");
+      addColumnPair("agent_mailbox", "child_thread_id", "child_session_id");
       addColumnPair("team_members", "child_thread_id", "child_session_id");
       addColumnPair("team_message_deliveries", "child_thread_id", "child_session_id");
       if (hasLegacyGoalTable) {
@@ -1647,7 +1553,7 @@ export class SqliteEventStore
             `select thread_id as legacy_id,
                     json_extract(payload_json, '${sessionPath}') as session_id
                from events
-              where thread_id is not null
+              where thread_id is not null and json_valid(payload_json)
                 and json_type(payload_json, '${sessionPath}') = 'text'`,
           );
         }
@@ -1664,7 +1570,7 @@ export class SqliteEventStore
           `select json_extract(payload_json, '${legacyPath}') as legacy_id,
                   json_extract(payload_json, '${sessionPath}') as session_id
              from events
-            where json_type(payload_json, '${legacyPath}') = 'text'
+            where json_valid(payload_json) and json_type(payload_json, '${legacyPath}') = 'text'
           and json_type(payload_json, '${sessionPath}') = 'text'`,
         );
       }
@@ -1672,7 +1578,7 @@ export class SqliteEventStore
         `select json_extract(payload_json, '$.childThreadId') as legacy_id,
                 json_extract(payload_json, '$.recipientSessionId') as session_id
            from events
-          where type = 'agent.message_queued'
+          where type = 'agent.message_queued' and json_valid(payload_json)
             and json_type(payload_json, '$.childThreadId') = 'text'
             and json_type(payload_json, '$.recipientSessionId') = 'text'`,
       );
@@ -1685,7 +1591,7 @@ export class SqliteEventStore
           `select json_extract(payload_json, '${legacyPath}') as legacy_id,
                   session_id
              from events
-            where json_type(payload_json, '${legacyPath}') = 'text'
+            where json_valid(payload_json) and json_type(payload_json, '${legacyPath}') = 'text'
               and session_id is not null`,
         );
       }
@@ -1941,54 +1847,124 @@ export class SqliteEventStore
   }
 
   /** Old workflow identities remain reserved, including references without a Session row. */
-  private legacySessionReservationExists(sessionId: SessionId): boolean {
-    const leadPath = this.columnExists("teams", "lead_path")
-      ? `(select lead_path from teams where id = m.team_id)` : "null";
-    const recipientIsLead = this.columnExists("teams", "session_id") && this.columnExists("teams", "lead_path")
-      ? "exists (select 1 from teams t where t.session_id = r.recipient_session_id and t.lead_path = r.path)" : "0";
-    const checks: string[] = [];
-    const parameters: string[] = [];
-    for (const [table, column] of [["agent_tasks", "child_session_id"], ["agent_runs", "child_session_id"]] as const) {
-      if (!this.columnExists(table, column)) continue;
-      checks.push(`exists (select 1 from ${table} where ${column} = ?)`);
-      parameters.push(sessionId);
-    }
-    if (this.columnExists("agent_mailbox", "recipient_session_id")) {
-      checks.push(`exists (select 1 from agent_mailbox r where r.recipient_session_id = ?
-        and r.path <> '/root' and not (${recipientIsLead}))`);
-      parameters.push(sessionId);
-    }
-    if (this.columnExists("team_members", "child_session_id")) {
-      checks.push(`exists (select 1 from team_members m where m.child_session_id = ?
-        and m.path <> coalesce(${leadPath},
-          (select json_extract(t.payload_json, '$.leadPath') from events t where t.type = 'team.created'
-            and json_extract(t.payload_json, '$.teamId') = m.team_id order by t.seq limit 1), '/root'))`);
-      parameters.push(sessionId);
-    }
-    if (checks.length && this.db.query<{ found: number }, string[]>(
-      `select 1 as found where ${checks.join(" or ")} limit 1`,
-    ).get(...parameters)) return true;
+  private migrateRetiredWorkflows(): void {
+    const migrate = this.db.transaction(() => {
+      this.addColumnIfMissing("sessions", "read_only", "integer not null default 0");
+      const marker = "retired_workflows_v1";
+      const tables = [
+        "team_message_deliveries", "team_messages", "team_tasks", "team_members",
+        "teams", "agent_mailbox", "agent_runs", "agent_tasks",
+      ];
+      const present = tables.filter((table) => this.tableExists(table));
+      if (!present.length && this.db.query("select 1 from schema_migrations where name = ?").get(marker)) return;
 
-    const legacyIds = [...this.legacySessionIds].filter(([, id]) => id === sessionId).map(([id]) => id);
-    const persistedLeadPath = this.columnExists("teams", "lead_path")
-      ? `(select lead_path from teams where id = json_extract(e.payload_json, '$.teamId'))` : "null";
-    // Event-only histories reserve child/recipient identities too. Lead/root
-    // sessions retain their ordinary conversation access.
-    return [sessionId, ...legacyIds].some((identity) => this.db.query<{ found: number }, [string, string, string, string]>(
-      `select 1 as found from events e
-        where (e.type like 'agent.%' or e.type = 'team.member_added')
-          and (json_extract(e.payload_json, '$.childSessionId') = ?
-            or json_extract(e.payload_json, '$.recipientSessionId') = ?
-            or json_extract(e.payload_json, '$.childThreadId') = ?
-            or json_extract(e.payload_json, '$.recipientThreadId') = ?)
-          and (e.type != 'agent.message_queued' or json_extract(e.payload_json, '$.path') <> '/root')
-          and (e.type != 'team.member_added' or json_extract(e.payload_json, '$.path') <> coalesce(
-            ${persistedLeadPath},
-            (select json_extract(t.payload_json, '$.leadPath') from events t where t.type = 'team.created'
-              and json_extract(t.payload_json, '$.teamId') = json_extract(e.payload_json, '$.teamId') order by t.seq limit 1),
-            '/root'))
-        limit 1`,
-    ).get(identity, identity, identity, identity) !== null);
+      // Only this migration reads the retired schemas. Keep identity restrictions
+      // in sessions before removing the tables; ordinary messages/events stay put.
+      const rows = (table: string, columns: string[]): Record<string, unknown>[] => {
+        if (!this.tableExists(table)) return [];
+        const fields = columns.map((column) => this.columnExists(table, column) ? column : `null as ${column}`);
+        return this.db.query<Record<string, unknown>, []>(`select ${fields.join(", ")} from ${table}`).all();
+      };
+      const canonicalId = (value: unknown): string | undefined => typeof value === "string" && value.length
+        ? this.legacySessionIds.get(value) ?? value : undefined;
+      const events = this.db.query<Record<string, unknown>, []>(`
+        select type, time, session_id,
+               json_extract(payload_json, '$.teamId') as team_id,
+               json_extract(payload_json, '$.leadPath') as lead_path,
+               json_extract(payload_json, '$.ownerSessionId') as owner_session_id,
+               json_extract(payload_json, '$.path') as path,
+               json_extract(payload_json, '$.childSessionId') as child_session_id,
+               json_extract(payload_json, '$.childThreadId') as child_thread_id,
+               json_extract(payload_json, '$.recipientSessionId') as recipient_session_id,
+               json_extract(payload_json, '$.recipientThreadId') as recipient_thread_id,
+               json_extract(payload_json, '$.cwd') as cwd
+          from events
+         where (type glob 'agent.*' or type in ('team.created', 'team.owner_session_bound', 'team.member_added'))
+           and json_valid(payload_json)
+         order by seq
+      `).all();
+      const leads = new Map<unknown, { path: string; sessionId: string | undefined }>();
+      for (const event of events) {
+        if (event.type === "team.created" && typeof event.lead_path === "string") {
+          leads.set(event.team_id, { path: event.lead_path, sessionId: canonicalId(event.session_id) });
+        } else if (event.type === "team.owner_session_bound") {
+          const lead = leads.get(event.team_id);
+          if (lead) lead.sessionId = canonicalId(event.owner_session_id);
+        }
+      }
+      for (const row of rows("teams", ["id", "lead_path", "session_id"])) {
+        if (typeof row.lead_path === "string") {
+          leads.set(row.id, { path: row.lead_path, sessionId: canonicalId(row.session_id) ?? leads.get(row.id)?.sessionId });
+        }
+      }
+      const members = rows("team_members", ["team_id", "path", "child_session_id"]);
+      for (const member of [...members, ...events.filter((event) => event.type === "team.member_added")]) {
+        const lead = leads.get(member.team_id);
+        if (lead && member.path === lead.path) {
+          lead.sessionId ??= canonicalId(member.child_session_id) ?? canonicalId(member.child_thread_id);
+        }
+      }
+      const isLead = (id: unknown, path: unknown): boolean => path === ROOT_AGENT_PATH
+        || [...leads.values()].some((lead) => lead.path === path && lead.sessionId === canonicalId(id));
+      const restrict = this.db.query(`
+        insert into sessions (id, cwd, status, read_only, created_at, updated_at)
+        values (?, ?, 'archived', 1, ?, ?)
+        on conflict(id) do update set read_only = 1
+        where sessions.parent_session_id is null
+      `);
+      const reserve = (id: unknown, cwd?: unknown, time?: unknown): void => {
+        const sessionId = canonicalId(id);
+        if (!sessionId) return;
+        const timestamp = typeof time === "number" && Number.isFinite(time) ? time : 0;
+        // A reservation without a conversation gets an archived identity only,
+        // never a fabricated session.created event or a runnable Agent.
+        // Historical callers may still hold the original thread identifier.
+        // Reserve that alias too so it cannot create a new writable identity.
+        for (const identity of new Set([sessionId, id as string])) {
+          restrict.run(identity, typeof cwd === "string" ? cwd : "", timestamp, timestamp);
+        }
+      };
+      for (const table of ["agent_tasks", "agent_runs"]) {
+        for (const row of rows(table, ["child_session_id", "cwd", "created_at"])) {
+          reserve(row.child_session_id, row.cwd, row.created_at);
+        }
+      }
+      for (const member of members) {
+        if (member.path !== (leads.get(member.team_id)?.path ?? ROOT_AGENT_PATH)) reserve(member.child_session_id);
+      }
+      for (const table of ["agent_mailbox", "team_message_deliveries"]) {
+        for (const row of rows(table, ["recipient_session_id", "child_session_id", "path", "created_at"])) {
+          for (const id of [row.recipient_session_id, row.child_session_id]) {
+            if (!isLead(id, row.path)) reserve(id, undefined, row.created_at);
+          }
+        }
+      }
+      for (const event of events) {
+        const ids = [event.child_session_id, event.child_thread_id, event.recipient_session_id, event.recipient_thread_id];
+        if (event.type === "team.member_added") {
+          if (event.path === (leads.get(event.team_id)?.path ?? ROOT_AGENT_PATH)) continue;
+        } else if (typeof event.type !== "string" || !event.type.startsWith("agent.")) {
+          continue;
+        }
+        for (const id of ids) {
+          if (event.type === "agent.message_queued" && isLead(id, event.path)) continue;
+          reserve(id, event.cwd, event.time);
+        }
+      }
+      // Claims from the old execution path cannot authorize further writes.
+      for (const table of ["session_creation_claims", "session_run_claims"]) {
+        this.db.exec(`delete from ${table} where session_id in (select id from sessions where read_only = 1)`);
+      }
+      for (const table of present) this.db.exec(`drop table ${table}`);
+      this.db.query("insert or ignore into schema_migrations (name) values (?)").run(marker);
+    });
+    migrate.immediate();
+  }
+
+  private isSessionReadOnly(sessionId: SessionId): boolean {
+    return this.db.query<{ read_only: number }, [string]>(
+      "select read_only from sessions where id = ?",
+    ).get(sessionId)?.read_only === 1;
   }
 
   private sessionCreationClaimExists(sessionId: SessionId): boolean {
@@ -2116,7 +2092,7 @@ export class SqliteEventStore
       if (creationClaim?.cwd !== undefined && creationClaim.cwd !== event.payload.cwd) {
         throw new SessionCwdConflictError(event.sessionId, creationClaim.cwd, event.payload.cwd);
       }
-      if (this.legacySessionReservationExists(event.sessionId)) {
+      if (this.isSessionReadOnly(event.sessionId)) {
         throw new SessionAccessError(event.sessionId);
       }
       const title = event.payload.cwd.split("/").filter(Boolean).at(-1) ?? "Untitled";

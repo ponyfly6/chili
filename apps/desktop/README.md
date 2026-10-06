@@ -1,6 +1,6 @@
 # Chili Desktop
 
-Chili Desktop 是本地优先的 Electron 控制端。它不是把 TUI 放进窗口，而是通过可替换 transport 驱动 React renderer，同时复用现有 protocol、core、server、store、SDK、tools、team 和 session runtime。
+Chili Desktop 是本地优先的 Electron 控制端，通过可替换 transport 驱动 React renderer，复用 protocol、core、server、store、SDK、tools，以及基于 Session 和持久输入队列的 Agent runtime。
 
 ## 开发运行
 
@@ -99,7 +99,7 @@ Permission profile 是当前项目 runtime/sidecar 的**全局内存状态**，�
 - Stop 会中断当前 turn 并暂停持久化输入队列；待处理消息仍会保留。有 active Goal 时，runtime 会把 Goal 持久化为 paused。终止完成后点击 **继续处理** 恢复；仍在 cancelling/running 时会拒绝抢跑。
 - Steer active Goal 时，Desktop 记住原状态，让 interrupt 暂停 Goal，先排空 steer/queued prompt，再在 terminal idle 后恢复 Goal，避免双启动。若 Desktop 在中途退出，持久化 Goal 保持 paused，重启后需显式 Resume。
 - `budgetLimited` Goal 必须先提高到大于已用 tokens 的新 budget，再以 active 状态恢复。
-- 暂停后发送的新消息进入待处理队列，点击 **继续处理** 才会执行。没有待处理消息时，会先核对上次中断的工作再继续。Goal task 的 Resume 会重新触发 paused/idle Goal continuation。session、事件、输入队列和 Goal 由 runtime/store 持久化，Desktop 或 sidecar 重启后可重新载入。
+- 暂停后发送的新消息进入待处理队列。点击 **继续处理** 先恢复原来已中断的输入，再处理待处理消息，沿用原 Session 和 inputId。Goal task 的 Resume 会重新触发 paused/idle Goal continuation。session、事件、输入队列和 Goal 由 runtime/store 持久化，Desktop 或 sidecar 重启后可重新载入。
 - Archive 在当前 Desktop 中是单向操作：没有 unarchive；归档非 busy task 前会把 active Goal 持久化为 paused，busy task 必须先 Stop。archived task 只读，不能 Resume、发送或改配置；其历史与 Goal 记录仍保留用于查看。
 
 MCP 面板读取当前 session scope 的 server 状态与汇总，并提供 reload。Desktop 当前不暴露 add/remove/auth 配置流程；这些仍由现有 CLI/TUI/runtime 配置完成。

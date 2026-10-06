@@ -26,17 +26,11 @@ SQLite message projections retain the sequence of their first `message.created` 
 
 An insert trigger also fills the sequence for older processes that continue writing the previous projection format. It uses the creation event already written in the same transaction and leaves existing historical orphan rows unchanged.
 
-## Team work is delivered as verified content
+## Agents own delegation and review
 
-Team verification captures an immutable Git artifact before and after checks. A passing result identifies the tested content. Merge must use that verified artifact, and a dependent write task requires a successfully applied artifact from every declared dependency.
+Agents use the same creation, messaging, waiting, stopping, and resuming operations. They decide how to split work and request review through ordinary inputs. There is no Team controller, business Task state machine, or automatic verification/merge workflow.
 
-New dependent worktrees are based on a composition of those declared artifacts, including transitive dependencies exactly once. Composition uses a private Git index. It does not copy the user's dirty main working tree or stage/commit the user's index or HEAD. Content-addressed `refs/chili/artifacts/*` keep recovery objects reachable by Git.
-
-Conflicting dependency patches and unexpected changes to affected main-worktree paths stop integration. Existing owner, cancellation and durable merge-intent checks remain part of the merge path. Runtime-owned `.chili` state is excluded from newly captured task changes.
-
-Older passed tasks without an artifact require real re-verification. For an older already-applied merge, successful re-verification confirms delivery only when the affected main-worktree files exactly match the newly verified artifact; it does not apply the old patch twice. An existing frozen merge intent is recovered before re-verification. An existing dependent worktree with the wrong base is rejected with its contents preserved.
-
-There is no automatic rebuild operation for that old worktree. Create a replacement team task with the correct dependencies, then explicitly transfer needed edits from the preserved directory into its new worktree. The runtime does not delete the old directory or silently overwrite its edits.
+`git_worktree` and `git_apply_patch` are independent tools. Agents can isolate work, review changes, run checks, and explicitly integrate patches under their tool permissions.
 
 ## Shell classification matches execution
 

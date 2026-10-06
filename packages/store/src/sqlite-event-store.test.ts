@@ -2,7 +2,7 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import type {
   AgentPath,
   ApprovalId,
@@ -369,7 +369,9 @@ test("session summaries include the recent prompt preview and renamed title", as
 });
 
 test("legacy task child sessions remain readable and reject both run access modes", async () => {
-  const store = new SqliteEventStore(":memory:");
+  const dir = await mkdtemp(join(tmpdir(), "chili-retired-messages-"));
+  const dbPath = join(dir, "events.sqlite");
+  let store = new SqliteEventStore(dbPath);
   const parentSessionId = "session_legacy_parent" as SessionId;
   const childSessionId = "session_legacy_child" as SessionId;
   const legacyEvent = legacyTaskEvent(parentSessionId, childSessionId);
@@ -399,6 +401,7 @@ test("legacy task child sessions remain readable and reject both run access mode
       historicalPart.id, messageId, childSessionId, JSON.stringify(historicalPart),
     );
 
+    store = reopenRetiredWorkflowFixture(store, dbPath);
     expect(await store.messages(childSessionId)).toEqual([{
       id: messageId, sessionId: childSessionId, role: "assistant", createdAt: 4 as TimestampMs,
       parts: [historicalPart],
@@ -418,11 +421,14 @@ test("legacy task child sessions remain readable and reject both run access mode
     }
   } finally {
     store.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
 test("legacy event-only reservations cannot be created or resumed", async () => {
-  const store = new SqliteEventStore(":memory:");
+  const dir = await mkdtemp(join(tmpdir(), "chili-retired-event-only-"));
+  const dbPath = join(dir, "events.sqlite");
+  let store = new SqliteEventStore(dbPath);
   const parentSessionId = "session_event_only_parent" as SessionId;
   const childSessionId = "session_event_only_child" as SessionId;
   const reservedSessionId = "session_event_only_reserved" as SessionId;
@@ -437,6 +443,8 @@ test("legacy event-only reservations cannot be created or resumed", async () => 
     expect(sqliteDatabase(store).query<{ name: string }, []>(
       "select name from sqlite_master where type = 'table' and name = 'agent_tasks'",
     ).get()).toBeNull();
+    store = reopenRetiredWorkflowFixture(store, dbPath);
+    expect(await store.session(reservedSessionId)).toMatchObject({ id: reservedSessionId, status: "archived", readOnly: true });
     expect(await store.session(childSessionId)).toMatchObject({ readOnly: true });
     for (const sessionId of [childSessionId, reservedSessionId]) {
       for (const sessionAccess of ["root", "child"] as const) {
@@ -452,11 +460,14 @@ test("legacy event-only reservations cannot be created or resumed", async () => 
     })).toEqual({ status: "forbidden" });
   } finally {
     store.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
 test("legacy team workers are read-only while the original lead remains a root session", async () => {
-  const store = new SqliteEventStore(":memory:");
+  const dir = await mkdtemp(join(tmpdir(), "chili-retired-team-"));
+  const dbPath = join(dir, "events.sqlite");
+  let store = new SqliteEventStore(dbPath);
   const rootSessionId = "session_team_root" as SessionId;
   const workerSessionId = "session_team_worker" as SessionId;
   const teamId = "team_legacy";
@@ -506,10 +517,12 @@ test("legacy team workers are read-only while the original lead remains a root s
       JSON.stringify(notice.payload.message),
     );
 
+    store = reopenRetiredWorkflowFixture(store, dbPath);
+    const migratedDb = sqliteDatabase(store);
     expect(await store.session(rootSessionId)).not.toHaveProperty("readOnly");
     expect(await store.session(workerSessionId)).toMatchObject({ readOnly: true });
     expect(await store.events({ sessionId: rootSessionId, type: "team.member_added" })).toEqual([]);
-    expect(db.query<{ count: number }, []>(
+    expect(migratedDb.query<{ count: number }, []>(
       "select count(*) as count from events where type = 'team.member_added'",
     ).get()).toEqual({ count: 2 });
     expect(store.claimSessionRun({
@@ -523,6 +536,47 @@ test("legacy team workers are read-only while the original lead remains a root s
     }
   } finally {
     store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runtime session admission reads durable flags without querying retired tables or events", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-retired-runtime-"));
+  const dbPath = join(dir, "events.sqlite");
+  let store = new SqliteEventStore(dbPath);
+  const rootSessionId = "session_persisted_root" as SessionId;
+  const childSessionId = "session_persisted_legacy_child" as SessionId;
+  try {
+    await store.appendMany([
+      sessionEvent("event_persisted_root", rootSessionId, 1 as TimestampMs),
+      sessionEvent("event_persisted_child", childSessionId, 2 as TimestampMs),
+    ]);
+    insertLegacyEvent(store, legacyTaskEvent(rootSessionId, childSessionId));
+    store = reopenRetiredWorkflowFixture(store, dbPath);
+    const db = sqliteDatabase(store);
+    const query = spyOn(db, "query");
+    let queries: string[];
+    try {
+      expect(await store.session(rootSessionId)).not.toHaveProperty("readOnly");
+      expect(await store.session(childSessionId)).toMatchObject({ readOnly: true });
+      expect(await store.childSessions(rootSessionId)).toEqual([]);
+      expect((await store.sessions()).find((session) => session.id === childSessionId)).toMatchObject({ readOnly: true });
+      for (const sessionAccess of ["root", "child"] as const) {
+        expect(store.claimSessionRun({ sessionId: childSessionId, claimId: `blocked_${sessionAccess}`,
+          sessionAccess, time: Date.now(), leaseDurationMs: 60_000 })).toEqual({ status: "forbidden" });
+      }
+      expect(store.claimSessionCreation({ sessionId: childSessionId, claimId: "blocked_creation",
+        cwd: "/repo", time: Date.now(), leaseDurationMs: 60_000 })).toEqual({ status: "forbidden" });
+      expect(store.claimSessionRun({ sessionId: rootSessionId, claimId: "ordinary_root",
+        time: Date.now(), leaseDurationMs: 60_000 })).toEqual({ status: "claimed" });
+      store.releaseSessionRun({ sessionId: rootSessionId, claimId: "ordinary_root" });
+      queries = query.mock.calls.map(([sql]) => sql);
+    } finally { query.mockRestore(); }
+    expect(queries.length).toBeGreaterThan(0);
+    expect(queries.filter((sql) => /\b(?:events|sqlite_master|agent_runs|agent_tasks|agent_mailbox|teams|team_members|team_tasks|team_messages|team_message_deliveries)\b/iu.test(sql))).toEqual([]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -557,7 +611,9 @@ test("legacy workflow appends reject the entire batch before persistence or obse
 });
 
 test("legacy message ownership rejects implicit and forged session writes atomically", async () => {
-  const store = new SqliteEventStore(":memory:");
+  const dir = await mkdtemp(join(tmpdir(), "chili-retired-ownership-"));
+  const dbPath = join(dir, "events.sqlite");
+  let store = new SqliteEventStore(dbPath);
   const rootSessionId = "session_readonly_root" as SessionId;
   const childSessionId = "session_readonly_child" as SessionId;
   const rootMessageId = "message_readonly_root" as MessageId;
@@ -582,6 +638,7 @@ test("legacy message ownership rejects implicit and forged session writes atomic
         sessionId: childSessionId, payload: { approvalId, permission: "bash.unsandboxed", patterns: ["echo historical"] } },
     ]);
     insertLegacyEvent(store, legacyTaskEvent(rootSessionId, childSessionId));
+    store = reopenRetiredWorkflowFixture(store, dbPath);
     const originalRoot = await store.session(rootSessionId);
     const originalApprovals = await store.pendingApprovals(childSessionId);
     const originalEvents = await store.events({ limit: 20 });
@@ -627,6 +684,7 @@ test("legacy message ownership rejects implicit and forged session writes atomic
     expect(await store.pendingApprovals(childSessionId)).toEqual(originalApprovals);
   } finally {
     store.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -1120,7 +1178,7 @@ test("an expired root creation owner fails closed when a contender discovers a c
   const dir = await mkdtemp(join(tmpdir(), "chili-store-expired-root-claim-"));
   const dbPath = join(dir, "events.sqlite");
   const staleRootStore = new SqliteEventStore(dbPath);
-  const contenderStore = new SqliteEventStore(dbPath);
+  let contenderStore = new SqliteEventStore(dbPath);
   const parentSessionId = "session_expired_claim_parent" as SessionId;
   const childSessionId = "session_expired_claim_child" as SessionId;
 
@@ -1141,6 +1199,7 @@ test("an expired root creation owner fails closed when a contender discovers a c
       reservation.payload.taskId, reservation.payload.path, parentSessionId, childSessionId,
     );
 
+    contenderStore = reopenRetiredWorkflowFixture(contenderStore, dbPath);
     expect(contenderStore.claimSessionCreation({
       sessionId: childSessionId,
       claimId: "creation_claim_reservation_contender",
@@ -1156,7 +1215,7 @@ test("an expired root creation owner fails closed when a contender discovers a c
       payload: { sessionId: childSessionId, cwd: "/repo" },
     })).rejects.toBeInstanceOf(SessionAccessError);
 
-    expect(await staleRootStore.sessions()).toEqual([]);
+    expect(await staleRootStore.session(childSessionId)).toMatchObject({ status: "archived", readOnly: true });
     expect(await staleRootStore.events({
       sessionId: childSessionId,
       type: "session.created",
@@ -1347,7 +1406,9 @@ test("reconciles stale turns without completion events", async () => {
 });
 
 test("stale recovery leaves legacy child history unchanged while recovering ordinary sessions", async () => {
-  const store = new SqliteEventStore(":memory:");
+  const dir = await mkdtemp(join(tmpdir(), "chili-retired-recovery-"));
+  const dbPath = join(dir, "events.sqlite");
+  let store = new SqliteEventStore(dbPath);
   const parentSessionId = "session_recovery_root" as SessionId;
   const childSessionId = "session_recovery_legacy" as SessionId;
   let recoveredIds = 0;
@@ -1361,6 +1422,7 @@ test("stale recovery leaves legacy child history unchanged while recovering ordi
       ]);
     }
     insertLegacyEvent(store, legacyTaskEvent(parentSessionId, childSessionId));
+    store = reopenRetiredWorkflowFixture(store, dbPath);
     const originalHistory = await store.events({ sessionId: childSessionId, limit: 10 });
     await expect(store.append({
       id: "event_legacy_reactivated", type: "session.status_changed", time: 4 as TimestampMs,
@@ -1376,6 +1438,7 @@ test("stale recovery leaves legacy child history unchanged while recovering ordi
     expect(await store.session(childSessionId)).toMatchObject({ readOnly: true });
   } finally {
     store.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -2264,11 +2327,8 @@ test("migrates the complete legacy thread schema to canonical session-only stora
       childSessionId: "session_legacy_recipient",
     });
     expect(rawMailboxPayload).not.toHaveProperty("recipientSessionId");
-    expect(sqliteDatabase(store).query<{ id: string; recipient_session_id: string }, []>(
-      "select id, recipient_session_id from agent_mailbox",
-    ).all()).toEqual([{
-      id: "event_legacy_mailbox", recipient_session_id: "session_legacy_recipient",
-    }]);
+    expect(retiredWorkflowTables(sqliteDatabase(store))).toEqual([]);
+    expect(await store.session("session_legacy_recipient" as SessionId)).toMatchObject({ readOnly: true, status: "archived" });
     expect(sqliteDatabase(store)
       .query<{ session_id: string }, [string]>(
         "select session_id from legacy_session_identities where legacy_id = ?",
@@ -2285,11 +2345,8 @@ test("migrates the complete legacy thread schema to canonical session-only stora
       objective: "finish the legacy migration",
       tokensUsed: 123,
     });
-    expect(sqliteDatabase(store).query<{ id: string; recipient_session_id: string }, []>(
-      "select id, recipient_session_id from agent_mailbox",
-    ).all()).toEqual([{
-      id: "event_legacy_mailbox", recipient_session_id: "session_legacy_recipient",
-    }]);
+    expect(retiredWorkflowTables(sqliteDatabase(store))).toEqual([]);
+    expect(await store.session("session_legacy_recipient" as SessionId)).toMatchObject({ readOnly: true, status: "archived" });
     assertCanonicalSchema(sqliteDatabase(store));
   } finally {
     store.close();
@@ -2395,9 +2452,8 @@ test("adds and backfills missing replacement session columns before dropping leg
         payload: { sessionId, cwd: "/repo" },
       },
     ]);
-    expect(sqliteDatabase(store).query<{ id: string; child_session_id: string; status: string }, [string]>(
-      "select id, child_session_id, status from agent_tasks where id = ?",
-    ).get(taskId)).toEqual({ id: taskId, child_session_id: sessionId, status: "running" });
+    expect(retiredWorkflowTables(sqliteDatabase(store))).toEqual([]);
+    expect(await store.session(sessionId)).toMatchObject({ readOnly: true });
     for (const sessionAccess of ["root", "child"] as const) {
       expect(store.claimSessionRun({
         sessionId, claimId: `migrated_${sessionAccess}`, sessionAccess,
@@ -2405,9 +2461,7 @@ test("adds and backfills missing replacement session columns before dropping leg
       })).toEqual({ status: "forbidden" });
     }
     const migratedDb = sqliteDatabase(store);
-    const columns = migratedDb.query<{ name: string }, []>("pragma table_info(agent_tasks)").all();
-    expect(columns).toContainEqual(expect.objectContaining({ name: "child_session_id" }));
-    expect(columns).not.toContainEqual(expect.objectContaining({ name: "child_thread_id" }));
+    expect(migratedDb.query<{ name: string }, []>("pragma table_info(agent_tasks)").all()).toEqual([]);
     expect(migratedDb.query<{ name: string }, []>(
       "select name from schema_migrations where name = 'session_only_schema_v1'",
     ).get()).toEqual({ name: "session_only_schema_v1" });
@@ -3009,3 +3063,229 @@ function createLegacyMailboxTable(db: Database): void {
     trigger_turn integer, status text, message_json text, created_at integer
   )`);
 }
+
+const retiredTables = [
+  "team_message_deliveries", "team_messages", "team_tasks", "team_members",
+  "teams", "agent_mailbox", "agent_runs", "agent_tasks",
+] as const;
+
+function retiredWorkflowTables(db: Database): string[] {
+  return db.query<{ name: string }, []>(`select name from sqlite_master
+    where type = 'table' and name in (${retiredTables.map((table) => `'${table}'`).join(",")}) order by name`)
+    .all().map((row) => row.name);
+}
+
+function reopenRetiredWorkflowFixture(store: SqliteEventStore, path: string): SqliteEventStore {
+  store.close();
+  const db = new Database(path);
+  try { db.query("delete from schema_migrations where name = 'retired_workflows_v1'").run(); }
+  finally { db.close(); }
+  return new SqliteEventStore(path);
+}
+
+function createAllRetiredWorkflowTables(db: Database, populated = false): void {
+  createLegacyTaskTable(db);
+  createLegacyTeamTables(db);
+  createLegacyMailboxTable(db);
+  db.exec(`
+    create table agent_runs (id text primary key, session_id text, parent_session_id text, child_session_id text);
+    create table team_tasks (id text primary key, team_id text);
+    create table team_messages (id text primary key, team_id text);
+    create table team_message_deliveries (mailbox_message_id text primary key, child_session_id text);
+  `);
+  if (!populated) return;
+  db.exec(`
+    insert into agent_tasks values ('old_task','/root/worker','retired_root','retired_worker','worker','completed',1,1);
+    insert into agent_runs values ('old_run','retired_root','retired_root','retired_reserved');
+    insert into teams values ('old_team','retired_root','old team','/root','active',1,1);
+    insert into team_members values ('old_team','/root/worker','worker','implementer','idle','retired_worker',1,1);
+    insert into agent_mailbox values ('old_mail','old_task','/root/worker','/root','retired_worker',1,'queued','{}',1);
+    insert into team_tasks values ('old_team_task','old_team');
+    insert into team_messages values ('old_team_message','old_team');
+    insert into team_message_deliveries values ('old_delivery','retired_worker');
+  `);
+}
+
+for (const populated of [false, true]) test(`startup migration removes all ${populated ? "populated" : "empty"} retired tables and is idempotent`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-retired-tables-"));
+  const dbPath = join(dir, "events.sqlite");
+  let store = new SqliteEventStore(dbPath);
+  const rootId = "retired_root" as SessionId;
+  const workerId = "retired_worker" as SessionId;
+  const messageId = "retired_message" as MessageId;
+  try {
+    await store.appendMany([
+      sessionEvent("retired_root_created", rootId, 1 as TimestampMs),
+      sessionEvent("retired_worker_created", workerId, 2 as TimestampMs),
+      { id: "retired_message_created", type: "message.created", sessionId: workerId, time: 3 as TimestampMs,
+        payload: { messageId, role: "assistant" } },
+      { id: "retired_message_text", type: "message.part_added", sessionId: workerId, time: 4 as TimestampMs,
+        payload: { messageId, part: { id: "retired_part" as PartId, messageId, sessionId: workerId, type: "text", text: "Saved ordinary response" } } },
+    ]);
+    const messages = await store.messages(workerId);
+    store.close();
+    const legacy = new Database(dbPath);
+    try {
+      // Even a database with the marker must clean up subsequently discovered old tables.
+      expect(legacy.query<{ name: string }, []>("select name from schema_migrations where name = 'retired_workflows_v1'").get())
+        .toEqual({ name: "retired_workflows_v1" });
+      createAllRetiredWorkflowTables(legacy, populated);
+      for (const table of retiredTables) {
+        expect(legacy.query<{ count: number }, []>(`select count(*) as count from ${table}`).get()?.count).toBe(populated ? 1 : 0);
+      }
+    } finally { legacy.close(); }
+    store = new SqliteEventStore(dbPath);
+    expect(retiredWorkflowTables(sqliteDatabase(store))).toEqual([]);
+    expect(await store.messages(workerId)).toEqual(messages);
+    expect(await store.session(rootId)).not.toHaveProperty("readOnly");
+    if (populated) {
+      expect(await store.session(workerId)).toMatchObject({ readOnly: true });
+      const reservedId = "retired_reserved" as SessionId;
+      expect(await store.session(reservedId)).toMatchObject({ id: reservedId, readOnly: true, status: "archived" });
+      expect(await store.session(reservedId)).not.toHaveProperty("agent");
+      expect(store.claimSessionCreation({ sessionId: reservedId, claimId: "reserved_creation", cwd: "/repo",
+        time: Date.now(), leaseDurationMs: 60_000 })).toEqual({ status: "forbidden" });
+      for (const sessionAccess of ["root", "child"] as const) {
+        expect(store.claimSessionRun({ sessionId: reservedId, claimId: `reserved_${sessionAccess}`, sessionAccess,
+          time: Date.now(), leaseDurationMs: 60_000 })).toEqual({ status: "forbidden" });
+      }
+    } else expect(await store.session(workerId)).not.toHaveProperty("readOnly");
+    const sessions = await store.sessions();
+    store.close();
+    store = new SqliteEventStore(dbPath);
+    expect(retiredWorkflowTables(sqliteDatabase(store))).toEqual([]);
+    expect(await store.sessions()).toEqual(sessions);
+    expect(await store.messages(workerId)).toEqual(messages);
+    expect(sqliteDatabase(store).query<{ count: number }, []>("select count(*) as count from schema_migrations where name = 'retired_workflows_v1'").get()?.count).toBe(1);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failed second retired-table drop rolls back every table, read-only flag and migration marker", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-retired-rollback-"));
+  const dbPath = join(dir, "events.sqlite");
+  const initial = new SqliteEventStore(dbPath);
+  await initial.appendMany([
+    sessionEvent("rollback_root", "retired_root" as SessionId, 1 as TimestampMs),
+    sessionEvent("rollback_worker", "retired_worker" as SessionId, 2 as TimestampMs),
+  ]);
+  initial.close();
+  const legacy = new Database(dbPath);
+  try {
+    createAllRetiredWorkflowTables(legacy, true);
+    legacy.query("delete from schema_migrations where name = 'retired_workflows_v1'").run();
+  } finally { legacy.close(); }
+  const originalExec = Database.prototype.exec;
+  let drops = 0;
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, ...args: Parameters<typeof originalExec>) {
+    if (/^\s*drop table\b/iu.test(args[0]) && retiredTables.some((table) => args[0].includes(table))) {
+      drops++;
+      if (drops === 2) throw new Error("injected retired-table drop failure");
+    }
+    return originalExec.apply(this, args);
+  });
+  try {
+    expect(() => new SqliteEventStore(dbPath)).toThrow("injected retired-table drop failure");
+    expect(drops).toBe(2);
+  } finally { exec.mockRestore(); }
+  try {
+    const audit = new Database(dbPath);
+    try {
+      expect(retiredWorkflowTables(audit)).toEqual([...retiredTables].sort());
+      for (const table of retiredTables) expect(audit.query<{ count: number }, []>(`select count(*) as count from ${table}`).get()?.count).toBe(1);
+      expect(audit.query<{ read_only: number }, []>("select read_only from sessions where id = 'retired_worker'").get()?.read_only).toBe(0);
+      expect(audit.query("select id from sessions where id = 'retired_reserved'").get()).toBeNull();
+      expect(audit.query("select name from schema_migrations where name = 'retired_workflows_v1'").get()).toBeNull();
+    } finally { audit.close(); }
+    const recovered = new SqliteEventStore(dbPath);
+    try {
+      expect(retiredWorkflowTables(sqliteDatabase(recovered))).toEqual([]);
+      expect(await recovered.session("retired_worker" as SessionId)).toMatchObject({ readOnly: true });
+    } finally { recovered.close(); }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("startup migration reserves both mapped historical thread aliases and their canonical sessions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-retired-aliases-"));
+  const dbPath = join(dir, "events.sqlite");
+  let store = new SqliteEventStore(dbPath);
+  const rootId = "alias_root" as SessionId;
+  await store.append(sessionEvent("alias_root_created", rootId, 1 as TimestampMs));
+  store.close();
+  const aliases = [
+    ["thread_old_child", "session_old_child"],
+    ["thread_old_recipient", "session_old_recipient"],
+  ] as const;
+  const legacy = new Database(dbPath);
+  try {
+    legacy.exec("create table legacy_session_identities (legacy_id text primary key, session_id text not null)");
+    for (const [alias, sessionId] of aliases) {
+      legacy.query("insert into legacy_session_identities values (?, ?)").run(alias, sessionId);
+    }
+    const insert = legacy.query("insert into events (id, type, time, session_id, payload_json) values (?, ?, 2, ?, ?)");
+    insert.run("alias_child_event", "agent.task_created", rootId,
+      JSON.stringify({ childThreadId: aliases[0][0], parentSessionId: rootId, path: "/root/worker", cwd: "/repo" }));
+    insert.run("alias_recipient_event", "agent.message_queued", rootId,
+      JSON.stringify({ recipientThreadId: aliases[1][0], path: "/root/recipient", from: "/root", triggerTurn: true }));
+    legacy.query("delete from schema_migrations where name = 'retired_workflows_v1'").run();
+  } finally { legacy.close(); }
+  try {
+    store = new SqliteEventStore(dbPath);
+    for (const identity of aliases.flat()) {
+      const sessionId = identity as SessionId;
+      expect(await store.session(sessionId)).toMatchObject({ id: identity, status: "archived", readOnly: true });
+      expect(await store.session(sessionId)).not.toHaveProperty("agent");
+      expect(store.claimSessionCreation({ sessionId, claimId: `create_${identity}`, cwd: "/repo",
+        time: Date.now(), leaseDurationMs: 60_000 })).toEqual({ status: "forbidden" });
+      for (const sessionAccess of ["root", "child"] as const) {
+        expect(store.claimSessionRun({ sessionId, claimId: `run_${identity}_${sessionAccess}`, sessionAccess,
+          time: Date.now(), leaseDurationMs: 60_000 })).toEqual({ status: "forbidden" });
+      }
+    }
+    expect(await store.session(rootId)).not.toHaveProperty("readOnly");
+    store.close();
+    store = new SqliteEventStore(dbPath);
+    for (const identity of aliases.flat()) {
+      expect(await store.session(identity as SessionId)).toMatchObject({ readOnly: true, status: "archived" });
+    }
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup migration tolerates opaque and invalid historical workflow JSON without changing the raw events", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-retired-opaque-"));
+  const dbPath = join(dir, "events.sqlite");
+  let store = new SqliteEventStore(dbPath);
+  const rootId = "opaque_root" as SessionId;
+  const created = sessionEvent("opaque_root_created", rootId, 1 as TimestampMs);
+  await store.append(created);
+  store.close();
+  const rawPayloads = ["{not valid JSON", '"opaque historical payload"', "null"];
+  const legacy = new Database(dbPath);
+  try {
+    for (const [index, payload] of rawPayloads.entries()) {
+      legacy.query("insert into events (id, type, time, session_id, payload_json) values (?, 'agent.task_created', 2, ?, ?)")
+        .run(`opaque_${index}`, rootId, payload);
+    }
+    // Exercise both the pre-Session payload scan and retired-workflow startup migration.
+    legacy.query("delete from schema_migrations where name in ('session_only_schema_v1', 'retired_workflows_v1')").run();
+  } finally { legacy.close(); }
+  try {
+    for (let reopen = 0; reopen < 2; reopen++) {
+      store = new SqliteEventStore(dbPath);
+      expect(await store.events({ sessionId: rootId, limit: 20 })).toEqual([created]);
+      expect(await store.session(rootId)).not.toHaveProperty("readOnly");
+      expect(sqliteDatabase(store).query<{ payload_json: string }, []>(
+        "select payload_json from events where type = 'agent.task_created' order by seq",
+      ).all().map((row) => row.payload_json)).toEqual(rawPayloads);
+      store.close();
+    }
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -20,6 +20,7 @@ export const SQLITE_SCHEMA = [
     cwd text not null,
     title text,
     status text not null,
+    read_only integer not null default 0,
     created_at integer not null,
     updated_at integer not null
   )`,
