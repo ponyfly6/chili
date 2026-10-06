@@ -1,4 +1,6 @@
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
+import { ProviderBackpressureCoordinator, sharedProviderBackpressureCoordinator } from "./provider-backpressure.js";
+beforeEach(() => sharedProviderBackpressureCoordinator.clear());
 import type { Message, MessageId, PartId, SessionId, TimestampMs, ToolCallId } from "@chili/protocol";
 import {
   buildOpenAICodexResponsesRequestBody,
@@ -765,7 +767,7 @@ test("refresh preserves existing token fields when Codex omits optional fields",
   });
 });
 
-test("ChatGPT Codex refreshes expiring OAuth credentials, persists them, and uses the refreshed identity", async () => {
+test("ChatGPT Codex refreshes expiring OAuth credentials, persists them, and preserves the account identity", async () => {
   const oldCredential: OAuthCredential = {
     type: "oauth",
     access: jwtWithAccount("acct_old"),
@@ -776,7 +778,7 @@ test("ChatGPT Codex refreshes expiring OAuth credentials, persists them, and use
   const refreshedAccess = jwtWithPayload({ sub: "refreshed_access" });
   const refreshedId = jwtWithPayload({
     exp: Math.floor(Date.now() / 1000) + 3600,
-    "https://api.openai.com/auth": { chatgpt_account_id: "acct_refreshed" },
+    "https://api.openai.com/auth": { chatgpt_account_id: "acct_old" },
   });
   const storage = new StaticOAuthStorage(oldCredential);
   let modelCalls = 0;
@@ -812,12 +814,12 @@ test("ChatGPT Codex refreshes expiring OAuth credentials, persists them, and use
 
   expect(modelCalls).toBe(1);
   expect(modelHeaders.get("authorization")).toBe(`Bearer ${refreshedAccess}`);
-  expect(modelHeaders.get("chatgpt-account-id")).toBe("acct_refreshed");
+  expect(modelHeaders.get("chatgpt-account-id")).toBe("acct_old");
   expect(storage.writes).toHaveLength(1);
   expect(storage.writes[0]).toMatchObject({
     access: refreshedAccess,
     refresh: "refresh_new",
-    accountId: "acct_refreshed",
+    accountId: "acct_old",
   });
 });
 
@@ -1736,6 +1738,7 @@ function sseFetch(events: string[]): typeof fetch {
 
 function codexStreamModel(events: readonly string[]): CodexApiResponsesModel {
   return new CodexApiResponsesModel({
+    backpressureCoordinator: new ProviderBackpressureCoordinator(),
     model: "gpt-5.6-sol",
     apiKey: "api-key",
     baseUrl: "https://gateway.test/v1",
@@ -1780,6 +1783,16 @@ class StaticOAuthStorage extends FileAuthStorage {
   override async getOAuthCredentials(provider: string): Promise<OAuthCredential | undefined> {
     return provider === OPENAI_CODEX_PROVIDER_ID ? this.credential : undefined;
   }
+
+  override async claimOAuthRefresh(): Promise<"claimed"> { return "claimed"; }
+
+  override async commitOAuthRefresh(provider: string, expected: OAuthCredential, credentials: OAuthCredentials): Promise<boolean> {
+    if (this.credential !== expected) return false;
+    await this.setOAuthCredentials(provider, credentials);
+    return true;
+  }
+
+  override async releaseOAuthRefresh(): Promise<void> {}
 
   override async setOAuthCredentials(provider: string, credentials: OAuthCredentials): Promise<void> {
     if (provider !== OPENAI_CODEX_PROVIDER_ID) return;

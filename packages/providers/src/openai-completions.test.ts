@@ -1,4 +1,6 @@
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
+import { sharedProviderBackpressureCoordinator } from "./provider-backpressure.js";
+beforeEach(() => sharedProviderBackpressureCoordinator.clear());
 import type { Message, MessageId, PartId, SessionId, TimestampMs, ToolCallId } from "@chili/protocol";
 import {
   buildOpenAICompletionsRequestBody,

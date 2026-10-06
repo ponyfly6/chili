@@ -47,6 +47,7 @@ export class ProviderBackpressureCoordinator {
   async beforeRequest(scope: ProviderRequestScope, signal?: AbortSignal): Promise<void> {
     const key = scopeKey(scope);
     while (true) {
+      if (signal?.aborted) throw abortError();
       const state = this.activeState(key);
       if (!state) return;
       if (state.mode === "circuit_open") throw cloneCircuitError(state.error);

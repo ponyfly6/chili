@@ -1,4 +1,4 @@
-import type { AssistantMessagePhase, Message, PersistedModelOutput, ServiceTier } from "@chili/protocol";
+import type { AssistantMessagePhase, Message, PersistedModelOutput, PreparedModelIdentity, ServiceTier } from "@chili/protocol";
 import type { ModelCompatibilityOverrides } from "./compat.js";
 
 export type ModelApiFamily = "anthropic-messages" | "openai-completions" | "openai-responses" | (string & {});
@@ -85,8 +85,14 @@ export interface ModelStreamInput {
   maxTokens?: number;
   temperature?: number;
   signal?: AbortSignal;
+  /** Total provider request deadline, including authentication and backpressure. Default: five minutes. */
+  requestTimeoutMs?: number;
+  /** Records the identity actually authorized for this attempt before network dispatch. */
+  onRequestIdentity?: (identity: ModelRequestIdentity) => Promise<void>;
   metadata?: Record<string, unknown>;
 }
+
+export type ModelRequestIdentity = PreparedModelIdentity;
 
 export interface ModelUsage {
   /** Non-cached input tokens. Cached reads and writes are reported separately. */

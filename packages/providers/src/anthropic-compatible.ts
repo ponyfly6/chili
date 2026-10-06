@@ -1,3 +1,4 @@
+import { credentialVersionFingerprint, recordRequestIdentity, runModelRequest } from "./request-lifecycle.js";
 import {
   formatToolResultForModel,
   normalizeToolCallId,
@@ -44,6 +45,8 @@ export interface AnthropicCompatibleModelOptions {
   headers?: Record<string, string>;
   inputCapabilities?: readonly ModelInputCapability[];
   backpressureCoordinator?: ProviderBackpressureCoordinator;
+  /** Defaults to streaming. Legacy adapters may request JSON while sharing the same execution boundary. */
+  stream?: boolean;
 }
 
 export interface AnthropicRequestBuildOptions {
@@ -174,6 +177,10 @@ export class AnthropicCompatibleModel implements ChiliModel {
   }
 
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+    yield* runModelRequest(input, (bounded) => this.streamRequest(bounded));
+  }
+
+  private async *streamRequest(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
     assertImageInputSupported(input, {
       provider: this.provider,
       model: this.options.model,
@@ -182,17 +189,19 @@ export class AnthropicCompatibleModel implements ChiliModel {
 
     const requestOptions: AnthropicRequestBuildOptions = {
       model: this.options.model,
-      stream: true,
+      stream: this.options.stream ?? true,
     };
     if (this.options.inputCapabilities) requestOptions.inputCapabilities = this.options.inputCapabilities;
     const maxTokens = input.maxTokens ?? this.options.maxTokens;
     const temperature = input.temperature ?? this.options.temperature;
     if (maxTokens !== undefined) requestOptions.maxTokens = maxTokens;
     if (temperature !== undefined) requestOptions.temperature = temperature;
-    const requestReasoning = this.provider === "minimax"
+    const requestControlsEnabled = this.provider === "minimax"
+      || this.options.reasoning !== undefined || this.options.serviceTier !== undefined;
+    const requestReasoning = requestControlsEnabled
       ? reasoningEnabledForInput(input) ?? this.options.reasoning
       : this.options.reasoning;
-    const requestServiceTier = this.provider === "minimax"
+    const requestServiceTier = requestControlsEnabled
       ? input.serviceTier ?? this.options.serviceTier
       : this.options.serviceTier;
     if (requestReasoning !== undefined) requestOptions.reasoning = requestReasoning;
@@ -206,6 +215,11 @@ export class AnthropicCompatibleModel implements ChiliModel {
     if (input.signal) init.signal = input.signal;
 
     await this.backpressureCoordinator.beforeRequest(this.requestScope, input.signal);
+    await recordRequestIdentity(input, {
+      provider: this.provider,
+      model: this.model,
+      credentialVersion: credentialVersionFingerprint(new Headers(init.headers).get(this.options.authScheme === "bearer" ? "authorization" : "x-api-key") ?? this.options.apiKey),
+    });
     const response = await this.fetchImpl(this.requestScope.endpoint ?? resolveMessagesUrl(this.options.baseUrl), init);
     if (!response.ok) {
       const error = await providerHttpError(response, {
@@ -393,16 +407,16 @@ export class AnthropicCompatibleModel implements ChiliModel {
   }
 
   private headers(): HeadersInit {
-    const headers: Record<string, string> = {
+    const headers = new Headers({
       accept: "text/event-stream, application/json",
       "content-type": "application/json",
       "anthropic-version": "2023-06-01",
       ...this.options.headers,
-    };
+    });
     if ((this.options.authScheme ?? "x-api-key") === "bearer") {
-      headers.authorization = `Bearer ${this.options.apiKey}`;
+      headers.set("authorization", `Bearer ${this.options.apiKey}`);
     } else {
-      headers["x-api-key"] = this.options.apiKey;
+      headers.set("x-api-key", this.options.apiKey);
     }
     return headers;
   }
@@ -454,7 +468,8 @@ export function resolveMessagesUrl(baseUrl: string): string {
 }
 
 function reasoningEnabledForInput(input: ModelStreamInput): boolean | undefined {
-  const reasoning = input.reasoning
+  const reasoning = input.reasoningLevel
+    ?? input.reasoning
     ?? input.thinking
     ?? input.selection?.reasoning
     ?? input.selection?.thinking;
@@ -480,14 +495,14 @@ function toAnthropicMessages(messages: readonly Message[], includeImageContent =
       } else if (part.type === "tool_call") {
         assistantBlocks.push({
           type: "tool_use",
-          id: part.callId,
+          id: part.providerCallId ?? part.callId,
           name: part.toolName,
           input: part.input,
         });
       } else if (part.type === "tool_result") {
         const block: AnthropicContentBlock = {
           type: "tool_result",
-          tool_use_id: part.callId,
+          tool_use_id: part.providerCallId ?? part.callId,
           content: formatToolResultContent(part, includeImageContent),
         };
         if (part.error) block.is_error = true;

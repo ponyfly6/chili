@@ -8,7 +8,7 @@ test("MiniMax M3 model factory resolves model, baseUrl, and API key from env", a
   let body: Record<string, unknown> = {};
   const fetchImpl = (async (input, init) => {
     url = String(input);
-    headers = init?.headers as Record<string, string>;
+    new Headers(init?.headers).forEach((value, key) => { headers[key] = value; });
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(JSON.stringify({ id: "msg_env", content: [], stop_reason: "end_turn" }), {
       status: 200,

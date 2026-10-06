@@ -4,6 +4,7 @@ import type { OAuthCredentials } from "../auth.js";
 import { OPENAI_CODEX_PROVIDER_ID } from "../models.js";
 import { providerHttpError, providerPayloadError, type ProviderRequestError } from "../provider-error.js";
 import { generatePKCE } from "./pkce.js";
+import { nonRetryableOAuthError, raceWithSignal, requestDeadline } from "../oauth-refresh.js";
 
 export const OPENAI_CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const OPENAI_CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
@@ -47,9 +48,11 @@ interface LocalOAuthServer {
   waitForCode: () => Promise<{ code: string } | null>;
 }
 
-interface OpenAICodexRefreshOptions {
+export interface OpenAICodexRefreshOptions {
   fetch?: typeof fetch;
   previous?: Partial<OAuthCredentials>;
+  signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 type TokenResponseJson = Record<string, unknown>;
@@ -94,20 +97,29 @@ export async function refreshOpenAICodexToken(
   options: OpenAICodexRefreshOptions = {},
 ): Promise<OAuthCredentials> {
   const fetchImpl = options.fetch ?? fetch;
-  const response = await fetchImpl(OPENAI_CODEX_TOKEN_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: OPENAI_CODEX_OAUTH_CLIENT_ID,
-    }),
-  });
-  const previous: Partial<OAuthCredentials> = { ...(options.previous ?? {}) };
-  if (!previous.refresh) previous.refresh = refreshToken;
-  const result = await readTokenResponse(response, previous);
-  if (result.type === "failed") throw result.error ?? new Error(result.message);
-  return result.credentials;
+  const deadline = requestDeadline(options.signal, options.timeoutMs);
+  try {
+    deadline.signal.throwIfAborted();
+    const response = await raceWithSignal(fetchImpl(OPENAI_CODEX_TOKEN_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      signal: deadline.signal,
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: OPENAI_CODEX_OAUTH_CLIENT_ID,
+      }),
+    }), deadline.signal);
+    const previous: Partial<OAuthCredentials> = { ...(options.previous ?? {}) };
+    if (!previous.refresh) previous.refresh = refreshToken;
+    const result = await raceWithSignal(readTokenResponse(response, previous), deadline.signal);
+    if (result.type === "failed") throw result.error ?? new Error(result.message);
+    return result.credentials;
+  } catch (error) {
+    throw nonRetryableOAuthError(error);
+  } finally {
+    deadline.dispose();
+  }
 }
 
 export async function exchangeOpenAICodexAuthorizationCode(
@@ -296,7 +308,7 @@ function numberField(record: TokenResponseJson, key: string): number | undefined
 }
 
 function resolveAccountId(idToken: string | undefined, previousAccountId: string | undefined, accessToken: string): string | undefined {
-  return extractAccountId(idToken) ?? previousAccountId ?? extractAccountId(accessToken);
+  return extractAccountId(idToken) ?? extractAccountId(accessToken) ?? previousAccountId;
 }
 
 function extractAccountId(token: string | undefined): string | undefined {

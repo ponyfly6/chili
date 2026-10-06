@@ -3,6 +3,8 @@ import { resolveChatCompletionsCompatibility, type ChatCompletionsCompatibility 
 import { assertImageInputSupported } from "./image-input.js";
 import { providerHttpError, providerPayloadError, providerStreamProtocolError } from "./provider-error.js";
 import { readSseEvents, throwIfStreamAborted } from "./sse.js";
+import { credentialVersionFingerprint, recordRequestIdentity, runModelRequest, withProviderBackpressure } from "./request-lifecycle.js";
+import { sharedProviderBackpressureCoordinator, type ProviderBackpressureCoordinator } from "./provider-backpressure.js";
 import { prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
 import type {
   ChiliModel,
@@ -27,6 +29,7 @@ export interface OpenAICompletionsModelOptions {
   reasoningEffort?: ReasoningLevel;
   compatibility?: Partial<ChatCompletionsCompatibility>;
   inputCapabilities?: readonly ModelInputCapability[];
+  backpressureCoordinator?: ProviderBackpressureCoordinator;
 }
 
 export interface OpenAICompletionsRequestBuildOptions {
@@ -152,6 +155,15 @@ export class OpenAICompletionsModel implements ChiliModel {
   }
 
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+    yield* runModelRequest(input, (bounded) => withProviderBackpressure(
+      this.options.backpressureCoordinator ?? sharedProviderBackpressureCoordinator,
+      { provider: this.provider, endpoint: resolveChatCompletionsUrl(this.options.baseUrl), credential: new Headers(this.headers()).get("authorization") ?? this.options.apiKey },
+      bounded.signal,
+      () => this.streamRequest(bounded),
+    ));
+  }
+
+  private async *streamRequest(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
     assertImageInputSupported(input, {
       provider: this.provider,
       model: this.options.model,
@@ -185,6 +197,11 @@ export class OpenAICompletionsModel implements ChiliModel {
     };
     if (input.signal) init.signal = input.signal;
 
+    await recordRequestIdentity(input, {
+      provider: this.provider,
+      model: this.model,
+      credentialVersion: credentialVersionFingerprint(new Headers(init.headers).get("authorization") ?? this.options.apiKey),
+    });
     const response = await this.fetchImpl(resolveChatCompletionsUrl(this.options.baseUrl), init);
     if (!response.ok) {
       throw await providerHttpError(response, {
@@ -492,7 +509,7 @@ function toOpenAIAssistantMessage(
   const toolCalls = message.parts
     .filter((part): part is Extract<MessagePart, { type: "tool_call" }> => part.type === "tool_call")
     .map((part) => ({
-      id: part.callId,
+      id: part.providerCallId ?? part.callId,
       type: "function" as const,
       function: {
         name: part.toolName,
@@ -532,7 +549,7 @@ function toOpenAIUserOrToolMessages(message: Message): OpenAIMessage[] {
     if (part.type !== "tool_result") continue;
     result.push({
       role: "tool",
-      tool_call_id: part.callId,
+      tool_call_id: part.providerCallId ?? part.callId,
       content: formatToolResultForModel(part),
     });
   }

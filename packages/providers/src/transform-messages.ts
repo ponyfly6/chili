@@ -10,6 +10,7 @@ export interface MessageTransformOptions {
 
 interface PendingToolCall {
   callId: ToolCallId;
+  providerCallId?: string;
   toolName: string;
   source: Message;
 }
@@ -71,6 +72,8 @@ export function normalizeAnthropicToolCallId(id: string): string {
 
 function normalizeMessageParts(messages: readonly Message[], options: MessageTransformOptions): Message[] {
   const callIdMap = new Map<string, ToolCallId>();
+  const modernCalls = new Set<string>();
+  const wireIds = new Set<string>();
   const result: Message[] = [];
   const dropRedactedReasoning = options.dropRedactedReasoning ?? true;
 
@@ -80,8 +83,21 @@ function normalizeMessageParts(messages: readonly Message[], options: MessageTra
 
     for (const part of message.parts) {
       if (part.type === "tool_call") {
-        const normalized = normalizeToolCallId(part.callId, options.normalizeToolCallId);
+        const original = (part.providerCallId ?? part.callId) as ToolCallId;
+        let normalized = normalizeToolCallId(original, options.normalizeToolCallId);
+        // Some providers reuse a short ID in later turns. A full replay still needs
+        // unambiguous wire IDs, without changing the stored provider or internal identity.
+        for (let collision = 0; wireIds.has(normalized); collision++) {
+          normalized = normalizeToolCallId(`${original}_${stableHash(`${part.callId}:${collision}`)}` as ToolCallId, options.normalizeToolCallId);
+        }
+        wireIds.add(normalized);
         callIdMap.set(String(part.callId), normalized);
+        if (part.providerCallId !== undefined) {
+          modernCalls.add(String(part.callId));
+          changed ||= normalized !== part.providerCallId;
+          parts.push(normalized === part.providerCallId ? part : { ...part, providerCallId: normalized });
+          continue;
+        }
         if (normalized === part.callId) {
           parts.push(part);
         } else {
@@ -92,7 +108,18 @@ function normalizeMessageParts(messages: readonly Message[], options: MessageTra
       }
 
       if (part.type === "tool_result") {
-        const normalized = callIdMap.get(String(part.callId));
+        const normalized = callIdMap.get(String(part.callId))
+          ?? (part.providerCallId === undefined ? undefined : normalizeToolCallId(part.providerCallId as ToolCallId, options.normalizeToolCallId));
+        if (part.providerCallId !== undefined) {
+          changed ||= normalized !== part.providerCallId;
+          parts.push(normalized === undefined || normalized === part.providerCallId ? part : { ...part, providerCallId: normalized });
+          continue;
+        }
+        if (modernCalls.has(String(part.callId)) && normalized !== undefined) {
+          changed = true;
+          parts.push({ ...part, providerCallId: normalized });
+          continue;
+        }
         if (!normalized || normalized === part.callId) {
           parts.push(part);
         } else {
@@ -202,7 +229,7 @@ function insertMissingToolResults(messages: readonly Message[], options: Message
 function toolCallsIn(message: Message): PendingToolCall[] {
   return message.parts
     .filter((part): part is Extract<MessagePart, { type: "tool_call" }> => part.type === "tool_call")
-    .map((part) => ({ callId: part.callId, toolName: part.toolName, source: message }));
+    .map((part) => ({ callId: part.callId, ...(part.providerCallId === undefined ? {} : { providerCallId: part.providerCallId }), toolName: part.toolName, source: message }));
 }
 
 function hasNonToolResultPart(message: Message): boolean {
@@ -231,6 +258,7 @@ function createSyntheticToolResultMessage(
       sessionId: source.sessionId,
       type: "tool_result",
       callId: toolCall.callId,
+      ...(toolCall.providerCallId === undefined ? {} : { providerCallId: toolCall.providerCallId }),
       output: options.missingToolResultText ?? DEFAULT_MISSING_TOOL_RESULT,
       error: options.missingToolResultText ?? DEFAULT_MISSING_TOOL_RESULT,
       synthetic: true,

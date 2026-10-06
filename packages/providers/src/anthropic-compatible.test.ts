@@ -424,7 +424,7 @@ test("passes AbortSignal through to fetch and requests streaming", async () => {
   );
 
   expect(url).toBe(`${MINIMAX_ANTHROPIC_BASE_URL}/v1/messages`);
-  expect(signal).toBe(controller.signal);
+  expect(signal).toBeInstanceOf(AbortSignal);
   expect(body?.model).toBe(MINIMAX_M3_MODEL);
   expect(body?.max_tokens).toBe(64);
   expect(body?.stream).toBe(true);

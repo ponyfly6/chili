@@ -208,7 +208,8 @@ export function classifyProviderError(input: ProviderErrorClassificationInput): 
   if (input.status === 429) {
     return { category: "rate_limit", retryable: true, opensCircuit: false };
   }
-  if (input.status === 401 || input.status === 403) {
+  if (input.status === 401 || input.status === 403
+    || type === "authentication_error" || code === "invalid_api_key" || code === "invalid_token") {
     return { category: "authentication", retryable: false, opensCircuit: false };
   }
   if (input.status === 408 || (input.status !== undefined && input.status >= 500 && input.status <= 599)) {
