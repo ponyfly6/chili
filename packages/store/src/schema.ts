@@ -69,6 +69,7 @@ export const SQLITE_SCHEMA = [
 
   `create table if not exists tool_calls (
     id text primary key,
+    provider_call_id text,
     session_id text,
     turn_id text,
     tool_name text not null,

@@ -48,6 +48,8 @@ export interface ToolOutputUpdate {
 export interface ToolResult {
   title: string;
   output: string;
+  /** Program data. JSON-only, bounded by the executor and never model-truncated. */
+  structuredData?: unknown;
   content?: ToolResultContent[];
   metadata?: Record<string, unknown>;
   artifactIds?: ArtifactId[];

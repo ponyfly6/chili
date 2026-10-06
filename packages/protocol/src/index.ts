@@ -10,3 +10,5 @@ export * from "./persisted-error.js";
 export * from "./persisted-json.js";
 export * from "./event.js";
 export * from "./session-input.js";
+export * from "./prepared-request.js";
+export * from "./execution-identity.js";

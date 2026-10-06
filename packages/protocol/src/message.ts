@@ -77,6 +77,8 @@ export interface PersistedModelOutput {
 export interface ToolCallPart extends BasePart {
   type: "tool_call";
   callId: ToolCallId;
+  /** Provider protocol identifier; old history falls back to the internal callId. */
+  providerCallId?: string;
   toolName: string;
   input: unknown;
   status: "pending" | "running" | "completed" | "failed" | "cancelled";
@@ -97,7 +99,11 @@ export interface ToolResultExecutionContext {
 
 export interface ToolResultPart extends BasePart {
   type: "tool_result";
+  /** Durable program result; omitted from the model context projection. */
+  structuredData?: unknown;
   callId: ToolCallId;
+  /** Provider protocol identifier; old history falls back to the internal callId. */
+  providerCallId?: string;
   output: string;
   content?: ToolResultContent[];
   error?: string;

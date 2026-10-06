@@ -523,6 +523,7 @@ export class SqliteEventStore
       this.migrateSubagentSchema();
       this.migrateTeamSchema();
       this.migrateSessionClaimSchema();
+      this.addColumnIfMissing("tool_calls", "provider_call_id", "text");
       this.inputs = new SessionInputRepository(this.db, {
         commit: (events, fence) => { this.writeTransactionEvents(events, fence); },
         claim: (input) => this.claimSessionRun(input),
@@ -698,6 +699,13 @@ export class SqliteEventStore
     }
   }
 
+  sessionRunClaim(sessionId: SessionId): { claimId: string; leaseExpiresAt: number } | undefined {
+    const row = this.db.query<{ claim_id: string; lease_expires_at: number }, [string]>(
+      "select claim_id, lease_expires_at from session_run_claims where session_id = ?",
+    ).get(sessionId);
+    return row ? { claimId: row.claim_id, leaseExpiresAt: row.lease_expires_at } : undefined;
+  }
+
   claimSessionRun(input: {
     sessionId: SessionId;
     claimId: string;
@@ -866,7 +874,14 @@ export class SqliteEventStore
 
     const rows = this.db
       .query<StoredEventRow, any>(
-        `select seq, id, type, time, session_id, payload_json
+        `select seq, id, type, time, session_id, ${query.compactRequests
+          ? `case when type = 'model.request_prepared' then
+               json_remove(json_set(payload_json, '$.contentVersion',
+                 coalesce(json_extract(payload_json, '$.contentVersion'), json_extract(payload_json, '$.request.contentVersion'))), '$.request')
+             when type = 'message.part_added' and json_extract(payload_json, '$.part.type') = 'tool_result'
+               then json_remove(payload_json, '$.part.structuredData')
+             else payload_json end as payload_json`
+          : "payload_json"}
          ${orderAndLimit}`,
       )
       .all(params);
@@ -2164,14 +2179,17 @@ export class SqliteEventStore
       if (!Number.isFinite(item.leaseTtlMs) || item.leaseTtlMs <= 0) {
         throw new Error("agent task run leaseTtlMs must be positive");
       }
+      let legacyMailboxBinding: AgentMailboxProjectionRow | undefined;
       if (item.sourceMailboxMessageId) {
         // A mailbox retry may recover an interrupted generation, but it must
         // never reopen a task that was explicitly cancelled after delivery was
         // claimed. Manual follow-ups (without a source message) remain allowed.
         if (current.status === "cancelled") return { applied: false, events: [] as ChiliEvent[] };
         const message = this.agentMailboxState(item.sourceMailboxMessageId);
-        if (!message || message.status !== "delivering" || message.task_id !== item.taskId) {
-          return { applied: false, events: [] as ChiliEvent[] };
+        if (!message || message.status !== "delivering") return { applied: false, events: [] as ChiliEvent[] };
+        if (message.task_id !== item.taskId) {
+          if (!this.canBindLegacyAgentMailbox(message, item.taskId)) return { applied: false, events: [] as ChiliEvent[] };
+          legacyMailboxBinding = message;
         }
       }
 
@@ -2222,6 +2240,19 @@ export class SqliteEventStore
 
       const sessionId = item.sessionId ?? current.parent_session_id ?? current.child_session_id;
       const events: ChiliEvent[] = [];
+      if (legacyMailboxBinding) {
+        // Record the compatibility binding in the same transaction as the new
+        // generation so projection replay retains it and a retry cannot run it
+        // through a different task that happens to share a path.
+        events.push({
+          id: `${item.spawnEventId}:mailbox_binding`,
+          type: "agent.message_claimed",
+          time: now as TimestampMs,
+          ...(sessionId ? { sessionId: sessionId as SessionId } : {}),
+          payload: { messageId: legacyMailboxBinding.id, taskId: item.taskId,
+            path: current.path as AgentPath, claimedBy: current.path as AgentPath },
+        });
+      }
       if (item.messageEventId && item.message && item.from) {
         const messageEvent: Extract<ChiliEvent, { type: "agent.message_queued" }> = {
           id: item.messageEventId,
@@ -4349,18 +4380,29 @@ export class SqliteEventStore
   }
 
   private applyToolEvent(event: ToolEvent): void {
+    // External/provider IDs are never keys for this projection. Also fence
+    // legacy writers so a repeated ID cannot alter another session or turn.
+    const existing = this.db.query<{ session_id: string | null; turn_id: string | null }, [string]>(
+      "select session_id, turn_id from tool_calls where id = ?",
+    ).get(event.payload.callId);
+    if (existing && (existing.session_id !== (event.sessionId ?? null)
+      || (event.type === "tool.call_started" && existing.turn_id !== event.payload.turnId))) {
+      throw new Error(`Tool call identity conflict: ${event.payload.callId}`);
+    }
     if (event.type === "tool.call_started") {
       this.db
         .query(
           `insert into tool_calls
-             (id, session_id, turn_id, tool_name, status, input_json, started_at, updated_at)
-           values (?, ?, ?, ?, 'running', ?, ?, ?)
+             (id, provider_call_id, session_id, turn_id, tool_name, status, input_json, started_at, updated_at)
+           values (?, ?, ?, ?, ?, 'running', ?, ?, ?)
            on conflict(id) do update set
              status = excluded.status,
+             provider_call_id = coalesce(excluded.provider_call_id, tool_calls.provider_call_id),
              updated_at = excluded.updated_at`,
         )
         .run(
           event.payload.callId,
+          event.payload.providerCallId ?? null,
           event.sessionId ?? null,
           event.payload.turnId,
           event.payload.toolName,
@@ -4373,8 +4415,8 @@ export class SqliteEventStore
 
     if (event.type === "tool.call_updated") {
       this.db
-        .query(`update tool_calls set status = ?, updated_at = ? where id = ?`)
-        .run(event.payload.status, event.time, event.payload.callId);
+        .query(`update tool_calls set status = ?, provider_call_id = coalesce(?, provider_call_id), updated_at = ? where id = ?`)
+        .run(event.payload.status, event.payload.providerCallId ?? null, event.time, event.payload.callId);
       return;
     }
 
@@ -4593,6 +4635,13 @@ export class SqliteEventStore
     }
 
     if (event.type === "agent.message_claimed") {
+      if (event.payload.taskId) {
+        const message = this.agentMailboxState(event.payload.messageId);
+        if (message && this.canBindLegacyAgentMailbox(message, event.payload.taskId)) {
+          this.db.query(`update agent_mailbox set task_id = ? where id = ? and task_id is null`)
+            .run(event.payload.taskId, event.payload.messageId);
+        }
+      }
       this.db
         .query(`update agent_mailbox set status = 'delivering' where id = ? and status = 'queued'`)
         .run(event.payload.messageId);
@@ -4874,6 +4923,15 @@ export class SqliteEventStore
       )
       .get(taskId);
     return row ?? undefined;
+  }
+
+  private canBindLegacyAgentMailbox(message: AgentMailboxProjectionRow, taskId: string): boolean {
+    if (message.task_id !== null || !message.recipient_session_id || message.trigger_turn !== 1
+      || (message.status !== "queued" && message.status !== "delivering")) return false;
+    const owners = this.db.query<{ id: string; path: string }, [string]>(
+      `select id, path from agent_tasks where child_session_id = ? limit 2`,
+    ).all(message.recipient_session_id);
+    return owners.length === 1 && owners[0]?.id === taskId && owners[0].path === message.path;
   }
 
   private agentMailboxState(messageId: string): AgentMailboxProjectionRow | undefined {

@@ -28,6 +28,8 @@ import type {
 } from "@chili/protocol";
 
 export interface EventQuery {
+  /** Omit request audit bodies and program-only results before decoding client projections. */
+  compactRequests?: boolean;
   sessionId?: SessionId;
   type?: string;
   afterEventId?: string;
@@ -50,6 +52,7 @@ export interface SessionRow {
 
 export interface ToolCallRow {
   id: string;
+  providerCallId?: string;
   sessionId?: SessionId;
   turnId?: TurnId;
   toolName: string;

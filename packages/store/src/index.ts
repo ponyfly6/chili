@@ -7,3 +7,5 @@ export * from "./sqlite-event-store.js";
 export * from "./sqlite-journal-policy.js";
 export * from "./types.js";
 export * from "./session-inputs.js";
+export * from "./host-owner.js";
+export * from "./memory-repository.js";

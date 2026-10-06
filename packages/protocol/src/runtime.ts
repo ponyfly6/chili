@@ -283,6 +283,8 @@ export interface RuntimeMcpControlService {
   status?(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpStatusResponse>;
   get?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpServerDescriptor | undefined>;
   reload?(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpReloadResponse>;
+  connect?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpServerDescriptor>;
+  disconnect?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpServerDescriptor>;
   add?(input: RuntimeMcpAddServerRequest): Promise<RuntimeMcpServerDescriptor>;
   remove?(server: string): Promise<RuntimeMcpRemoveServerResponse>;
   tools?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpToolsResponse>;

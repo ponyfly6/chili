@@ -182,6 +182,13 @@ export class ObservableEventStore
     return this.inner.sessions();
   }
 
+  sessionRunClaim(sessionId: SessionId): { claimId: string; leaseExpiresAt: number } | undefined {
+    const store = this.inner as EventStore & {
+      sessionRunClaim?: (sessionId: SessionId) => { claimId: string; leaseExpiresAt: number } | undefined;
+    };
+    return store.sessionRunClaim?.(sessionId);
+  }
+
   messages(sessionId: SessionId): Promise<Message[]> {
     return this.inner.messages(sessionId);
   }

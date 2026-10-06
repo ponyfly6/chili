@@ -13,7 +13,7 @@ import type {
 } from "./ids.js";
 import type { AgentPath } from "./agent-path.js";
 import type { SessionGoal, SessionGoalUpdateReason, SessionGoalUsageDelta } from "./goal.js";
-import type { MessagePart } from "./message.js";
+import type { Message, MessagePart } from "./message.js";
 import type {
   McpDiagnosticPayload,
   McpProgressPayload,
@@ -26,6 +26,8 @@ import type { DelegationPolicy, ModelSelection, ReasoningLevel, ServiceTier, Mod
 import type { ApprovalDecisionAction, ApprovalScope, ToolCallStatus, ToolOutputStream } from "./tool.js";
 import type { PersistedErrorDetails } from "./persisted-error.js";
 import type { RuntimeInputQueue } from "./session-input.js";
+import type { PreparedModelIdentity, PreparedModelRequest } from "./prepared-request.js";
+import type { ExecutionIdentity } from "./execution-identity.js";
 
 export interface EventEnvelope<TType extends string = string, TPayload = unknown> {
   id: string;
@@ -55,9 +57,42 @@ export function isTransientEvent(event: Pick<EventEnvelope, "type">): boolean {
   return event.type === "tool.output_delta";
 }
 
+/** Program results are read through storage; UI history carries their model/display form. */
+export function compactRuntimeMessage(message: Message): Message {
+  if (!message.parts.some((part) => part.type === "tool_result" && part.structuredData !== undefined)) return message;
+  return {
+    ...message,
+    parts: message.parts.map((part) => {
+      if (part.type !== "tool_result" || part.structuredData === undefined) return part;
+      const { structuredData: _, ...displayPart } = part;
+      return displayPart;
+    }),
+  };
+}
+
+/** Keep the audit record in storage while transporting only its stable reference. */
+export function compactRuntimeEvent(event: ChiliEvent): ChiliEvent {
+  if (event.type === "message.part_added" && event.payload.part.type === "tool_result") {
+    const { structuredData, ...part } = event.payload.part;
+    if (structuredData === undefined) return event;
+    return { ...event, payload: { ...event.payload, part } };
+  }
+  if (event.type !== "model.request_prepared") return event;
+  const { request, ...payload } = event.payload;
+  return {
+    ...event,
+    payload: {
+      ...payload,
+      // Full events written before the reference field was introduced remain replayable.
+      contentVersion: payload.contentVersion ?? request?.contentVersion,
+    },
+  };
+}
+
 export type SessionEvent =
   | SessionScopedEventEnvelope<"session.input_queue_changed", RuntimeInputQueue>
-  | SessionScopedEventEnvelope<"session.created", { sessionId: SessionId; cwd: string }>
+  | SessionScopedEventEnvelope<"session.created", { sessionId: SessionId; cwd: string; identity?: ExecutionIdentity }>
+  | SessionScopedEventEnvelope<"session.identity_bound", { sessionId: SessionId; identity: ExecutionIdentity }>
   | SessionScopedEventEnvelope<"session.renamed", { sessionId: SessionId; title: string }>
   | SessionScopedEventEnvelope<"session.status_changed", RuntimeStatusPayload>
   | SessionScopedEventEnvelope<"session.model_changed", { sessionId: SessionId; modelSelection: ModelSelection }>
@@ -67,6 +102,8 @@ export type SessionEvent =
   | SessionScopedEventEnvelope<"session.archived", { sessionId: SessionId }>;
 
 export type TurnEvent =
+  | EventEnvelope<"model.request_prepared", { turnId: TurnId; requestId: string; attempt: number; contentVersion: string; request?: PreparedModelRequest }>
+  | EventEnvelope<"model.request_identity", { turnId: TurnId; requestId: string; attempt: number; identity: PreparedModelIdentity }>
   | EventEnvelope<"turn.started", { turnId: TurnId }>
   | EventEnvelope<"turn.model_metadata", ModelMetadataPayload>
   | EventEnvelope<"turn.completed", { turnId: TurnId; status: "completed" | "failed" | "cancelled" }>
@@ -83,10 +120,10 @@ export type MessageEvent =
   | EventEnvelope<"message.part_delta", { messageId: MessageId; partId: string; field: string; delta: string }>;
 
 export type ToolEvent =
-  | EventEnvelope<"tool.call_started", { turnId: TurnId; callId: ToolCallId; toolName: string; input: unknown }>
-  | EventEnvelope<"tool.call_updated", { callId: ToolCallId; status: ToolCallStatus; toolName?: string; input?: unknown; metadata?: Record<string, unknown> }>
+  | EventEnvelope<"tool.call_started", { turnId: TurnId; callId: ToolCallId; providerCallId?: string; toolName: string; input: unknown }>
+  | EventEnvelope<"tool.call_updated", { callId: ToolCallId; providerCallId?: string; status: ToolCallStatus; toolName?: string; input?: unknown; metadata?: Record<string, unknown> }>
   | EventEnvelope<"tool.output_delta", { callId: ToolCallId; stream: ToolOutputStream; delta: string; bytes?: number; truncated?: boolean; sequence?: number }>
-  | EventEnvelope<"tool.call_finished", { callId: ToolCallId; status: "completed" | "failed" | "cancelled"; output?: string; error?: string; errorDetails?: PersistedErrorDetails; synthetic?: boolean }>;
+  | EventEnvelope<"tool.call_finished", { callId: ToolCallId; providerCallId?: string; status: "completed" | "failed" | "cancelled"; output?: string; error?: string; errorDetails?: PersistedErrorDetails; synthetic?: boolean }>;
 
 export type ApprovalEvent =
   | EventEnvelope<"approval.requested", { approvalId: ApprovalId; callId?: ToolCallId; permission: string; patterns: string[]; maxApprovalScope?: ApprovalScope; metadata?: Record<string, unknown> }>

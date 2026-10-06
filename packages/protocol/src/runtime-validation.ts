@@ -36,6 +36,8 @@ import {
 } from "./runtime.js";
 import type { Message } from "./message.js";
 import type { RuntimeInputQueue, RuntimeSessionInput } from "./session-input.js";
+import type { ExecutionIdentity } from "./execution-identity.js";
+import type { PreparedModelIdentity } from "./prepared-request.js";
 
 const MAX_VALIDATION_PATH_CHARS = 512;
 const MAX_VALIDATION_EXPECTATION_CHARS = 512;
@@ -606,6 +608,7 @@ export function parseRuntimeMcpLogoutResponse(value: unknown, path = "response")
 const CHILI_EVENT_TYPES = [
   "session.input_queue_changed",
   "session.created",
+  "session.identity_bound",
   "session.renamed",
   "session.status_changed",
   "session.model_changed",
@@ -614,6 +617,8 @@ const CHILI_EVENT_TYPES = [
   "session.delegation_changed",
   "session.archived",
   "turn.started",
+  "model.request_prepared",
+  "model.request_identity",
   "turn.model_metadata",
   "turn.completed",
   "turn.compaction_requested",
@@ -669,6 +674,7 @@ const CHILI_EVENT_TYPES = [
 
 const SESSION_SCOPED_EVENT_TYPES = new Set<ChiliEvent["type"]>([
   "session.created",
+  "session.identity_bound",
   "session.renamed",
   "session.status_changed",
   "session.model_changed",
@@ -701,7 +707,42 @@ export function parseChiliEvent(value: unknown, path = "event"): ChiliEvent {
   }
   const payload = parseRuntimeRecord(record.payload, `${path}.payload`);
   validateChiliEventPayload(type, payload, `${path}.payload`, sessionId, id);
+  if (type === "model.request_prepared" && payload.contentVersion === undefined) {
+    const request = parseRuntimeRecord(payload.request, `${path}.payload.request`);
+    return { ...record, payload: { ...payload, contentVersion: request.contentVersion } } as unknown as ChiliEvent;
+  }
   return record as unknown as ChiliEvent;
+}
+
+export function parseRuntimeExecutionIdentity(value: unknown, path = "identity"): ExecutionIdentity {
+  const identity = parseRuntimeRecord(value, path);
+  rejectRuntimeUnknownFields(identity, ["profileId", "profilePath", "authPath", "projectId", "projectRoot", "workspaceId", "workspaceRoot"], path);
+  return {
+    profileId: parseRuntimeIdentifier(identity.profileId, `${path}.profileId`),
+    profilePath: parseRuntimeString(identity.profilePath, `${path}.profilePath`),
+    ...(identity.authPath !== undefined ? { authPath: parseRuntimeString(identity.authPath, `${path}.authPath`) } : {}),
+    projectId: parseRuntimeIdentifier(identity.projectId, `${path}.projectId`),
+    projectRoot: parseRuntimeString(identity.projectRoot, `${path}.projectRoot`),
+    workspaceId: parseRuntimeIdentifier(identity.workspaceId, `${path}.workspaceId`),
+    workspaceRoot: parseRuntimeString(identity.workspaceRoot, `${path}.workspaceRoot`),
+  };
+}
+
+export function parseRuntimePreparedModelIdentity(value: unknown, path = "identity"): PreparedModelIdentity {
+  const identity = parseRuntimeRecord(value, path);
+  rejectRuntimeUnknownFields(identity, ["provider", "model", "accountId", "credentialVersion", "profileId"], path);
+  const parsed: PreparedModelIdentity = {
+    provider: parseRuntimeIdentifier(identity.provider, `${path}.provider`),
+    model: parseRuntimeIdentifier(identity.model, `${path}.model`),
+  };
+  if (identity.accountId !== undefined) parsed.accountId = parseRuntimeIdentifier(identity.accountId, `${path}.accountId`);
+  if (identity.profileId !== undefined) parsed.profileId = parseRuntimeIdentifier(identity.profileId, `${path}.profileId`);
+  if (identity.credentialVersion !== undefined) {
+    parsed.credentialVersion = typeof identity.credentialVersion === "number"
+      ? parseRuntimeNonNegativeInteger(identity.credentialVersion, `${path}.credentialVersion`)
+      : parseRuntimeIdentifier(identity.credentialVersion, `${path}.credentialVersion`);
+  }
+  return parsed;
 }
 
 export function parseChiliEventArray(value: unknown, path = "response"): ChiliEvent[] {
@@ -723,6 +764,11 @@ function validateChiliEventPayload(
     case "session.created":
       matchingEventSessionId(payload.sessionId, envelopeSessionId, `${path}.sessionId`);
       parseRuntimeString(payload.cwd, `${path}.cwd`);
+      if (payload.identity !== undefined) parseRuntimeExecutionIdentity(payload.identity, `${path}.identity`);
+      return;
+    case "session.identity_bound":
+      matchingEventSessionId(payload.sessionId, envelopeSessionId, `${path}.sessionId`);
+      parseRuntimeExecutionIdentity(payload.identity, `${path}.identity`);
       return;
     case "session.renamed":
       matchingEventSessionId(payload.sessionId, envelopeSessionId, `${path}.sessionId`);
@@ -762,6 +808,41 @@ function validateChiliEventPayload(
       return;
     case "turn.started":
       parseRuntimeIdentifier(payload.turnId, `${path}.turnId`);
+      return;
+    case "model.request_prepared": {
+      parseRuntimeIdentifier(payload.turnId, `${path}.turnId`);
+      parseRuntimeIdentifier(payload.requestId, `${path}.requestId`);
+      parseRuntimePositiveInteger(payload.attempt, `${path}.attempt`);
+      if (payload.request === undefined) {
+        parseRuntimeIdentifier(payload.contentVersion, `${path}.contentVersion`);
+        return;
+      }
+      const request = parseRuntimeRecord(payload.request, `${path}.request`);
+      if (request.version !== 1) throw new RuntimeValidationError(`${path}.request.version`, "must be 1");
+      parseRuntimeEnum(request.purpose, ["turn", "compaction"] as const, `${path}.request.purpose`);
+      parseRuntimeIdentifier(request.contentVersion, `${path}.request.contentVersion`);
+      if (payload.contentVersion !== undefined && payload.contentVersion !== request.contentVersion) {
+        throw new RuntimeValidationError(`${path}.contentVersion`, "must match the prepared request content version");
+      }
+      parseRuntimeNonNegativeInteger(request.sessionRevision, `${path}.request.sessionRevision`);
+      if (request.executionIdentity !== undefined) parseRuntimeExecutionIdentity(request.executionIdentity, `${path}.request.executionIdentity`);
+      if (request.modelIdentity !== undefined) parseRuntimePreparedModelIdentity(request.modelIdentity, `${path}.request.modelIdentity`);
+      for (const key of ["system", "developer", "contextualUser"] as const) {
+        if (!Array.isArray(request[key]) || request[key].some((entry) => typeof entry !== "string")) {
+          throw new RuntimeValidationError(`${path}.request.${key}`, "must be a string array");
+        }
+      }
+      for (const key of ["messages", "tools", "sources"] as const) {
+        if (!Array.isArray(request[key])) throw new RuntimeValidationError(`${path}.request.${key}`, "must be an array");
+      }
+      parseRuntimeRecord(request.budget, `${path}.request.budget`);
+      return;
+    }
+    case "model.request_identity":
+      parseRuntimeIdentifier(payload.turnId, `${path}.turnId`);
+      parseRuntimeIdentifier(payload.requestId, `${path}.requestId`);
+      parseRuntimePositiveInteger(payload.attempt, `${path}.attempt`);
+      parseRuntimePreparedModelIdentity(payload.identity, `${path}.identity`);
       return;
     case "turn.model_metadata":
       parseRuntimeIdentifier(payload.turnId, `${path}.turnId`);
@@ -830,11 +911,13 @@ function validateChiliEventPayload(
     case "tool.call_started":
       parseRuntimeIdentifier(payload.turnId, `${path}.turnId`);
       parseRuntimeIdentifier(payload.callId, `${path}.callId`);
+      optionalEventString(payload.providerCallId, `${path}.providerCallId`);
       parseRuntimeString(payload.toolName, `${path}.toolName`);
       if (!("input" in payload)) throw new RuntimeValidationError(`${path}.input`, "is required");
       return;
     case "tool.call_updated":
       parseRuntimeIdentifier(payload.callId, `${path}.callId`);
+      optionalEventString(payload.providerCallId, `${path}.providerCallId`);
       parseRuntimeEnum(payload.status, [
         "pending",
         "validating",
