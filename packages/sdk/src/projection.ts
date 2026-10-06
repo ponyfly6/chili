@@ -125,6 +125,8 @@ export interface RuntimeToolOutputDelta {
   time: number;
   bytes?: number;
   truncated?: boolean;
+  /** Output was interrupted; missing transient text cannot be replayed. */
+  gapBefore?: boolean;
   sequence?: number;
 }
 
@@ -304,6 +306,26 @@ export function reduceRuntimeEvents(
     applyRuntimeEvent(view, event);
   }
   return view;
+}
+
+/**
+ * A durable cursor restores state, but does not restore transient tool output.
+ * Preserve the available preview and make that gap visible, even if no further
+ * output arrives. Final durable tool results remain authoritative.
+ */
+export function markRuntimeOutputGap(view: ChiliRuntimeView): void {
+  for (const toolCall of Object.values(view.toolCalls)) {
+    if (isTerminalToolStatus(toolCall.status)) continue;
+    const last = toolCall.liveOutput?.at(-1);
+    if (last?.gapBefore && last.delta === "") continue;
+    appendToolOutputDelta(toolCall, {
+      stream: "stdout",
+      delta: "",
+      time: toolCall.updatedAt,
+      truncated: true,
+      gapBefore: true,
+    });
+  }
 }
 
 export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvelope): ChiliRuntimeView {
@@ -492,21 +514,21 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
     }
     case "tool.call_started": {
       if (event.sessionId) clearSessionRetry(view, event.sessionId, event.payload.turnId);
-      const toolCall: RuntimeToolCallView = {
-        id: event.payload.callId,
-        status: "running",
-        toolName: event.payload.toolName,
-        input: event.payload.input,
-        startedAt: event.time,
-        updatedAt: event.time,
-      };
+      // Transient output can arrive before its durable start is replayed. Fill
+      // in that existing call instead of replacing its preview or terminal state.
+      const toolCall = upsertToolCall(view, event.payload.callId, event.time);
+      if (!isTerminalToolStatus(toolCall.status)) toolCall.status = "running";
+      toolCall.toolName = event.payload.toolName;
+      toolCall.input = event.payload.input;
+      toolCall.startedAt ??= event.time;
+      toolCall.updatedAt = Math.max(toolCall.updatedAt, event.time);
       assignOptional(toolCall, "sessionId", event.sessionId);
       assignOptional(toolCall, "turnId", event.payload.turnId);
       assignOptional(toolCall, "parentCallId", event.payload.parentCallId);
       view.toolCalls[toolCall.id] = toolCall;
       assignTranscriptOrder(view, "tool", toolCall.id);
       linkToolCallToSession(view, toolCall, event.time);
-      setToolPartStatus(view, event.payload.callId, "running");
+      setToolPartStatus(view, event.payload.callId, toolCall.status);
       break;
     }
     case "tool.call_updated": {
@@ -1377,16 +1399,42 @@ function upsertToolCall(view: ChiliRuntimeView, callId: ToolCallId, time: number
 }
 
 const MAX_TOOL_OUTPUT_DELTAS = 80;
+/** UTF-8 text budget per tool preview, independent of sender-provided bytes. */
+export const MAX_TOOL_OUTPUT_PREVIEW_BYTES = 64 * 1024;
+const toolOutputEncoder = new TextEncoder();
+const toolOutputDecoder = new TextDecoder();
+
+function isTerminalToolStatus(status: RuntimeToolCallView["status"]): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
 
 function appendToolOutputDelta(toolCall: RuntimeToolCallView, delta: RuntimeToolOutputDelta): void {
-  if (!delta.delta) return;
+  if (!delta.delta && !delta.gapBefore) return;
+  const previousSequence = toolCall.liveOutput?.findLast((entry) => entry.sequence !== undefined)?.sequence;
+  if (delta.sequence !== undefined && previousSequence !== undefined) {
+    if (delta.sequence <= previousSequence) return;
+    if (delta.sequence > previousSequence + 1) delta = { ...delta, truncated: true, gapBefore: true };
+  }
+  const encoded = toolOutputEncoder.encode(delta.delta);
+  if (encoded.byteLength > MAX_TOOL_OUTPUT_PREVIEW_BYTES) {
+    let start = encoded.byteLength - MAX_TOOL_OUTPUT_PREVIEW_BYTES;
+    // Keep a valid UTF-8 suffix rather than splitting a multibyte code point.
+    while ((encoded[start]! & 0xc0) === 0x80) start += 1;
+    delta = { ...delta, delta: toolOutputDecoder.decode(encoded.subarray(start)), truncated: true };
+  }
   const liveOutput = toolCall.liveOutput ? [...toolCall.liveOutput, delta] : [delta];
-  if (liveOutput.length > MAX_TOOL_OUTPUT_DELTAS) {
-    const dropped = liveOutput.splice(0, liveOutput.length - MAX_TOOL_OUTPUT_DELTAS);
-    const first = liveOutput[0];
-    if (first && (dropped.length > 0 || dropped.some((entry) => entry.truncated === true))) {
-      liveOutput[0] = { ...first, truncated: true };
-    }
+  let bytes = liveOutput.reduce((total, entry) => total + toolOutputEncoder.encode(entry.delta).byteLength, 0);
+  let dropped = false;
+  let droppedGap = false;
+  while (liveOutput.length > MAX_TOOL_OUTPUT_DELTAS || bytes > MAX_TOOL_OUTPUT_PREVIEW_BYTES) {
+    const removed = liveOutput.shift()!;
+    bytes -= toolOutputEncoder.encode(removed.delta).byteLength;
+    dropped = true;
+    droppedGap ||= removed.gapBefore === true;
+  }
+  const first = liveOutput[0];
+  if (dropped && first) {
+    liveOutput[0] = { ...first, truncated: true, ...(droppedGap ? { gapBefore: true } : {}) };
   }
   toolCall.liveOutput = liveOutput;
 }

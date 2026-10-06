@@ -17,6 +17,8 @@ import {
   applyRuntimeEvent,
   chatSessionView,
   createRuntimeView,
+  markRuntimeOutputGap,
+  MAX_TOOL_OUTPUT_PREVIEW_BYTES,
   pendingApprovals,
   reduceRuntimeEvents,
   runtimeSessionAgents,
@@ -1711,6 +1713,113 @@ test("marks the retained tool-output head when the 80-delta projection drops old
   expect(view.toolCalls[callId]?.liveOutput).toHaveLength(80);
   expect(view.toolCalls[callId]?.liveOutput?.[0]).toMatchObject({ delta: "1|", truncated: true });
   expect(view.toolCalls[callId]?.liveOutput?.at(-1)).toMatchObject({ delta: "80|" });
+});
+
+test("durable tool starts preserve earlier transient output and cannot revive finished calls", () => {
+  const sessionId = "session_output_handoff" as SessionId;
+  const callId = "call_output_handoff" as ToolCallId;
+  const view = createRuntimeView();
+  applyRuntimeEvent(view, {
+    id: "early_output", type: "tool.output_delta", time: 3 as TimestampMs, sessionId,
+    payload: { callId, stream: "stdout", delta: "early\n", sequence: 1 },
+  });
+  const start: ChiliEvent = {
+    id: "durable_start", type: "tool.call_started", time: 2 as TimestampMs, sessionId,
+    payload: { callId, turnId: "turn_output_handoff" as TurnId, toolName: "bash", input: { command: "echo early" } },
+  };
+  applyRuntimeEvent(view, start);
+  expect(view.toolCalls[callId]).toMatchObject({
+    status: "running", toolName: "bash", startedAt: 2, updatedAt: 3,
+    liveOutput: [{ delta: "early\n", sequence: 1 }],
+  });
+  applyRuntimeEvent(view, {
+    id: "durable_finish", type: "tool.call_finished", time: 4 as TimestampMs, sessionId,
+    payload: { callId, status: "completed", output: "durable full output" },
+  });
+  applyRuntimeEvent(view, start);
+  expect(view.toolCalls[callId]).toMatchObject({ status: "completed", updatedAt: 4, output: "durable full output" });
+  expect(view.sessions[sessionId]?.toolCallIds).toEqual([callId]);
+});
+
+test("tool previews obey a UTF-8 byte budget even when reported bytes are inaccurate", () => {
+  const callId = "call_output_bytes" as ToolCallId;
+  const view = createRuntimeView();
+  for (const [index, text] of ["old".repeat(10_000), "🌶".repeat(30_000)].entries()) {
+    applyRuntimeEvent(view, {
+      id: `large_output_${index}`, type: "tool.output_delta", time: index as TimestampMs,
+      payload: { callId, stream: "stdout", delta: text, bytes: 1, sequence: index + 1 },
+    });
+  }
+  const preview = view.toolCalls[callId]!.liveOutput!;
+  const retainedText = preview.map((delta) => delta.delta).join("");
+  expect(new TextEncoder().encode(retainedText).byteLength).toBeLessThanOrEqual(MAX_TOOL_OUTPUT_PREVIEW_BYTES);
+  expect(retainedText).toBe("🌶".repeat(MAX_TOOL_OUTPUT_PREVIEW_BYTES / 4));
+  expect(preview[0]?.truncated).toBe(true);
+  const finalOutput = "final ".repeat(30_000);
+  applyRuntimeEvent(view, {
+    id: "large_output_finished", type: "tool.call_finished", time: 3 as TimestampMs,
+    payload: { callId, status: "completed", output: finalOutput },
+  });
+  expect(view.toolCalls[callId]?.output).toBe(finalOutput);
+});
+
+test("tool previews bound the sum of many individually small UTF-8 chunks", () => {
+  const callId = "call_output_sum" as ToolCallId;
+  const view = createRuntimeView();
+  for (let index = 0; index < 40; index += 1) {
+    applyRuntimeEvent(view, {
+      id: `sum_output_${index}`, type: "tool.output_delta", time: index as TimestampMs,
+      payload: { callId, stream: "stdout", delta: "界".repeat(1_000), sequence: index },
+    });
+  }
+  const preview = view.toolCalls[callId]!.liveOutput!;
+  expect(preview).toHaveLength(Math.floor(MAX_TOOL_OUTPUT_PREVIEW_BYTES / 3_000));
+  expect(preview[0]?.truncated).toBe(true);
+  expect(preview.at(-1)?.sequence).toBe(39);
+});
+
+test("disconnect marks active previews, including empty ones, without changing final results or durable cursors", () => {
+  const view = createRuntimeView();
+  const runningId = "call_output_gap" as ToolCallId;
+  const completedId = "call_output_gap_completed" as ToolCallId;
+  for (const callId of [runningId, completedId]) {
+    applyRuntimeEvent(view, {
+      id: `start_${callId}`, type: "tool.call_started", time: 1 as TimestampMs,
+      payload: { callId, turnId: "turn_output_gap" as TurnId, toolName: "bash", input: {} },
+    });
+  }
+  applyRuntimeEvent(view, {
+    id: "gap_completed", type: "tool.call_finished", time: 2 as TimestampMs,
+    payload: { callId: completedId, status: "completed", output: "durable result" },
+  });
+  markRuntimeOutputGap(view);
+  markRuntimeOutputGap(view);
+  expect(view.toolCalls[runningId]?.liveOutput).toEqual([
+    { stream: "stdout", delta: "", time: 1, truncated: true, gapBefore: true },
+  ]);
+  expect(view.toolCalls[completedId]?.liveOutput).toBeUndefined();
+  expect(view.lastEventId).toBe("gap_completed");
+  applyRuntimeEvent(view, {
+    id: "gap_resumed", type: "tool.output_delta", time: 3 as TimestampMs,
+    payload: { callId: runningId, stream: "stderr", delta: "after gap\n", sequence: 5 },
+  });
+  expect(view.toolCalls[runningId]?.liveOutput?.some((entry) => entry.gapBefore)).toBe(true);
+  expect(view.toolCalls[runningId]?.liveOutput?.at(-1)?.delta).toBe("after gap\n");
+});
+
+test("temporary output sequence gaps remain visible and late duplicate chunks are ignored", () => {
+  const callId = "call_output_sequence_gap" as ToolCallId;
+  const view = createRuntimeView();
+  for (const sequence of [1, 3, 2, 3]) {
+    applyRuntimeEvent(view, {
+      id: `sequence_output_${sequence}`, type: "tool.output_delta", time: sequence as TimestampMs,
+      payload: { callId, stream: "stdout", delta: `chunk ${sequence}\n`, sequence },
+    });
+  }
+  expect(view.toolCalls[callId]?.liveOutput).toEqual([
+    { stream: "stdout", delta: "chunk 1\n", time: 1, sequence: 1 },
+    { stream: "stdout", delta: "chunk 3\n", time: 3, sequence: 3, truncated: true, gapBefore: true },
+  ]);
 });
 
 test("projects latest model metadata and stable usage summaries for chat sessions", () => {

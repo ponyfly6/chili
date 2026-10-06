@@ -33,6 +33,7 @@ import type {
   RuntimePromptAccepted,
   RuntimePromptResult,
   RuntimeSessionRef,
+  RuntimeStateSnapshot,
   RuntimeSkillMention,
   ModelSelection,
   ReasoningLevel,
@@ -45,6 +46,7 @@ import type {
   UserInputQuestion as ProtocolUserInputQuestion,
 } from "@chili/protocol";
 import {
+  RUNTIME_STATE_SNAPSHOT_MAX_BYTES,
   normalizePersistedError,
   parseRuntimeInputQueue,
   parseSessionAgentMetadata,
@@ -78,6 +80,7 @@ import {
   parseRuntimeRecord,
   parseRuntimeSessionGoal,
   parseRuntimeSessionRef,
+  parseRuntimeStateSnapshot,
   parseRuntimeString,
   parseRuntimeStringArray,
   type RuntimeParser,
@@ -145,6 +148,8 @@ export interface RuntimeClient {
   resumeAgent(input: TargetAgentRequest): Promise<{ agentId: string; inputId?: string }>;
   messages(sessionId: SessionId): Promise<Message[]>;
   streamEvents(input?: StreamEventsRequest): AsyncIterable<ChiliEvent>;
+  /** Atomic projected state and its durable stream watermark. */
+  eventSnapshot(input?: EventSnapshotRequest): Promise<RuntimeStateSnapshot>;
 }
 
 export interface CreateSessionRequest {
@@ -449,6 +454,13 @@ export interface WaitAgentRequest extends TargetAgentRequest {
 export interface StreamEventsRequest {
   sessionId?: SessionId;
   afterEventId?: string;
+  /** Resume an empty snapshot from the beginning, without an initial tail limit. */
+  fromStart?: boolean;
+  signal?: AbortSignal;
+}
+
+export interface EventSnapshotRequest {
+  sessionId?: SessionId;
   signal?: AbortSignal;
 }
 
@@ -458,7 +470,7 @@ export class EventCursorResyncRequiredError extends Error {
 
   constructor(
     message: string,
-    readonly afterEventId: string,
+    readonly afterEventId: string | undefined,
   ) {
     super(message);
     this.name = "EventCursorResyncRequiredError";
@@ -474,7 +486,9 @@ export class EventTransportResyncRequiredError extends Error {
 
   constructor(
     message: string,
-    readonly resumeAfterEventId: string,
+    /** Diagnostic only. Recover state through eventSnapshot before advancing. */
+    readonly resumeAfterEventId?: string,
+    readonly reason: "event_transport_limit" | "transient_buffer_overflow" = "event_transport_limit",
   ) {
     super(message);
     this.name = "EventTransportResyncRequiredError";
@@ -818,10 +832,18 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.get(`sessions/${encodeURIComponent(sessionId)}/messages`, undefined, parseRuntimeMessageArray);
   }
 
+  eventSnapshot(input: EventSnapshotRequest = {}): Promise<RuntimeStateSnapshot> {
+    return this.get(
+      sessionScopedRequestPath("events/snapshot", input.sessionId), input.signal, parseRuntimeStateSnapshot,
+      false, RUNTIME_STATE_SNAPSHOT_MAX_BYTES,
+    );
+  }
+
   async *streamEvents(input: StreamEventsRequest = {}): AsyncIterable<ChiliEvent> {
     const url = this.url("events");
     if (input.sessionId) url.searchParams.set("sessionId", input.sessionId);
     if (input.afterEventId) url.searchParams.set("afterEventId", input.afterEventId);
+    if (input.fromStart) url.searchParams.set("fromStart", "true");
 
     const init: RequestInit = {
       headers: { accept: "text/event-stream" },
@@ -833,7 +855,7 @@ export class HttpRuntimeClient implements RuntimeClient {
     const response = await this.fetchImpl(url, init);
     if (!response.ok || !response.body) {
       const error = await responseError(response, this.#authorization);
-      if (response.status === 409 && input.afterEventId) {
+      if (response.status === 409 && (input.afterEventId || input.fromStart)) {
         throw new EventCursorResyncRequiredError(error.message, input.afterEventId);
       }
       throw error;
@@ -853,11 +875,11 @@ export class HttpRuntimeClient implements RuntimeClient {
           buffer += decoder.decode();
           if (buffer.trim().length > 0) {
             if (new TextEncoder().encode(buffer).byteLength > MAX_SSE_CLIENT_BUFFER_BYTES) {
-              throw new TypeError(`Runtime SSE frame exceeds ${MAX_SSE_CLIENT_BUFFER_BYTES} bytes`);
+              throw new EventTransportResyncRequiredError(`Runtime SSE frame exceeds ${MAX_SSE_CLIENT_BUFFER_BYTES} bytes`);
             }
             const parsed = parseSseFrame(buffer, this.#authorization);
             if (parsed?.kind === "resync") {
-              throw new EventTransportResyncRequiredError(parsed.message, parsed.afterEventId);
+              throw new EventTransportResyncRequiredError(parsed.message, parsed.afterEventId, parsed.reason);
             }
             if (parsed) yield parsed.event;
           }
@@ -871,16 +893,16 @@ export class HttpRuntimeClient implements RuntimeClient {
           const frame = buffer.slice(0, boundary.index);
           buffer = buffer.slice(boundary.index + boundary.length);
           if (new TextEncoder().encode(frame).byteLength > MAX_SSE_CLIENT_BUFFER_BYTES) {
-            throw new TypeError(`Runtime SSE frame exceeds ${MAX_SSE_CLIENT_BUFFER_BYTES} bytes`);
+            throw new EventTransportResyncRequiredError(`Runtime SSE frame exceeds ${MAX_SSE_CLIENT_BUFFER_BYTES} bytes`);
           }
           const parsed = parseSseFrame(frame, this.#authorization);
           if (parsed?.kind === "resync") {
-            throw new EventTransportResyncRequiredError(parsed.message, parsed.afterEventId);
+            throw new EventTransportResyncRequiredError(parsed.message, parsed.afterEventId, parsed.reason);
           }
           if (parsed) yield parsed.event;
         }
         if (new TextEncoder().encode(buffer).byteLength > MAX_SSE_CLIENT_BUFFER_BYTES) {
-          throw new TypeError(`Runtime SSE frame exceeds ${MAX_SSE_CLIENT_BUFFER_BYTES} bytes`);
+          throw new EventTransportResyncRequiredError(`Runtime SSE frame exceeds ${MAX_SSE_CLIENT_BUFFER_BYTES} bytes`);
         }
       }
     } finally {
@@ -898,10 +920,11 @@ export class HttpRuntimeClient implements RuntimeClient {
     signal?: AbortSignal,
     parser?: RuntimeParser<T>,
     allowNoContent = false,
+    maxResponseBytes?: number,
   ): Promise<T> {
     const init: RequestInit = { method: "GET" };
     if (signal) init.signal = signal;
-    return this.request(path, init, parser, allowNoContent);
+    return this.request(path, init, parser, allowNoContent, maxResponseBytes);
   }
 
   private post<T>(
@@ -941,6 +964,7 @@ export class HttpRuntimeClient implements RuntimeClient {
     init: RequestInit,
     parser?: RuntimeParser<T>,
     allowNoContent = false,
+    maxResponseBytes?: number,
   ): Promise<T> {
     if (this.#authorization) {
       const headers = new Headers(init.headers);
@@ -956,9 +980,15 @@ export class HttpRuntimeClient implements RuntimeClient {
     if (!isJsonContentType(response.headers.get("content-type"))) {
       throw new TypeError(`Runtime response for ${path} must use an application/json content type`);
     }
+    // Limit snapshot bytes before JSON parsing or creating the projection.
+    // Content-Length alone cannot bound chunked or dishonest response bodies.
+    const text = maxResponseBytes === undefined ? undefined : await readBoundedResponseText(response, maxResponseBytes, init.signal);
+    if (maxResponseBytes !== undefined && text === undefined) {
+      throw new TypeError(`Runtime response for ${path} exceeds ${maxResponseBytes} bytes`);
+    }
     let value: unknown;
     try {
-      value = await response.json() as unknown;
+      value = text === undefined ? await response.json() as unknown : JSON.parse(text) as unknown;
     } catch {
       throw new TypeError(`Runtime response for ${path} must contain valid JSON`);
     }
@@ -1156,7 +1186,7 @@ function approvalDecisionForApproveRequest(input: ApproveApprovalRequest): Appro
 
 type ParsedSseFrame =
   | { kind: "event"; event: ChiliEvent }
-  | { kind: "resync"; afterEventId: string; message: string };
+  | { kind: "resync"; afterEventId?: string; message: string; reason: EventTransportResyncRequiredError["reason"] };
 
 function parseSseFrame(frame: string, authorization?: string): ParsedSseFrame | undefined {
   const data: string[] = [];
@@ -1175,8 +1205,8 @@ function parseSseFrame(frame: string, authorization?: string): ParsedSseFrame | 
   if (eventName === "chili.resync") {
     if (!value || typeof value !== "object") throw new TypeError("Invalid event resync control frame");
     const record = value as Record<string, unknown>;
-    const afterEventId = requireSseControlText(record.afterEventId, "afterEventId", 512);
-    if (boundedRemoteDiagnostic(afterEventId, 512, authorization) !== afterEventId) {
+    const afterEventId = record.afterEventId === undefined ? undefined : requireSseControlText(record.afterEventId, "afterEventId", 512);
+    if (afterEventId !== undefined && boundedRemoteDiagnostic(afterEventId, 512, authorization) !== afterEventId) {
       throw new TypeError("Invalid event resync afterEventId");
     }
     const message = boundedRemoteDiagnostic(
@@ -1184,8 +1214,10 @@ function parseSseFrame(frame: string, authorization?: string): ParsedSseFrame | 
       MAX_SSE_CONTROL_MESSAGE_BYTES,
       authorization,
     );
-    if (record.reason !== "event_transport_limit") throw new TypeError("Invalid event resync reason");
-    return { kind: "resync", afterEventId, message };
+    if (record.reason !== "event_transport_limit" && record.reason !== "transient_buffer_overflow") {
+      throw new TypeError("Invalid event resync reason");
+    }
+    return { kind: "resync", ...(afterEventId === undefined ? {} : { afterEventId }), message, reason: record.reason };
   }
   if (eventName !== "message" && eventName !== "chili.event") {
     throw new TypeError("Invalid runtime SSE event name");
@@ -1243,7 +1275,11 @@ async function responseError(response: Response, authorization?: string): Promis
   return new RuntimeHttpError(response.status, fallback);
 }
 
-async function readBoundedResponseText(response: Response, maxBytes: number): Promise<string | undefined> {
+async function readBoundedResponseText(response: Response, maxBytes: number, signal?: AbortSignal | null): Promise<string | undefined> {
+  if (signal?.aborted) {
+    void response.body?.cancel().catch(() => {});
+    signal.throwIfAborted();
+  }
   const declaredLength = response.headers.get("content-length");
   if (declaredLength && /^\d+$/u.test(declaredLength)) {
     const bytes = Number(declaredLength);
@@ -1259,12 +1295,18 @@ async function readBoundedResponseText(response: Response, maxBytes: number): Pr
   if (!response.body) return "";
 
   const reader = response.body.getReader();
+  // A mocked/custom fetch need not connect its body to the request's signal.
+  // Cancelling the reader also releases an outstanding read in that case.
+  const onAbort = (): void => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener("abort", onAbort, { once: true });
   const decoder = new TextDecoder();
   let bytes = 0;
   let text = "";
   try {
     while (true) {
+      signal?.throwIfAborted();
       const chunk = await reader.read();
+      signal?.throwIfAborted();
       if (chunk.done) return text + decoder.decode();
       bytes += chunk.value.byteLength;
       if (bytes > maxBytes) {
@@ -1277,9 +1319,8 @@ async function readBoundedResponseText(response: Response, maxBytes: number): Pr
       }
       text += decoder.decode(chunk.value, { stream: true });
     }
-  } catch {
-    return undefined;
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     reader.releaseLock();
   }
 }

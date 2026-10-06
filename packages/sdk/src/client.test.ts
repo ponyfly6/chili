@@ -6,7 +6,7 @@ import {
   isEventCursorResyncRequiredError,
   isEventTransportResyncRequiredError,
 } from "./client.js";
-import type { SessionId, UserInputId } from "@chili/protocol";
+import { RUNTIME_STATE_SNAPSHOT_MAX_BYTES, type SessionId, type UserInputId } from "@chili/protocol";
 
 test("listSessions aborts a stalled real HTTP read", async () => {
   let received = false;
@@ -119,6 +119,133 @@ test("streamEvents exposes a bounded transport resync cursor without yielding a 
     message: "Authoritative resync required",
   });
   expect(isEventCursorResyncRequiredError(caught)).toBe(false);
+});
+
+test("streamEvents accepts transient overflow recovery before any durable cursor exists", async () => {
+  const client = new HttpRuntimeClient({
+    baseUrl: "http://chili.test",
+    fetch: (async () => new Response(
+      'event: chili.resync\ndata: {"reason":"transient_buffer_overflow","message":"Restore state"}\n\n',
+      { headers: { "content-type": "text/event-stream" } },
+    )) as unknown as typeof fetch,
+  });
+  let caught: unknown;
+  try {
+    for await (const _event of client.streamEvents()) {
+      throw new Error("control frame must not yield an event");
+    }
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(EventTransportResyncRequiredError);
+  expect(caught).toMatchObject({ reason: "transient_buffer_overflow", resumeAfterEventId: undefined });
+});
+
+test("eventSnapshot validates atomic recovery state and preserves scope, authentication and abort", async () => {
+  const requests: Request[] = [];
+  let response: unknown = {
+    version: 1,
+    afterEventId: "durable_watermark",
+    events: [],
+    coveredSessionIds: ["session_snapshot"],
+    truncated: false,
+    temporaryOutput: "not-replayed",
+  };
+  const client = new HttpRuntimeClient({
+    baseUrl: "https://chili.test/api",
+    authToken: "snapshot-test-token",
+    fetch: (async (input, init) => {
+      requests.push(new Request(input, init));
+      return Response.json(response);
+    }) as typeof fetch,
+  });
+  const controller = new AbortController();
+  const recovered = await client.eventSnapshot({ sessionId: "session_snapshot" as SessionId, signal: controller.signal });
+  expect(recovered.afterEventId).toBe("durable_watermark");
+  expect(requests[0]?.url).toBe("https://chili.test/api/events/snapshot?sessionId=session_snapshot");
+  expect(requests[0]?.headers.get("authorization")).toBe("Bearer snapshot-test-token");
+  controller.abort();
+  expect(requests[0]?.signal.aborted).toBe(true);
+  response = { version: 1, events: "malformed" };
+  await expect(client.eventSnapshot()).rejects.toThrow();
+});
+
+test("eventSnapshot bounds actual multi-chunk UTF-8 bytes before JSON parsing despite a false content length", async () => {
+  const chunk = new TextEncoder().encode("界".repeat(1_000_000));
+  let cancelled = false;
+  let reads = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      reads += 1;
+      controller.enqueue(chunk);
+    },
+    cancel() { cancelled = true; },
+  });
+  const client = new HttpRuntimeClient({
+    baseUrl: "http://chili.test",
+    fetch: (async () => new Response(stream, {
+      headers: { "content-type": "application/json", "content-length": "1" },
+    })) as unknown as typeof fetch,
+  });
+  await expect(client.eventSnapshot()).rejects.toThrow(`exceeds ${RUNTIME_STATE_SNAPSHOT_MAX_BYTES} bytes`);
+  expect(cancelled).toBe(true);
+  // Three chunks cross the byte budget; at most one more may be pre-pulled.
+  expect(reads).toBeLessThanOrEqual(4);
+});
+
+test("eventSnapshot rejects a declared oversized body without consuming it", async () => {
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } });
+  const client = new HttpRuntimeClient({
+    baseUrl: "http://chili.test",
+    fetch: (async () => new Response(stream, {
+      headers: { "content-type": "application/json", "content-length": String(RUNTIME_STATE_SNAPSHOT_MAX_BYTES + 1) },
+    })) as unknown as typeof fetch,
+  });
+  await expect(client.eventSnapshot()).rejects.toThrow(`exceeds ${RUNTIME_STATE_SNAPSHOT_MAX_BYTES} bytes`);
+  expect(cancelled).toBe(true);
+});
+
+for (const preAborted of [false, true]) {
+  test(`eventSnapshot cancels ${preAborted ? "a pre-aborted" : "an interrupted stalled"} response body`, async () => {
+    let cancelled = false;
+    let fetched!: () => void;
+    const fetchStarted = new Promise<void>((resolve) => { fetched = resolve; });
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(new TextEncoder().encode('{"version":')); },
+      cancel() { cancelled = true; },
+    });
+    const client = new HttpRuntimeClient({
+      baseUrl: "http://chili.test",
+      fetch: (async () => {
+        fetched();
+        return new Response(stream, { headers: { "content-type": "application/json" } });
+      }) as unknown as typeof fetch,
+    });
+    const controller = new AbortController();
+    if (preAborted) controller.abort();
+    const reading = client.eventSnapshot({ signal: controller.signal }).catch((error: unknown) => error);
+    await fetchStarted;
+    if (!preAborted) {
+      await Bun.sleep(5);
+      controller.abort();
+    }
+    expect(await reading).toMatchObject({ name: "AbortError" });
+    expect(cancelled).toBe(true);
+  });
+}
+
+test("streamEvents encodes an empty-snapshot resume and requests recovery on its backlog conflict", async () => {
+  let request: Request | undefined;
+  const client = new HttpRuntimeClient({
+    baseUrl: "http://chili.test",
+    fetch: (async (input, init) => {
+      request = new Request(input, init);
+      return Response.json({ error: { message: "backlog exceeded" } }, { status: 409 });
+    }) as typeof fetch,
+  });
+  await expect(client.streamEvents({ fromStart: true })[Symbol.asyncIterator]().next()).rejects.toBeInstanceOf(EventCursorResyncRequiredError);
+  expect(request?.url).toBe("http://chili.test/events?fromStart=true");
 });
 
 test("delegation client reads and updates the deterministic session policy endpoint", async () => {
@@ -621,7 +748,7 @@ test("cancels SSE readers on early iteration exit and rejects oversized partial 
   } catch (error) {
     caught = error;
   }
-  expect(caught).toBeInstanceOf(Error);
+  expect(caught).toBeInstanceOf(EventTransportResyncRequiredError);
   expect((caught as Error).message).toContain("exceeds 4100000 bytes");
 });
 
