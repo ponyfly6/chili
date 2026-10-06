@@ -11,15 +11,24 @@ export interface StoredSessionInput extends RuntimeSessionInput {
   claimId?: string;
   source: string;
   identity: string;
+  /** This input was explicitly resumed after an interrupted or unsuccessful execution. */
+  resumed: boolean;
 }
 
+export interface SessionInputMutationOptions {
+  /** Trusted runtime option, never accepted from the input payload. */
+  allowSubagentSessions?: boolean;
+}
+
+export type SessionInputAccept = { kind: "accept"; sessionId: SessionId; submissionId: string; inputId: string; mode: RuntimeInputMode; payload: string; text: string; source: string; identity?: string };
+
 export type SessionInputMutation =
-  | { kind: "accept"; sessionId: SessionId; submissionId: string; inputId: string; mode: RuntimeInputMode; payload: string; text: string; source: string; identity?: string }
+  | SessionInputAccept
   | { kind: "claim"; sessionId: SessionId; claimId: string; executionRef: string; leaseDurationMs: number }
   | { kind: "promote"; sessionId: SessionId; inputId: string; claimId: string; text: string; displayText?: string; images?: readonly MessageImageContent[] }
-  | { kind: "settle"; sessionId: SessionId; inputId: string; claimId: string; outcome: RuntimeInputOutcome; error?: string }
+  | { kind: "settle"; sessionId: SessionId; inputId: string; claimId: string; outcome: RuntimeInputOutcome; error?: string; resultMessageId?: MessageId }
   | { kind: "pause"; sessionId: SessionId }
-  | { kind: "resume"; sessionId: SessionId; expectedRevision?: number }
+  | { kind: "resume"; sessionId: SessionId; expectedRevision?: number; inputId?: string; expectedInputRevision?: number }
   | { kind: "recover"; sessionId: SessionId }
   | { kind: "cancel"; sessionId: SessionId; inputId: string; expectedRevision: number }
   | { kind: "cancel-source"; sessionId: SessionId; source: string };
@@ -35,7 +44,8 @@ export interface SessionInputStore {
   supportsSessionInputs?(): boolean;
   sessionInputQueue(sessionId: SessionId): RuntimeInputQueue;
   sessionInput(sessionId: SessionId, submissionId: string): StoredSessionInput | undefined;
-  mutateSessionInputs(input: SessionInputMutation): SessionInputMutationResult;
+  sessionInputById(sessionId: SessionId, inputId: string): StoredSessionInput | undefined;
+  mutateSessionInputs(input: SessionInputMutation, options?: SessionInputMutationOptions): SessionInputMutationResult;
 }
 
 export class SessionInputConflictError extends Error {
@@ -49,13 +59,14 @@ interface InputRow {
   accepted_at: number; updated_at: number; claim_id: string | null;
   execution_ref: string | null; message_id: string | null; turn_id: string | null;
   outcome: RuntimeInputOutcome | null; error: string | null;
+  result_message_id: string | null; resumed: number;
 }
 
 interface InputRepositoryOptions {
   commit(events: readonly ChiliEvent[], fence?: SessionRunClaimFence): void;
   claim(input: { sessionId: SessionId; claimId: string; allowSubagentSessions: boolean; time: number; leaseDurationMs: number }): { status: string };
   forgetClaim(sessionId: SessionId, claimId: string): void;
-  assertSession(sessionId: SessionId): void;
+  assertSession(sessionId: SessionId, options: SessionInputMutationOptions): void;
   retry<T>(operation: () => T): T;
 }
 
@@ -80,6 +91,9 @@ export class SessionInputRepository {
       unique(session_id, submission_id)
     )`);
     db.exec("create index if not exists session_inputs_pending on session_inputs(session_id, state, sequence)");
+    const inputColumns = db.query<{ name: string }, []>("pragma table_info(session_inputs)").all();
+    if (!inputColumns.some((column) => column.name === "result_message_id")) db.exec("alter table session_inputs add column result_message_id text");
+    if (!inputColumns.some((column) => column.name === "resumed")) db.exec("alter table session_inputs add column resumed integer not null default 0");
     db.exec("create table if not exists session_input_revocations(session_id text not null, source text not null, primary key(session_id, source))");
     // Old runtimes do not populate this column. They must not acquire a durable
     // session and bypass its queue or persisted pause state.
@@ -102,6 +116,13 @@ export class SessionInputRepository {
     return row ? storedInput(row) : undefined;
   }
 
+  getById(sessionId: SessionId, inputId: string): StoredSessionInput | undefined {
+    const row = this.db.query<InputRow, [string, string]>(
+      "select * from session_inputs where session_id = ? and input_id = ?",
+    ).get(sessionId, inputId);
+    return row ? storedInput(row) : undefined;
+  }
+
   queue(sessionId: SessionId): RuntimeInputQueue {
     return this.db.transaction(() => this.readQueue(sessionId))();
   }
@@ -111,7 +132,7 @@ export class SessionInputRepository {
       "select paused, revision from session_dispatch where session_id = ?",
     ).get(sessionId);
     const rows = this.db.query<InputRow, [string]>(
-      "select * from session_inputs where session_id = ? and state != 'settled' order by case mode when 'steer' then 0 else 1 end, sequence",
+      "select * from session_inputs where session_id = ? and state != 'settled' order by resumed desc, case mode when 'steer' then 0 else 1 end, sequence",
     ).all(sessionId);
     // Steer can finish newer submissions before older queued work. Recovery
     // follows settlement revisions, not the admission sequence.
@@ -131,12 +152,12 @@ export class SessionInputRepository {
     };
   }
 
-  mutate(command: SessionInputMutation): SessionInputMutationResult {
+  mutate(command: SessionInputMutation, options: SessionInputMutationOptions = {}): SessionInputMutationResult {
     const time = Date.now();
     let claimed = false;
     const transact = this.db.transaction((): SessionInputMutationResult => {
       const { sessionId } = command;
-      this.options.assertSession(sessionId);
+      this.options.assertSession(sessionId, options);
       let input: StoredSessionInput | undefined;
       let changed = false;
       let fence: SessionRunClaimFence | undefined;
@@ -183,16 +204,18 @@ export class SessionInputRepository {
         if (this.queue(sessionId).paused) return { queue: this.queue(sessionId), events };
         const orphan = this.db.query<{ found: number }, [string, number]>(`select 1 as found from session_inputs i where i.session_id = ? and i.state = 'claimed'
           and not exists(select 1 from session_run_claims r where r.session_id = i.session_id and r.claim_id = i.claim_id and r.lease_expires_at > ?) limit 1`).get(sessionId, time);
-        if (orphan) return this.mutate({ kind: "recover", sessionId });
+        if (orphan) return this.mutate({ kind: "recover", sessionId }, options);
+        // Finish the explicitly resumed execution before later queue/steer
+        // inputs. Once it settles, ordinary steer/FIFO ordering applies again.
         const row = this.db.query<InputRow, [string]>(`select * from session_inputs where session_id = ? and state = 'pending'
-          order by case mode when 'steer' then 0 else 1 end, sequence limit 1`).get(sessionId);
+          order by resumed desc, case mode when 'steer' then 0 else 1 end, sequence limit 1`).get(sessionId);
         if (!row) return { queue: this.queue(sessionId), events };
-        const result = this.options.claim({ sessionId, claimId: command.claimId, allowSubagentSessions: false, time, leaseDurationMs: command.leaseDurationMs });
+        const result = this.options.claim({ sessionId, claimId: command.claimId, allowSubagentSessions: options.allowSubagentSessions === true, time, leaseDurationMs: command.leaseDurationMs });
         if (result.status !== "claimed") return { queue: this.queue(sessionId), events };
         claimed = true;
         fence = { sessionId, claimId: command.claimId };
         this.db.query(`update session_inputs set state = 'claimed', revision = revision + 1, updated_at = ?, claim_id = ?, execution_ref = ?, message_id = ?, turn_id = ? where input_id = ?`).run(
-          time, command.claimId, command.executionRef, `msg_input_${row.input_id}`, `turn_input_${row.input_id}`, row.input_id,
+          time, command.claimId, command.executionRef, `msg_input_${row.input_id}`, row.turn_id ? `turn_input_${row.input_id}_${row.revision}` : `turn_input_${row.input_id}`, row.input_id,
         );
         input = this.get(sessionId, row.submission_id);
         changed = true;
@@ -221,8 +244,20 @@ export class SessionInputRepository {
             changed = true;
           }
         } else {
-          this.db.query("update session_inputs set state = 'settled', outcome = ?, error = ?, revision = revision + 1, updated_at = ?, settled_revision = (select revision + 1 from session_dispatch where session_id = session_inputs.session_id) where input_id = ?").run(
-            command.outcome, command.error?.slice(0, 2000) ?? null, time, row.input_id,
+          if (command.resultMessageId) {
+            // The receipt points at this execution's response, never a later
+            // Session response or an earlier run's last assistant message.
+            const result = this.db.query<{ found: number }, [string, string, string, string, number]>(`select 1 as found from messages m
+              where m.id = ? and m.session_id = ? and m.role = 'assistant'
+              and m.created_event_seq > (select min(e.seq) from events e, json_each(e.payload_json, '$.items') item
+                where e.type = 'session.input_queue_changed' and e.session_id = m.session_id
+                and json_extract(item.value, '$.inputId') = ? and json_extract(item.value, '$.executionRef') = ?
+                and json_extract(item.value, '$.state') = 'claimed'
+                and json_extract(item.value, '$.revision') = ?)`).get(command.resultMessageId, sessionId, row.input_id, row.execution_ref!, row.revision);
+            if (!result) throw new SessionInputConflictError("Result message does not belong to this input execution");
+          }
+          this.db.query("update session_inputs set state = 'settled', outcome = ?, error = ?, result_message_id = ?, revision = revision + 1, updated_at = ?, settled_revision = (select revision + 1 from session_dispatch where session_id = session_inputs.session_id) where input_id = ?").run(
+            command.outcome, command.error?.slice(0, 2000) ?? null, command.resultMessageId ?? null, time, row.input_id,
           );
           changed = true;
         }
@@ -231,9 +266,21 @@ export class SessionInputRepository {
         if (command.kind === "resume" && command.expectedRevision !== undefined && this.queue(sessionId).revision !== command.expectedRevision) {
           throw new SessionInputConflictError("Input queue changed; refresh before resuming");
         }
+        if (command.kind === "resume" && command.inputId !== undefined) {
+          const row = this.getById(sessionId, command.inputId);
+          if (!row || row.state !== "settled" || row.outcome === "completed"
+            || (command.expectedInputRevision !== undefined && row.revision !== command.expectedInputRevision)) {
+            throw new SessionInputConflictError("Input changed or cannot be resumed");
+          }
+          const revoked = this.db.query<{ found: number }, [string, string]>("select 1 as found from session_input_revocations where session_id = ? and source = ?").get(sessionId, row.source);
+          if (revoked) throw new SessionInputConflictError("Input authorization was revoked");
+          this.db.query("update session_inputs set state = 'pending', outcome = null, error = null, result_message_id = null, claim_id = null, execution_ref = null, resumed = 1, revision = revision + 1, updated_at = ? where input_id = ?").run(time, row.inputId);
+          input = this.getById(sessionId, row.inputId);
+          changed = true;
+        }
         const paused = command.kind === "pause" ? 1 : 0;
         this.db.query("insert or ignore into session_dispatch(session_id) values (?)").run(sessionId);
-        changed = this.db.query("update session_dispatch set paused = ? where session_id = ? and (paused != ? or ? = 1)").run(paused, sessionId, paused, paused).changes > 0;
+        changed = this.db.query("update session_dispatch set paused = ? where session_id = ? and (paused != ? or ? = 1)").run(paused, sessionId, paused, paused).changes > 0 || changed;
       } else if (command.kind === "recover") {
         const live = this.db.query<{ found: number }, [string, number]>("select 1 as found from session_run_claims where session_id = ? and lease_expires_at > ?").get(sessionId, time);
         if (!live && this.queue(sessionId).items.some((item) => item.state !== "settled")) {
@@ -294,9 +341,10 @@ function publicInput(row: InputRow): RuntimeSessionInput {
     ...(row.message_id ? { messageId: row.message_id as MessageId } : {}),
     ...(row.turn_id ? { turnId: row.turn_id as TurnId } : {}),
     ...(row.outcome ? { outcome: row.outcome } : {}), ...(row.error ? { error: row.error } : {}),
+    ...(row.result_message_id ? { resultMessageId: row.result_message_id as MessageId } : {}),
   };
 }
 
 function storedInput(row: InputRow): StoredSessionInput {
-  return { ...publicInput(row), payload: row.payload, identity: row.identity, source: row.source, ...(row.claim_id ? { claimId: row.claim_id } : {}) };
+  return { ...publicInput(row), payload: row.payload, identity: row.identity, source: row.source, resumed: row.resumed === 1, ...(row.claim_id ? { claimId: row.claim_id } : {}) };
 }

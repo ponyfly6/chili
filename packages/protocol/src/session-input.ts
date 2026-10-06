@@ -17,6 +17,8 @@ export interface RuntimeSessionInput {
   updatedAt: number;
   executionRef?: string;
   messageId?: MessageId;
+  /** Final assistant response for this input, which may be in a later turn. */
+  resultMessageId?: MessageId;
   turnId?: TurnId;
   outcome?: RuntimeInputOutcome;
   error?: string;

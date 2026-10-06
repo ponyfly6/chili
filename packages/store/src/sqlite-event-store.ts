@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { SessionInputRepository, type SessionInputMutation, type SessionInputMutationResult } from "./session-inputs.js";
+import { SessionInputConflictError, SessionInputRepository, type SessionInputMutation, type SessionInputMutationOptions, type SessionInputMutationResult } from "./session-inputs.js";
 import type {
   AgentCompleteTaskPayload,
   AgentCompletedPayload,
@@ -40,6 +40,8 @@ import {
   normalizePersistedError,
   PERSISTED_JSON_LIMITS,
   TEAM_TASK_RUNTIME_METADATA_KEYS,
+  parseSessionAgentMetadata,
+  ROOT_AGENT_PATH,
 } from "@chili/protocol";
 import { decodeJson, encodeJson } from "./json.js";
 import { AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX, SQLITE_SCHEMA } from "./schema.js";
@@ -88,6 +90,8 @@ import type {
   GoalMutationSnapshot,
   GoalMutationStore,
   SessionRow,
+  CreateChildSessionInput,
+  CreateChildSessionResult,
   SessionCreationClaimFence,
   SessionRunClaimFence,
   StaleTurnRecoveryInput,
@@ -536,6 +540,11 @@ export class SqliteEventStore
       this.migrateSubagentSchema();
       this.migrateTeamSchema();
       this.migrateSessionClaimSchema();
+      this.addColumnIfMissing("sessions", "parent_session_id", "text");
+      this.addColumnIfMissing("sessions", "agent_name", "text");
+      this.addColumnIfMissing("sessions", "agent_path", "text");
+      this.addColumnIfMissing("sessions", "agent_policy_json", "text");
+      this.db.exec("create unique index if not exists sessions_agent_name on sessions(parent_session_id, agent_name) where parent_session_id is not null");
       this.addColumnIfMissing("tool_calls", "provider_call_id", "text");
       this.inputs = new SessionInputRepository(this.db, {
         commit: (events, fence) => { this.writeTransactionEvents(events, fence); },
@@ -543,9 +552,14 @@ export class SqliteEventStore
         forgetClaim: (sessionId, claimId) => {
           if (this.ownedRunClaims.get(sessionId) === claimId) this.ownedRunClaims.delete(sessionId);
         },
-        assertSession: (sessionId) => {
-          if (this.subagentSessionReservationExists(sessionId)) throw new SessionReservedForSubagentError(sessionId);
-          const session = this.db.query<{ status: string }, [string]>("select status from sessions where id = ?").get(sessionId);
+        assertSession: (sessionId, options) => {
+          const session = this.db.query<{ status: string; parent_session_id: string | null }, [string]>("select status, parent_session_id from sessions where id = ?").get(sessionId);
+          // Legacy task/team reservations remain read-only. A trusted adapter
+          // may execute only a Session created with the new Agent identity.
+          if ((session?.parent_session_id && !options.allowSubagentSessions)
+            || (!session?.parent_session_id && this.subagentSessionReservationExists(sessionId))) {
+            throw new SessionReservedForSubagentError(sessionId);
+          }
           if (!session || session.status !== "active") throw new SessionStateConflictError(sessionId, session?.status);
         },
         retry: (operation) => this.runWithWriteRetry(operation),
@@ -575,12 +589,104 @@ export class SqliteEventStore
 
   sessionInput(sessionId: SessionId, submissionId: string) { return this.inputs.get(sessionId, submissionId); }
 
-  mutateSessionInputs(input: SessionInputMutation): SessionInputMutationResult {
-    const result = this.inputs.mutate(input);
+  sessionInputById(sessionId: SessionId, inputId: string) { return this.inputs.getById(sessionId, inputId); }
+
+  mutateSessionInputs(input: SessionInputMutation, options?: SessionInputMutationOptions): SessionInputMutationResult {
+    const result = this.inputs.mutate(input, options);
     this.inputMirrors = this.inputMirrors.catch(() => undefined).then(() => this.writeMirrors(result.events));
     // Mirror failures never change an already committed receipt.
     void this.inputMirrors.catch(() => undefined);
     return result;
+  }
+
+  async createChildSession(input: CreateChildSessionInput): Promise<CreateChildSessionResult> {
+    for (const [name, value] of [["maxChildren", input.maxChildren], ["maxDepth", input.maxDepth]] as const) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) throw new TypeError(`${name} must be a nonnegative safe integer`);
+    }
+    if (input.runClaim.sessionId !== input.parentSessionId) throw new SessionRunClaimConflictError(input.parentSessionId);
+    const transact = this.db.transaction(() => {
+      // This is the only cross-Session creation operation. Check the parent's
+      // live ownership here without weakening ordinary event write fences.
+      this.assertRunClaimFence(input.runClaim, []);
+      const parent = this.readSession(input.parentSessionId);
+      if (!parent || parent.status !== "active") throw new SessionStateConflictError(input.parentSessionId, parent?.status);
+      if (!parent.agent && this.subagentSessionReservationExists(parent.id)) throw new SessionReservedForSubagentError(parent.id);
+      const agent = parseSessionAgentMetadata({
+        parentSessionId: input.parentSessionId,
+        name: input.name,
+        path: `${parent.agent?.path ?? ROOT_AGENT_PATH}/${input.name}`,
+        policy: input.policy,
+      });
+      const existing = this.readSession(input.sessionId);
+      if (existing) {
+        if (existing.cwd !== input.cwd || encodeJson(existing.agent) !== encodeJson(agent)) {
+          throw new SessionInputConflictError("Agent Session ID already belongs to a different creation");
+        }
+        const initial = this.inputs.get(existing.id, input.initialInput.submissionId);
+        if (!initial || initial.inputId !== input.initialInput.inputId
+          || initial.identity !== (input.initialInput.identity ?? input.initialInput.payload)
+          || initial.mode !== input.initialInput.mode || initial.source !== input.initialInput.source) {
+          throw new SessionInputConflictError("Agent Session ID already belongs to a different initial input");
+        }
+        return { session: existing, input: initial, queue: this.inputs.queue(existing.id), events: [], duplicate: true };
+      }
+      if (this.subagentSessionReservationExists(input.sessionId) || this.sessionCreationClaimExists(input.sessionId)) {
+        throw new SessionReservedForSubagentError(input.sessionId);
+      }
+      const seen = new Set<SessionId>();
+      let ancestor: SessionRow | undefined = parent;
+      let childDepth = 0;
+      while (ancestor) {
+        if (seen.has(ancestor.id)) throw new SessionInputConflictError("Agent ancestry contains a cycle");
+        seen.add(ancestor.id);
+        childDepth++;
+        if (!ancestor.agent) break;
+        ancestor = this.readSession(ancestor.agent.parentSessionId);
+        if (!ancestor) throw new SessionInputConflictError("Agent parent Session is missing");
+      }
+      if (input.maxDepth !== undefined && childDepth > input.maxDepth) {
+        throw new SessionInputConflictError(`Agent depth ${childDepth} exceeds maxDepth ${input.maxDepth}`);
+      }
+      const count = this.db.query<{ count: number }, [string]>("select count(*) as count from sessions where parent_session_id = ?").get(parent.id)!.count;
+      if (input.maxChildren !== undefined && count >= input.maxChildren) {
+        throw new SessionInputConflictError(`Agent ${parent.id} already has ${count} direct children (maxChildren: ${input.maxChildren}); resume an existing agent instead`);
+      }
+      const event: Extract<ChiliEvent, { type: "session.created" }> = {
+        id: crypto.randomUUID(), type: "session.created", sessionId: input.sessionId, time: Date.now() as TimestampMs,
+        payload: { sessionId: input.sessionId, cwd: input.cwd, agent, ...(input.identity ? { identity: input.identity } : {}) },
+      };
+      const created = this.writeTransactionEvents([event]);
+      const accepted = this.inputs.mutate({ ...input.initialInput, kind: "accept", sessionId: input.sessionId }, { allowSubagentSessions: true });
+      return { session: this.readSession(input.sessionId)!, input: accepted.input!, queue: accepted.queue, events: [...created, ...accepted.events] };
+    });
+    const result = this.runWithWriteRetry(() => transact.immediate());
+    await this.writeMirrors(result.events);
+    return result;
+  }
+
+  private readSession(sessionId: SessionId): SessionRow | undefined {
+    const row = this.db.query<{
+      id: string; cwd: string; title: string | null; status: "active" | "archived";
+      created_at: number; updated_at: number; parent_session_id: string | null;
+      agent_name: string | null; agent_path: string | null; agent_policy_json: string | null;
+    }, [string]>("select * from sessions where id = ?").get(sessionId);
+    if (!row) return undefined;
+    return {
+      id: row.id as SessionId, cwd: row.cwd, ...(row.title ? { title: row.title } : {}), status: row.status,
+      createdAt: row.created_at, updatedAt: row.updated_at,
+      source: row.parent_session_id || this.subagentSessionReservationExists(sessionId) ? "subagent" : "interactive",
+      ...(row.parent_session_id ? { agent: parseSessionAgentMetadata({
+        parentSessionId: row.parent_session_id, name: row.agent_name, path: row.agent_path,
+        policy: row.agent_policy_json ? decodeJson(row.agent_policy_json, undefined) : undefined,
+      }) } : {}),
+    };
+  }
+
+  async session(sessionId: SessionId): Promise<SessionRow | undefined> { return this.readSession(sessionId); }
+
+  async childSessions(parentSessionId: SessionId): Promise<SessionRow[]> {
+    return this.db.query<{ id: string }, [string]>("select id from sessions where parent_session_id = ? order by created_at, id").all(parentSessionId)
+      .map((row) => this.readSession(row.id as SessionId)!);
   }
 
   async flushInputMirrors(): Promise<void> { await this.inputMirrors; }
@@ -913,10 +1019,16 @@ export class SqliteEventStore
         status: "active" | "archived";
         created_at: number;
         updated_at: number;
+        parent_session_id: string | null;
+        agent_name: string | null;
+        agent_path: string | null;
+        agent_policy_json: string | null;
       }, []>(
         `select s.id, s.cwd, s.title, s.status, s.created_at, s.updated_at,
+                s.parent_session_id, s.agent_name, s.agent_path, s.agent_policy_json,
                 case
-                  when exists (select 1 from agent_tasks t where t.child_session_id = s.id)
+                  when s.parent_session_id is not null
+                    or exists (select 1 from agent_tasks t where t.child_session_id = s.id)
                     or exists (select 1 from agent_runs r where r.child_session_id = s.id)
                     or exists (
                       select 1
@@ -952,6 +1064,10 @@ export class SqliteEventStore
         status: row.status,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
+        ...(row.parent_session_id ? { agent: parseSessionAgentMetadata({
+          parentSessionId: row.parent_session_id, name: row.agent_name, path: row.agent_path,
+          policy: decodeJson(row.agent_policy_json, undefined),
+        }) } : {}),
       }));
   }
 
@@ -4080,9 +4196,10 @@ export class SqliteEventStore
   }
 
   private subagentSessionReservationExists(sessionId: SessionId): boolean {
-    return this.db.query<{ found: number }, [string, string, string]>(
+    return this.db.query<{ found: number }, [string, string, string, string]>(
       `select 1 as found
-         where exists (select 1 from agent_tasks where child_session_id = ?)
+         where exists (select 1 from sessions where id = ? and parent_session_id is not null)
+            or exists (select 1 from agent_tasks where child_session_id = ?)
             or exists (select 1 from agent_runs where child_session_id = ?)
             or exists (
               select 1
@@ -4092,7 +4209,7 @@ export class SqliteEventStore
                  and m.path <> t.lead_path
             )
          limit 1`,
-    ).get(sessionId, sessionId, sessionId) !== null;
+    ).get(sessionId, sessionId, sessionId, sessionId) !== null;
   }
 
   private teamOwnerSessionState(
@@ -4257,13 +4374,20 @@ export class SqliteEventStore
         throw new SessionReservedForSubagentError(event.sessionId);
       }
       const title = event.payload.cwd.split("/").filter(Boolean).at(-1) ?? "Untitled";
+      const agent = event.payload.agent === undefined ? undefined : parseSessionAgentMetadata(event.payload.agent);
+      if (agent) {
+        if (agent.parentSessionId === event.sessionId) throw new SessionInputConflictError("Agent cannot be its own parent");
+        const parent = this.readSession(agent.parentSessionId);
+        if (!parent || agent.path !== `${parent.agent?.path ?? ROOT_AGENT_PATH}/${agent.name}`) throw new SessionInputConflictError("Agent parent or path does not match");
+      }
       const inserted = this.db
         .query(
-          `insert into sessions (id, cwd, title, status, created_at, updated_at)
-           values (?, ?, ?, 'active', ?, ?)
+          `insert into sessions (id, cwd, title, status, created_at, updated_at, parent_session_id, agent_name, agent_path, agent_policy_json)
+           values (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
            on conflict(id) do nothing`,
         )
-        .run(event.sessionId, event.payload.cwd, title, event.time, event.time);
+        .run(event.sessionId, event.payload.cwd, title, event.time, event.time,
+          agent?.parentSessionId ?? null, agent?.name ?? null, agent?.path ?? null, agent ? encodeJson(agent.policy) : null);
       if (inserted.changes === 0) {
         const persisted = this.db
           .query<{ cwd: string }, [string]>(`select cwd from sessions where id = ?`)

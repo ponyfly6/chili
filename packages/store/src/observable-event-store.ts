@@ -1,5 +1,5 @@
 import type { ChiliEvent, EventEnvelope, Message, SessionId, TaskId } from "@chili/protocol";
-import type { SessionInputMutation, SessionInputStore } from "./session-inputs.js";
+import type { SessionInputMutation, SessionInputMutationOptions, SessionInputStore } from "./session-inputs.js";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
@@ -44,6 +44,9 @@ import type {
   GoalMutationStore,
   GoalProjectionStore,
   SessionRow,
+  AgentSessionStore,
+  CreateChildSessionInput,
+  CreateChildSessionResult,
   StaleTurnRecoveryInput,
   StaleTurnRecoveryStore,
   SubagentProjectionStore,
@@ -130,8 +133,28 @@ export class ObservableEventStore
 
   sessionInput(sessionId: SessionId, submissionId: string) { return this.inputStore().sessionInput(sessionId, submissionId); }
 
-  mutateSessionInputs(input: SessionInputMutation) {
-    const result = this.inputStore().mutateSessionInputs(input);
+  sessionInputById(sessionId: SessionId, inputId: string) { return this.inputStore().sessionInputById(sessionId, inputId); }
+
+  mutateSessionInputs(input: SessionInputMutation, options?: SessionInputMutationOptions) {
+    const result = this.inputStore().mutateSessionInputs(input, options);
+    for (const event of result.events) this.emit(event);
+    return result;
+  }
+
+  async session(sessionId: SessionId): Promise<SessionRow | undefined> {
+    const store = this.inner as EventStore & Partial<AgentSessionStore>;
+    return store.session ? store.session(sessionId) : (await store.sessions()).find((session) => session.id === sessionId);
+  }
+
+  async childSessions(parentSessionId: SessionId): Promise<SessionRow[]> {
+    const store = this.inner as EventStore & Partial<AgentSessionStore>;
+    return store.childSessions ? store.childSessions(parentSessionId) : (await store.sessions()).filter((session) => session.agent?.parentSessionId === parentSessionId);
+  }
+
+  async createChildSession(input: CreateChildSessionInput): Promise<CreateChildSessionResult> {
+    const store = this.inner as EventStore & Partial<AgentSessionStore>;
+    if (!store.createChildSession) throw new Error("Store does not support atomic Agent creation");
+    const result = await store.createChildSession(input);
     for (const event of result.events) this.emit(event);
     return result;
   }

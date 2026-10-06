@@ -38,6 +38,9 @@ import type { Message } from "./message.js";
 import type { RuntimeInputQueue, RuntimeSessionInput } from "./session-input.js";
 import type { ExecutionIdentity } from "./execution-identity.js";
 import type { PreparedModelIdentity } from "./prepared-request.js";
+import { assertAgentSegment, normalizeAgentPath } from "./agent-path.js";
+import type { PersistedToolPolicy, SessionAgentMetadata } from "./session-agent.js";
+import type { MessageId } from "./ids.js";
 
 const MAX_VALIDATION_PATH_CHARS = 512;
 const MAX_VALIDATION_EXPECTATION_CHARS = 512;
@@ -369,6 +372,9 @@ export function parseRuntimeSessionInput(value: unknown, path = "input"): Runtim
   };
   assignOptionalString(input, "executionRef", row.executionRef, path);
   assignOptionalString(input, "messageId", row.messageId, path);
+  if (row.resultMessageId !== undefined) {
+    input.resultMessageId = parseRuntimeIdentifier(row.resultMessageId, `${path}.resultMessageId`) as MessageId;
+  }
   assignOptionalString(input, "turnId", row.turnId, path);
   assignOptionalString(input, "error", row.error, path);
   if (row.outcome !== undefined) input.outcome = parseRuntimeEnum(row.outcome, ["completed", "failed", "cancelled", "interrupted"] as const, `${path}.outcome`);
@@ -730,6 +736,54 @@ export function parseRuntimeExecutionIdentity(value: unknown, path = "identity")
   };
 }
 
+/** Invalid stored constraints must fail closed instead of being dropped. */
+export function parsePersistedToolPolicy(value: unknown, path = "policy"): PersistedToolPolicy {
+  const policy = parseSessionAgentRecord(value, path);
+  const fields = ["allowedTools", "deniedTools", "writeScope", "executeScope"] as const;
+  rejectRuntimeUnknownFields(policy, fields, path);
+  const parsed: PersistedToolPolicy = {};
+  for (const field of fields) {
+    const items = policy[field];
+    if (items === undefined) continue;
+    if (!Array.isArray(items)) throw new RuntimeValidationError(`${path}.${field}`, "must be an array");
+    // Array.from also validates sparse entries, which JSON would turn into null.
+    parsed[field] = Array.from(items, (item, index) => parseRuntimeString(item, `${path}.${field}[${index}]`));
+  }
+  return parsed;
+}
+
+export function parseSessionAgentMetadata(value: unknown, path = "agent"): SessionAgentMetadata {
+  const agent = parseSessionAgentRecord(value, path);
+  rejectRuntimeUnknownFields(agent, ["parentSessionId", "name", "path", "policy"], path);
+  const parentSessionId = parseRuntimeIdentifier(agent.parentSessionId, `${path}.parentSessionId`) as SessionAgentMetadata["parentSessionId"];
+  const name = parseRuntimeIdentifier(agent.name, `${path}.name`);
+  try {
+    assertAgentSegment(name);
+  } catch {
+    throw new RuntimeValidationError(`${path}.name`, "must be an agent path segment");
+  }
+  const agentPath = parseRuntimeIdentifier(agent.path, `${path}.path`);
+  let normalized: SessionAgentMetadata["path"];
+  try {
+    normalized = normalizeAgentPath(agentPath);
+  } catch {
+    throw new RuntimeValidationError(`${path}.path`, "must be a canonical absolute agent path");
+  }
+  if (agentPath !== normalized || !normalized.endsWith(`/${name}`) || normalized.split("/").length < 3) {
+    throw new RuntimeValidationError(`${path}.path`, "must be a canonical child agent path ending in its name");
+  }
+  return { parentSessionId, name, path: normalized, policy: parsePersistedToolPolicy(agent.policy, `${path}.policy`) };
+}
+
+function parseSessionAgentRecord(value: unknown, path: string): Record<string, unknown> {
+  const record = parseRuntimeRecord(value, path);
+  const prototype = Object.getPrototypeOf(record);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new RuntimeValidationError(path, "must be a plain JSON object");
+  }
+  return record;
+}
+
 export function parseRuntimePreparedModelIdentity(value: unknown, path = "identity"): PreparedModelIdentity {
   const identity = parseRuntimeRecord(value, path);
   rejectRuntimeUnknownFields(identity, ["provider", "model", "accountId", "credentialVersion", "profileId"], path);
@@ -773,6 +827,12 @@ function validateChiliEventPayload(
       matchingEventSessionId(payload.sessionId, envelopeSessionId, `${path}.sessionId`);
       parseRuntimeString(payload.cwd, `${path}.cwd`);
       if (payload.identity !== undefined) parseRuntimeExecutionIdentity(payload.identity, `${path}.identity`);
+      if (payload.agent !== undefined) {
+        const agent = parseSessionAgentMetadata(payload.agent, `${path}.agent`);
+        if (agent.parentSessionId === envelopeSessionId) {
+          throw new RuntimeValidationError(`${path}.agent.parentSessionId`, "must identify a different session");
+        }
+      }
       return;
     case "session.identity_bound":
       matchingEventSessionId(payload.sessionId, envelopeSessionId, `${path}.sessionId`);

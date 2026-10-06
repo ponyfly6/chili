@@ -12,6 +12,7 @@ import type {
   UserInputId,
 } from "./ids.js";
 import type { AgentPath } from "./agent-path.js";
+import type { SessionAgentMetadata } from "./session-agent.js";
 import type { SessionGoal, SessionGoalUpdateReason, SessionGoalUsageDelta } from "./goal.js";
 import type { Message, MessagePart } from "./message.js";
 import type {
@@ -92,7 +93,7 @@ export function compactRuntimeEvent(event: ChiliEvent): ChiliEvent {
 export type SessionEvent =
   | SessionScopedEventEnvelope<"session.tools_loaded", { sessionId: SessionId; turnId: TurnId; callId: ToolCallId; names: string[] }>
   | SessionScopedEventEnvelope<"session.input_queue_changed", RuntimeInputQueue>
-  | SessionScopedEventEnvelope<"session.created", { sessionId: SessionId; cwd: string; identity?: ExecutionIdentity }>
+  | SessionScopedEventEnvelope<"session.created", { sessionId: SessionId; cwd: string; identity?: ExecutionIdentity; agent?: SessionAgentMetadata }>
   | SessionScopedEventEnvelope<"session.identity_bound", { sessionId: SessionId; identity: ExecutionIdentity }>
   | SessionScopedEventEnvelope<"session.renamed", { sessionId: SessionId; title: string }>
   | SessionScopedEventEnvelope<"session.status_changed", RuntimeStatusPayload>

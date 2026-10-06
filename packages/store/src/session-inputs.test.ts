@@ -73,6 +73,60 @@ test("pause and claim are atomic across connections; resume is explicit", async 
   } finally { peer.close(); }
 });
 
+test("resuming after restart finishes the original input before later steer and queued inputs", async () => {
+  const { path, store } = await fixture();
+  const original = accept(store, "original").input!;
+  claim(store, "original_claim");
+  accept(store, "queued");
+  accept(store, "steering", '{"text":"steer"}', "steer");
+  accept(store, "last");
+  store.mutateSessionInputs({ kind: "pause", sessionId });
+  store.mutateSessionInputs({ kind: "settle", sessionId, inputId: original.inputId, claimId: "original_claim", outcome: "cancelled" });
+  store.releaseSessionRun({ sessionId, claimId: "original_claim" });
+
+  const reopened = new SqliteEventStore(path);
+  try {
+    expect(claim(reopened, "before_resume").input).toBeUndefined();
+    const before = reopened.sessionInputQueue(sessionId);
+    const interrupted = before.items.findLast((input) => input.state === "settled")!;
+    expect(interrupted.inputId).toBe(original.inputId);
+    reopened.mutateSessionInputs({ kind: "resume", sessionId, inputId: interrupted.inputId, expectedRevision: before.revision, expectedInputRevision: interrupted.revision });
+    expect(reopened.sessionInputQueue(sessionId).items.map((input) => input.submissionId)).toEqual(["original", "steering", "queued", "last"]);
+    const resumed = claim(reopened, "resumed_claim").input!;
+    expect(resumed).toMatchObject({ inputId: original.inputId, submissionId: original.submissionId, sequence: original.sequence, resumed: true });
+    reopened.mutateSessionInputs({ kind: "settle", sessionId, inputId: resumed.inputId, claimId: "resumed_claim", outcome: "completed" });
+    reopened.releaseSessionRun({ sessionId, claimId: "resumed_claim" });
+
+    for (const next of ["steering", "queued", "last"]) {
+      const claimId = `claim_${next}`;
+      const input = claim(reopened, claimId).input!;
+      expect(input.submissionId).toBe(next);
+      reopened.mutateSessionInputs({ kind: "settle", sessionId, inputId: input.inputId, claimId, outcome: "completed" });
+      reopened.releaseSessionRun({ sessionId, claimId });
+    }
+    expect(reopened.sessionInputQueue(sessionId).items).toEqual([]);
+  } finally { reopened.close(); }
+});
+
+for (const finalOutcome of ["completed", "failed"] as const) {
+  test(`recovery uses execution order when an older queued input ${finalOutcome} after a newer steer`, async () => {
+    const { store } = await fixture();
+    accept(store, "older");
+    accept(store, "newer", '{"text":"steer"}', "steer");
+    const first = claim(store, "first_claim").input!;
+    expect(first.submissionId).toBe("newer");
+    store.mutateSessionInputs({ kind: "settle", sessionId, inputId: first.inputId, claimId: "first_claim", outcome: finalOutcome === "completed" ? "failed" : "completed" });
+    store.releaseSessionRun({ sessionId, claimId: "first_claim" });
+    const second = claim(store, "second_claim").input!;
+    expect(second.submissionId).toBe("older");
+    store.mutateSessionInputs({ kind: "settle", sessionId, inputId: second.inputId, claimId: "second_claim", outcome: finalOutcome });
+    store.releaseSessionRun({ sessionId, claimId: "second_claim" });
+    const recoverable = store.sessionInputQueue(sessionId).items.filter((input) => input.state === "settled");
+    expect(recoverable.map((input) => input.submissionId)).toEqual(finalOutcome === "failed" ? ["older"] : []);
+    expect(store.sessionInputById(sessionId, first.inputId)?.outcome).toBe(finalOutcome === "completed" ? "failed" : "completed");
+  });
+}
+
 test("message and image parts materialize together and cannot be appended twice", async () => {
   const { path, store } = await fixture();
   accept(store);

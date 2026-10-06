@@ -25,7 +25,12 @@ import type {
   TurnId,
   ApprovalDecisionAction,
   ApprovalScope,
+  SessionAgentMetadata,
+  PersistedToolPolicy,
+  ExecutionIdentity,
+  RuntimeInputQueue,
 } from "@chili/protocol";
+import type { SessionInputAccept, StoredSessionInput } from "./session-inputs.js";
 
 export interface EventQuery {
   /** Omit request audit bodies and program-only results before decoding client projections. */
@@ -48,6 +53,34 @@ export interface SessionRow {
   status: "active" | "archived";
   createdAt: number;
   updatedAt: number;
+  agent?: SessionAgentMetadata;
+}
+
+export interface CreateChildSessionInput {
+  sessionId: SessionId;
+  parentSessionId: SessionId;
+  name: string;
+  cwd: string;
+  policy: PersistedToolPolicy;
+  identity?: ExecutionIdentity;
+  initialInput: Omit<SessionInputAccept, "kind" | "sessionId">;
+  maxChildren?: number;
+  maxDepth?: number;
+  runClaim: SessionRunClaimFence;
+}
+
+export interface CreateChildSessionResult {
+  session: SessionRow;
+  input: StoredSessionInput;
+  queue: RuntimeInputQueue;
+  events: ChiliEvent[];
+  duplicate?: boolean;
+}
+
+export interface AgentSessionStore {
+  session(sessionId: SessionId): Promise<SessionRow | undefined>;
+  childSessions(parentSessionId: SessionId): Promise<SessionRow[]>;
+  createChildSession(input: CreateChildSessionInput): Promise<CreateChildSessionResult>;
 }
 
 export interface ToolCallRow {
