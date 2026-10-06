@@ -8,6 +8,7 @@ import type {
   Message,
   MessageId,
   MessagePart,
+  RuntimeModelDescriptor,
   SessionId,
   TimestampMs,
   TurnId,
@@ -311,10 +312,7 @@ test("runs a child task through an AgentRunner", async () => {
     },
   ]);
   expect(runner.userMessages).toEqual([
-    {
-      sessionId: "session_child" as SessionId,
-      text: "Read README",
-    },
+    expect.objectContaining({ sessionId: "session_child" as SessionId, text: "Read README" }),
   ]);
   expect(runner.turnInputs[0]).toMatchObject({
     sessionId: "session_child",
@@ -322,9 +320,9 @@ test("runs a child task through an AgentRunner", async () => {
     system: [
       "You are a local Chili subagent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
     ],
-    developer: [
+    developer: expect.arrayContaining([
       "Subagent task id: task_child. Repository cwd: /repo. Agent path: /root/task_child (logical agent identifier, not a filesystem path). Use repository-relative paths, or absolute paths under the repository cwd; never prefix file paths with the agent path. When the task is complete, either provide a final concise answer or call complete_task with this task id and a clear summary.",
-    ],
+    ]),
   });
 });
 
@@ -1963,7 +1961,9 @@ class MemoryEventStore implements EventStore {
   }
 
   async sessions(): Promise<SessionRow[]> {
-    return [];
+    return this.items.flatMap((event): SessionRow[] => event.type === "session.created" && event.sessionId
+      ? [{ id: event.sessionId, cwd: event.payload.cwd, source: "subagent", status: "active", createdAt: event.time, updatedAt: event.time }]
+      : []);
   }
 
   async messages(): Promise<Message[]> {
@@ -2009,7 +2009,10 @@ class FakeChildRunner implements AgentRunner {
 
   async createSession(input: CreateSessionInput): Promise<SessionId> {
     this.createInputs.push(input);
-    return input.sessionId ?? ("session_child" as SessionId);
+    const sessionId = input.sessionId ?? ("session_child" as SessionId);
+    await this.store.append({ id: `created_${sessionId}`, type: "session.created", sessionId,
+      time: 1 as TimestampMs, payload: { sessionId, cwd: input.cwd } });
+    return sessionId;
   }
 
   async appendUserMessage(input: AppendUserMessageInput): Promise<MessageId> {
@@ -2056,6 +2059,10 @@ class ScriptedChildRunner implements AgentRunner {
   readonly turnInputs: RunTurnInput[] = [];
   private index = 0;
 
+  listModels(): RuntimeModelDescriptor[] {
+    return [{ provider: "test", model: "selected", reasoningLevels: ["low", "high"], serviceTiers: ["standard", "fast"] }];
+  }
+
   constructor(
     private readonly store: MemoryEventStore,
     private readonly script: Array<{ text?: string; finishReason?: string }>,
@@ -2063,7 +2070,10 @@ class ScriptedChildRunner implements AgentRunner {
 
   async createSession(input: CreateSessionInput): Promise<SessionId> {
     this.createInputs.push(input);
-    return input.sessionId ?? ("session_child" as SessionId);
+    const sessionId = input.sessionId ?? ("session_child" as SessionId);
+    await this.store.append({ id: `created_${sessionId}`, type: "session.created", sessionId,
+      time: 1 as TimestampMs, payload: { sessionId, cwd: input.cwd } });
+    return sessionId;
   }
 
   async appendUserMessage(input: AppendUserMessageInput): Promise<MessageId> {

@@ -713,6 +713,7 @@ test("sends idempotent agent messages and keeps consumed messages terminal", asy
   }
 });
 
+// Several 5 MiB hostile values need headroom under concurrent validation load.
 test("normalizes nested mailbox metadata diagnostics without redacting ordinary feedback", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-agent-message-metadata-bounds-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -777,7 +778,7 @@ test("normalizes nested mailbox metadata diagnostics without redacting ordinary 
     store.close();
     await rm(dir, { recursive: true, force: true });
   }
-});
+}, 15_000);
 
 test("scopes named agent recipients to the sending session", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-agent-message-scope-"));

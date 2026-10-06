@@ -1,5 +1,7 @@
 import {
   DELEGATION_POLICIES,
+  compactRuntimeEvent,
+  compactRuntimeMessage,
   isTransientEvent,
   normalizePersistedError,
   normalizeSessionTitle,
@@ -369,6 +371,14 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         return json(await withMcpMutationScope(options, url, (scope) => mcp.reload!(scope)));
       }
 
+      if (route.name === "mcpConnect" || route.name === "mcpDisconnect") {
+        const mcp = requireMcpControl(options);
+        const action = route.name === "mcpConnect" ? "connect" : "disconnect";
+        const mutate = mcp[action];
+        if (!mutate) return jsonError(501, `No MCP ${action} controller is configured`);
+        return json(await withMcpMutationScope(options, url, (scope) => mutate.call(mcp, route.server, scope)));
+      }
+
       if (route.name === "mcpAdd") {
         const mcp = requireMcpControl(options);
         if (!mcp.add) return jsonError(501, "No MCP add controller is configured");
@@ -703,7 +713,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "messages") {
-        return json(await options.store.messages(route.sessionId));
+        return json((await options.store.messages(route.sessionId)).map(compactRuntimeMessage));
       }
 
       if (route.name === "sessionEvents") {
@@ -1212,6 +1222,8 @@ type Route =
   | { name: "mcpList" }
   | { name: "mcpStatus" }
   | { name: "mcpReload" }
+  | { name: "mcpConnect"; server: string }
+  | { name: "mcpDisconnect"; server: string }
   | { name: "mcpAdd" }
   | { name: "mcpServer"; server: string }
   | { name: "mcpRemove"; server: string }
@@ -1556,6 +1568,8 @@ function routeRequest(method: string, pathname: string): Route {
     if (method === "GET" && !action) return { name: "mcpServer", server };
     if (method === "DELETE" && !action) return { name: "mcpRemove", server };
     if (method === "GET" && action === "tools") return { name: "mcpTools", server };
+    if (method === "POST" && action === "connect") return { name: "mcpConnect", server };
+    if (method === "POST" && action === "disconnect") return { name: "mcpDisconnect", server };
     if (method === "POST" && action === "auth") return { name: "mcpAuth", server };
     if (method === "POST" && action === "logout") return { name: "mcpLogout", server };
     return { name: "notFound" };
@@ -1935,11 +1949,12 @@ async function readAllProjectionEvents(
 
   while (true) {
     const batch = await store.events({
+      compactRequests: true,
       ...(sessionId ? { sessionId } : {}),
       ...(afterEventId ? { afterEventId } : {}),
       limit: pageSize,
     });
-    events.push(...batch);
+    events.push(...batch.map((event) => compactRuntimeEvent(event as ChiliEvent)));
     if (batch.length < pageSize) return events;
     afterEventId = batch.at(-1)?.id;
     if (!afterEventId) return events;
@@ -2124,6 +2139,7 @@ async function replayableSessionEventWindow(
   };
 
   const created = await input.store.events({
+    compactRequests: true,
     sessionId: input.sessionId,
     type: "session.created",
     limit: 1,
@@ -2261,6 +2277,7 @@ async function boundedSessionEventTail(
   while (count < input.limit + 1) {
     const requested = Math.min(SESSION_EVENT_WINDOW_PAGE_SIZE, input.limit + 1 - count);
     const batch = await input.store.events({
+      compactRequests: true,
       sessionId: input.sessionId,
       limit: requested,
       tail: true,
@@ -2273,8 +2290,9 @@ async function boundedSessionEventTail(
     }
     const accepted: ChiliEvent[] = [];
     for (let index = batch.length - 1; index >= 0; index -= 1) {
-      const event = batch[index];
-      if (!event) continue;
+      const storedEvent = batch[index];
+      if (!storedEvent) continue;
+      const event = compactRuntimeEvent(storedEvent);
       const eventBytes = runtimeEventJsonUtf8Bytes(event) + (count > 0 ? 1 : 0);
       if (bytes + eventBytes > input.limits.maxBytes || count >= input.limit + 1) {
         truncated = true;
@@ -2325,13 +2343,15 @@ async function scanSessionDependencyProviders(
       input.limits.maxScanEvents - state.events,
     );
     const batch = await input.store.events({
+      compactRequests: true,
       sessionId: input.sessionId,
       ...(afterEventId ? { afterEventId } : {}),
       limit: requested,
     }) as ChiliEvent[];
     state.pages += 1;
     if (batch.length === 0) break;
-    for (const event of batch) {
+    for (const storedEvent of batch) {
+      const event = compactRuntimeEvent(storedEvent);
       const eventBytes = runtimeEventJsonUtf8Bytes(event);
       if (state.bytes + eventBytes > input.limits.maxScanBytes) {
         state.boundary = "bytes";
@@ -2437,6 +2457,7 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
   };
 
   type BacklogQuery = {
+    compactRequests: true;
     sessionId?: SessionId;
     afterEventId?: string;
     limit: number;
@@ -2444,6 +2465,7 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
   };
   const query = (input: { afterEventId?: string; limit: number; tail: boolean }): BacklogQuery => ({
     ...input,
+    compactRequests: true,
     ...(options.sessionId ? { sessionId: options.sessionId } : {}),
   });
 
@@ -2636,7 +2658,7 @@ const MAX_SSE_FRAME_BYTES = 4_000_000;
 const MAX_SSE_RESYNC_FRAME_BYTES = 4_096;
 
 function formatSse(event: ChiliEvent): Uint8Array {
-  const payload = JSON.stringify(event);
+  const payload = JSON.stringify(compactRuntimeEvent(event));
   const payloadBytes = Buffer.byteLength(payload, "utf8");
   const prefix = `${!isTransientEvent(event) ? `id: ${event.id}\n` : ""}event: chili.event\ndata: `;
   const suffix = "\n\n";
@@ -3032,7 +3054,7 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "TeamMessageSenderUnauthorizedError") {
     return { status: 403, message: err.message };
   }
-  if (err.name === "RuntimeBusyError" || err.name === "SessionInputConflictError") {
+  if (err.name === "RuntimeBusyError" || err.name === "RuntimeForeignOwnerError" || err.name === "SessionInputConflictError") {
     return { status: 409, message: err.message };
   }
   if (err.name === "RuntimeSubagentSessionAccessError") {
@@ -3042,6 +3064,7 @@ function toHttpError(error: unknown): HttpError {
     err.name === "RuntimeSessionAlreadyExistsError" ||
     err.name === "RuntimeSessionCreationConflictError" ||
     err.name === "RuntimeSessionInactiveError"
+    || err.name === "RuntimeSessionIdentityError"
   ) {
     return { status: 409, message: err.message };
   }

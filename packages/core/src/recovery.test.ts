@@ -28,7 +28,7 @@ test("reverts only a snapshot created by the target session and records the resu
     removed: [],
   });
 
-  expect(fixture.revertCalls).toEqual([{ snapshotId, options: { cwd: "/workspace" } }]);
+  expect(fixture.revertCalls).toEqual([{ snapshotId, options: { cwd: "/workspace", signal: expect.any(AbortSignal) } }]);
   expect(fixture.appended).toEqual([expect.objectContaining({
     type: "snapshot.reverted",
     sessionId,
@@ -317,6 +317,11 @@ function recoveryFixture(input: {
     service: new SnapshotRecoveryService({
       store,
       snapshotProvider,
+      sessionOperations: {
+        async withSessionOperation(_sessionId, fn) {
+          return fn({ signal: new AbortController().signal, assertCurrent() {} });
+        },
+      },
       createId: () => "event_snapshot_reverted",
       now: () => 100 as TimestampMs,
     }),

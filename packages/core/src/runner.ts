@@ -1,4 +1,4 @@
-import type { MessageId, MessageImageContent, ModelSelection, ModelUsage, ReasoningLevel, ServiceTier, SessionId, TurnId } from "@chili/protocol";
+import type { ExecutionIdentity, MessageId, MessageImageContent, ModelSelection, ModelUsage, ReasoningLevel, ServiceTier, SessionId, TurnId } from "@chili/protocol";
 import type { ToolAccessPolicy } from "@chili/tools";
 import type { ContextUsage } from "./context/index.js";
 import type { PromptDebugManifest } from "./prompt/index.js";
@@ -6,6 +6,7 @@ import type { PromptDebugManifest } from "./prompt/index.js";
 export interface CreateSessionInput {
   sessionId?: SessionId;
   cwd: string;
+  identity?: ExecutionIdentity;
 }
 
 export interface AppendUserMessageInput {

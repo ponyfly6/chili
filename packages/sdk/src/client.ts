@@ -115,6 +115,8 @@ export interface RuntimeClient {
   mcpStatus(input?: McpStatusRequest): Promise<RuntimeMcpStatusResponse>;
   mcpServer(input: McpServerRequest): Promise<RuntimeMcpServerDescriptor>;
   reloadMcp(input?: ReloadMcpRequest): Promise<RuntimeMcpReloadResponse>;
+  connectMcpServer(input: McpServerRequest): Promise<RuntimeMcpServerDescriptor>;
+  disconnectMcpServer(input: McpServerRequest): Promise<RuntimeMcpServerDescriptor>;
   addMcpServer(input: AddMcpServerRequest): Promise<RuntimeMcpServerDescriptor>;
   removeMcpServer(input: RemoveMcpServerRequest): Promise<RuntimeMcpRemoveServerResponse>;
   listMcpTools(input: ListMcpToolsRequest): Promise<RuntimeMcpToolsResponse>;
@@ -1215,6 +1217,14 @@ export class HttpRuntimeClient implements RuntimeClient {
 
   reloadMcp(input: ReloadMcpRequest = {}): Promise<RuntimeMcpReloadResponse> {
     return this.post(sessionScopedRequestPath("mcp/reload", input.sessionId), {}, input.signal, parseRuntimeMcpReloadResponse);
+  }
+
+  connectMcpServer(input: McpServerRequest): Promise<RuntimeMcpServerDescriptor> {
+    return this.post(sessionScopedRequestPath(`mcp/${encodeURIComponent(input.server)}/connect`, input.sessionId), {}, input.signal, parseRuntimeMcpServerDescriptor);
+  }
+
+  disconnectMcpServer(input: McpServerRequest): Promise<RuntimeMcpServerDescriptor> {
+    return this.post(sessionScopedRequestPath(`mcp/${encodeURIComponent(input.server)}/disconnect`, input.sessionId), {}, input.signal, parseRuntimeMcpServerDescriptor);
   }
 
   addMcpServer(input: AddMcpServerRequest): Promise<RuntimeMcpServerDescriptor> {

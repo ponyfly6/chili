@@ -16,7 +16,7 @@ test("mcp server instructions are mcp sourced and cannot claim system trust", ()
 
   expect(fragment).toMatchObject({
     id: "mcp.server.docs-server.instructions",
-    layer: "developer",
+    layer: "contextual_user",
     source: "mcp",
     trust: "tool",
     lifecycle: "session",

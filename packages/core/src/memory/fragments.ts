@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import type { PromptFragment } from "../prompt/index.js";
 import { DEFAULT_MAX_DOCUMENT_CHARS, MEMORY_MECHANICS_PROMPT } from "./constants.js";
 import { loadDocument, memoryDocumentDebugMetadata, renderChiliMemoryDocument } from "./documents.js";
+import { searchChiliMemoryEntries } from "./entries.js";
 import { resolveChiliMemoryPaths } from "./project-instructions.js";
 import type { ChiliMemoryDocument, ChiliMemoryLoadOptions, ChiliMemorySnapshot } from "./types.js";
 
@@ -11,20 +13,27 @@ export async function loadChiliMemoryContext(options: ChiliMemoryLoadOptions): P
   const missingPaths: string[] = [];
   const maxChars = options.maxDocumentChars ?? DEFAULT_MAX_DOCUMENT_CHARS;
 
-  await loadDocument(documents, missingPaths, {
-    kind: "user_memory",
-    scope: "user",
-    label: "User memory",
-    path: paths.userMemoryPath,
-    maxChars,
-  });
-  await loadDocument(documents, missingPaths, {
-    kind: "project_memory",
-    scope: "project",
-    label: "Project memory",
-    path: paths.projectMemoryPath,
-    maxChars,
-  });
+  const omittedDocuments: { path: string; reason: string }[] = [];
+  const memoryScopes = options.memoryScopes ?? ["user", "project"];
+  for (const scope of ["user", "project"] as const) {
+    if (!memoryScopes.includes(scope)) omittedDocuments.push({ path: `${paths.databasePath}#${scope}`, reason: "memory_read_not_authorized" });
+  }
+  for (const entry of await searchChiliMemoryEntries(options)) {
+    const truncated = entry.text.length > maxChars;
+    documents.push({
+      kind: entry.scope === "user" ? "user_memory" : "project_memory",
+      scope: entry.scope,
+      label: `${entry.scope === "user" ? "User" : "Project"} memory (${entry.id})`,
+      path: entry.path,
+      content: entry.text.slice(0, maxChars),
+      truncated,
+      ...(truncated ? { truncatedAfter: maxChars } : {}),
+      contentVersion: createHash("sha256").update(`${entry.id}:${entry.revision}:${entry.text}`).digest("hex"),
+      memoryId: entry.id,
+      memoryRevision: entry.revision,
+      memorySource: entry.source,
+    });
+  }
   for (const instruction of paths.instructions) {
     await loadDocument(documents, missingPaths, {
       kind: instruction.kind,
@@ -32,6 +41,9 @@ export async function loadChiliMemoryContext(options: ChiliMemoryLoadOptions): P
       label: instruction.label,
       path: instruction.path,
       maxChars,
+      projectRoot: paths.projectRoot,
+      targetPaths: options.targetPaths ?? [],
+      omittedDocuments,
     });
   }
 
@@ -43,6 +55,7 @@ export async function loadChiliMemoryContext(options: ChiliMemoryLoadOptions): P
     instructionPaths: paths.instructions.map((instruction) => instruction.path),
     documents,
     missingPaths,
+    omittedDocuments,
   };
 }
 
@@ -60,6 +73,7 @@ export function chiliMemoryPromptFragments(snapshot: ChiliMemorySnapshot): Promp
       lifecycle: "session",
       trust: "system",
       content: MEMORY_MECHANICS_PROMPT,
+      metadata: { omittedDocuments: snapshot.omittedDocuments ?? [] },
     },
   ];
 
@@ -67,7 +81,7 @@ export function chiliMemoryPromptFragments(snapshot: ChiliMemorySnapshot): Promp
     const source = document.kind === "project_instruction" || document.kind === "project_rule" ? "project" : "memory";
     const trust = document.kind === "user_memory" ? "user" : "project";
     fragments.push({
-      id: `chili.context.${document.kind}.${index}`,
+      id: document.memoryId ? `chili.context.${document.kind}.${document.memoryId}` : `chili.context.${document.kind}.${index}`,
       layer: "contextual_user",
       source,
       priority: 100 + index,

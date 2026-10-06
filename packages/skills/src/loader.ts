@@ -21,14 +21,16 @@ interface ParsedSkillMarkdown {
 }
 
 export async function loadSkills(options: DiscoverSkillsOptions): Promise<SkillsLoadResult> {
-  const cwd = path.resolve(options.cwd);
+  const cwd = path.resolve(options.projectRoot ?? options.cwd);
   const home = path.resolve(options.homeDir ?? homedir());
+  const chiliHome = path.resolve(options.chiliHome ?? path.join(home, ".chili"));
   const includeAgentsAlias = options.includeAgentsAlias ?? true;
+  const includeUserAgentsAlias = chiliHome === path.join(home, ".chili");
   const settings = options.disabledSkills
     ? { disabledSkillNames: [...options.disabledSkills] }
-    : await loadSkillSettings({ cwd, homeDir: home });
+    : await loadSkillSettings({ cwd, homeDir: home, chiliHome });
   const disabledSkillNames = settings.disabledSkillNames;
-  const roots = skillRoots({ cwd, homeDir: home, includeAgentsAlias });
+  const roots = skillRoots({ cwd, homeDir: home, chiliHome, includeAgentsAlias, includeUserAgentsAlias });
   const diagnostics: SkillDiagnostic[] = [];
   const byName = new Map<string, Skill>();
   const allSkills: Skill[] = [];
@@ -68,12 +70,12 @@ function compareSkills(left: Skill, right: Skill): number {
     || left.filePath.localeCompare(right.filePath);
 }
 
-function skillRoots(input: { cwd: string; homeDir: string; includeAgentsAlias: boolean }): SkillRoot[] {
+function skillRoots(input: { cwd: string; homeDir: string; chiliHome: string; includeAgentsAlias: boolean; includeUserAgentsAlias: boolean }): SkillRoot[] {
   const roots: SkillRoot[] = [];
-  if (input.includeAgentsAlias) {
+  if (input.includeAgentsAlias && input.includeUserAgentsAlias) {
     roots.push({ source: "user", rootDir: path.join(input.homeDir, ".agents", "skills"), compatibilityAlias: true });
   }
-  roots.push({ source: "user", rootDir: path.join(input.homeDir, ".chili", "skills"), compatibilityAlias: false });
+  roots.push({ source: "user", rootDir: path.join(input.chiliHome, "skills"), compatibilityAlias: false });
   if (input.includeAgentsAlias) {
     roots.push({ source: "project", rootDir: path.join(input.cwd, ".agents", "skills"), compatibilityAlias: true });
   }

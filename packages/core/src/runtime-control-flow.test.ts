@@ -14,7 +14,7 @@ import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.
 import { RuntimeService } from "./runtime-service.js";
 import { SingleAgentRuntime } from "./single-agent-runtime.js";
 
-test("does not retry aborted model requests", async () => {
+test("does not start or retry already aborted model requests", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();
   let modelCalls = 0;
@@ -48,7 +48,7 @@ test("does not retry aborted model requests", async () => {
   });
 
   expect(result.status).toBe("cancelled");
-  expect(modelCalls).toBe(1);
+  expect(modelCalls).toBe(0);
   expect(store.items.some((event) => event.type === "turn.retry_scheduled")).toBe(false);
 });
 
@@ -267,7 +267,7 @@ test("consumes rich model streams and executes tool calls after the stream finis
       messageId: expect.any(String),
       sessionId: "session_rich_stream" as SessionId,
       type: "tool_call",
-      callId: "tool_provider_1" as ToolCallId,
+      callId: expect.any(String), providerCallId: "tool_provider_1",
       toolName: "echo",
       input: { value: "ok" },
       status: "pending",
@@ -279,15 +279,15 @@ test("consumes rich model streams and executes tool calls after the stream finis
     (event) => event.type === "message.part_added" && event.payload.part.type === "tool_call",
   );
   const liveToolUpdates = store.items.filter(
-    (event) => event.type === "tool.call_updated" && event.payload.callId === "tool_provider_1" && event.payload.toolName !== undefined,
+    (event) => event.type === "tool.call_updated" && event.payload.providerCallId === "tool_provider_1" && event.payload.toolName !== undefined,
   );
   expect(liveToolUpdates.map((event) => event.payload)).toEqual([
-    { callId: "tool_provider_1" as ToolCallId, status: "running", toolName: "echo", input: {} },
-    { callId: "tool_provider_1" as ToolCallId, status: "running", toolName: "echo", input: { value: "ok" } },
-    { callId: "tool_provider_1" as ToolCallId, status: "running", toolName: "echo", input: { value: "ok" } },
+    { callId: expect.any(String), providerCallId: "tool_provider_1", status: "running", toolName: "echo", input: {} },
+    { callId: expect.any(String), providerCallId: "tool_provider_1", status: "running", toolName: "echo", input: { value: "ok" } },
+    { callId: expect.any(String), providerCallId: "tool_provider_1", status: "running", toolName: "echo", input: { value: "ok" } },
   ]);
   const liveToolUpdateIndex = store.items.findIndex(
-    (event) => event.type === "tool.call_updated" && event.payload.callId === "tool_provider_1" && event.payload.toolName === "echo",
+    (event) => event.type === "tool.call_updated" && event.payload.providerCallId === "tool_provider_1" && event.payload.toolName === "echo",
   );
   const toolStartedIndex = store.items.findIndex((event) => event.type === "tool.call_started");
   expect(liveToolUpdateIndex).toBeGreaterThan(-1);
@@ -340,7 +340,7 @@ test("bounds partial and final tool inputs only at persistence and desktop bound
   expect(executedInputBytes).toBe(4 * 1024 * 1024);
   const inputEvents = store.items.filter((event) =>
     (event.type === "tool.call_updated" || event.type === "tool.call_started")
-      && event.payload.callId === "tool_large_input"
+      && event.payload.providerCallId === "tool_large_input"
   );
   const toolCallPartEvents = store.items.filter((event) =>
     event.type === "message.part_added" && event.payload.part.type === "tool_call"
@@ -404,7 +404,9 @@ test("keeps one desktop-safe call id across provider stream, message parts, and 
     : event.payload.callId);
   expect(ids.length).toBeGreaterThanOrEqual(6);
   expect(new Set(ids).size).toBe(1);
-  expect(ids[0]).toMatch(/^toolcall_invalid_[a-f0-9]{16}$/u);
+  expect(ids[0]).toMatch(/^toolcall_/u);
+  expect(toolCallParts(store)[0]?.providerCallId).toMatch(/^toolcall_invalid_[a-f0-9]{16}$/u);
+  expect(ids[0]).not.toBe(toolCallParts(store)[0]?.providerCallId);
 
   const contractsModulePath = "../../../apps/desktop/src/shared/contracts.ts";
   const { parseDesktopEvent } = await import(contractsModulePath) as {
@@ -782,7 +784,7 @@ test("finishes live streaming tool rows as failed when the model errors before t
   expect(result.status).toBe("failed");
   expect(toolCallParts(store)).toEqual([]);
   expect(toolFinishedPayloads(store)).toEqual([
-    { callId: "tool_error" as ToolCallId, status: "failed", error: "provider exploded", synthetic: true },
+    { callId: expect.any(String), providerCallId: "tool_error", status: "failed", error: "provider exploded", synthetic: true },
   ]);
 });
 
@@ -921,7 +923,7 @@ test("finishes live streaming tool rows as cancelled when aborted before tool_ca
   expect(result.status).toBe("cancelled");
   expect(toolCallParts(store)).toEqual([]);
   expect(toolFinishedPayloads(store)).toEqual([
-    { callId: "tool_abort" as ToolCallId, status: "cancelled", error: "Turn aborted", synthetic: true },
+    { callId: expect.any(String), providerCallId: "tool_abort", status: "cancelled", error: "Turn aborted", synthetic: true },
   ]);
 });
 
@@ -947,7 +949,7 @@ test("finishes live streaming tool rows as failed when finish arrives before too
   expect(toolResultParts(store)).toEqual([]);
   expect(toolFinishedPayloads(store)).toEqual([
     {
-      callId: "tool_unfinished" as ToolCallId,
+      callId: expect.any(String), providerCallId: "tool_unfinished",
       status: "failed",
       error: "Tool call stream ended before tool_call_end",
       errorDetails: expect.objectContaining({ name: "ModelStreamIncompleteError" }),
@@ -976,7 +978,7 @@ test("finishes live streaming tool rows as failed when the stream ends before to
   expect(toolCallParts(store)).toEqual([]);
   expect(toolFinishedPayloads(store)).toEqual([
     {
-      callId: "tool_eof" as ToolCallId,
+      callId: expect.any(String), providerCallId: "tool_eof",
       status: "failed",
       error: "Model stream ended before an explicit finish event",
       errorDetails: expect.objectContaining({ name: "ModelStreamIncompleteError" }),
@@ -992,6 +994,7 @@ test("runtime hides unauthorized tools from model input", async () => {
     name: "read",
     description: "Read",
     risk: "read",
+    resourcePolicy: "internal",
     inputSchema: { type: "object" },
     approval: () => false,
     execute: async () => ({ title: "read", output: "ok" }),

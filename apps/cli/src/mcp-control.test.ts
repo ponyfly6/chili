@@ -76,7 +76,7 @@ test("project stdio MCP servers do not auto-start without user trust", async () 
   }
 });
 
-test("same-name user trust allows a project stdio override to start", async () => {
+test("same-name user trust cannot authorize a different project stdio target", async () => {
   const root = await mkdtemp(join(tmpdir(), "chili-mcp-project-trusted-"));
   const cwd = join(root, "repo");
   const chiliHome = join(root, "home");
@@ -114,11 +114,11 @@ test("same-name user trust allows a project stdio override to start", async () =
     const status = await scopedMcpControl(runtime).status?.({ cwd });
     expect(status?.servers[0]).toMatchObject({
       name: "project_shell",
-      status: "error",
-      enabled: true,
+      status: "disabled",
+      enabled: false,
       transport: "stdio",
     });
-    await access(marker);
+    await expect(access(marker)).rejects.toThrow();
   } finally {
     await runtime.close();
     await rm(root, { recursive: true, force: true });
@@ -801,6 +801,7 @@ test("MCP tool, prompt, and resource descriptors are recursively bounded and red
     const secret = "sk-mcpDescriptorSecret123456789";
     const loopback = "http://[::1]:45111/private?api_key=mcpDescriptorToken";
     const worstEscaped = "\u0000\"\\\n".repeat(1_310_720);
+    state.status = "connected";
     state.tools = [
       {
         name: "normal_tool",
@@ -1294,6 +1295,7 @@ async function stubMcpPrompts(
   if (!manager) throw new Error("MCP manager scope was not initialized");
   const entries = prompts as ReadonlyArray<{ server: { name: string }; prompt: unknown }>;
   for (const state of manager.listStates()) {
+    state.status = "connected";
     state.prompts = entries
       .filter((entry) => entry.server.name === state.server.name)
       .map((entry) => entry.prompt);
@@ -1305,6 +1307,7 @@ interface StubMcpManager {
   listStates(): Array<{
     server: { name: string };
     prompts: unknown[];
+    status: string;
   }>;
   getPrompt(serverName: string, promptName: string, args: Record<string, string>): Promise<unknown>;
 }
@@ -1329,6 +1332,7 @@ async function stubMcpTools(
     : (await implementation.projectScope(cwd)).manager;
   if (!manager) throw new Error("MCP manager scope was not initialized");
   for (const state of manager.listStates()) {
+    state.status = "connected";
     state.tools = [...(toolsByServer[state.server.name] ?? [])];
   }
   manager.callTool = callTool;
@@ -1338,6 +1342,7 @@ interface StubMcpToolManager {
   listStates(): Array<{
     server: { name: string };
     tools: StubMcpTool[];
+    status: string;
   }>;
   callTool(serverName: string, toolName: string, input: unknown): Promise<unknown>;
 }

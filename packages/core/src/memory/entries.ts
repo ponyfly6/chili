@@ -1,8 +1,10 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { SqliteMemoryRepository, type MemoryRecord, type MemoryScope } from "@chili/store";
 import { CHILI_MEMORY_SECTION_HEADER, DEFAULT_MAX_MEMORY_ENTRY_CHARS } from "./constants.js";
 import { memoryPathForScope, resolveChiliMemoryPaths } from "./project-instructions.js";
 import type {
+  ChiliMemoryLoadOptions,
+  ChiliMemoryPaths,
+  ChiliMemoryScope,
   ChiliMemoryAddInput,
   ChiliMemoryAddResult,
   ChiliMemoryEntry,
@@ -12,69 +14,112 @@ import type {
 } from "./types.js";
 import { readTextIfExists } from "./utils.js";
 
+/** Opens only the selected profile; migration and every mutation use SQLite transactions. */
+async function withMemoryRepository<T>(
+  options: ChiliMemoryLoadOptions,
+  action: (repository: SqliteMemoryRepository, paths: ChiliMemoryPaths) => T,
+  scopes: readonly ChiliMemoryScope[] = options.memoryScopes ?? ["user", "project"],
+): Promise<T> {
+  const paths = await resolveChiliMemoryPaths(options, false);
+  await options.assertCurrentAuthorization?.();
+  const repository = new SqliteMemoryRepository(paths.databasePath);
+  try {
+    for (const scope of scopes) {
+      const address = memoryScope(paths, scope);
+      if (repository.hasLegacyImport(address)) continue;
+      const path = memoryPathForScope(paths, scope);
+      const content = await readTextIfExists(path);
+      const entries = legacyMemoryEntries(content);
+      await options.assertCurrentAuthorization?.();
+      repository.importLegacy(address, path, content, entries);
+    }
+    await options.assertCurrentAuthorization?.();
+    return action(repository, paths);
+  } finally {
+    repository.close();
+  }
+}
+
+function memoryScope(paths: ChiliMemoryPaths, scope: ChiliMemoryScope): MemoryScope {
+  return { kind: scope, id: scope === "user" ? "profile" : paths.projectId };
+}
+
 export async function addChiliMemoryEntry(input: ChiliMemoryAddInput): Promise<ChiliMemoryAddResult> {
-  const paths = await resolveChiliMemoryPaths(input);
   const scope = input.scope ?? "project";
-  const path = memoryPathForScope(paths, scope);
-  const current = await readTextIfExists(path);
   const text = sanitizeMemoryEntry(input.text, input.maxEntryChars);
-  const next = appendMemoryContent(current ?? "", text);
+  return withMemoryRepository(input, (repository, paths) => {
+    const entry = repository.put({ scope: memoryScope(paths, scope), text, source: input.source ?? "memory-api" });
+    return { id: entry.id, revision: entry.revision, scope, path: paths.databasePath, text, created: true };
+  }, [scope]);
+}
 
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, next, "utf8");
-
-  return {
-    scope,
-    path,
-    text,
-    created: current === undefined,
-  };
+function selectedScopes(input: ChiliMemoryListInput): ChiliMemoryScope[] {
+  const requested = input.scope === "all" || input.scope === undefined ? (["user", "project"] as const) : [input.scope];
+  return requested.filter((scope) => input.memoryScopes === undefined || input.memoryScopes.includes(scope));
 }
 
 export async function listChiliMemoryEntries(input: ChiliMemoryListInput): Promise<ChiliMemoryEntry[]> {
-  const paths = await resolveChiliMemoryPaths(input);
-  const scopes = input.scope === "all" || input.scope === undefined ? (["user", "project"] as const) : [input.scope];
-  const entries: ChiliMemoryEntry[] = [];
+  const scopes = selectedScopes(input);
+  if (scopes.length === 0) return [];
+  return withMemoryRepository(input, (repository, paths) =>
+    scopes.flatMap((scope) => repository.list(memoryScope(paths, scope)).map((entry) => memoryEntry(entry, paths))), scopes);
+}
 
-  for (const scope of scopes) {
-    const path = memoryPathForScope(paths, scope);
-    const current = await readTextIfExists(path);
-    if (!current) continue;
-    for (const entry of parseMemoryEntries(current)) {
-      entries.push({
-        scope,
-        path,
-        index: entry.index,
-        text: entry.text,
-      });
-    }
-  }
+export async function searchChiliMemoryEntries(input: ChiliMemoryListInput): Promise<ChiliMemoryEntry[]> {
+  const scopes = selectedScopes(input);
+  if (scopes.length === 0) return [];
+  return withMemoryRepository(input, (repository, paths) =>
+    scopes.flatMap((scope) => repository.search(memoryScope(paths, scope), input.query, input.maxMemoryEntries ?? 24)
+      .map((entry) => memoryEntry(entry, paths))), scopes);
+}
 
-  return entries;
+export async function getChiliMemoryEntry(input: ChiliMemoryLoadOptions & { scope: ChiliMemoryScope; id: string }): Promise<ChiliMemoryEntry | undefined> {
+  return withMemoryRepository(input, (repository, paths) => {
+    const entry = repository.get(memoryScope(paths, input.scope), input.id);
+    return entry ? memoryEntry(entry, paths) : undefined;
+  }, [input.scope]);
+}
+
+export async function putChiliMemoryEntry(input: ChiliMemoryAddInput & { id: string; expectedRevision: number }): Promise<ChiliMemoryEntry> {
+  return withMemoryRepository(input, (repository, paths) => memoryEntry(repository.put({
+    id: input.id, expectedRevision: input.expectedRevision, scope: memoryScope(paths, input.scope ?? "project"),
+    text: sanitizeMemoryEntry(input.text, input.maxEntryChars), source: input.source ?? "memory-api",
+  }), paths), [input.scope ?? "project"]);
+}
+
+export async function exportChiliMemory(input: ChiliMemoryLoadOptions & { scope: ChiliMemoryScope }): Promise<string> {
+  return withMemoryRepository(input, (repository, paths) => repository.exportMarkdown(memoryScope(paths, input.scope)), [input.scope]);
 }
 
 export async function removeChiliMemoryEntry(input: ChiliMemoryRemoveInput): Promise<ChiliMemoryRemoveResult> {
-  if (!Number.isInteger(input.index) || input.index <= 0) {
-    throw new Error("Memory index must be a positive integer");
-  }
-
-  const paths = await resolveChiliMemoryPaths(input);
   const scope = input.scope ?? "project";
-  const path = memoryPathForScope(paths, scope);
-  const current = await readTextIfExists(path);
-  if (current === undefined) {
-    throw new Error(`No ${scope} memory file exists: ${path}`);
-  }
+  if (!input.id && (!Number.isInteger(input.index) || (input.index ?? 0) <= 0)) throw new Error("Memory removal requires an ID or positive stable ordinal");
+  if (input.id && !Number.isInteger(input.expectedRevision)) throw new Error("Memory removal by ID requires expectedRevision");
+  return withMemoryRepository(input, (repository, paths) => {
+    const address = memoryScope(paths, scope);
+    const current = input.id ? repository.get(address, input.id) : repository.getByOrdinal(address, input.index!);
+    if (!current) throw new Error(`Memory entry not found: ${input.id ?? `#${input.index}`}`);
+    const removed = repository.delete(address, current.id, input.expectedRevision ?? current.revision);
+    return { id: removed.id, revision: removed.revision, scope, path: paths.databasePath, index: removed.ordinal, text: removed.text };
+  }, [scope]);
+}
 
-  const removed = removeMemoryLine(current, input.index);
-  await writeFile(path, removed.content, "utf8");
-
+function memoryEntry(entry: MemoryRecord, paths: ChiliMemoryPaths): ChiliMemoryEntry {
   return {
-    scope,
-    path,
-    index: input.index,
-    text: removed.text,
+    id: entry.id, revision: entry.revision, source: entry.source, updatedAt: entry.updatedAt,
+    scope: entry.scope.kind, path: paths.databasePath, index: entry.ordinal, text: entry.text,
   };
+}
+
+function legacyMemoryEntries(content: string | undefined): string[] {
+  if (!content?.trim()) return [];
+  const entries = parseMemoryEntries(content);
+  if (entries.length === 0) return [content.trim()];
+  const lines = contentLines(content);
+  const removedLines = new Set(entries.map((entry) => entry.lineIndex));
+  const remainder = lines.filter((line, index) => !removedLines.has(index)
+    && line.trim() !== CHILI_MEMORY_SECTION_HEADER && line.trim() !== "# Chili Memory").join("\n").trim();
+  return [...entries.map((entry) => entry.text), ...(remainder ? [remainder] : [])];
 }
 
 export function sanitizeMemoryEntry(input: string, maxChars = DEFAULT_MAX_MEMORY_ENTRY_CHARS): string {
@@ -118,7 +163,7 @@ export function appendMemoryContent(currentContent: string, sanitizedText: strin
 
 export function formatMemoryEntries(entries: readonly ChiliMemoryEntry[]): string {
   if (entries.length === 0) return "No saved Chili memory entries.";
-  return entries.map((entry) => `[${entry.scope} #${entry.index}] ${entry.text}\n${entry.path}`).join("\n\n");
+  return entries.map((entry) => `[${entry.scope} #${entry.index}] ${entry.text}\nID: ${entry.id}; revision: ${entry.revision}\n${entry.path}`).join("\n\n");
 }
 
 function parseMemoryEntries(content: string): ChiliMemoryEntryLine[] {
@@ -138,20 +183,6 @@ function parseMemoryEntries(content: string): ChiliMemoryEntryLine[] {
     });
   }
   return entries;
-}
-
-function removeMemoryLine(content: string, index: number): { content: string; text: string } {
-  const lines = contentLines(content);
-  const entries = parseMemoryEntries(content);
-  const target = entries.find((entry) => entry.index === index);
-  if (!target) throw new Error(`Memory entry not found: #${index}`);
-
-  lines.splice(target.lineIndex, 1);
-  const next = lines.join("\n").replace(/\n{3,}/g, "\n\n");
-  return {
-    content: `${next.replace(/\n*$/, "")}\n`,
-    text: target.text,
-  };
 }
 
 function contentLines(content: string): string[] {

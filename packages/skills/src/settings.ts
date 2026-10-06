@@ -8,6 +8,8 @@ const SKILL_SETTINGS_FILENAME = "skills.json";
 export interface SkillSettingsOptions {
   cwd: string;
   homeDir?: string;
+  chiliHome?: string;
+  projectRoot?: string;
 }
 
 export interface UpdateSkillDisabledOptions extends SkillSettingsOptions {
@@ -45,10 +47,10 @@ export function isSkillDisabled(name: string, disabledSkillNames: readonly strin
 }
 
 function resolveSkillSettingsPaths(options: SkillSettingsOptions): { userPath: string; projectPath: string } {
-  const cwd = path.resolve(options.cwd);
+  const cwd = path.resolve(options.projectRoot ?? options.cwd);
   const home = path.resolve(options.homeDir ?? homedir());
   return {
-    userPath: path.join(home, ".chili", SKILL_SETTINGS_FILENAME),
+    userPath: path.join(options.chiliHome ?? path.join(home, ".chili"), SKILL_SETTINGS_FILENAME),
     projectPath: path.join(cwd, ".chili", SKILL_SETTINGS_FILENAME),
   };
 }

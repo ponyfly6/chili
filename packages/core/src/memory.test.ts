@@ -3,12 +3,17 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { SessionId, TimestampMs, TurnId } from "@chili/protocol";
-import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
+import { SqliteMemoryRepository } from "@chili/store";
+import { InMemoryToolRegistry, PolicyApprovalBroker, ToolExecutor } from "@chili/tools";
 import {
   addChiliMemoryEntry,
   buildChiliMemoryPromptFragments,
   createMemoryTool,
   listChiliMemoryEntries,
+  getChiliMemoryEntry,
+  putChiliMemoryEntry,
+  searchChiliMemoryEntries,
+  exportChiliMemory,
   loadChiliMemoryContext,
   removeChiliMemoryEntry,
   sanitizeMemoryEntry,
@@ -56,7 +61,7 @@ test("memory loader tolerates missing files", async () => {
     });
 
     expect(loaded.documents).toEqual([]);
-    expect(loaded.missingPaths).toHaveLength(4);
+    expect(loaded.missingPaths).toHaveLength(2);
   } finally {
     await fixture.cleanup();
   }
@@ -212,6 +217,7 @@ test(".chili/rules frontmatter is stripped before rule content enters prompt fra
       cwd: fixture.repo,
       homeDir: fixture.home,
       projectRoot: fixture.repo,
+      targetPaths: ["packages/core/src/test.ts"],
     });
     const rule = loaded.documents.find((document) => document.kind === "project_rule");
     expect(rule?.content).toBe("# Core rule\nUse explicit imports.");
@@ -220,6 +226,7 @@ test(".chili/rules frontmatter is stripped before rule content enters prompt fra
       cwd: fixture.repo,
       homeDir: fixture.home,
       projectRoot: fixture.repo,
+      targetPaths: ["packages/core/src/test.ts"],
     });
     const ruleFragment = fragments.find((fragment) => fragment.metadata?.path === rulePath);
     expect(ruleFragment?.content).toContain("# Core rule\nUse explicit imports.");
@@ -256,6 +263,7 @@ test(".chili/rules frontmatter fields appear in debug metadata", async () => {
       cwd: fixture.repo,
       homeDir: fixture.home,
       projectRoot: fixture.repo,
+      targetPaths: ["packages/core/src/test.ts"],
     });
     const assembly = assemblePromptFragments(fragments);
     const ruleManifest = assembly.debug.fragments.find((fragment) => fragment.metadata?.path === rulePath);
@@ -270,7 +278,7 @@ test(".chili/rules frontmatter fields appear in debug metadata", async () => {
           scope: "project",
           truncated: false,
           truncatedAfter: null,
-          ruleType: "unconditional",
+          ruleType: "path_scoped",
           paths: ["packages/core/**", "docs/*.md"],
           alwaysApply: false,
           description: "Applies to core and docs changes",
@@ -411,11 +419,11 @@ test("memory debug manifest includes document path kind scope and truncation met
 
     expect(memoryDocument).toEqual(
       expect.objectContaining({
-        id: "chili.context.user_memory.0",
+        id: expect.stringContaining("chili.context.user_memory.memory_"),
         source: "memory",
         layer: "contextual_user",
         metadata: expect.objectContaining({
-          path: memoryPath,
+          path: join(fixture.home, ".chili", "memory.sqlite"),
           kind: "user_memory",
           scope: "user",
           truncated: true,
@@ -450,7 +458,7 @@ test("memory entry sanitization removes control characters, angle brackets, and 
   );
 });
 
-test("memory add writes sanitized project memory", async () => {
+test("memory add writes sanitized project memory to SQLite", async () => {
   const fixture = await createMemoryFixture();
   try {
     const result = await addChiliMemoryEntry({
@@ -462,15 +470,15 @@ test("memory add writes sanitized project memory", async () => {
 
     expect(result.scope).toBe("project");
     expect(result.text).toBe("use bun test /project_context");
-    expect(await readFile(join(fixture.repo, ".chili", "memory.md"), "utf8")).toContain(
-      "- use bun test /project_context",
-    );
+    const saved = await getChiliMemoryEntry({ cwd: fixture.repo, homeDir: fixture.home, projectRoot: fixture.repo, scope: "project", id: result.id });
+    expect(saved?.text).toBe("use bun test /project_context");
+    expect(saved?.revision).toBe(1);
   } finally {
     await fixture.cleanup();
   }
 });
 
-test("memory list and remove only touch Chili managed section entries", async () => {
+test("memory migrates managed entries and custom Markdown once; mutation leaves the archive unchanged", async () => {
   const fixture = await createMemoryFixture();
   try {
     const memoryPath = join(fixture.repo, ".chili", "memory.md");
@@ -501,7 +509,8 @@ test("memory list and remove only touch Chili managed section entries", async ()
       scope: "project",
     });
 
-    expect(entries.map((entry) => entry.text)).toEqual(["managed one", "managed two"]);
+    expect(entries.slice(0, 2).map((entry) => entry.text)).toEqual(["managed one", "managed two"]);
+    expect(entries[2]?.text).toContain("ordinary notes bullet");
 
     const removed = await removeChiliMemoryEntry({
       cwd: fixture.repo,
@@ -517,7 +526,10 @@ test("memory list and remove only touch Chili managed section entries", async ()
     expect(content).toContain("- ordinary notes bullet");
     expect(content).toContain("- ordinary other bullet");
     expect(content).toContain("- managed one");
-    expect(content).not.toContain("* managed two");
+    expect(content).toContain("* managed two");
+    const saved = await listChiliMemoryEntries({ cwd: fixture.repo, homeDir: fixture.home, projectRoot: fixture.repo, scope: "project" });
+    expect(saved.map((entry) => entry.text)).not.toContain("managed two");
+    expect(saved.map((entry) => entry.index)).toEqual([1, 3]);
   } finally {
     await fixture.cleanup();
   }
@@ -545,7 +557,7 @@ test("memory tool supports add and list", async () => {
     });
 
     expect(add.status).toBe("completed");
-    expect(await readFile(join(fixture.repo, ".chili", "memory.md"), "utf8")).toContain("- prefer small patches bad");
+    expect((await listChiliMemoryEntries({ cwd: fixture.repo, homeDir: fixture.home, projectRoot: fixture.repo }))[0]?.text).toBe("prefer small patches bad");
 
     const list = await executor.execute({
       sessionId: "session_memory_tool" as SessionId,
@@ -586,3 +598,166 @@ function createSequentialId(): (prefix: string) => string {
   let index = 0;
   return (prefix) => `${prefix}_${++index}`;
 }
+
+test("memory profiles are isolated and a stable project identity follows a separate workspace", async () => {
+  const fixture = await createMemoryFixture();
+  const profileA = join(fixture.home, "profile-a");
+  const profileB = join(fixture.home, "profile-b");
+  const workspace = join(fixture.repo, "worktree");
+  await mkdirp(workspace);
+  try {
+    const identity = { cwd: fixture.repo, projectRoot: fixture.repo, projectId: "stable-project", chiliHome: profileA };
+    const added = await addChiliMemoryEntry({ ...identity, text: "remember deployment preference", scope: "project" });
+    await addChiliMemoryEntry({ ...identity, text: "user formatting preference", scope: "user" });
+    const moved = await listChiliMemoryEntries({ ...identity, cwd: workspace });
+    expect(moved).toHaveLength(2);
+    expect(moved.some((entry) => entry.id === added.id)).toBe(true);
+    expect(await listChiliMemoryEntries({ ...identity, chiliHome: profileB })).toEqual([]);
+    const other = await listChiliMemoryEntries({ ...identity, projectId: "other-project" });
+    expect(other.map((entry) => entry.scope)).toEqual(["user"]);
+  } finally { await fixture.cleanup(); }
+});
+
+test("memory context uses relevant entries from the full library and immutable IDs/revisions", async () => {
+  const fixture = await createMemoryFixture();
+  const options = { cwd: fixture.repo, homeDir: fixture.home, projectRoot: fixture.repo };
+  try {
+    for (let index = 0; index < 35; index++) await addChiliMemoryEntry({ ...options, text: `old unrelated ${index}` });
+    const added = await addChiliMemoryEntry({ ...options, text: "Quartz reconnect uses exponential backoff" });
+    const saved = await buildChiliMemoryPromptFragments({ ...options, query: "Quartz reconnect", maxMemoryEntries: 2 });
+    const fragment = saved.find((item) => item.metadata?.memoryId === added.id);
+    expect(fragment?.content).toContain("Quartz reconnect uses exponential backoff");
+    expect(saved.filter((item) => item.metadata?.memoryId)).toHaveLength(1);
+    await putChiliMemoryEntry({ ...options, id: added.id, expectedRevision: 1, text: "Quartz retries now use jitter" });
+    await expect(putChiliMemoryEntry({ ...options, id: added.id, expectedRevision: 1, text: "stale" })).rejects.toThrow("revision conflict");
+    expect(fragment?.metadata?.memoryRevision).toBe(1);
+    expect(fragment?.content).toContain("exponential backoff");
+    expect((await searchChiliMemoryEntries({ ...options, query: "Quartz" }))[0]?.revision).toBe(2);
+    expect(await exportChiliMemory({ ...options, scope: "project" })).toContain("Quartz retries now use jitter");
+  } finally { await fixture.cleanup(); }
+});
+
+test("rules honor target paths, explicit alwaysApply, empty scopes and changed file versions", async () => {
+  const fixture = await createMemoryFixture();
+  const rulesDir = join(fixture.repo, ".chili", "rules");
+  const options = { cwd: fixture.repo, homeDir: fixture.home, projectRoot: fixture.repo };
+  await mkdirp(rulesDir);
+  try {
+    await writeFile(join(rulesDir, "scoped.md"), "---\npaths: [src/**]\n---\nScoped instructions.\n");
+    await writeFile(join(rulesDir, "always.md"), "---\npaths: []\nalwaysApply: true\n---\nAlways instructions.\n");
+    await writeFile(join(rulesDir, "never.md"), "---\npaths: []\nalwaysApply: false\n---\nNever instructions.\n");
+    const unknown = await loadChiliMemoryContext(options);
+    expect(unknown.documents.map((item) => item.content)).toEqual(["Always instructions."]);
+    expect(unknown.omittedDocuments).toHaveLength(2);
+    const matched = await loadChiliMemoryContext({ ...options, targetPaths: ["./src/a.ts", "../outside"] });
+    expect(matched.documents.map((item) => item.content)).toEqual(["Always instructions.", "Scoped instructions."]);
+    const version = matched.documents[1]?.contentVersion;
+    await writeFile(join(rulesDir, "scoped.md"), "---\npaths: [src/**]\n---\nUpdated instructions.\n");
+    const changed = await loadChiliMemoryContext({ ...options, targetPaths: [join(fixture.repo, "src", "a.ts")] });
+    expect(changed.documents[1]?.contentVersion).not.toBe(version);
+    expect(matched.documents[1]?.content).toBe("Scoped instructions.");
+  } finally { await fixture.cleanup(); }
+});
+
+test("imported Memory no longer depends on the old Markdown being readable", async () => {
+  const fixture = await createMemoryFixture();
+  const options = { cwd: fixture.repo, homeDir: fixture.home, projectRoot: fixture.repo };
+  const legacy = join(fixture.repo, ".chili", "memory.md");
+  try {
+    await writeFile(legacy, "Quartz archived fact\n");
+    expect((await loadChiliMemoryContext(options)).documents[0]?.content).toBe("Quartz archived fact");
+    await rm(legacy);
+    // Reading a directory as UTF-8 would fail; no Memory operation should reread it.
+    await mkdir(legacy);
+    expect((await loadChiliMemoryContext(options)).documents[0]?.content).toBe("Quartz archived fact");
+    expect((await listChiliMemoryEntries(options))[0]?.text).toBe("Quartz archived fact");
+  } finally { await fixture.cleanup(); }
+});
+
+test("dynamic Memory binds approval and execution to one prepared project and ignores forged bindings", async () => {
+  const fixture = await createMemoryFixture();
+  const chiliHome = join(fixture.home, "profile");
+  let projectId = "project-before-approval";
+  let resolutions = 0;
+  const patterns: string[][] = [];
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register(createMemoryTool({ chiliHome, optionsForCwd: async (cwd) => {
+      resolutions += 1;
+      expect(cwd).toBe(fixture.repo);
+      return { chiliHome, projectRoot: fixture.repo, projectId };
+    } }));
+    const executor = new ToolExecutor({
+      registry, events: { publish: async () => undefined }, createId: createSequentialId(), now: () => 1 as TimestampMs,
+      approvals: { decide: async (request) => {
+        patterns.push(request.patterns);
+        projectId = "different-project-after-approval";
+        return { action: "allow_once" };
+      } },
+    });
+    const result = await executor.execute({
+      sessionId: "session_dynamic_memory" as SessionId, turnId: "turn_dynamic_memory" as TurnId,
+      toolName: "memory", cwd: fixture.repo,
+      input: { operation: "add", text: "Prepared resource fact", scope: "project", memoryBinding: {
+        cwd: fixture.repo, chiliHome, projectRoot: fixture.repo, projectId: "forged-project",
+      } },
+    });
+    expect(result.status).toBe("completed");
+    expect(resolutions).toBe(1);
+    expect(patterns).toEqual([[`profile:${chiliHome}/project:project-before-approval`]]);
+    expect((await listChiliMemoryEntries({ cwd: fixture.repo, chiliHome, projectRoot: fixture.repo, projectId: "project-before-approval" })).map((entry) => entry.text)).toEqual(["Prepared resource fact"]);
+    expect(await listChiliMemoryEntries({ cwd: fixture.repo, chiliHome, projectRoot: fixture.repo, projectId: "different-project-after-approval" })).toEqual([]);
+    expect(await listChiliMemoryEntries({ cwd: fixture.repo, chiliHome, projectRoot: fixture.repo, projectId: "forged-project" })).toEqual([]);
+  } finally { await fixture.cleanup(); }
+});
+
+test("Memory rechecks real policy after waiting on migration preparation before committing effects", async () => {
+  const fixture = await createMemoryFixture();
+  const chiliHome = join(fixture.home, "profile");
+  let release!: () => void;
+  let reached!: () => void;
+  const paused = new Promise<void>((resolve) => { reached = resolve; });
+  const resumed = new Promise<void>((resolve) => { release = resolve; });
+  const broker = new PolicyApprovalBroker({ rulesets: [[{ permission: "memory.write", pattern: "*", action: "allow", source: "test-policy" }]] });
+  let pending: ReturnType<ToolExecutor["execute"]> | undefined;
+  try {
+    await writeFile(join(fixture.repo, ".chili", "memory.md"), "Uncommitted legacy fact\n");
+    const memory = createMemoryTool({ chiliHome, projectRoot: fixture.repo, projectId: "controlled-project" });
+    const registry = new InMemoryToolRegistry();
+    let finalChecks = 0;
+    registry.register({ ...memory, execute: (input, context) => memory.execute(input, {
+      ...context,
+      assertCurrentAuthorization: async () => {
+        finalChecks += 1;
+        if (finalChecks === 2) { reached(); await resumed; }
+        await context.assertCurrentAuthorization?.();
+      },
+    }) });
+    const executor = new ToolExecutor({ registry, approvals: broker, events: { publish: async () => undefined },
+      policyResolver: { resolve: () => ({ allowedTools: ["memory"], writeScope: [], executeScope: [] }) },
+    });
+    pending = executor.execute({ sessionId: "session_memory_revoke" as SessionId, turnId: "turn_memory_revoke" as TurnId,
+      toolName: "memory", cwd: fixture.repo,
+      input: { operation: "add", scope: "project", text: "Never committed fact", assertCurrentAuthorization: "forged skip" },
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([paused, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Memory never reached the final migration authorization boundary")), 2000); })]);
+    } finally { if (timer) clearTimeout(timer); }
+    broker.setRulesets([[{ permission: "memory.write", pattern: "*", action: "deny", source: "revoked-policy" }]]);
+    release();
+    const outcome = await pending;
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") expect(outcome.error.message).toContain("denied");
+    const repository = new SqliteMemoryRepository(join(chiliHome, "memory.sqlite"));
+    try {
+      expect(repository.list({ kind: "project", id: "controlled-project" })).toEqual([]);
+      expect(repository.hasLegacyImport({ kind: "project", id: "controlled-project" })).toBe(false);
+    } finally { repository.close(); }
+    expect(finalChecks).toBe(2);
+  } finally {
+    release();
+    await pending;
+    await fixture.cleanup();
+  }
+});

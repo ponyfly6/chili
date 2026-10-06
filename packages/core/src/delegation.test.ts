@@ -9,7 +9,7 @@ import {
 
 const sessionId = "session_delegation" as SessionId;
 
-test("delegation selector defaults to explicit and preserves the legacy ultra fallback", () => {
+test("delegation selector defaults to explicit regardless of reasoning effort", () => {
   expect(resolveDelegationConfig({ sessionId })).toEqual({
     sessionId,
     policy: "explicit",
@@ -17,8 +17,8 @@ test("delegation selector defaults to explicit and preserves the legacy ultra fa
   });
   expect(resolveDelegationConfig({ sessionId, reasoningLevel: "ultra" })).toEqual({
     sessionId,
-    policy: "proactive",
-    source: "reasoning_legacy",
+    policy: "explicit",
+    source: "default",
   });
 });
 

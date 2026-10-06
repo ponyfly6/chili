@@ -1,11 +1,13 @@
 import type { ChiliEvent, EventEnvelope, SessionId, SnapshotId, TimestampMs } from "@chili/protocol";
 import { boundPersistedJsonValue, normalizePersistedError, timestampNow } from "@chili/protocol";
-import type { EventStore, SessionRow } from "@chili/store";
+import type { EventAppendOptions, EventStore, SessionRow } from "@chili/store";
 import type { SnapshotProvider, SnapshotRevertResult } from "@chili/tools";
+import { RuntimeService, type SessionOperationCoordinator, type RuntimeSessionOperation } from "./runtime-service.js";
 
 export interface SnapshotRecoveryServiceOptions {
   store: EventStore;
   snapshotProvider: SnapshotProvider;
+  sessionOperations?: SessionOperationCoordinator;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
 }
@@ -22,9 +24,27 @@ export const SNAPSHOT_REVERT_EVENT_LIMITS = {
 } as const;
 
 export class SnapshotRecoveryService {
-  constructor(private readonly options: SnapshotRecoveryServiceOptions) {}
+  private readonly sessionOperations: SessionOperationCoordinator;
+
+  constructor(private readonly options: SnapshotRecoveryServiceOptions) {
+    // Standalone callers retain the same durable run claim as normal prompts.
+    // Host injects its service so cancellation and shutdown share local ownership.
+    this.sessionOperations = options.sessionOperations ?? new RuntimeService({
+      store: options.store,
+      cwd: ".",
+      runtime: {
+        async createSession() { throw new Error("Recovery cannot create sessions"); },
+        async appendUserMessage() { throw new Error("Recovery cannot append messages"); },
+        async runTurn() { throw new Error("Recovery cannot run model turns"); },
+      },
+    });
+  }
 
   async revert(input: RevertSnapshotInput): Promise<SnapshotRevertResult> {
+    return this.sessionOperations.withSessionOperation(input.sessionId, (operation) => this.revertOwned(input, operation));
+  }
+
+  private async revertOwned(input: RevertSnapshotInput, operation: RuntimeSessionOperation): Promise<SnapshotRevertResult> {
     await this.requireRecoverableSession(input.sessionId);
     if (!(await this.snapshotBelongsToSession(input))) {
       throw new Error(`Snapshot not found for session ${input.sessionId}: ${input.snapshotId}`);
@@ -34,22 +54,28 @@ export class SnapshotRecoveryService {
     // archive or ownership change during that lookup fails closed.
     const session = await this.requireRecoverableSession(input.sessionId);
 
+    const appendOptions: EventAppendOptions | undefined = operation.runClaim ? { runClaim: operation.runClaim } : undefined;
     try {
-      const result = await this.options.snapshotProvider.revert(input.snapshotId, { cwd: session.cwd });
+      operation.assertCurrent();
+      if (operation.signal.aborted) throw operation.signal.reason ?? new Error("Snapshot recovery cancelled");
+      const result = await this.options.snapshotProvider.revert(input.snapshotId, { cwd: session.cwd, signal: operation.signal });
+      operation.assertCurrent();
+      if (operation.signal.aborted) throw operation.signal.reason ?? new Error("Snapshot recovery cancelled");
       await this.append(input, "snapshot.reverted", {
         snapshotId: input.snapshotId,
         status: "completed",
         paths: boundedSnapshotPaths(result.paths),
-      });
+      }, appendOptions);
       return result;
     } catch (error) {
+      operation.assertCurrent();
       const err = normalizePersistedError(error);
       await this.append(input, "snapshot.reverted", {
         snapshotId: input.snapshotId,
         status: "failed",
         paths: [],
         error: err.message,
-      });
+      }, appendOptions);
       throw err;
     }
   }
@@ -93,6 +119,7 @@ export class SnapshotRecoveryService {
     input: RevertSnapshotInput,
     type: TType,
     payload: TPayload,
+    options?: EventAppendOptions,
   ): Promise<void> {
     const event: EventEnvelope<TType, TPayload> = {
       id: this.id("event"),
@@ -101,7 +128,7 @@ export class SnapshotRecoveryService {
       sessionId: input.sessionId,
       payload,
     };
-    await this.options.store.append(event as ChiliEvent);
+    await this.options.store.append(event as ChiliEvent, options);
   }
 
   private id<T extends string>(prefix: string): T {

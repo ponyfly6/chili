@@ -37,16 +37,11 @@ import type {
   TaskCompletionPolicy,
   TaskToolInput,
 } from "@chili/tools";
-import {
-  PromptAssembler,
-  type PromptAssembly,
-  type PromptFragment,
-} from "./prompt/index.js";
-import type { AgentRunner, PromptExecutionScope, RunTurnInput } from "./runner.js";
-import type { RuntimePromptFragmentsProvider } from "./runtime-service.js";
+import type { PromptFragment } from "./prompt/index.js";
+import type { AgentRunner, RunTurnInput } from "./runner.js";
+import { RuntimeService, type RuntimePromptFragmentsProvider } from "./runtime-service.js";
 import {
   assessSubagentCompletion,
-  subagentCompletionRepairPrompt,
   type SubagentCompletionAssessment,
 } from "./subagent-completion.js";
 import {
@@ -61,8 +56,6 @@ import {
   type WorkerToolPolicyTemplate,
 } from "./worker-policy.js";
 
-const FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM =
-  "The automatic tool-use continuation limit has been reached. Do not call tools. Use the information already available in the conversation to give the best final answer now, and briefly state anything that remains uncertain.";
 const AGENT_EVENT_TEXT_JSON_BYTES = 64 * 1024;
 const AGENT_EVENT_METADATA_JSON_BYTES = 256 * 1024;
 
@@ -212,6 +205,8 @@ interface LocalSubagentTaskLease {
 
 export interface AgentRunnerSubagentRunnerOptions {
   runner: AgentRunner;
+  /** Shared child service used for first run, follow-ups and mailbox turns. */
+  runtime?: Pick<RuntimeService, "createSession" | "submitPrompt">;
   store: EventStore;
   maxTurns?: number;
   promptFragments?: RuntimePromptFragmentsProvider;
@@ -1315,165 +1310,50 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
 
   async run(input: LocalSubagentRunInput): Promise<LocalSubagentRunResult> {
     throwIfRunAborted(input);
-    await this.options.runner.createSession({
-      sessionId: input.childSessionId,
+    const runtime = this.options.runtime ?? new RuntimeService({
+      runtime: this.options.runner,
+      store: this.options.store,
       cwd: input.cwd,
+      allowSubagentSessions: true,
+      ...(this.options.maxTurns !== undefined ? { maxTurns: this.options.maxTurns } : {}),
+      promptFragments: async (context) => [
+        ...(await this.options.promptFragments?.(context) ?? []),
+        ...subagentRunPromptFragments(input),
+      ],
     });
+    if (!(await this.options.store.sessions()).some((session) => session.id === input.childSessionId)) {
+      await runtime.createSession({ sessionId: input.childSessionId, cwd: input.cwd });
+    }
     throwIfRunAborted(input);
-    await this.options.runner.appendUserMessage({
+    const resolved = await this.options.modelConfig?.({ sessionId: input.childSessionId, cwd: input.cwd });
+    throwIfRunAborted(input);
+    const result = await runtime.submitPrompt({
       sessionId: input.childSessionId,
       text: input.prompt,
+      cwd: input.cwd,
+      ...(this.options.maxTurns !== undefined ? { maxTurns: this.options.maxTurns } : {}),
+      ...(input.signal ? { signal: input.signal } : {}),
+      ...(resolved?.modelSelection ? { modelSelection: { ...resolved.modelSelection } } : {}),
+      ...(resolved?.reasoningLevel !== undefined ? { reasoningLevel: resolved.reasoningLevel } : {}),
+      ...(resolved?.serviceTier !== undefined ? { serviceTier: resolved.serviceTier } : {}),
     });
     throwIfRunAborted(input);
-
-    const resolvedModelConfig = await this.options.modelConfig?.({
-      sessionId: input.childSessionId,
-      cwd: input.cwd,
-    });
-    throwIfRunAborted(input);
-    const modelConfig = {
-      ...(resolvedModelConfig?.modelSelection
-        ? { modelSelection: { ...resolvedModelConfig.modelSelection } }
-        : {}),
-      ...(resolvedModelConfig?.reasoningLevel !== undefined
-        ? { reasoningLevel: resolvedModelConfig.reasoningLevel }
-        : {}),
-      ...(resolvedModelConfig?.serviceTier !== undefined
-        ? { serviceTier: resolvedModelConfig.serviceTier }
-        : {}),
-    };
-    const promptExecution: PromptExecutionScope = { sessionId: input.childSessionId };
-    const maxTurns = this.options.maxTurns ?? 128;
-    const prompt = await this.resolvePromptAssembly(input);
-    throwIfRunAborted(input);
-    let repairAttempted = false;
-    let extraRepairTurn = false;
-    for (let index = 0; index < maxTurns || extraRepairTurn; index++) {
-      extraRepairTurn = false;
-      const runInput = runTurnInputFromPrompt(input, prompt);
-      Object.assign(runInput, modelConfig, { promptExecution });
-      if (input.signal) runInput.signal = input.signal;
-      throwIfRunAborted(input);
-      const result = await this.options.runner.runTurn(runInput);
-      throwIfRunAborted(input);
-
-      if (result.status !== "completed") {
-        return result.error === undefined
-          ? { status: result.status }
-          : { status: result.status, error: normalizePersistedError(result.error) };
-      }
-
-      if (!isToolUseFinishReason(result.finishReason)) {
-        const assessment = await this.assessLatestCompletion(input.childSessionId);
-        throwIfRunAborted(input);
-        if (assessment.status === "completed") {
-          return { status: "completed", summary: boundedPersistedText(assessment.summary, "subagent summary") };
-        }
-        if (repairAttempted) return incompleteRunResult(assessment);
-
-        repairAttempted = true;
-        await this.options.runner.appendUserMessage({
-          sessionId: input.childSessionId,
-          text: subagentCompletionRepairPrompt(assessment),
-        });
-        throwIfRunAborted(input);
-        if (index + 1 >= maxTurns) extraRepairTurn = true;
-      }
+    if (result.status === "failed" || result.status === "cancelled") {
+      return { status: result.status, ...(result.error ? { error: normalizePersistedError(result.error) } : {}) };
     }
-
-    throwIfRunAborted(input);
-    const finalPrompt = this.withFinalResponsePrompt(prompt);
-    const finalInput: RunTurnInput = {
-      sessionId: input.childSessionId,
-      cwd: input.cwd,
-      system: finalPrompt.system,
-      toolMode: "disabled",
-      ...modelConfig,
-      promptExecution,
-    };
-    if (finalPrompt.developer.length > 0) finalInput.developer = finalPrompt.developer;
-    if (finalPrompt.contextualUser.length > 0) finalInput.contextualUser = finalPrompt.contextualUser;
-    finalInput.promptDebug = finalPrompt.debug;
-    if (input.signal) finalInput.signal = input.signal;
-    throwIfRunAborted(input);
-    const finalResult = await this.options.runner.runTurn(finalInput);
-    throwIfRunAborted(input);
-    if (finalResult.status !== "completed") {
-      return finalResult.error === undefined
-        ? { status: finalResult.status }
-        : { status: finalResult.status, error: normalizePersistedError(finalResult.error) };
+    const messages = await this.options.store.messages(input.childSessionId);
+    const lastTurn = result.turns.at(-1);
+    const message = lastTurn?.assistantMessageId
+      ? messages.find((candidate) => candidate.id === lastTurn.assistantMessageId)
+      : undefined;
+    const text = message?.parts.flatMap((part) => part.type === "text" && part.phase !== "commentary" ? [part.text] : []).join("");
+    const assessment = assessSubagentCompletion(text);
+    if (assessment.status === "incomplete") return incompleteRunResult(assessment);
+    if (result.status === "max_turns") {
+      return { status: "incomplete", summary: assessment.summary, error: new Error(`Subagent did not finish: ${result.finishReason ?? "max_turns"}`) };
     }
-    if (!isToolUseFinishReason(finalResult.finishReason)) {
-      const assessment = await this.assessLatestCompletion(input.childSessionId);
-      throwIfRunAborted(input);
-      return assessment.status === "completed"
-        ? { status: "completed", summary: boundedPersistedText(assessment.summary, "subagent summary") }
-        : incompleteRunResult(assessment);
-    }
-
-    return {
-      status: "incomplete",
-      error: new Error(`Subagent max-turn final response attempted tool use: ${maxTurns}`),
-    };
+    return { status: "completed", summary: boundedPersistedText(assessment.summary, "subagent summary") };
   }
-
-  private async resolvePromptAssembly(input: LocalSubagentRunInput): Promise<PromptAssembly> {
-    throwIfRunAborted(input);
-    const fragments = await this.options.promptFragments?.({
-      sessionId: input.childSessionId,
-      cwd: input.cwd,
-    });
-    throwIfRunAborted(input);
-    return new PromptAssembler()
-      .addMany(fragments)
-      .addMany(subagentRunPromptFragments(input))
-      .assemble();
-  }
-
-  private withFinalResponsePrompt(prompt: PromptAssembly): PromptAssembly {
-    return new PromptAssembler()
-      .addMany(prompt.fragments)
-      .add({
-        id: "subagent.final_response_after_max_turns",
-        layer: "base",
-        source: "runtime",
-        priority: Number.MAX_SAFE_INTEGER,
-        lifecycle: "turn",
-        trust: "system",
-        content: FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM,
-      })
-      .assemble();
-  }
-
-  private async latestAssistantText(sessionId: SessionId): Promise<string | undefined> {
-    const messages = await this.options.store.messages(sessionId);
-    for (let index = messages.length - 1; index >= 0; index--) {
-      const message = messages[index];
-      if (message?.role !== "assistant") continue;
-      const text = message.parts
-        .filter((part): part is Extract<(typeof message.parts)[number], { type: "text" }> => part.type === "text")
-        .map((part) => part.text)
-        .join("");
-      if (text.trim().length > 0) return text;
-    }
-    return undefined;
-  }
-
-  private async assessLatestCompletion(sessionId: SessionId): Promise<SubagentCompletionAssessment> {
-    return assessSubagentCompletion(await this.latestAssistantText(sessionId));
-  }
-}
-
-function runTurnInputFromPrompt(input: LocalSubagentRunInput, prompt: PromptAssembly): RunTurnInput {
-  const runInput: RunTurnInput = {
-    sessionId: input.childSessionId,
-    cwd: input.cwd,
-    system: prompt.system,
-    promptDebug: prompt.debug,
-  };
-  if (prompt.developer.length > 0) runInput.developer = prompt.developer;
-  if (prompt.contextualUser.length > 0) runInput.contextualUser = prompt.contextualUser;
-  return runInput;
 }
 
 function validateReservedTaskIdentity(input: LocalSubagentTaskInput): void {
@@ -1682,9 +1562,7 @@ function isAbortError(error: Error): boolean {
   return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
 }
 
-function isToolUseFinishReason(reason: string | undefined): boolean {
-  return reason === "tool_use" || reason === "tool_calls" || reason === "function_call";
-}
+
 
 function boundedLocalSubagentTaskInput(input: LocalSubagentTaskInput): LocalSubagentTaskInput {
   const bounded: LocalSubagentTaskInput = {

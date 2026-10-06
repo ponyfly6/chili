@@ -2,6 +2,8 @@ import type { ReadingPreferences } from "./reading-preferences.js";
 import type { DesktopTheme } from "./appearance.js";
 import {
   normalizeSessionTitle,
+  parseChiliEvent,
+  parseRuntimeExecutionIdentity,
   parseRuntimeInputQueue,
   type RuntimeInputQueue,
   parseRuntimeDelegationConfig as parseProtocolDelegationConfig,
@@ -908,6 +910,9 @@ function parseRuntimeEvent(value: unknown): ChiliEvent {
   const payload = requireRecord(event.payload, "event.payload");
   if (event.sessionId !== undefined) requireIdentifier(event.sessionId, "event.sessionId");
   assertJsonValue(payload, "event.payload", 0);
+  if (type === "model.request_prepared" || type === "model.request_identity" || type === "session.identity_bound") {
+    return parseChiliEvent(value);
+  }
   assertRuntimePayloadSchema(type, payload);
   assertRuntimePayloadIdentifiers(type, payload);
   if (type === "message.part_added") {
@@ -1257,6 +1262,7 @@ function assertRuntimePayloadSchema(type: string, payload: Record<string, unknow
   if (type === "session.created") {
     requirePayloadString(payload.sessionId, "event.payload.sessionId");
     requirePayloadString(payload.cwd, "event.payload.cwd", true);
+    if (payload.identity !== undefined) parseRuntimeExecutionIdentity(payload.identity, "event.payload.identity");
     return;
   }
   if (type === "session.renamed") {
@@ -1978,6 +1984,7 @@ function requireOwnField(record: Record<string, unknown>, key: string, field: st
 
 const RUNTIME_EVENT_ID_FIELDS: Readonly<Record<string, readonly string[]>> = {
   "session.created": ["sessionId"],
+  "session.identity_bound": ["sessionId"],
   "session.input_queue_changed": ["sessionId"],
   "session.renamed": ["sessionId"],
   "session.status_changed": ["sessionId", "turnId"],
@@ -1987,6 +1994,8 @@ const RUNTIME_EVENT_ID_FIELDS: Readonly<Record<string, readonly string[]>> = {
   "session.delegation_changed": ["sessionId"],
   "session.archived": ["sessionId"],
   "turn.started": ["turnId"],
+  "model.request_prepared": ["turnId", "requestId", "contentVersion"],
+  "model.request_identity": ["turnId", "requestId"],
   "turn.model_metadata": ["turnId", "responseId"],
   "turn.completed": ["turnId"],
   "turn.compaction_requested": ["turnId", "boundaryMessageId"],

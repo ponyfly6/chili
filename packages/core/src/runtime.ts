@@ -7,6 +7,7 @@ import type {
   ModelSelection,
   ModelUsage as ProtocolModelUsage,
   PersistedModelOutput,
+  PreparedModelIdentity,
   ReasoningLevel,
   RuntimeModelDescriptor,
   ServiceTier,
@@ -63,6 +64,8 @@ export interface ModelRequestLimits {
   requestMaxOutputTokens?: number;
 }
 
+export type ModelRequestIdentity = PreparedModelIdentity;
+
 export interface ModelStreamInput {
   sessionId: SessionId;
   turnId: TurnId;
@@ -72,6 +75,9 @@ export interface ModelStreamInput {
   developer?: string[];
   contextualUser?: string[];
   promptDebug?: PromptDebugManifest;
+  onRequestIdentity?: (identity: ModelRequestIdentity) => Promise<void>;
+  /** Total provider request deadline, including credentials and concurrency wait. */
+  requestTimeoutMs?: number;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
   serviceTier?: ServiceTier;

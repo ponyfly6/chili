@@ -125,7 +125,15 @@ class RecordingChildRunner implements AgentRunner {
 
   async createSession(input: CreateSessionInput): Promise<SessionId> {
     this.createInputs.push(input);
-    return input.sessionId ?? ("session_child" as SessionId);
+    const sessionId = input.sessionId ?? ("session_child" as SessionId);
+    await this.store.append({
+      id: `event_child_session_${this.createInputs.length}`,
+      type: "session.created",
+      time: 0 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: input.cwd },
+    });
+    return sessionId;
   }
 
   async appendUserMessage(input: AppendUserMessageInput): Promise<MessageId> {
@@ -174,9 +182,14 @@ class MessagesBarrierStore extends SqliteEventStore {
   readonly allowMessages = deferred<void>();
 
   override async messages(sessionId: SessionId): Promise<Message[]> {
-    this.messagesEntered.resolve();
-    await this.allowMessages.promise;
-    return super.messages(sessionId);
+    const messages = await super.messages(sessionId);
+    // Context preparation can read history before the first model turn. The
+    // cancellation fence under test is the later completion assessment read.
+    if (messages.some((message) => message.role === "assistant")) {
+      this.messagesEntered.resolve();
+      await this.allowMessages.promise;
+    }
+    return messages;
   }
 }
 

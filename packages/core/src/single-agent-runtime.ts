@@ -2,11 +2,13 @@ import type {
   AssistantMessagePhase,
   ChiliEvent,
   EventEnvelope,
+  ExecutionIdentity,
   Message,
   MessageId,
   MessagePart,
   ModelSelection,
   ModelUsage,
+  PreparedModelRequest,
   RuntimeModelDescriptor,
   ReasoningLevel,
   ServiceTier,
@@ -26,8 +28,8 @@ import {
   timestampNow,
 } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
-import type { ChiliToolDefinition, ToolAccessPolicy, ToolAccessPolicyResolver, ToolRegistry } from "@chili/tools";
-import { ToolExecutor, filterToolsByPolicy } from "@chili/tools";
+import type { ChiliToolDefinition, ExecuteToolInput, PreparedToolCall, ToolAccessPolicy, ToolAccessPolicyResolver, ToolRegistry } from "@chili/tools";
+import { ToolExecutor, ToolValidationError, UnknownToolError, filterToolsByPolicy } from "@chili/tools";
 import {
   ContextCompactionService,
   ContextWindowExceededError,
@@ -38,6 +40,7 @@ import {
   type ContextCompactionResult,
   type ContextRequestSurface,
   type ContextUsage,
+  prepareModelRequest,
 } from "./context/index.js";
 import { messagesForContext } from "./cancelled-turn-context.js";
 import { DoomLoopError, DoomLoopGuard, type DoomLoopGuardOptions } from "./doom-loop-guard.js";
@@ -78,13 +81,16 @@ interface EventContext {
 
 interface PendingToolCall {
   callId: ToolCallId;
+  providerCallId?: string;
   toolName: string;
   input: unknown;
   inputParseError?: string;
+  prepared?: PreparedToolCall;
 }
 
 interface StreamingToolCall {
   callId: ToolCallId;
+  providerCallId?: string;
   toolName: string;
   input: unknown;
 }
@@ -157,7 +163,7 @@ export class SingleAgentRuntime implements AgentRunner {
     await this.append(
       { sessionId },
       "session.created",
-      { sessionId, cwd: input.cwd },
+      { sessionId, cwd: input.cwd, ...(input.identity ? { identity: input.identity } : {}) },
     );
     return sessionId;
   }
@@ -267,6 +273,7 @@ export class SingleAgentRuntime implements AgentRunner {
       const guard = this.guardForTurn(input);
 
       const visibleTools = await this.visibleTools(input, turnId);
+      const advertisedCatalogRevision = this.options.toolRegistry.getRevision?.();
       const requestLimits = await this.options.model.resolveRequestLimits?.({
         ...(input.modelSelection ? { modelSelection: input.modelSelection } : {}),
         ...(input.reasoningLevel !== undefined ? { reasoningLevel: input.reasoningLevel } : {}),
@@ -330,9 +337,10 @@ export class SingleAgentRuntime implements AgentRunner {
       if (input.serviceTier !== undefined) modelInput.serviceTier = input.serviceTier;
       if (input.signal) modelInput.signal = input.signal;
 
+      let request = await this.prepareRequest(modelInput, contextSurface, contextUsage, "turn", advertisedCatalogRevision);
       let streamResult: AssistantStreamResult;
       try {
-        streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
+        streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard, request);
       } catch (error) {
         const err = toError(error);
         if (!this.canRecoverWithCompaction(err)) throw err;
@@ -368,7 +376,8 @@ export class SingleAgentRuntime implements AgentRunner {
             ? { contextualUser: recoveredContext.surface.contextualUser }
             : {}),
         };
-        streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
+        request = await this.prepareRequest(modelInput, contextSurface, contextUsage, "turn", advertisedCatalogRevision);
+        streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard, request);
       }
       turnUsage = addModelUsage(turnUsage, streamResult.usage);
       for (const toolCall of streamResult.toolCalls) pendingToolCalls.add(toolCall);
@@ -379,6 +388,7 @@ export class SingleAgentRuntime implements AgentRunner {
         assistantMessageId,
         streamResult.toolCalls,
         pendingToolCalls,
+        request.toolCatalogRevision,
         new Set(
           visibleTools
             .map((tool) => tool.name)
@@ -486,16 +496,43 @@ export class SingleAgentRuntime implements AgentRunner {
     return tools.filter((tool) => !isExternalImageUnderstandingTool(tool));
   }
 
+  private async prepareRequest(
+    modelInput: ModelStreamInput,
+    sourceSurface: ContextRequestSurface,
+    usage?: ContextUsage,
+    purpose: "turn" | "compaction" = "turn",
+    advertisedCatalogRevision?: number,
+  ): Promise<PreparedModelRequest> {
+    const sourceMessages = await messagesForContext(this.options.store, modelInput.sessionId);
+    const lastEvent = (await this.options.store.events({ sessionId: modelInput.sessionId, tail: true, limit: 1, compactRequests: true }))[0];
+    const revision = advertisedCatalogRevision ?? this.options.toolRegistry.getRevision?.();
+    const identityEvents = await Promise.all([
+      this.options.store.events({ sessionId: modelInput.sessionId, type: "session.identity_bound", tail: true, limit: 1 }),
+      this.options.store.events({ sessionId: modelInput.sessionId, type: "session.created", tail: true, limit: 1 }),
+    ]);
+    const identityEvent = identityEvents[0][0] ?? identityEvents[1][0];
+    const identity = (identityEvent?.payload as { identity?: ExecutionIdentity } | undefined)?.identity;
+    return prepareModelRequest({
+      modelInput, sourceMessages, sourceSurface, purpose,
+      ...(identity ? { executionIdentity: identity } : {}),
+      ...(usage ? { usage } : {}),
+      ...(lastEvent ? { sourceEventId: lastEvent.id } : {}),
+      ...(revision !== undefined ? { toolCatalogRevision: revision } : {}),
+    });
+  }
+
   private async consumeModelStream(
     input: RunTurnInput,
     turnId: TurnId,
     assistantMessageId: MessageId,
     modelInput: ModelStreamInput,
     guard: DoomLoopGuard,
+    request: PreparedModelRequest,
   ): Promise<AssistantStreamResult> {
     const retryPolicy = normalizeRetryPolicy(this.options.retryPolicy);
     let attempt = 1;
     let previousAttemptUsage: ModelUsage | undefined;
+    const requestId = this.id("request");
 
     while (true) {
       let assistantMutated = false;
@@ -507,7 +544,16 @@ export class SingleAgentRuntime implements AgentRunner {
         streamingToolCalls: new Map(),
       };
       try {
-        for await (const event of this.options.model.stream(modelInput)) {
+        throwIfTurnAborted(input.signal);
+        await this.append(input, "model.request_prepared", { turnId, requestId, attempt, contentVersion: request.contentVersion, request });
+        const executionInput: ModelStreamInput = {
+          ...modelInput,
+          onRequestIdentity: async (identity) => {
+            throwIfTurnAborted(input.signal);
+            await this.append(input, "model.request_identity", { turnId, requestId, attempt, identity });
+          },
+        };
+        for await (const event of this.options.model.stream(executionInput)) {
           if (input.signal?.aborted) throw abortError("Turn aborted");
           if (event.type === "text_delta") {
             assistantMutated = true;
@@ -547,8 +593,12 @@ export class SingleAgentRuntime implements AgentRunner {
 
           if (event.type === "tool_call_start") {
             assistantMutated = true;
+            if (state.streamingToolCalls.has(toolCallKey(event.toolCallId, event.index))) {
+              throw incompleteModelStreamError("Model reused a live tool call stream identifier before completing it");
+            }
             const toolCall: StreamingToolCall = {
-              callId: normalizeToolCallId(event.toolCallId, event.index),
+              callId: this.id<ToolCallId>("toolcall"),
+              providerCallId: normalizeToolCallId(event.toolCallId, event.index),
               toolName: event.name,
               input: {},
             };
@@ -563,7 +613,8 @@ export class SingleAgentRuntime implements AgentRunner {
             if (!toolCall && event.name) {
               assistantMutated = true;
               toolCall = {
-                callId: normalizeToolCallId(event.toolCallId, event.index),
+                callId: this.id<ToolCallId>("toolcall"),
+                providerCallId: normalizeToolCallId(event.toolCallId, event.index),
                 toolName: event.name,
                 input: {},
               };
@@ -585,7 +636,8 @@ export class SingleAgentRuntime implements AgentRunner {
             const existing = state.streamingToolCalls.get(key);
             state.streamingToolCalls.delete(key);
             const toolCall = {
-              callId: existing?.callId ?? normalizeToolCallId(event.toolCallId, event.index),
+              callId: existing?.callId ?? this.id<ToolCallId>("toolcall"),
+              providerCallId: existing?.providerCallId ?? normalizeToolCallId(event.toolCallId, event.index),
               toolName: event.name || existing?.toolName || "",
               input: event.input,
               ...(event.inputParseError ? { inputParseError: event.inputParseError } : {}),
@@ -723,6 +775,7 @@ export class SingleAgentRuntime implements AgentRunner {
       turnId: TurnId;
       messages: readonly Message[];
       boundary: CompactionBoundary;
+      onPreparedRequest?: (request: ModelStreamInput) => Promise<void>;
       instructions?: string;
       modelSelection?: ModelSelection;
       reasoningLevel?: ReasoningLevel;
@@ -733,6 +786,20 @@ export class SingleAgentRuntime implements AgentRunner {
       turnId,
       messages,
       boundary,
+      onPreparedRequest: async (modelInput) => {
+        const request = await this.prepareRequest(modelInput, {
+          system: modelInput.system,
+          ...(modelInput.developer ? { developer: modelInput.developer } : {}),
+          ...(modelInput.contextualUser ? { contextualUser: modelInput.contextualUser } : {}),
+          tools: modelInput.tools,
+        }, undefined, "compaction");
+        const requestId = this.id("request");
+        await this.append(input, "model.request_prepared", { turnId, requestId, attempt: 1, contentVersion: request.contentVersion, request });
+        modelInput.onRequestIdentity = async (identity) => {
+          throwIfTurnAborted(input.signal);
+          await this.append(input, "model.request_identity", { turnId, requestId, attempt: 1, identity });
+        };
+      },
     };
     if (input.instructions !== undefined) compactInput.instructions = input.instructions;
     if (input.modelSelection !== undefined) compactInput.modelSelection = input.modelSelection;
@@ -884,6 +951,7 @@ export class SingleAgentRuntime implements AgentRunner {
       sessionId: input.sessionId,
       type: "tool_call",
       callId: toolCall.callId,
+      ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
       toolName: persistedToolName,
       input: persistedInput,
       status: "pending",
@@ -905,12 +973,14 @@ export class SingleAgentRuntime implements AgentRunner {
       await this.append(input, "tool.call_started", {
         turnId,
         callId: toolCall.callId,
+        ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
         toolName: persistedToolName,
         input: persistedInput,
       });
       const persistedError = normalizePersistedError(error);
       await this.append(input, "tool.call_finished", {
         callId: toolCall.callId,
+        ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
         status: "failed",
         error: persistedError.message,
         ...persistedErrorDetailsPayload(persistedError),
@@ -922,6 +992,7 @@ export class SingleAgentRuntime implements AgentRunner {
         sessionId: input.sessionId,
         type: "tool_result",
         callId: toolCall.callId,
+        ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
         output: "",
         error: persistedError.message,
         synthetic: true,
@@ -936,6 +1007,7 @@ export class SingleAgentRuntime implements AgentRunner {
     toolCall.callId = normalizeToolCallId(toolCall.callId);
     await this.append(input, "tool.call_updated", {
       callId: toolCall.callId,
+      ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
       status: "running",
       toolName: boundedToolName(toolCall.toolName),
       input: boundedToolInput(toolCall.input),
@@ -957,6 +1029,7 @@ export class SingleAgentRuntime implements AgentRunner {
       seen.add(toolCall.callId);
       await this.append(input, "tool.call_finished", {
         callId: toolCall.callId,
+        ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
         status,
         error: persistedError.message,
         ...persistedErrorDetailsPayload(persistedError),
@@ -971,6 +1044,7 @@ export class SingleAgentRuntime implements AgentRunner {
     assistantMessageId: MessageId,
     toolCalls: readonly PendingToolCall[],
     pendingToolCalls: Set<PendingToolCall>,
+    advertisedCatalogRevision: number | undefined,
     envelopeHiddenToolNames: ReadonlySet<string>,
   ): Promise<void> {
     const concurrentLimit = this.options.maxConcurrentToolCalls ?? 10;
@@ -1041,12 +1115,20 @@ export class SingleAgentRuntime implements AgentRunner {
         await this.appendPart(input, assistantMessageId, part);
         continue;
       }
-      const safe = await this.options.toolExecutor.canRunConcurrently(toolCall.toolName, toolCall.input, {
-        sessionId: input.sessionId,
-        turnId,
-        cwd: input.cwd,
-      });
-      if (safe) {
+      try {
+        toolCall.prepared = await this.options.toolExecutor.prepare(this.executeInput(input, turnId, toolCall));
+        if (advertisedCatalogRevision !== undefined && toolCall.prepared.registryRevision !== advertisedCatalogRevision) {
+          throw new ToolValidationError(toolCall.toolName, "Tool catalog changed after this model request; retry with the refreshed tool definitions.");
+        }
+      } catch (error) {
+        if (!(error instanceof ToolValidationError) && !(error instanceof UnknownToolError)) throw error;
+        await flush();
+        const part = await this.failToolCallWithoutExecution(input, turnId, assistantMessageId, toolCall, error);
+        pendingToolCalls.delete(toolCall);
+        await this.appendPart(input, assistantMessageId, part);
+        continue;
+      }
+      if (toolCall.prepared.isConcurrencySafe) {
         batch.push(toolCall);
         if (batch.length >= concurrentLimit) await flush();
         continue;
@@ -1075,11 +1157,13 @@ export class SingleAgentRuntime implements AgentRunner {
     await this.append(input, "tool.call_started", {
       turnId,
       callId: toolCall.callId,
+      ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
       toolName: boundedToolName(toolCall.toolName),
       input: boundedToolInput(toolCall.input),
     });
     await this.append(input, "tool.call_finished", {
       callId: toolCall.callId,
+      ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
       status,
       error: persistedError.message,
       ...persistedErrorDetailsPayload(persistedError),
@@ -1091,6 +1175,7 @@ export class SingleAgentRuntime implements AgentRunner {
       sessionId: input.sessionId,
       type: "tool_result",
       callId: toolCall.callId,
+      ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
       output: "",
       error: persistedError.message,
       synthetic: true,
@@ -1118,28 +1203,30 @@ export class SingleAgentRuntime implements AgentRunner {
     }
   }
 
+  private executeInput(input: RunTurnInput, turnId: TurnId, toolCall: PendingToolCall): ExecuteToolInput {
+    return {
+      sessionId: input.sessionId,
+      turnId,
+      callId: toolCall.callId,
+      ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
+      toolName: toolCall.toolName,
+      input: toolCall.input,
+      cwd: input.cwd,
+      ...(input.toolPolicy ? { policy: input.toolPolicy } : {}),
+      ...(input.signal ? { signal: input.signal } : {}),
+    };
+  }
+
   private async runToolCall(
     input: RunTurnInput,
     turnId: TurnId,
     assistantMessageId: MessageId,
     toolCall: PendingToolCall,
   ): Promise<{ part: MessagePart; cancelledError?: Error }> {
-    const executeInput = {
-      sessionId: input.sessionId,
-      turnId,
-      callId: toolCall.callId,
-      toolName: toolCall.toolName,
-      input: toolCall.input,
-      cwd: input.cwd,
-    };
-    if (input.toolPolicy) {
-      Object.assign(executeInput, { policy: input.toolPolicy });
-    }
-    if (input.signal) {
-      Object.assign(executeInput, { signal: input.signal });
-    }
-
-    const result = await this.options.toolExecutor.execute(executeInput);
+    const result = await this.options.toolExecutor.execute({
+      ...this.executeInput(input, turnId, toolCall),
+      ...(toolCall.prepared ? { prepared: toolCall.prepared } : {}),
+    });
 
     if (result.status === "completed") {
       const executionContext = toolResultExecutionContext(result.result.metadata);
@@ -1149,7 +1236,9 @@ export class SingleAgentRuntime implements AgentRunner {
         sessionId: input.sessionId,
         type: "tool_result",
         callId: toolCall.callId,
+        ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
         output: result.result.output,
+        ...(result.result.structuredData !== undefined ? { structuredData: result.result.structuredData } : {}),
         ...(executionContext ? { executionContext } : {}),
       };
       if (result.result.content) {
@@ -1168,6 +1257,7 @@ export class SingleAgentRuntime implements AgentRunner {
       sessionId: input.sessionId,
       type: "tool_result",
       callId: toolCall.callId,
+      ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
       output: "",
       error: persistedError.message,
       synthetic: true,

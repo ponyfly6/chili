@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { isAbsolute, relative, resolve } from "node:path";
 import { DEFAULT_MAX_DOCUMENT_CHARS } from "./constants.js";
 import { parseProjectRuleMarkdown } from "./project-rules.js";
 import type { ChiliMemoryDocument, ChiliMemoryDocumentKind, ChiliMemoryDocumentScope } from "./types.js";
@@ -12,6 +14,9 @@ export async function loadDocument(
     label: string;
     path: string;
     maxChars: number;
+    projectRoot?: string;
+    targetPaths?: readonly string[];
+    omittedDocuments?: { path: string; reason: string }[];
   },
 ): Promise<void> {
   const content = await readTextIfExists(input.path);
@@ -21,6 +26,10 @@ export async function loadDocument(
   }
 
   const parsedRule = input.kind === "project_rule" ? parseProjectRuleMarkdown(content) : undefined;
+  if (parsedRule?.metadata && !projectRuleApplies(parsedRule.metadata, input.projectRoot ?? "", input.targetPaths ?? [])) {
+    input.omittedDocuments?.push({ path: input.path, reason: "rule_paths_not_applicable" });
+    return;
+  }
   const trimmed = (parsedRule?.body ?? content).trim();
   if (!trimmed) return;
 
@@ -32,6 +41,7 @@ export async function loadDocument(
     path: input.path,
     content: clipped.content,
     truncated: clipped.truncated,
+    contentVersion: createHash("sha256").update(content).digest("hex"),
   };
   if (clipped.truncated) document.truncatedAfter = input.maxChars;
   if (parsedRule?.metadata !== undefined) document.ruleMetadata = parsedRule.metadata;
@@ -45,10 +55,12 @@ export function memoryDocumentDebugMetadata(document: ChiliMemoryDocument): Reco
     scope: document.scope,
     truncated: document.truncated,
     truncatedAfter: document.truncatedAfter ?? null,
+    contentVersion: document.contentVersion ?? null,
+    ...(document.memoryId ? { memoryId: document.memoryId, memoryRevision: document.memoryRevision, memorySource: document.memorySource } : {}),
   };
 
   if (document.kind === "project_rule") {
-    metadata.ruleType = "unconditional";
+    metadata.ruleType = document.ruleMetadata?.alwaysApply === false ? "path_scoped" : "unconditional";
     if (document.ruleMetadata !== undefined) {
       metadata.alwaysApply = document.ruleMetadata.alwaysApply;
       if (document.ruleMetadata.paths !== undefined) metadata.paths = document.ruleMetadata.paths;
@@ -78,4 +90,15 @@ function clipDocument(content: string, maxChars: number): { content: string; tru
     content: content.slice(0, maxChars).trimEnd(),
     truncated: true,
   };
+}
+
+function projectRuleApplies(metadata: NonNullable<ChiliMemoryDocument["ruleMetadata"]>, root: string, targets: readonly string[]): boolean {
+  if (metadata.alwaysApply) return true;
+  if (!metadata.paths?.length) return false;
+  return targets.some((target) => {
+    const absolute = resolve(root, target);
+    const path = relative(resolve(root), absolute).replaceAll("\\", "/");
+    if (path.startsWith("../") || path === ".." || isAbsolute(path)) return false;
+    return metadata.paths!.some((pattern) => new Bun.Glob(pattern.replace(/^\.\//, "")).match(path));
+  });
 }

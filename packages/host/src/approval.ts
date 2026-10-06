@@ -3,6 +3,8 @@ import {
   PolicyApprovalBroker,
   PolicyApprovalState,
   approvalDecisionWithinScope,
+  approvalGrantPermission,
+  approvalGrantPatterns,
   type ApprovalBrokerRequest,
   type ApprovalPreflightDecision,
   type ApprovalPreflightRequest,
@@ -61,18 +63,19 @@ export function createHostApprovalBroker(options: HostApprovalOptions = {}): Pol
     dangerousShellCommands: dangerousShellCommandsForProfile(profile),
     allowOneShotPolicyBypass: profile === "full-access",
     state,
-    ask: async (request, signal) => {
-      const decision = options.askApproval
-        ? await options.askApproval(request, signal)
-        : { action: "deny", feedback: "No approval interface available." } as const;
-      return persistAllowAlwaysDecision(request, decision, {
-        ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
-        onPersisted: (persistedRequest) => state.addPersistentGrant({
-          permission: persistedRequest.permission,
-          patterns: persistedRequest.patterns,
+    ask: async (request, signal) => options.askApproval
+      ? options.askApproval(request, signal)
+      : { action: "deny", feedback: "No approval interface available." },
+    onApproved: (request, decision) => persistAllowAlwaysDecision(request, decision, {
+      ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
+      // Dynamic Host policy rereads persistent config. A cached grant would survive revocation.
+      ...(!options.rulesetsForRequest ? {
+        onPersisted: (persistedRequest: ApprovalBrokerRequest) => state.addPersistentGrant({
+          permission: approvalGrantPermission(persistedRequest),
+          patterns: approvalGrantPatterns(persistedRequest),
         }),
-      });
-    },
+      } : {}),
+    }),
   };
   return options.rulesetsForRequest
     ? createRequestScopedPolicyApprovalBroker({ ...brokerOptions, rulesetsForRequest: options.rulesetsForRequest })
@@ -82,80 +85,7 @@ export function createHostApprovalBroker(options: HostApprovalOptions = {}): Pol
 export function createRequestScopedPolicyApprovalBroker(
   options: RequestScopedPolicyApprovalBrokerOptions,
 ): PolicyApprovalBroker {
-  return new RequestScopedPolicyApprovalBroker(options);
-}
-
-class RequestScopedPolicyApprovalBroker extends PolicyApprovalBroker {
-  private readonly rulesetsForRequest: ApprovalRulesetResolver;
-  private readonly delegateOptions: PolicyApprovalBrokerOptions;
-
-  constructor(options: RequestScopedPolicyApprovalBrokerOptions) {
-    const { rulesetsForRequest, ...brokerOptions } = options;
-    const delegateOptions: PolicyApprovalBrokerOptions = {
-      ...brokerOptions,
-      state: brokerOptions.state ?? new PolicyApprovalState(),
-    };
-    super(delegateOptions);
-    this.rulesetsForRequest = rulesetsForRequest;
-    this.delegateOptions = delegateOptions;
-  }
-
-  override setRulesets(rulesets: readonly (readonly PermissionRule[])[]): void {
-    this.delegateOptions.rulesets = rulesets;
-    super.setRulesets(rulesets);
-  }
-
-  override setDangerousShellCommands(mode: "ask" | "allow"): void {
-    this.delegateOptions.dangerousShellCommands = mode;
-    super.setDangerousShellCommands(mode);
-  }
-
-  override async preflight(request: ApprovalPreflightRequest): Promise<ApprovalPreflightDecision> {
-    let delegate: PolicyApprovalBroker;
-    try {
-      delegate = await this.delegateFor(request);
-    } catch {
-      return approvalPolicyResolutionFailure(request);
-    }
-    return delegate.preflight(request);
-  }
-
-  override async decide(request: ApprovalBrokerRequest, signal?: AbortSignal): Promise<ApprovalDecision> {
-    let delegate: PolicyApprovalBroker;
-    try {
-      delegate = await this.delegateFor(request);
-    } catch {
-      const failure = approvalPolicyResolutionFailure(request);
-      return {
-        action: "deny",
-        feedback: failure.feedback ?? failure.reason ?? "Unable to resolve session permission policy.",
-      };
-    }
-    return delegate.decide(request, signal);
-  }
-
-  private async delegateFor(request: ApprovalPreflightRequest): Promise<PolicyApprovalBroker> {
-    const rulesets = await this.rulesetsForRequest(request);
-    return new PolicyApprovalBroker({
-      ...this.delegateOptions,
-      rulesets,
-    });
-  }
-}
-
-function approvalPolicyResolutionFailure(request: ApprovalPreflightRequest): ApprovalPreflightDecision {
-  const message = `Unable to resolve permission policy for session ${request.sessionId}.`;
-  return {
-    action: "deny",
-    source: "session_workspace_policy",
-    reason: message,
-    feedback: message,
-    metadata: {
-      sessionId: request.sessionId,
-      permission: request.permission,
-      patterns: request.patterns,
-    },
-  };
+  return new PolicyApprovalBroker(options);
 }
 
 export function createApprovalRulesets(
@@ -192,6 +122,8 @@ export function createPermissionRules(
   const source = `permission_profile:${resolvedProfile}`;
   return [
     { permission: "read", pattern: "*", action: "allow", source },
+    { permission: "memory.read", pattern: "*", action: "allow", source },
+    { permission: "memory.write", pattern: "*", action: "ask", source },
     { permission: "glob", pattern: "*", action: "allow", source },
     { permission: "grep", pattern: "*", action: "allow", source },
     { permission: "edit", pattern: "*", action: "allow", source },
@@ -248,7 +180,7 @@ export async function persistApprovalGrantForRequest(
     throw new Error("This approval is restricted to a narrower scope and cannot be persisted.");
   }
   await addPersistentPermissionGrants(
-    request.patterns.map((pattern) => ({ permission: request.permission, pattern })),
+    approvalGrantPatterns(request).map((pattern) => ({ permission: approvalGrantPermission(request), pattern })),
     options,
   );
 }

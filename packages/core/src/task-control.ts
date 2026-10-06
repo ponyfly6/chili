@@ -804,8 +804,8 @@ export class AgentTaskControlService {
     if (result.status === "completed") {
       const assessment = assessSubagentCompletion(summary);
       if (assessment.status === "incomplete") {
-        // RuntimeService owns a normal interactive prompt, not a subagent repair loop.
-        // Close this generation as incomplete so an explicit follow-up can retry it.
+        // Adapters without the shared child runtime still fail closed at the
+        // typed Task/Run finalization boundary.
         return this.completeTaskFinal(
           task,
           "incomplete",

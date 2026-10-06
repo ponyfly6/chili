@@ -1,6 +1,6 @@
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import path from "node:path";
+import path, { join } from "node:path";
 import { expect, test } from "bun:test";
 import { loadSkills, parseSkillMarkdown } from "./loader.js";
 import { discoverSkills } from "./registry.js";
@@ -145,3 +145,30 @@ async function writeRawSkill(root: string, _scope: "project" | "user", name: str
   await mkdir(skillDir, { recursive: true });
   await writeFile(path.join(skillDir, "SKILL.md"), content, "utf8");
 }
+
+test("custom profiles isolate user skills and settings while preserving project-root aliases", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-skills-profile-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const cwd = join(project, "nested");
+  const profileA = join(home, "profile-a");
+  const profileB = join(home, "profile-b");
+  try {
+    const put = async (base: string, name: string) => {
+      await mkdir(join(base, name), { recursive: true });
+      await writeFile(join(base, name, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} test skill\n---\nbody\n`);
+    };
+    await mkdir(cwd, { recursive: true });
+    await put(join(profileA, "skills"), "profile-a");
+    await put(join(profileB, "skills"), "profile-b");
+    await put(join(home, ".agents", "skills"), "global-leak");
+    await put(join(project, ".agents", "skills"), "project-alias");
+    const a = await loadSkills({ cwd, projectRoot: project, homeDir: home, chiliHome: profileA });
+    const b = await loadSkills({ cwd, projectRoot: project, homeDir: home, chiliHome: profileB });
+    expect(a.skills.map((skill) => skill.name)).toEqual(["profile-a", "project-alias"]);
+    expect(b.skills.map((skill) => skill.name)).toEqual(["profile-b", "project-alias"]);
+    await writeFile(join(profileA, "skills.json"), JSON.stringify({ disabled: ["project-alias"] }));
+    expect((await loadSkills({ cwd, projectRoot: project, homeDir: home, chiliHome: profileA })).skills.map((skill) => skill.name)).toEqual(["profile-a"]);
+    expect((await loadSkills({ cwd, projectRoot: project, homeDir: home, chiliHome: profileB })).skills.map((skill) => skill.name)).toEqual(["profile-b", "project-alias"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

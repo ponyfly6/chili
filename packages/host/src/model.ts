@@ -5,7 +5,7 @@ import type {
   ModelStreamEvent,
   ModelStreamInput,
 } from "@chili/core";
-import type { ModelSelection, RuntimeModelDescriptor, ServiceTier } from "@chili/protocol";
+import type { ModelSelection, PreparedModelIdentity, RuntimeModelDescriptor, ServiceTier } from "@chili/protocol";
 import * as providersModule from "@chili/providers";
 import {
   assertCodexApiModel,
@@ -81,7 +81,7 @@ interface ProviderRouterOptions {
   serviceTier?: ServiceTier;
 }
 
-type HostModelOptions = ProviderRouterOptions & HostModelSelection;
+type HostModelOptions = ProviderRouterOptions & HostModelSelection & { profileId?: string };
 
 type ProviderRouterFactory = (options?: ProviderRouterOptions) => ProviderModelOrProvider | Promise<ProviderModelOrProvider>;
 
@@ -103,6 +103,8 @@ interface ProviderModelStreamInput {
   maxTokens?: number;
   temperature?: number;
   signal?: AbortSignal;
+  requestTimeoutMs?: number;
+  onRequestIdentity?: (identity: PreparedModelIdentity) => Promise<void>;
   metadata?: Record<string, unknown>;
 }
 
@@ -148,6 +150,7 @@ export async function createHostModel(selection?: HostModelName | HostModelSelec
   const routerOptions: HostProviderRouterOptions = {
     defaultSelection,
     baseOptions,
+    ...(config.profileId !== undefined ? { profileId: config.profileId } : {}),
   };
   if (config.reasoningLevel !== undefined) routerOptions.defaultReasoningLevel = config.reasoningLevel;
   if (config.serviceTier !== undefined) routerOptions.defaultServiceTier = config.serviceTier;
@@ -313,8 +316,8 @@ function modelFromFactoryResult(
 function normalizeCreateHostModelInput(
   selection: HostModelName | HostModelSelection | undefined,
   options: HostModelOptions,
-): HostModelSelection & ProviderRouterOptions {
-  const merged: HostModelSelection & ProviderRouterOptions = { ...options };
+): HostModelOptions {
+  const merged: HostModelOptions = { ...options };
   if (typeof selection === "string") {
     const parsed = splitReasoningSuffix(selection);
     merged.model = parsed.model;
@@ -504,6 +507,7 @@ interface HostProviderRouterOptions {
   defaultReasoningLevel?: HostReasoningLevel;
   defaultServiceTier?: ServiceTier;
   baseOptions: ProviderRouterOptions;
+  profileId?: string;
 }
 
 class HostProviderRouter implements ModelRouter {
@@ -556,7 +560,7 @@ class HostProviderRouter implements ModelRouter {
       providerOptions.model,
       PROVIDER_DISPLAY_NAMES[selection.provider],
     );
-    yield* new ProviderModelRouterAdapter(model).stream(input);
+    yield* new ProviderModelRouterAdapter(model, this.options.profileId).stream(input);
   }
 
   resolveRequestLimits(input: ModelRequestLimitsInput): ModelRequestLimits | undefined {
@@ -922,10 +926,10 @@ function safeEndpointOrigin(value: string | undefined): string | undefined {
 }
 
 class ProviderModelRouterAdapter implements ModelRouter {
-  constructor(private readonly model: ProviderModel) {}
+  constructor(private readonly model: ProviderModel, private readonly profileId?: string) {}
 
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
-    for await (const event of this.model.stream(toProviderInput(input))) {
+    for await (const event of this.model.stream(toProviderInput(input, this.profileId))) {
       if (isModelStreamEvent(event)) {
         yield enrichMetadata(event as ModelStreamEvent);
       }
@@ -963,7 +967,7 @@ function isModelStreamEvent(event: ProviderModelStreamEvent): boolean {
   );
 }
 
-function toProviderInput(input: ModelStreamInput): ProviderModelStreamInput {
+function toProviderInput(input: ModelStreamInput, profileId?: string): ProviderModelStreamInput {
   const extended = input as ExtendedModelStreamInput;
   const providerInput: ProviderModelStreamInput = {
     messages: input.messages,
@@ -977,6 +981,20 @@ function toProviderInput(input: ModelStreamInput): ProviderModelStreamInput {
   if (input.developer !== undefined) providerInput.developer = input.developer;
   if (input.contextualUser !== undefined) providerInput.contextualUser = input.contextualUser;
   if (input.signal) providerInput.signal = input.signal;
+  if (input.requestTimeoutMs !== undefined) providerInput.requestTimeoutMs = input.requestTimeoutMs;
+  if (input.onRequestIdentity) {
+    const onRequestIdentity = input.onRequestIdentity;
+    providerInput.onRequestIdentity = async (identity) => {
+      // Explicitly copy the audit fields; provider internals must never persist credentials.
+      await onRequestIdentity({
+        provider: identity.provider,
+        model: identity.model,
+        ...(identity.accountId !== undefined ? { accountId: identity.accountId } : {}),
+        ...(identity.credentialVersion !== undefined ? { credentialVersion: identity.credentialVersion } : {}),
+        ...(profileId !== undefined ? { profileId } : {}),
+      });
+    };
+  }
   if (input.serviceTier !== undefined) providerInput.serviceTier = input.serviceTier;
   if (extended.maxTokens !== undefined) providerInput.maxTokens = extended.maxTokens;
   if (extended.temperature !== undefined) providerInput.temperature = extended.temperature;

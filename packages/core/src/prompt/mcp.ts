@@ -37,7 +37,7 @@ export function mcpServerInstructionsPromptFragment(input: McpServerInstructions
 
   const fragment: PromptFragment = {
     id: `mcp.server.${safeFragmentId(input.serverName)}.instructions`,
-    layer: "developer",
+    layer: "contextual_user",
     source: "mcp",
     priority: input.priority ?? 70,
     lifecycle: input.lifecycle ?? "session",

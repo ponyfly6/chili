@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { buildPromptDebugManifest, type PromptDebugManifest } from "./debug.js";
 import {
   PROMPT_LAYER_ORDER,
@@ -48,7 +49,7 @@ export class PromptAssembler {
 
   private sortedFragments(): IndexedPromptFragment[] {
     return this.fragments
-      .map((fragment, index) => ({ fragment, index }))
+      .map((fragment, index) => ({ fragment: enforceFragmentAuthority(fragment), index }))
       .sort((left, right) => {
         const layerDelta = PROMPT_LAYER_ORDER[left.fragment.layer] - PROMPT_LAYER_ORDER[right.fragment.layer];
         if (layerDelta !== 0) return layerDelta;
@@ -77,7 +78,14 @@ export function renderPromptFragment(fragment: PromptFragment): RenderedPromptFr
     content,
     chars: content.length,
   };
-  if (fragment.metadata !== undefined) rendered.metadata = fragment.metadata;
+  const maxChars = normalizeMaxChars(fragment.maxChars ?? DEFAULT_PROMPT_FRAGMENT_MAX_CHARS);
+  const wrapperChars = fragment.marker ? fragment.marker.open.length + fragment.marker.close.length + 2 : 0;
+  rendered.metadata = {
+    ...fragment.metadata,
+    sourceContentVersion: createHash("sha256").update(fragment.content).digest("hex"),
+    sourceChars: fragment.content.trim().length,
+    truncated: fragment.metadata?.truncated === true || fragment.content.trim().length > Math.max(0, maxChars - wrapperChars),
+  };
   return rendered;
 }
 
@@ -119,4 +127,14 @@ function contentForLayer(fragments: readonly RenderedPromptFragment[], layer: Pr
     .filter((fragment) => fragment.layer === layer)
     .map((fragment) => fragment.content)
     .filter(Boolean);
+}
+
+/** Material trust is enforced at the role boundary, not only recorded in debug labels. */
+function enforceFragmentAuthority(fragment: PromptFragment): PromptFragment {
+  if (fragment.trust === "system" || (fragment.layer !== "base" && fragment.layer !== "developer")) return fragment;
+  return {
+    ...fragment,
+    layer: "contextual_user",
+    metadata: { ...fragment.metadata, requestedLayer: fragment.layer, authority: "reference_material" },
+  };
 }

@@ -199,20 +199,13 @@ export class DelegationPolicyGate {
   }
 }
 
-/**
- * Resolve policy separately from agent tool capability. The reasoning fallback
- * preserves Chili's legacy ultra behavior for callers that have not selected
- * an explicit delegation policy.
- */
+/** Reasoning effort never grants delegation authority. */
 export function resolveDelegationConfig(input: ResolveDelegationConfigInput): RuntimeDelegationConfig {
   if (input.sessionPolicy) {
     return delegationConfig(input.sessionId, input.sessionPolicy, "session");
   }
   if (input.defaultPolicy) {
     return delegationConfig(input.sessionId, input.defaultPolicy, "default");
-  }
-  if (input.reasoningLevel === "ultra") {
-    return delegationConfig(input.sessionId, "proactive", "reasoning_legacy");
   }
   return delegationConfig(input.sessionId, "explicit", "default");
 }

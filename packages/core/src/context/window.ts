@@ -585,7 +585,9 @@ export class ContextWindowBuilder {
     preferredIndex?: number,
   ): CompactionBoundary | undefined {
     if (messages.length === 0) return undefined;
-    const boundaryIndex = preferredIndex ?? Math.max(0, messages.length - this.preserveRecentMessages - 1);
+    const candidateIndex = preferredIndex ?? Math.max(0, messages.length - this.preserveRecentMessages - 1);
+    const boundaryIndex = completeToolPairBoundary(messages, candidateIndex);
+    if (boundaryIndex < 0) return undefined;
     if (wouldCompactOnlySummary(messages, boundaryIndex)) return undefined;
     const boundaryMessage = messages[boundaryIndex];
     if (!boundaryMessage) return undefined;
@@ -836,6 +838,7 @@ function snapshotMessagePart(part: MessagePart): MessagePart {
         ...base,
         type: "tool_call",
         callId: part.callId,
+        ...(part.providerCallId ? { providerCallId: part.providerCallId } : {}),
         toolName: part.toolName,
         input: jsonSnapshot(part.input),
         status: part.status,
@@ -845,6 +848,7 @@ function snapshotMessagePart(part: MessagePart): MessagePart {
         ...base,
         type: "tool_result",
         callId: part.callId,
+        ...(part.providerCallId ? { providerCallId: part.providerCallId } : {}),
         output: part.output,
       };
       const content = part.content;
@@ -959,9 +963,20 @@ function normalizePromptItems(
   maxChars: number,
   label: string,
 ): string[] {
-  const joined = (values ?? []).filter(Boolean).join("\n\n");
-  if (!joined || maxChars <= 0) return [];
-  return [truncateContextText(joined, maxChars, label)];
+  const items = (values ?? []).filter(Boolean);
+  if (maxChars <= 0) return [];
+  // Preserve material boundaries so one long source cannot erase the middle of
+  // unrelated rules. Oversized individual sources remain visibly bounded.
+  if (items.length === 1) return [truncateContextText(items[0]!, maxChars, label)];
+  const selected: string[] = [];
+  let remaining = maxChars;
+  for (const item of items) {
+    const separator = selected.length > 0 ? 2 : 0;
+    if (item.length + separator > remaining) continue;
+    selected.push(item);
+    remaining -= item.length + separator;
+  }
+  return selected;
 }
 
 function joinedTextLength(values: readonly string[], separator: string): number {
@@ -1186,4 +1201,18 @@ function countToolResults(messages: readonly Message[]): number {
     (count, message) => count + message.parts.filter((part) => part.type === "tool_result").length,
     0,
   );
+}
+
+/** Never summarize a call while leaving its result (or unfinished effect) behind. */
+function completeToolPairBoundary(messages: readonly Message[], candidate: number): number {
+  const open = new Map<string, number>();
+  let lastComplete = -1;
+  for (let index = 0; index <= candidate; index++) {
+    for (const part of messages[index]?.parts ?? []) {
+      if (part.type === "tool_call") open.set(part.callId, index);
+      if (part.type === "tool_result") open.delete(part.callId);
+    }
+    if (open.size === 0) lastComplete = index;
+  }
+  return lastComplete;
 }

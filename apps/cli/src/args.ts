@@ -39,6 +39,7 @@ export interface CliArgs {
     | "help";
   prompt?: string;
   cwd: string;
+  chiliHome?: string;
   host: string;
   port: number;
   resume?: string;
@@ -273,10 +274,7 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.command = "help";
       continue;
     }
-    if (arg === "--cwd") {
-      result.cwd = requireValue(arg, args);
-      continue;
-    }
+    if (parseLocationFlag(result, arg, args)) continue;
     if (arg === "--host") {
       result.host = requireValue(arg, args);
       continue;
@@ -452,6 +450,7 @@ export function usage(): string {
     "",
     "Options:",
     "  --cwd <path>        Workspace directory, default current directory",
+    "  --chili-home <path> Profile directory, default CHILI_HOME or ~/.chili",
     "  --host <host>       Runtime server host, default 127.0.0.1",
     "  --port <port>       Runtime server port for serve, default 4777",
     "  --resume, -r <id>   Resume a session",
@@ -522,6 +521,7 @@ function parseMcpAddFlags(result: CliArgs, args: string[]): void {
   while (args.length > 0) {
     const arg = args.shift();
     if (!arg) continue;
+    if (parseLocationFlag(result, arg, args)) continue;
     if (arg === "--json") {
       result.json = true;
       continue;
@@ -568,6 +568,7 @@ function parseMcpFlags(result: CliArgs, args: string[]): void {
   while (args.length > 0) {
     const arg = args.shift();
     if (!arg) continue;
+    if (parseLocationFlag(result, arg, args)) continue;
     if (arg === "--json") {
       result.json = true;
       continue;
@@ -624,6 +625,7 @@ function parseSkillFlags(result: CliArgs, args: string[], nameAllowed: boolean):
   while (args.length > 0) {
     const arg = args.shift();
     if (!arg) continue;
+    if (parseLocationFlag(result, arg, args)) continue;
     if (arg === "--user") {
       result.skillScope = "user";
       continue;
@@ -653,6 +655,13 @@ function parseModelValue(value: string): { model: CliModelName; reasoningLevel?:
   const model = trimmed.slice(0, colonIndex);
   if (!model) throw new Error("--model requires a model before the thinking suffix");
   return { model, reasoningLevel: suffix };
+}
+
+function parseLocationFlag(result: CliArgs, arg: string, args: string[]): boolean {
+  if (arg === "--cwd") result.cwd = requireValue(arg, args);
+  else if (arg === "--chili-home") result.chiliHome = requireValue(arg, args);
+  else return false;
+  return true;
 }
 
 function parseReasoningLevel(value: string, flag: string): CliReasoningLevel {
@@ -703,6 +712,7 @@ function parseMemoryFlags(
   while (args.length > 0) {
     const arg = args.shift();
     if (!arg) continue;
+    if (parseLocationFlag(result, arg, args)) continue;
     if (arg === "--user") {
       result.memoryScope = "user";
       continue;

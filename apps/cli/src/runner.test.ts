@@ -95,6 +95,67 @@ test("CLI and HTTP command submissions enforce the same tool scope and preserve 
   }
 }, 15_000);
 
+test("CLI and HTTP commands retain explicitly empty capabilities in the real Host execution path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-command-empty-entrypoints-"));
+  const cwd = join(root, "repo");
+  let harness: CliHarness | undefined;
+  let nextCall: { name: string; input: Record<string, unknown> } = { name: "read", input: { filePath: "input.txt" } };
+  let modelTurns = 0;
+  let bashCalls = 0;
+  const model: ModelRouter = {
+    async *stream() {
+      if (modelTurns++ % 2 === 0) {
+        yield { type: "tool_call", ...nextCall };
+        yield { type: "finish", reason: "tool_use" };
+      } else {
+        yield { type: "text_delta", text: "Stopped at the capability boundary." };
+        yield { type: "finish", reason: "stop" };
+      }
+    },
+  };
+  try {
+    await mkdir(join(cwd, ".chili/commands"), { recursive: true });
+    await writeFile(join(cwd, "input.txt"), "Session-local test input");
+    const cases = [
+      { field: "allowedTools", name: "read", input: { filePath: "input.txt" } },
+      { field: "writeScope", name: "write", input: { filePath: "output.txt", content: "forbidden" } },
+      { field: "executeScope", name: "bash", input: { command: "printf forbidden > output.txt" } },
+    ];
+    for (const { field } of cases) {
+      await writeFile(join(cwd, `.chili/commands/${field.toLowerCase()}.md`), `---\n${field}: []\n---\nTry the restricted operation`);
+    }
+    harness = await createCliHarness({
+      cwd, chiliHome: join(root, "home"), model: "fake", modelRouter: model,
+      quiet: true, yes: true, mcpConnectMode: "manual", staleTurnRecoveryIntervalMs: false,
+      bashRunner: { async run() { bashCalls += 1; throw new Error("Empty execution scope reached the runner"); } },
+    });
+    const handler = createRuntimeHttpHandler({ service: harness.service, store: harness.events, commands: harness.commands });
+    for (const { field, name, input } of cases) {
+      nextCall = { name, input };
+      for (const entrypoint of ["cli", "command"]) {
+        const { sessionId } = await harness.service.createSession();
+        const commandId = `prompt.project.${field.toLowerCase()}`;
+        if (entrypoint === "cli") {
+          await runSessionCommand({ harness, sessionId, commandId, maxTurns: 3 });
+        } else {
+          const response = await handler(new Request(`http://localhost/sessions/${sessionId}/command`, {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ commandId }),
+          }));
+          expect(response.status).toBe(200);
+        }
+        const calls = await harness.store.events({ sessionId, type: "tool.call_finished" });
+        expect(calls).toHaveLength(1);
+        expect(calls[0]?.payload).toMatchObject({ status: "failed" });
+      }
+    }
+    expect(bashCalls).toBe(0);
+    await expect(readFile(join(cwd, "output.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}, 15_000);
+
 test("CLI and HTTP reject invalid command text before persisting messages or running the model", async () => {
   const root = await mkdtemp(join(tmpdir(), "chili-command-validation-"));
   const cwd = join(root, "repo");

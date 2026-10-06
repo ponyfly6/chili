@@ -1034,9 +1034,17 @@ test("verifier policy is read-only and denies write tools", async () => {
   expect(policy.executeScope).toEqual(["bun test packages/core/src/team-verifier.test.ts"]);
   expect(filterToolsByPolicy([read, gitDiff, bash, edit, write, applyPatch], policy).map((tool) => tool.name)).toEqual([
     "read",
-    "git_diff",
     "bash",
   ]);
+  // Git can invoke repository filters and does not implement scoped isolation;
+  // a name allowlist cannot grant capabilities the backend cannot enforce.
+  await expect(authorizeToolByPolicy({
+    tool: gitDiff,
+    executeInput: { sessionId: "session_policy" as SessionId, turnId: "turn_policy" as TurnId,
+      toolName: "git_diff", input: {}, cwd: "/tmp" },
+    validatedInput: {}, approvalSpec: { permission: "git_diff", patterns: ["*"], metadata: {} },
+    policy, isReadOnly: actualReadOnly,
+  })).rejects.toThrow("not allowed");
   await expect(
     authorizeToolByPolicy({
       tool: bash,

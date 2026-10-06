@@ -15,6 +15,46 @@ import {
 } from "./contracts.js";
 
 describe("desktop IPC contracts", () => {
+  test("accepts compact model audit references and rejects malformed resolved identities", () => {
+    const prepared = runtimeEnvelope("model.request_prepared", {
+      turnId: "turn_1", requestId: "request_1", attempt: 1, contentVersion: "sha256:content",
+    }, "prepared_1");
+    const resolved = runtimeEnvelope("model.request_identity", {
+      turnId: "turn_1", requestId: "request_1", attempt: 1,
+      identity: { provider: "test", model: "test-model", profileId: "profile-a", credentialVersion: "sha256:credential" },
+    }, "identity_1");
+    for (const event of [prepared, resolved]) {
+      expect(parseDesktopEvent({ type: "runtime.event", event })).toMatchObject({ type: "runtime.event", event });
+    }
+    expect(() => parseDesktopEvent({ type: "runtime.event", event: {
+      ...prepared, payload: { turnId: "turn_1", requestId: "request_1", attempt: 1 },
+    } })).toThrow("contentVersion");
+    expect(() => parseDesktopEvent({ type: "runtime.event", event: {
+      ...resolved, payload: { ...resolved.payload, identity: { provider: "test", model: 5 } },
+    } })).toThrow("model");
+    expect(() => parseDesktopEvent({ type: "runtime.event", event: {
+      ...resolved, payload: { ...resolved.payload, identity: { provider: "test", model: "test-model", accessToken: "fake-secret" } },
+    } })).toThrow("unsupported field");
+  });
+
+  test("validates execution identity for both new and legacy session binding events", () => {
+    const identity = {
+      profileId: "profile-a", profilePath: "/tmp/profile-a", authPath: "/tmp/profile-a/auth.json",
+      projectId: "project-a", projectRoot: "/tmp/project-a",
+      workspaceId: "workspace-a", workspaceRoot: "/tmp/project-a/worktree",
+    };
+    for (const type of ["session.created", "session.identity_bound"]) {
+      const event = runtimeEnvelope(type, { sessionId: "session_1", cwd: "/tmp", identity }, `${type}_1`);
+      expect(parseDesktopEvent({ type: "runtime.event", event })).toMatchObject({ type: "runtime.event", event });
+      expect(() => parseDesktopEvent({ type: "runtime.event", event: {
+        ...event, payload: { ...event.payload, identity: { ...identity, workspaceId: 4 } },
+      } })).toThrow("workspaceId");
+    }
+    expect(() => parseDesktopEvent({ type: "runtime.event", event:
+      runtimeEnvelope("session.identity_bound", { sessionId: "other-session", identity }, "binding_1"),
+    })).toThrow("sessionId");
+  });
+
   test("validates project-scoped requests and bounded project summaries", () => {
     const request = { type: "session.stop", projectId: "project-a", sessionId: "session-1" } as const;
     expect(parseDesktopRequest(request)).toEqual(request);

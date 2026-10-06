@@ -3,6 +3,7 @@ import { stat } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { addChiliMemoryEntry, loadChiliMemoryContext } from "@chili/core";
+import { resolveHostExecutionIdentity } from "@chili/host";
 import type { AgentTreeNode, TeamExecutionRunSummary, TeamMergeSweepResult, TeamSnapshot } from "@chili/core";
 import type {
   RuntimeMcpAddServerRequest,
@@ -36,6 +37,16 @@ import { formatStoreDoctorText } from "./store-doctor.js";
 import { bindNewTeamOwnerSession } from "./team-owner-session.js";
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "--chili-mcp-stdio-guardian") {
+    const { runMcpStdioGuardianEntrypoint } = await import("@chili/mcp");
+    runMcpStdioGuardianEntrypoint();
+    return;
+  }
+  if (process.argv[2] === "--chili-process-guardian") {
+    const { runProcessGuardianEntrypoint } = await import("@chili/tools");
+    runProcessGuardianEntrypoint();
+    return;
+  }
   const args = parseArgs(process.argv.slice(2));
   if (args.command === "help") {
     console.log(usage());
@@ -60,6 +71,7 @@ async function main(): Promise<void> {
       : args.mcpMode === "eager" ? "eager" : "manual";
   const harnessInput: Parameters<typeof createCliHarness>[0] = {
     cwd: args.cwd,
+    ...(args.chiliHome !== undefined ? { chiliHome: args.chiliHome } : {}),
     yes: args.yes,
     quiet: args.command === "sessions" || args.command === "prompt-debug" || args.command === "mcp" || args.json,
     mcpConnectMode,
@@ -1317,7 +1329,7 @@ async function printMemory(
   scope: MemoryScopeArg,
   cwd = harness.cwd,
 ): Promise<void> {
-  const snapshot = await loadChiliMemoryContext({ cwd });
+  const snapshot = await loadChiliMemoryContext(await cliMemoryContext(harness, cwd));
   const documents = filterMemoryDocuments(snapshot.documents, scope);
   if (documents.length === 0) {
     console.log("No Chili memory or project instructions loaded.");
@@ -1339,7 +1351,7 @@ async function addMemory(
   cwd = harness.cwd,
 ): Promise<void> {
   const result = await addChiliMemoryEntry({
-    cwd,
+    ...await cliMemoryContext(harness, cwd),
     text,
     scope: memoryWriteScope(scope),
   });
@@ -1352,7 +1364,7 @@ async function reloadMemory(
   scope: MemoryScopeArg,
   cwd = harness.cwd,
 ): Promise<void> {
-  const snapshot = await loadChiliMemoryContext({ cwd });
+  const snapshot = await loadChiliMemoryContext(await cliMemoryContext(harness, cwd));
   const documents = filterMemoryDocuments(snapshot.documents, scope);
   console.log(`[memory] reloaded ${documents.length} source(s)`);
   if (documents.length > 0) {
@@ -1364,15 +1376,17 @@ async function reloadMemory(
 }
 
 async function handleSkillsCommand(args: ReturnType<typeof parseArgs>): Promise<void> {
+  const identity = await resolveHostExecutionIdentity({ cwd: args.cwd, ...(args.chiliHome !== undefined ? { chiliHome: args.chiliHome } : {}) });
+  const context = { cwd: identity.workspaceRoot, chiliHome: identity.profilePath, projectRoot: identity.projectRoot };
   if (args.command === "skills-list") {
-    await printSkills(args.cwd, args.json);
+    await printSkills(context, args.json);
     return;
   }
   if (!args.skillName) throw new Error("skills enable/disable requires a skill name");
   const scope = args.skillScope ?? "project";
   const disabled = args.command === "skills-disable";
   const snapshot = await updateSkillDisabledSetting({
-    cwd: args.cwd,
+    ...context,
     scope,
     name: args.skillName,
     disabled,
@@ -1382,10 +1396,10 @@ async function handleSkillsCommand(args: ReturnType<typeof parseArgs>): Promise<
   console.log(`[skills] ${args.skillName}\t${state}\t${scope}\t${path}`);
 }
 
-async function printSkills(cwd: string, asJson: boolean): Promise<void> {
-  const settings = await loadSkillSettings({ cwd });
+async function printSkills(context: Parameters<typeof loadSkillSettings>[0], asJson: boolean): Promise<void> {
+  const settings = await loadSkillSettings(context);
   const result = await loadSkills({
-    cwd,
+    ...context,
     includeDisabled: true,
     disabledSkills: [],
   });
@@ -1413,6 +1427,11 @@ async function printSkills(cwd: string, asJson: boolean): Promise<void> {
       skill.description,
     ].join("\t"));
   }
+}
+
+async function cliMemoryContext(harness: Awaited<ReturnType<typeof createCliHarness>>, cwd: string) {
+  const identity = await resolveHostExecutionIdentity({ cwd, chiliHome: harness.identity.profilePath });
+  return { cwd: identity.workspaceRoot, chiliHome: identity.profilePath, projectRoot: identity.projectRoot, projectId: identity.projectId };
 }
 
 function skillListItem(skill: Skill, disabled: Set<string>): {
@@ -1535,7 +1554,8 @@ async function repl(input: {
       }
     },
     showMemory: async (cwd, scope) => handleMemoryReplCommand(input.harness, `show ${scope}`.trim(), cwd),
-    addMemory: async (cwd, value) => handleMemoryReplCommand(input.harness, `add ${value}`.trim(), cwd),
+    addMemory: async (cwd, value) => input.harness.service.withSessionOperation(input.sessionId,
+      () => handleMemoryReplCommand(input.harness, `add ${value}`.trim(), cwd)),
     reloadMemory: async (cwd, scope) => handleMemoryReplCommand(input.harness, `reload ${scope}`.trim(), cwd),
     runPromptCommand: async (sessionId, commandId, args) => {
       const interrupt = installReplInterruptHandler(input.shutdownSignal);

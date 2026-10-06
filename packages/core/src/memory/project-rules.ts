@@ -54,7 +54,7 @@ export function parseProjectRuleMarkdown(content: string): {
 
   const frontmatter = parsed.frontmatter;
   const metadata: ChiliProjectRuleMetadata = {
-    alwaysApply: frontmatter.alwaysApply ?? true,
+    alwaysApply: frontmatter.alwaysApply ?? frontmatter.paths === undefined,
   };
   if (frontmatter.paths !== undefined) metadata.paths = frontmatter.paths;
   if (frontmatter.description !== undefined) metadata.description = frontmatter.description;

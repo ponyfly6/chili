@@ -9,6 +9,8 @@ import {
   RuntimeSessionAlreadyExistsError,
   RuntimeSessionCreationConflictError,
   RuntimeSessionInactiveError,
+  RuntimeSessionIdentityError,
+  RuntimeForeignOwnerError,
   RuntimeSessionNotFoundError,
   RuntimeSubagentSessionAccessError,
   TeamControlService,
@@ -41,6 +43,8 @@ import type {
   DelegationPolicySource,
   EventEnvelope,
   Message,
+  MessageId,
+  PartId,
   ModelSelection,
   PendingUserInputRequest,
   ReasoningLevel,
@@ -571,6 +575,69 @@ test("serves sessions and event backlog over the runtime HTTP handler", async ()
   expect(new TextDecoder().decode(chunk.value)).toContain("session.created");
 });
 
+test("request audit snapshots stay complete in storage while SSE and replay deliver a compact cursor", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "chili-http-request-audit-"));
+  const baseStore = new SqliteEventStore(join(directory, "events.sqlite"));
+  try {
+    const store = new ObservableEventStore(baseStore);
+    const service = new FakeRuntimeService(store);
+    const { sessionId } = await service.createSession({ cwd: "/workspace" });
+    const contentVersion = "prepared-content-version";
+    const requestEvent: ChiliEvent = {
+      id: "event_request_snapshot", type: "model.request_prepared", time: 2 as TimestampMs, sessionId,
+      payload: {
+        turnId: "turn_request_snapshot" as TurnId, requestId: "request_snapshot", attempt: 1, contentVersion,
+        request: {
+          version: 1, purpose: "turn", contentVersion, sessionRevision: 1,
+          system: ["REQUEST_AUDIT_CANARY" + "x".repeat(5_000_000)], developer: [], contextualUser: [],
+          messages: [], tools: [], sources: [], budget: {},
+        },
+      },
+    };
+    await store.append(requestEvent);
+    const handler = createRuntimeHttpHandler({ service, store, maxEventStreamDurableEvents: 2 });
+    const client = new HttpRuntimeClient({
+      baseUrl: "http://chili.test/",
+      fetch: ((input, init) => handler(new Request(input, init))) as typeof fetch,
+    });
+    const streamed: ChiliEvent[] = [];
+    for await (const event of client.streamEvents({ sessionId })) streamed.push(event);
+    expect(streamed.map((event) => event.id)).toContain(requestEvent.id);
+    expect(streamed.find((event) => event.id === requestEvent.id)?.payload).toEqual({
+      turnId: "turn_request_snapshot" as TurnId, requestId: "request_snapshot", attempt: 1, contentVersion,
+    });
+    const replay = await handler(new Request(`http://chili.test/sessions/${sessionId}/events?window=replayable`));
+    const body = await replay.text();
+    expect(body).not.toContain("REQUEST_AUDIT_CANARY");
+    expect(body.length).toBeLessThan(8_000);
+    const window = JSON.parse(body) as RuntimeSessionEventWindow;
+    expect(window.truncated).toBe(false);
+    expect(window.events.find((event) => event.id === requestEvent.id)).toEqual(streamed.find((event) => event.id === requestEvent.id));
+    expect((await store.events({ sessionId, type: "model.request_prepared" }))[0]?.payload).toEqual(requestEvent.payload);
+
+    const messageId = "message_program_result" as MessageId;
+    await store.append({ id: "event_program_message", type: "message.created", sessionId, time: 3 as TimestampMs,
+      payload: { messageId, role: "assistant" } });
+    const resultEvent: ChiliEvent = { id: "event_program_result", type: "message.part_added", sessionId, time: 4 as TimestampMs,
+      payload: { messageId, part: {
+        id: "part_program_result" as PartId, messageId, sessionId, type: "tool_result", callId: "call_program" as ToolCallId,
+        output: "Concise model and display output", structuredData: { internal: "PROGRAM_DATA_CANARY", rows: [1, 2, 3] },
+      } } };
+    await store.append(resultEvent);
+    const messages = await handler(new Request(`http://chili.test/sessions/${sessionId}/messages`));
+    const messageText = await messages.text();
+    expect(messageText).toContain("Concise model and display output");
+    expect(messageText).not.toContain("PROGRAM_DATA_CANARY");
+    const streamedResult: ChiliEvent[] = [];
+    for await (const event of client.streamEvents({ sessionId, afterEventId: requestEvent.id })) streamedResult.push(event);
+    expect(JSON.stringify(streamedResult)).not.toContain("PROGRAM_DATA_CANARY");
+    expect((await store.messages(sessionId))[0]?.parts[0]).toMatchObject({ structuredData: { internal: "PROGRAM_DATA_CANARY", rows: [1, 2, 3] } });
+  } finally {
+    baseStore.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("SSE serializes a normalized 5 MiB escape-heavy error within a deterministic byte ceiling", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -983,6 +1050,21 @@ test("returns 409 when an explicit session id is created more than once", async 
   expect((await store.sessions()).find((session) => session.id === sessionId)?.cwd).toBe(
     "/authoritative/repo",
   );
+});
+
+test("returns conflicts for foreign execution owners and mismatched session identity", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const service = new FakeRuntimeService(store);
+  const { sessionId } = await service.createSession({ cwd: "/workspace" });
+  const handler = createRuntimeHttpHandler({ service, store });
+  for (const error of [new RuntimeForeignOwnerError(sessionId), new RuntimeSessionIdentityError(sessionId, ["profile"])]) {
+    service.assertSessionTurnAllowed = async () => { throw error; };
+    const response = await handler(new Request(`http://chili.test/sessions/${sessionId}/prompt`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: "Continue" }),
+    }));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: { message: error.message } });
+  }
 });
 
 test("returns 503 when runtime admission closes during an HTTP mutation", async () => {
@@ -3812,6 +3894,8 @@ test("scopes MCP catalog views to the persisted canonical session workspace", as
     expect((await handler(new Request(`http://chili.test/mcp/github?${query}`))).status).toBe(200);
     expect((await handler(new Request(`http://chili.test/mcp/github/tools?${query}`))).status).toBe(200);
     expect((await handler(new Request(`http://chili.test/mcp/reload?${query}`, { method: "POST" }))).status).toBe(200);
+    expect((await handler(new Request(`http://chili.test/mcp/github/connect?${query}`, { method: "POST" }))).status).toBe(200);
+    expect((await handler(new Request(`http://chili.test/mcp/github/disconnect?${query}`, { method: "POST" }))).status).toBe(200);
 
     const canonicalWorkspace = await realpath(workspace);
     expect(mcp.scopeInputs).toEqual([
@@ -3820,8 +3904,10 @@ test("scopes MCP catalog views to the persisted canonical session workspace", as
       { operation: "list", cwd: canonicalWorkspace },
       { operation: "tools", cwd: canonicalWorkspace },
       { operation: "reload", cwd: canonicalWorkspace },
+      { operation: "connect", cwd: canonicalWorkspace },
+      { operation: "disconnect", cwd: canonicalWorkspace },
     ]);
-    expect(service.sessionOperationIds).toEqual([sessionId]);
+    expect(service.sessionOperationIds).toEqual([sessionId, sessionId, sessionId]);
 
     const callCount = mcp.scopeInputs.length;
     const missing = await handler(new Request("http://chili.test/mcp/status?sessionId=session_missing"));
@@ -3836,7 +3922,7 @@ test("scopes MCP catalog views to the persisted canonical session workspace", as
   }
 });
 
-test("keeps archived MCP reads project-scoped while reload remains active-only", async () => {
+test("keeps archived MCP reads project-scoped while connection mutations remain active-only", async () => {
   const tempRoot = await mkdtemp(join(tmpdir(), "chili-mcp-http-archived-scope-"));
   const workspace = join(tempRoot, "workspace");
   const workspaceAlias = join(tempRoot, "workspace-alias");
@@ -3876,6 +3962,12 @@ test("keeps archived MCP reads project-scoped while reload remains active-only",
     expect(await reloadResponse.json()).toEqual({
       error: { message: `Session is not active: ${sessionId} (archived)` },
     });
+    expect(mcp.scopeInputs).toEqual([]);
+
+    for (const action of ["connect", "disconnect"]) {
+      const response = await handler(new Request(`http://chili.test/mcp/github/${action}?sessionId=${sessionId}`, { method: "POST" }));
+      expect(response.status).toBe(409);
+    }
     expect(mcp.scopeInputs).toEqual([]);
 
     expect(await client.listMcpServers({ sessionId })).toMatchObject({
@@ -3937,19 +4029,20 @@ test("keeps archived MCP reads project-scoped while reload remains active-only",
           },
         });
       }
-      const reload = await handler(new Request(
-        `http://chili.test/mcp/reload?${childQuery}`,
-        { method: "POST" },
-      ));
-      expect(reload.status).toBe(409);
-      expect(await reload.json()).toEqual({
-        error: {
-          message: expect.stringContaining(`Session ${childId} belongs to a subagent`),
-        },
-      });
+      for (const path of ["reload", "github/connect", "github/disconnect"]) {
+        const response = await handler(new Request(`http://chili.test/mcp/${path}?${childQuery}`, { method: "POST" }));
+        expect(response.status).toBe(409);
+        expect(await response.json()).toEqual({
+          error: { message: expect.stringContaining(`Session ${childId} belongs to a subagent`) },
+        });
+      }
     }
     expect(mcp.scopeInputs).toHaveLength(4);
-    expect(service.sessionOperationIds).toEqual([sessionId, activeChildId, archivedChildId]);
+    expect(service.sessionOperationIds).toEqual([
+      sessionId, sessionId, sessionId,
+      activeChildId, activeChildId, activeChildId,
+      archivedChildId, archivedChildId, archivedChildId,
+    ]);
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
@@ -4727,7 +4820,17 @@ class FakePromptCommandControl implements PromptCommandControl {
 class FakeMcpControlService implements RuntimeMcpControlService {
   added: Parameters<NonNullable<RuntimeMcpControlService["add"]>>[0] | undefined;
   authInput: Parameters<NonNullable<RuntimeMcpControlService["auth"]>>[1] | undefined;
-  readonly scopeInputs: Array<{ operation: "list" | "reload" | "tools"; cwd?: string }> = [];
+  readonly scopeInputs: Array<{ operation: "list" | "reload" | "tools" | "connect" | "disconnect"; cwd?: string }> = [];
+
+  async connect(server: string, input: RuntimeMcpScopeInput = {}): Promise<Awaited<ReturnType<NonNullable<RuntimeMcpControlService["connect"]>>>> {
+    this.scopeInputs.push({ operation: "connect", ...input });
+    return { ...mcpServer(), name: server };
+  }
+
+  async disconnect(server: string, input: RuntimeMcpScopeInput = {}): Promise<Awaited<ReturnType<NonNullable<RuntimeMcpControlService["disconnect"]>>>> {
+    this.scopeInputs.push({ operation: "disconnect", ...input });
+    return { ...mcpServer(), name: server, status: "stopped" };
+  }
 
   async list(input: RuntimeMcpScopeInput = {}): Promise<Awaited<ReturnType<RuntimeMcpControlService["list"]>>> {
     this.scopeInputs.push({ operation: "list", ...input });

@@ -57,6 +57,7 @@ export {
 export {
   createIdFactory,
 } from "./id.js";
+export { resolveHostExecutionIdentity } from "./identity.js";
 export {
   readUserModelSelection,
   writeUserModelSelection,

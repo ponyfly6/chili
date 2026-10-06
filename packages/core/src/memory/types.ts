@@ -12,9 +12,19 @@ export interface ChiliProjectRuleMetadata {
 
 export interface ChiliMemoryLoadOptions {
   cwd: string;
+  /** Trusted executor hook; never accepted from model tool arguments. */
+  assertCurrentAuthorization?: () => Promise<void>;
   homeDir?: string;
+  /** Profile directory, e.g. ~/.chili. Takes precedence over homeDir. */
+  chiliHome?: string;
   projectRoot?: string;
+  projectId?: string;
   maxDocumentChars?: number;
+  query?: string;
+  targetPaths?: readonly string[];
+  maxMemoryEntries?: number;
+  /** Prompt selection filter supplied by the Host after checking memory.read policy. */
+  memoryScopes?: readonly ChiliMemoryScope[];
 }
 
 export interface ChiliMemoryDocument {
@@ -26,6 +36,10 @@ export interface ChiliMemoryDocument {
   truncated: boolean;
   truncatedAfter?: number;
   ruleMetadata?: ChiliProjectRuleMetadata;
+  contentVersion?: string;
+  memoryId?: string;
+  memoryRevision?: number;
+  memorySource?: string;
 }
 
 export interface ChiliMemorySnapshot {
@@ -36,9 +50,14 @@ export interface ChiliMemorySnapshot {
   instructionPaths: string[];
   documents: ChiliMemoryDocument[];
   missingPaths: string[];
+  omittedDocuments?: { path: string; reason: string }[];
 }
 
 export interface ChiliMemoryEntry {
+  id: string;
+  revision: number;
+  source: string;
+  updatedAt: number;
   scope: ChiliMemoryScope;
   path: string;
   index: number;
@@ -49,9 +68,12 @@ export interface ChiliMemoryAddInput extends ChiliMemoryLoadOptions {
   text: string;
   scope?: ChiliMemoryScope;
   maxEntryChars?: number;
+  source?: string;
 }
 
 export interface ChiliMemoryAddResult {
+  id: string;
+  revision: number;
   scope: ChiliMemoryScope;
   path: string;
   text: string;
@@ -64,10 +86,14 @@ export interface ChiliMemoryListInput extends ChiliMemoryLoadOptions {
 
 export interface ChiliMemoryRemoveInput extends ChiliMemoryLoadOptions {
   scope?: ChiliMemoryScope;
-  index: number;
+  index?: number;
+  id?: string;
+  expectedRevision?: number;
 }
 
 export interface ChiliMemoryRemoveResult {
+  id: string;
+  revision: number;
   scope: ChiliMemoryScope;
   path: string;
   index: number;
@@ -75,27 +101,26 @@ export interface ChiliMemoryRemoveResult {
 }
 
 export type ChiliMemoryToolInput =
-  | {
-      operation: "add";
-      text: string;
-      scope: ChiliMemoryScope;
-    }
-  | {
-      operation: "list";
-      scope: ChiliMemoryListScope;
-    }
-  | {
-      operation: "remove";
-      scope: ChiliMemoryScope;
-      index: number;
-    };
+  | { operation: "add"; text: string; scope: ChiliMemoryScope }
+  | { operation: "put"; text: string; scope: ChiliMemoryScope; id: string; expectedRevision: number }
+  | { operation: "list" | "search"; scope: ChiliMemoryListScope; query?: string }
+  | { operation: "get"; scope: ChiliMemoryScope; id: string }
+  | { operation: "remove"; scope: ChiliMemoryScope; id: string; expectedRevision: number }
+  | { operation: "export"; scope: ChiliMemoryScope };
 
 export interface ChiliMemoryToolOptions {
+  /** Trusted Host resolver; evaluated once per prepared call for its execution cwd. */
+  optionsForCwd?: (cwd: string) => Promise<ChiliMemoryToolOptions>;
   homeDir?: string;
+  chiliHome?: string;
   projectRoot?: string;
+  projectId?: string;
 }
 
 export interface ChiliMemoryPaths {
+  chiliHome: string;
+  databasePath: string;
+  projectId: string;
   projectRoot: string;
   userMemoryPath: string;
   projectMemoryPath: string;

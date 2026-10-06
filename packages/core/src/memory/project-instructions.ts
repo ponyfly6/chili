@@ -1,6 +1,7 @@
+import { realpath } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { CHILI_MEMORY_DIR, CHILI_MEMORY_FILENAME, PROJECT_INSTRUCTION_FILES } from "./constants.js";
 import { projectRuleSources } from "./project-rules.js";
@@ -8,15 +9,20 @@ import type { ChiliMemoryDocumentSource, ChiliMemoryLoadOptions, ChiliMemoryPath
 
 const execFileAsync = promisify(execFile);
 
-export async function resolveChiliMemoryPaths(options: ChiliMemoryLoadOptions): Promise<ChiliMemoryPaths> {
+export async function resolveChiliMemoryPaths(options: ChiliMemoryLoadOptions, includeInstructions = true): Promise<ChiliMemoryPaths> {
   const projectRoot = resolve(options.projectRoot ?? (await findProjectRoot(options.cwd)));
   const cwd = resolve(options.cwd);
   const home = resolve(options.homeDir ?? homedir());
+  const chiliHome = resolve(options.chiliHome ?? join(home, CHILI_MEMORY_DIR));
+  const canonicalRoot = await realpath(projectRoot).catch(() => projectRoot);
   return {
+    chiliHome,
+    databasePath: join(chiliHome, "memory.sqlite"),
+    projectId: options.projectId ?? canonicalRoot,
     projectRoot,
-    userMemoryPath: join(home, CHILI_MEMORY_DIR, CHILI_MEMORY_FILENAME),
+    userMemoryPath: join(chiliHome, CHILI_MEMORY_FILENAME),
     projectMemoryPath: join(projectRoot, CHILI_MEMORY_DIR, CHILI_MEMORY_FILENAME),
-    instructions: await resolveProjectInstructionSources(projectRoot, cwd),
+    instructions: includeInstructions ? await resolveProjectInstructionSources(projectRoot, cwd, options.targetPaths ?? []) : [],
   };
 }
 
@@ -30,9 +36,15 @@ export function memoryPathForScope(
   return scope === "user" ? paths.userMemoryPath : paths.projectMemoryPath;
 }
 
-async function resolveProjectInstructionSources(projectRoot: string, cwd: string): Promise<ChiliMemoryDocumentSource[]> {
+async function resolveProjectInstructionSources(projectRoot: string, cwd: string, targets: readonly string[]): Promise<ChiliMemoryDocumentSource[]> {
   const sources: ChiliMemoryDocumentSource[] = [];
-  for (const dir of projectInstructionDirs(projectRoot, cwd)) {
+  const dirs = new Set(projectInstructionDirs(projectRoot, cwd));
+  for (const target of targets.slice(0, 64)) {
+    const absolute = resolve(projectRoot, target);
+    if (!isInsideOrEqual(projectRoot, absolute)) continue;
+    for (const dir of projectInstructionDirs(projectRoot, dirname(absolute))) dirs.add(dir);
+  }
+  for (const dir of dirs) {
     for (const file of PROJECT_INSTRUCTION_FILES) {
       sources.push({
         kind: "project_instruction",

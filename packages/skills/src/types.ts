@@ -45,6 +45,8 @@ export interface SkillDiagnostic {
 export interface DiscoverSkillsOptions {
   cwd: string;
   homeDir?: string;
+  chiliHome?: string;
+  projectRoot?: string;
   includeAgentsAlias?: boolean;
   includeDisabled?: boolean;
   disabledSkills?: readonly string[];

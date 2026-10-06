@@ -3,6 +3,10 @@ export {
   appendMemoryContent,
   formatMemoryEntries,
   listChiliMemoryEntries,
+  searchChiliMemoryEntries,
+  getChiliMemoryEntry,
+  putChiliMemoryEntry,
+  exportChiliMemory,
   removeChiliMemoryEntry,
   sanitizeMemoryEntry,
 } from "./entries.js";

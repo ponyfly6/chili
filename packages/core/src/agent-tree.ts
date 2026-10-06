@@ -514,10 +514,35 @@ export class AgentTreeControlService {
     delivery: TeamMessageDelivery,
   ): Promise<ResolvedAgentMessageRecipient> {
     if (input.recipientSessionId) {
-      return {
-        path: explicitRecipientPath(input.to, input.from),
-        sessionId: input.recipientSessionId,
-      };
+      const path = explicitRecipientPath(input.to, input.from);
+      if (input.taskId) {
+        const task = await this.options.store.agentTask(input.taskId);
+        // Legacy child-to-parent notifications used taskId for the sender.
+        // Preserve that meaning only when the durable parent relationship
+        // proves the explicit recipient; it must not bind the parent's mailbox
+        // to the child's generation.
+        if (task && task.path === input.from && task.parentSessionId === input.recipientSessionId
+          && (task.parentPath ?? parentAgentPath(task.path)) === path) {
+          return this.explicitSessionRecipient(path, input.recipientSessionId);
+        }
+        if (!task || task.childSessionId !== input.recipientSessionId || task.path !== path) {
+          throw new AgentMessageRecipientMetadataError(
+            `Explicit recipient session, path and task do not identify the same agent: ${input.taskId}`,
+          );
+        }
+        const scoped = scopeMessageCandidates(input, [task], input.sessionId
+          ? await this.options.store.agentTasks({ limit: ALL_AGENT_TASKS_LIMIT }) : [task]);
+        if (!scoped.some((candidate) => candidate.id === task.id)) {
+          throw new AgentMessageRecipientNotFoundError(input.to);
+        }
+        if (delivery === "triggerTurn" && isTerminalAgentTaskStatus(task.status)) {
+          throw new AgentMessageRecipientTerminalError(task.id, task.status);
+        }
+        // The source mailbox row must keep its task identity for the fenced
+        // follow-up claim; session metadata alone is not an interchangeable key.
+        return { path, task, sessionId: input.recipientSessionId };
+      }
+      return this.explicitSessionRecipient(path, input.recipientSessionId);
     }
 
     if (input.to.trim().toLowerCase() === "parent") {
@@ -580,6 +605,18 @@ export class AgentTreeControlService {
       task,
       sessionId: task.childSessionId,
     };
+  }
+
+  private async explicitSessionRecipient(path: AgentPath, sessionId: SessionId): Promise<ResolvedAgentMessageRecipient> {
+    const tasks = (await this.options.store.agentTasks({ childSessionId: sessionId, limit: 2 }))
+      .filter((task) => task.childSessionId === sessionId);
+    if (tasks.length > 1 || (tasks[0] && tasks[0].path !== path)) {
+      throw new AgentMessageRecipientMetadataError(`Explicit recipient session has ambiguous or conflicting task ownership: ${sessionId}`);
+    }
+    // Internal completion notifications address a parent session directly. If
+    // that parent is itself a task, bind its mailbox to that task as well so
+    // its next turn enters the same generation-fenced follow-up path.
+    return { path, sessionId, ...(tasks[0] ? { task: tasks[0] } : {}) };
   }
 
   private async resolveTaskCandidates(target: string, candidates: AgentTaskRow[]): Promise<AgentTaskRow> {

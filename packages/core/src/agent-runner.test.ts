@@ -159,6 +159,14 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
   expect(rootRunner.turnInputs).toEqual([]);
 
   const childRunner = new FakeAgentRunner();
+  store.messageRows.push({
+    id: "message_assistant_fake" as MessageId,
+    sessionId,
+    role: "assistant",
+    createdAt: 1 as TimestampMs,
+    parts: [{ id: "child_answer" as PartId, messageId: "message_assistant_fake" as MessageId,
+      sessionId, type: "text", text: "Verified the parser implementation and its regression test." }],
+  });
   const child = new RuntimeService({
     runtime: childRunner,
     store,
@@ -984,7 +992,7 @@ test("RuntimeService prefers direct image input over external image tools for im
   expect(runner.turnInputs[0]?.system?.some((item) => item.includes("direct image attachment"))).toBe(true);
   expect(runner.turnInputs[0]?.promptDebug?.fragments).toContainEqual(expect.objectContaining({
     id: "runtime.direct_image_input",
-    metadata: { imageCount: 1 },
+    metadata: expect.objectContaining({ imageCount: 1 }),
   }));
 });
 
@@ -1102,13 +1110,12 @@ test("RuntimeService passes promptFragments by prompt layer", async () => {
 
   expect(result.status).toBe("completed");
   expect(runner.turnInputs[0]?.system).toEqual(["base system"]);
-  expect(runner.turnInputs[0]?.developer?.[0]).toBe("skills catalog");
-  expect(runner.turnInputs[0]?.developer?.[1]).toContain("Delegation policy is explicit");
-  expect(runner.turnInputs[0]?.contextualUser).toEqual(["memory context"]);
+  expect(runner.turnInputs[0]?.developer?.[0]).toContain("Delegation policy is explicit");
+  expect(runner.turnInputs[0]?.contextualUser).toEqual(["skills catalog", "memory context"]);
   expect(runner.turnInputs[0]?.promptDebug?.fragments.map((fragment) => [fragment.id, fragment.source, fragment.layer])).toEqual([
     ["base", "core", "base"],
-    ["skills", "skills", "developer"],
     ["chili.delegation.explicit", "runtime", "developer"],
+    ["skills", "skills", "contextual_user"],
     ["memory", "memory", "contextual_user"],
   ]);
 });
@@ -1332,7 +1339,7 @@ test("RuntimeService canonicalizes symlink cwd aliases and nonexistent lexical t
   }
 });
 
-test("RuntimeService injects proactive delegation guidance for ultra reasoning", async () => {
+test("RuntimeService keeps delegation explicit when reasoning is ultra", async () => {
   const runner = new FakeAgentRunner();
   const store = new MemoryEventStore();
   const sessionId = "session_ultra_prompt" as SessionId;
@@ -1352,13 +1359,13 @@ test("RuntimeService injects proactive delegation guidance for ultra reasoning",
     includeContent: true,
   });
 
-  expect(inspected.fragments.find((fragment) => fragment.id === "chili.delegation.proactive")).toMatchObject({
+  expect(inspected.fragments.find((fragment) => fragment.id === "chili.delegation.explicit")).toMatchObject({
     layer: "developer",
     lifecycle: "turn",
-    metadata: { policy: "proactive" },
+    metadata: { policy: "explicit" },
   });
-  expect(inspected.fragments.find((fragment) => fragment.id === "chili.delegation.proactive")?.content).toContain(
-    "Proactively delegate",
+  expect(inspected.fragments.find((fragment) => fragment.id === "chili.delegation.explicit")?.content).toContain(
+    "Delegate only when the user explicitly asks",
   );
 });
 
@@ -1600,7 +1607,7 @@ test("RuntimeService inspectPrompt only assembles prompt debug output", async ()
   expect(debug.fragments.map((fragment) => [fragment.id, fragment.layer, fragment.source])).toEqual([
     ["debug.base", "base", "core"],
     ["chili.delegation.explicit", "developer", "runtime"],
-    ["debug.skills", "developer", "skills"],
+    ["debug.skills", "contextual_user", "skills"],
     ["debug.project", "contextual_user", "project"],
   ]);
   expect(debug.fragments[0]).not.toHaveProperty("content");
@@ -2680,7 +2687,7 @@ test("RuntimeService stops before another tool-use turn when interrupted", async
   expect(cancelling?.sessionId).toBe(sessionId);
 });
 
-test("SingleAgentRuntime satisfies AgentRunner without changing aborted turn behavior", async () => {
+test("SingleAgentRuntime satisfies AgentRunner without starting an already aborted model request", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();
   let modelCalls = 0;
@@ -2715,7 +2722,7 @@ test("SingleAgentRuntime satisfies AgentRunner without changing aborted turn beh
   });
 
   expect(result.status).toBe("cancelled");
-  expect(modelCalls).toBe(1);
+  expect(modelCalls).toBe(0);
   expect(store.items.some((event) => event.type === "turn.retry_scheduled")).toBe(false);
 });
 

@@ -749,11 +749,12 @@ test("CLI prompt fragments include base, memory/project context, and skills cata
     expect(contextual.some((fragment) => fragment.source === "memory" && fragment.content.includes("project uses bun"))).toBe(true);
     expect(contextual.some((fragment) => fragment.source === "project" && fragment.content.includes("prefer focused patches"))).toBe(true);
     expect(developer.some((fragment) => fragment.id === "chili.memory.mechanics" && fragment.source === "memory")).toBe(true);
-    const skills = developer.find((fragment) => fragment.id === "chili.skills.catalog");
+    const skills = contextual.find((fragment) => fragment.id === "chili.skills.catalog");
     expect(skills).toMatchObject({
       id: "chili.skills.catalog",
       source: "skills",
-      layer: "developer",
+      layer: "contextual_user",
+      trust: "tool",
     });
     expect(skills?.content).toContain("<available_skills>");
     expect(skills?.content).toContain("reviewer");
@@ -769,7 +770,7 @@ test("CLI harness promptFragments provider includes chili.base", async () => {
   try {
     await mkdir(repo, { recursive: true });
     harness = await createCliHarness({
-      cwd: repo, model: "fake", quiet: true, yes: true,
+      cwd: repo, chiliHome: join(root, "profile"), model: "fake", quiet: true, yes: true,
       // Base prompt assembly does not need live servers from the user's config.
       mcpConnectMode: "manual",
     });
@@ -790,7 +791,7 @@ test("CLI harness promptFragments provider includes chili.base", async () => {
   }
 });
 
-test("CLI harness scopes skill catalogs, mentions, and activation to the session cwd", async () => {
+test("CLI harness scopes skill catalogs, mentions, and activation to each session project in one Host", async () => {
   const root = await mkdtempName();
   const repoA = join(root, "repo-a");
   const repoB = join(root, "repo-b");
@@ -815,6 +816,7 @@ test("CLI harness scopes skill catalogs, mentions, and activation to the session
     }
     harness = await createCliHarness({
       cwd: repoB,
+      chiliHome: join(root, "profile"),
       model: "fake",
       quiet: true,
       yes: true,
@@ -1995,6 +1997,7 @@ test("CLI prompt fragments inject explicitly mentioned skill bodies for one turn
     const skillRegistry = new SkillRegistry([skill("reviewer", "project", skillDir)]);
     const fragments = await buildCliPromptFragments({
       cwd: repo,
+      chiliHome: join(root, "profile"),
       skillRegistry,
       turn: {
         text: "please use $reviewer here",
@@ -2026,6 +2029,7 @@ test("CLI prompt fragments warn instead of choosing ambiguous plain skill mentio
   const projectSkill = skill("same", "project");
   const fragments = await buildCliPromptFragments({
     cwd: "/repo",
+    memoryScopes: [],
     skillRegistry: new SkillRegistry([projectSkill], [], [userSkill, projectSkill]),
     turn: {
       text: "try $same",
@@ -2041,6 +2045,7 @@ test("CLI prompt fragments use structured skill path bindings for duplicate name
   const projectSkill = skill("same", "project");
   const fragments = await buildCliPromptFragments({
     cwd: "/repo",
+    memoryScopes: [],
     skillRegistry: new SkillRegistry([projectSkill], [], [userSkill, projectSkill]),
     turn: {
       text: "try $same",

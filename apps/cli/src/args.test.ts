@@ -1,6 +1,12 @@
 import { expect, test } from "bun:test";
 import { parseArgs, usage } from "./args.js";
 
+test("parses an explicit profile directory for every CLI entry point", () => {
+  expect(parseArgs(["skills", "list", "--chili-home", "/tmp/profile"]))
+    .toMatchObject({ command: "skills-list", chiliHome: "/tmp/profile" });
+  expect(() => parseArgs(["--chili-home"])).toThrow("--chili-home requires a value");
+});
+
 test("parses DeepSeek as a CLI model", () => {
   expect(parseArgs(["--model", "deepseek", "hello"])).toMatchObject({
     command: "run",

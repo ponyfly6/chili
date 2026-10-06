@@ -15,9 +15,13 @@ import {
 } from "@chili/commands";
 import {
   McpClientManager,
+  McpStdioGuardianOwner,
+  type McpGuardianLifecycleEvent,
   createMcpChiliTools,
   createSdkMcpClient,
   parseMcpConfig,
+  mcpServerIdentity,
+  mcpDefinitionFingerprint,
   type McpClient,
   type McpConfig,
   type McpDiagnostic,
@@ -51,8 +55,11 @@ import type {
   TimestampMs,
 } from "@chili/protocol";
 import type { RuntimeMcpControlService } from "@chili/protocol";
+import { validateStructuredToolData } from "@chili/tools";
 import type {
   McpResourceReadResult,
+  McpResourceReadInput,
+  ToolRegistryContext,
   McpResourceSummary,
   McpResourcesController,
   McpToolControllerContext,
@@ -69,6 +76,7 @@ export interface HostMcpRuntimeOptions {
   deferConnect?: boolean;
   connectMode?: "eager" | "background" | "manual";
   createClient?: (server: McpServerConfig) => McpClient;
+  guardianLifecycle?: (event: McpGuardianLifecycleEvent) => void;
 }
 
 export interface HostMcpRuntime {
@@ -114,6 +122,7 @@ export class HostMcpRuntimeClosedError extends Error {
 
 class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, McpResourcesController, McpPromptController {
   private userScope: McpManagerScope | undefined;
+  private stdioGuardian: McpStdioGuardianOwner | undefined;
   private readonly projectScopes = new Map<string, Promise<McpManagerScope>>();
   private readonly liveScopes = new Set<McpManagerScope>();
   private readonly activeDisconnects = new Map<McpManagerScope, Promise<void>>();
@@ -148,6 +157,9 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
   async start(): Promise<void> {
     this.assertOpen();
     this.connectMode = this.options.connectMode ?? (this.options.deferConnect === true ? "background" : "eager");
+    if (!this.options.createClient && process.platform !== "win32") {
+      this.stdioGuardian = await McpStdioGuardianOwner.create(this.options.guardianLifecycle);
+    }
     await this.reloadUserScope();
     this.assertOpen();
     this.registerMcpToolProviders();
@@ -171,6 +183,7 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
       ...scopes.map((scope) => this.disconnectScope(scope)),
       ...this.persistentMutations,
       ...this.eventPublications,
+      ...(this.stdioGuardian ? [this.stdioGuardian.close()] : []),
     ];
     void Promise.allSettled(cleanups).then((results) => {
       this.lifecycle = "closed";
@@ -218,6 +231,30 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
         servers: boundedServerDescriptors(scopedStates(view)),
         errors: scopedLoadErrors(view),
       };
+    });
+  }
+
+  async connect(server: string, input: McpScopeInput = {}): Promise<RuntimeMcpServerDescriptor> {
+    return this.enqueueMutation(async () => {
+      const view = await this.scopeView(input.cwd);
+      const manager = scopedManagerForServer(view, server);
+      if (!manager) throw new Error("MCP server not found");
+      await manager.connect(server);
+      this.assertOpen();
+      if (manager === view.user.manager) this.publishUserScopeSnapshot(view.user);
+      return toRuntimeServerDescriptor(manager.getState(server)!);
+    });
+  }
+
+  async disconnect(server: string, input: McpScopeInput = {}): Promise<RuntimeMcpServerDescriptor> {
+    return this.enqueueMutation(async () => {
+      const view = await this.scopeView(input.cwd);
+      const manager = scopedManagerForServer(view, server);
+      if (!manager) throw new Error("MCP server not found");
+      await manager.disconnect(server);
+      this.assertOpen();
+      if (manager === view.user.manager) this.publishUserScopeSnapshot(view.user);
+      return toRuntimeServerDescriptor(manager.getState(server)!);
     });
   }
 
@@ -297,8 +334,18 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
     return requireBoundedFlatCatalog(resources, "resource");
   }
 
+  async prepareRead(input: McpResourceReadInput, context: ToolRegistryContext): Promise<{ resourceIdentity: string; revision: string }> {
+    const view = await this.scopeView(context.cwd);
+    this.assertOpen();
+    const manager = scopedManagerForServer(view, input.serverName);
+    const state = manager?.getState(input.serverName);
+    const revision = manager?.getResourceRevision(input.serverName, input.uri);
+    if (!state || !revision) throw new Error("MCP resource server is not connected");
+    return { resourceIdentity: mcpServerIdentity(state.server), revision };
+  }
+
   async readResource(
-    input: { serverName: string; uri: string },
+    input: McpResourceReadInput,
     context: McpToolControllerContext,
   ): Promise<McpResourceReadResult> {
     const view = await this.scopeView(context.cwd);
@@ -309,7 +356,14 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
       "MCP server name",
       MCP_DESCRIPTOR_LIMITS.identityBytes,
     )}`);
-    const result = await manager.readResource(input.serverName, input.uri, context.signal);
+    if (input.resourceIdentity !== undefined && input.resourceIdentity !== mcpServerIdentity(manager.getState(input.serverName)!.server)) {
+      throw new Error("MCP resource target changed; prepare the read again");
+    }
+    // Scope discovery can await filesystem or connection work after approval.
+    // Revalidate policy at the effect boundary; manager also fences the revision.
+    await context.assertCurrentAuthorization?.();
+    this.assertOpen();
+    const result = await manager.readResource(input.serverName, input.uri, context.signal, input.revision);
     const content = firstResourceContent(result, input.uri);
     return {
       serverName: safeIdentity(input.serverName, "MCP server name", MCP_DESCRIPTOR_LIMITS.identityBytes),
@@ -350,7 +404,19 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
     const prompts = scopedPrompts(view);
     const catalog = boundMcpPromptDefinitions(prompts);
     requireCompleteCatalog(catalog, "prompt");
-    return createMcpPromptCommands(catalog.items, this);
+    const bindings = new Map(prompts.map(({ server, prompt }) => {
+      const manager = scopedManagerForServer(view, server.name)!;
+      return [`${server.name}\0${prompt.name}`, { manager, revision: manager.getPromptRevision(server.name, prompt.name) }] as const;
+    }));
+    return createMcpPromptCommands(catalog.items, {
+      renderPrompt: async (request) => {
+        this.assertOpen();
+        const binding = bindings.get(`${request.serverName}\0${request.promptName}`);
+        if (!binding) throw new Error("MCP prompt is no longer available");
+        const result = await binding.manager.getPrompt(request.serverName, request.promptName, request.arguments, undefined, binding.revision);
+        return { messages: result.messages.map((message) => ({ role: message.role, content: mcpPromptContentText(message.content) })) };
+      },
+    });
   }
 
   assertOpen(): void {
@@ -566,7 +632,11 @@ class HostMcpRuntimeImpl implements HostMcpRuntime, RuntimeMcpControlService, Mc
   private createManager(scope: McpManagerScope, config: McpConfig): McpClientManager {
     return new McpClientManager({
       config,
-      createClient: (server) => (this.options.createClient ?? createSdkMcpClient)(server),
+      createClient: (server) => {
+        if (this.options.createClient) return this.options.createClient(server);
+        if (server.type === "stdio" && !this.stdioGuardian) throw new Error("Managed MCP stdio is unavailable on this host");
+        return createSdkMcpClient(server, this.stdioGuardian ? { stdioGuardian: this.stdioGuardian } : {});
+      },
       onDiagnostic: (diagnostic) => {
         if (!scope.active || this.lifecycle !== "open") return;
         const safeDiagnostic = sanitizeMcpDiagnostic(diagnostic);
@@ -910,7 +980,7 @@ function enforceProjectMcpTrustPolicy(
     if (server.enabled && projectStdioServerRequiresApproval({
       scope: server.source,
       transport: server.type,
-      trustedByUser: trustedUserServers.has(name),
+      trustedByUser: trustedUserServers.has(mcpServerIdentity(server)),
     })) {
       diagnostics.push({
         severity: "warning",
@@ -930,7 +1000,7 @@ function enforceProjectMcpTrustPolicy(
 function explicitlyTrustedUserServers(config: McpConfig): ReadonlySet<string> {
   return new Set(Object.values(config.servers)
     .filter((server) => server.source === "user" && server.trust === true)
-    .map((server) => server.name));
+    .map((server) => mcpServerIdentity(server)));
 }
 
 async function readJsonIfExists(path: string | undefined, errors: RuntimeMcpReloadError[]): Promise<unknown> {
@@ -1760,6 +1830,7 @@ function scopedToolDefinitions(
   const definitions: ReturnType<typeof createMcpChiliTools> = [];
   let descriptorBytes = 2;
   for (const { state, manager } of boundedScopedStateEntries(view, "tool")) {
+    if (state.status !== "connected") continue;
     const tools = boundedToolsForExecution(state.server.name, state.tools);
     if (definitions.length + tools.length > MCP_DESCRIPTOR_LIMITS.catalogItems) {
       throw descriptorLimitError("tool", "catalog count");
@@ -1769,9 +1840,10 @@ function scopedToolDefinitions(
       throw descriptorLimitError("tool", "catalog aggregate");
     }
     definitions.push(...createMcpChiliTools(state.server, tools, {
-      callTool(serverName, toolName, input, signal) {
+      getToolRevision: (serverName, toolName) => manager.getToolRevision(serverName, toolName),
+      callTool(serverName, toolName, input, signal, revision) {
         assertOpen();
-        return manager.callTool(serverName, toolName, input, signal);
+        return manager.callTool(serverName, toolName, input, signal, revision);
       },
     }));
     descriptorBytes += toolsBytes;
@@ -1785,7 +1857,16 @@ function scopedToolDefinitions(
 function boundedToolsForExecution(serverName: string, tools: readonly McpTool[]): McpTool[] {
   const catalog = boundMcpToolCatalog(serverName, tools);
   requireCompleteCatalog(catalog, "tool");
-  return catalog.items.map(({ serverName: _serverName, ...tool }) => tool);
+  return catalog.items.map(({ serverName: _serverName, ...tool }, index) => {
+    const originalSchema = tools[index]?.inputSchema;
+    if (originalSchema !== undefined) {
+      const schema = validateStructuredToolData(originalSchema);
+      if (mcpDefinitionFingerprint(schema) !== mcpDefinitionFingerprint(tool.inputSchema)) {
+        throw new Error("MCP tool input schema cannot be represented without changing its definition");
+      }
+    }
+    return tool;
+  });
 }
 
 function scopedState(view: McpScopeView, serverName: string): McpServerState | undefined {
@@ -1801,6 +1882,7 @@ function scopedManagerForServer(view: McpScopeView, serverName: string): McpClie
 function scopedPrompts(view: McpScopeView): ReturnType<McpClientManager["listPrompts"]> {
   const result: ReturnType<McpClientManager["listPrompts"]> = [];
   for (const { state } of boundedScopedStateEntries(view, "prompt")) {
+    if (state.status !== "connected") continue;
     const count = safeCollectionLength(state.prompts);
     for (let index = 0; index < count; index += 1) {
       if (result.length > MCP_DESCRIPTOR_LIMITS.catalogItems) return result;
@@ -1815,6 +1897,7 @@ function scopedPrompts(view: McpScopeView): ReturnType<McpClientManager["listPro
 function scopedResources(view: McpScopeView): ReturnType<McpClientManager["listResources"]> {
   const result: ReturnType<McpClientManager["listResources"]> = [];
   for (const { state } of boundedScopedStateEntries(view, "resource")) {
+    if (state.status !== "connected") continue;
     const count = safeCollectionLength(state.resources);
     for (let index = 0; index < count; index += 1) {
       if (result.length > MCP_DESCRIPTOR_LIMITS.catalogItems) return result;

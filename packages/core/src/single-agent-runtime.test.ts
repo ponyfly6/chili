@@ -221,11 +221,11 @@ test("terminalizes pending tools when generator cleanup aborts after explicit fi
   expect(result.usage).toEqual(usage);
   expect(fixture.executed).toEqual([]);
   expect(await fixture.store.events({ sessionId, type: "tool.call_finished" })).toMatchObject([
-    { payload: { callId: "inspect_after_finish", status: "cancelled", synthetic: true } },
+    { payload: { providerCallId: "inspect_after_finish", status: "cancelled", synthetic: true } },
   ]);
   const parts = (await fixture.store.messages(sessionId)).flatMap((message) => message.parts);
   expect(parts.filter((part) => part.type === "tool_result"))
-    .toMatchObject([{ callId: "inspect_after_finish", synthetic: true }]);
+    .toMatchObject([{ providerCallId: "inspect_after_finish", synthetic: true }]);
 });
 
 test("cancels remaining serial tools without changing the first completed tool", async () => {
@@ -242,7 +242,7 @@ test("cancels remaining serial tools without changing the first completed tool",
   const append = fixture.store.append.bind(fixture.store);
   fixture.store.append = async (event, options) => {
     await append(event, options);
-    if (event.type === "tool.call_finished" && event.payload.callId === "inspect_first") controller.abort();
+    if (event.type === "tool.call_finished" && event.payload.providerCallId === "inspect_first") controller.abort();
   };
   const sessionId = await fixture.runtime.createSession({ cwd: tmpdir() });
   const result = await fixture.runtime.runTurn({ sessionId, cwd: tmpdir(), signal: controller.signal });
@@ -250,12 +250,12 @@ test("cancels remaining serial tools without changing the first completed tool",
   expect(result.usage).toEqual(usage);
   expect(fixture.executed).toEqual([sessionId]);
   expect(await fixture.store.events({ sessionId, type: "tool.call_finished" })).toMatchObject([
-    { payload: { callId: "inspect_first", status: "completed", output: "unchanged" } },
-    { payload: { callId: "inspect_second", status: "cancelled", synthetic: true } },
+    { payload: { providerCallId: "inspect_first", status: "completed", output: "unchanged" } },
+    { payload: { providerCallId: "inspect_second", status: "cancelled", synthetic: true } },
   ]);
   const parts = (await fixture.store.messages(sessionId)).flatMap((message) => message.parts);
   expect(parts.filter((part) => part.type === "tool_result"))
-    .toMatchObject([{ callId: "inspect_first", output: "unchanged" }, { callId: "inspect_second", synthetic: true }]);
+    .toMatchObject([{ providerCallId: "inspect_first", output: "unchanged" }, { providerCallId: "inspect_second", synthetic: true }]);
 });
 
 test("preserves completed parallel results when cancellation precedes the next serial tool", async () => {
@@ -299,14 +299,14 @@ test("preserves completed parallel results when cancellation precedes the next s
   expect(fixture.executed).toEqual([]);
   const finished = await fixture.store.events({ sessionId, type: "tool.call_finished" });
   expect(finished).toHaveLength(3);
-  expect(finished).toContainEqual(expect.objectContaining({ payload: expect.objectContaining({ callId: "parallel_first", status: "completed" }) }));
-  expect(finished).toContainEqual(expect.objectContaining({ payload: expect.objectContaining({ callId: "parallel_second", status: "completed" }) }));
-  expect(finished).toContainEqual(expect.objectContaining({ payload: expect.objectContaining({ callId: "serial_last", status: "cancelled", synthetic: true }) }));
+  expect(finished).toContainEqual(expect.objectContaining({ payload: expect.objectContaining({ providerCallId: "parallel_first", status: "completed" }) }));
+  expect(finished).toContainEqual(expect.objectContaining({ payload: expect.objectContaining({ providerCallId: "parallel_second", status: "completed" }) }));
+  expect(finished).toContainEqual(expect.objectContaining({ payload: expect.objectContaining({ providerCallId: "serial_last", status: "cancelled", synthetic: true }) }));
   const parts = (await fixture.store.messages(sessionId)).flatMap((message) => message.parts);
   expect(parts.filter((part) => part.type === "tool_result")).toMatchObject([
-    { callId: "parallel_first", output: "parallel complete" },
-    { callId: "parallel_second", output: "parallel complete" },
-    { callId: "serial_last", synthetic: true },
+    { providerCallId: "parallel_first", output: "parallel complete" },
+    { providerCallId: "parallel_second", output: "parallel complete" },
+    { providerCallId: "serial_last", synthetic: true },
   ]);
 });
 
@@ -343,9 +343,9 @@ test("fails undispatched tools after a planning error without repeating complete
   expect(executed).toBe(1);
   if (result.status === "failed") expect(result.error.message).toBe("tool scheduling failed");
   expect(await fixture.store.events({ sessionId, type: "tool.call_finished" })).toMatchObject([
-    { payload: { callId: "planned_first", status: "completed", output: "first complete" } },
-    { payload: { callId: "planned_second", status: "failed", error: "tool scheduling failed", synthetic: true } },
-    { payload: { callId: "planned_third", status: "failed", error: "tool scheduling failed", synthetic: true } },
+    { payload: { providerCallId: "planned_first", status: "completed", output: "first complete" } },
+    { payload: { providerCallId: "planned_second", status: "failed", error: "tool scheduling failed", synthetic: true } },
+    { payload: { providerCallId: "planned_third", status: "failed", error: "tool scheduling failed", synthetic: true } },
   ]);
 });
 

@@ -40,6 +40,7 @@ export interface ContextCompactionInput {
   reasoningLevel?: ReasoningLevel;
   serviceTier?: ServiceTier;
   signal?: AbortSignal;
+  onPreparedRequest?: (request: ModelStreamInput) => Promise<void>;
 }
 
 export interface ContextCompactionResult {
@@ -221,14 +222,25 @@ export class ContextCompactionService {
 
     let text = "";
     let usage: ModelUsage | undefined;
+    let finished = false;
     try {
+      input.signal?.throwIfAborted();
+      await input.onPreparedRequest?.(modelInput);
       for await (const event of this.options.model.stream(modelInput)) {
+        input.signal?.throwIfAborted();
         if (event.type === "text_delta") {
           text += event.text;
           continue;
         }
         if (event.type === "metadata" || event.type === "finish") {
           if (event.usage) usage = event.usage;
+          if (event.type === "finish") {
+            if (!event.reason.trim() || /^(length|max_tokens|max_output_tokens|content_filter)$/i.test(event.reason)) {
+              throw new Error(`Compaction model did not complete successfully (${event.reason})`);
+            }
+            finished = true;
+            break;
+          }
           continue;
         }
         if (event.type === "error") {
@@ -239,6 +251,8 @@ export class ContextCompactionService {
           throw new Error("Compaction model attempted to call a tool");
         }
       }
+      input.signal?.throwIfAborted();
+      if (!finished) throw new Error("Compaction model stream ended before an explicit finish event");
     } catch (error) {
       throw attachModelUsage(toError(error), usage);
     }

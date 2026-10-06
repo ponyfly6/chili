@@ -2,12 +2,14 @@ import type {
   ChiliEvent,
   DelegationPolicy,
   EventEnvelope,
+  ExecutionIdentity,
   Message,
   MessageImageContent,
   MessageId,
   ModelSelection,
   ModelUsage,
   PartId,
+  PreparedModelRequest,
   ReasoningLevel,
   RuntimeModelConfig,
   RuntimeModelDescriptor,
@@ -42,6 +44,7 @@ import {
   SessionReservedForSubagentError,
   SessionRunClaimConflictError,
   SessionStateConflictError,
+  type AgentTaskRow,
   type EventAppendOptions,
   type EventStore,
   type SessionCreationClaimFence,
@@ -59,6 +62,9 @@ import { basename, dirname, resolve } from "node:path";
 import {
   ContextWindowBuilder,
   conversationPromptFragment,
+  latestPreparedRequest,
+  preparedRequestDebug,
+  preparedRequestFragments,
   type ContextBudgetOptions,
 } from "./context/index.js";
 import { messagesForContext } from "./cancelled-turn-context.js";
@@ -77,6 +83,8 @@ import type { AgentRunner, PromptExecutionScope, RunTurnInput, RunTurnResult } f
 import type { CompactContextResult } from "./single-agent-runtime.js";
 import {
   assessDelegationIntegration,
+  assessSubagentCompletion,
+  subagentCompletionRepairPrompt,
   delegationIntegrationRepairPrompt,
 } from "./subagent-completion.js";
 
@@ -120,6 +128,8 @@ export interface RuntimeServiceOptions {
     & Partial<Pick<SubagentProjectionStore, "agentTasks" | "agentRuns">>
     & Partial<Pick<TeamProjectionStore, "teamMembers" | "teams">>;
   cwd: string;
+  executionIdentityResolver?: (cwd: string) => ExecutionIdentity | Promise<ExecutionIdentity>;
+  executionContext?: <T>(operation: () => T) => T;
   maxTurns?: number;
   maxGoalTurns?: number;
   defaultGoalTokenBudget?: number;
@@ -201,6 +211,8 @@ export interface InspectPromptInput {
 export interface InspectPromptWithContentResult {
   debug: PromptDebugManifest;
   fragments: RenderedPromptFragment[];
+  /** Present when inspecting the actual persisted provider request. */
+  preparedRequest?: PreparedModelRequest;
 }
 
 export interface CompactSessionInput {
@@ -251,6 +263,7 @@ interface RuntimeRunState {
   input?: StoredSessionInput;
   inputResult?: SubmitPromptResult;
   steering?: boolean;
+  controlInterrupted?: boolean;
 }
 
 interface DeferredGoalContinuationState {
@@ -304,6 +317,7 @@ interface RuntimeAtomicSessionStore {
     leaseDurationMs: number;
   }): boolean;
   releaseSessionRun(input: { sessionId: SessionId; claimId: string }): void;
+  sessionRunClaim?(sessionId: SessionId): { claimId: string; leaseExpiresAt: number } | undefined;
 }
 
 export type SubmitPromptResult =
@@ -339,6 +353,15 @@ export class RuntimeBusyError extends Error {
   constructor(readonly sessionId: SessionId) {
     super(`Session is already running: ${sessionId}`);
     this.name = "RuntimeBusyError";
+  }
+}
+
+/** A store lease is fencing, not a cancellation transport. */
+export class RuntimeForeignOwnerError extends RuntimeBusyError {
+  constructor(sessionId: SessionId) {
+    super(sessionId);
+    this.name = "RuntimeForeignOwnerError";
+    this.message = `Session ${sessionId} is executing in another runtime; cross-owner control is unavailable. Use its owning Host.`;
   }
 }
 
@@ -382,6 +405,13 @@ export class RuntimeSessionClaimCapabilityError extends Error {
       `Incomplete atomic session ${capability} capability; missing ${missingMethods.join(", ")}`,
     );
     this.name = "RuntimeSessionClaimCapabilityError";
+  }
+}
+
+export class RuntimeSessionIdentityError extends Error {
+  constructor(readonly sessionId: SessionId, readonly dimensions: readonly string[]) {
+    super(`Session ${sessionId} belongs to a different execution identity (${dimensions.join(", ")}); use its original profile, project and workspace.`);
+    this.name = "RuntimeSessionIdentityError";
   }
 }
 
@@ -441,7 +471,11 @@ export class RuntimeService {
     this.goals = new GoalService(goalOptions);
   }
 
-  async createSession(input: CreateRuntimeSessionInput = {}): Promise<RuntimeSessionHandle> {
+  createSession(input: CreateRuntimeSessionInput = {}): Promise<RuntimeSessionHandle> {
+    return this.inExecutionContext(() => this.createAdmittedSession(input));
+  }
+
+  private async createAdmittedSession(input: CreateRuntimeSessionInput): Promise<RuntimeSessionHandle> {
     this.assertOpen();
     const sessionId = input.sessionId ?? this.id<SessionId>("session");
     if (this.creatingSessions.has(sessionId)) {
@@ -465,6 +499,7 @@ export class RuntimeService {
         throw new RuntimeSubagentSessionAccessError(sessionId);
       }
 
+      const identity = await this.options.executionIdentityResolver?.(cwd);
       const atomicStore = this.atomicSessionStore("creation");
       let creationClaimId: string | undefined;
       let creationClaimHeartbeat: ReturnType<typeof setInterval> | undefined;
@@ -501,10 +536,7 @@ export class RuntimeService {
         }
       }
 
-      const createInput: { sessionId: SessionId; cwd: string } = {
-        sessionId,
-        cwd,
-      };
+      const createInput = { sessionId, cwd, ...(identity ? { identity } : {}) };
       try {
         const createdSessionId = await this.options.runtime.createSession(createInput);
         if (createdSessionId !== sessionId) {
@@ -598,7 +630,34 @@ export class RuntimeService {
   }
 
   async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
+    this.assertControlOwner(sessionId);
     await this.assertSessionAccessAllowed(sessionId, true);
+    await this.assertSessionIdentity(sessionId);
+  }
+
+  private async assertSessionIdentity(sessionId: SessionId): Promise<void> {
+    if (!this.options.executionIdentityResolver) return;
+    const session = (await this.options.store.sessions()).find((candidate) => candidate.id === sessionId);
+    if (!session) throw new RuntimeSessionNotFoundError(sessionId);
+    const expected = await this.options.executionIdentityResolver(await canonicalWorkspacePath(session.cwd));
+    const bound = await this.options.store.events({ sessionId, type: "session.identity_bound", tail: true, limit: 1 });
+    const created = bound.length === 0
+      ? await this.options.store.events({ sessionId, type: "session.created", tail: true, limit: 1 })
+      : [];
+    const recorded = ((bound[0] ?? created[0])?.payload as { identity?: ExecutionIdentity } | undefined)?.identity;
+    if (recorded) {
+      const dimensions = (["profileId", "projectId", "workspaceId"] as const).filter((key) => recorded[key] !== expected[key]);
+      if (dimensions.length > 0) throw new RuntimeSessionIdentityError(sessionId, dimensions);
+      return;
+    }
+    // Legacy sessions bind once at the first fenced execution. Merely reading
+    // or accepting an input never grants a different profile permission to run.
+    const run = this.running.get(sessionId);
+    if (run) {
+      run.operationContext.capability.assertCurrent();
+      await this.append({ sessionId }, "session.identity_bound", { sessionId, identity: expected },
+        run.operationContext.capability.runClaim ? { runClaim: run.operationContext.capability.runClaim } : undefined);
+    }
   }
 
   private async assertSessionAccessAllowed(sessionId: SessionId, requireActive: boolean): Promise<void> {
@@ -958,6 +1017,15 @@ export class RuntimeService {
   async inspectPrompt(input: InspectPromptInput): Promise<PromptDebugManifest | InspectPromptWithContentResult>;
   async inspectPrompt(input: InspectPromptInput): Promise<PromptDebugManifest | InspectPromptWithContentResult> {
     await this.assertSessionTurnAllowed(input.sessionId);
+    if (input.text === undefined && input.skillMentions === undefined && input.cwd === undefined) {
+      const preparedRequest = await latestPreparedRequest(this.options.store, input.sessionId);
+      if (preparedRequest) {
+        const debug = preparedRequestDebug(preparedRequest);
+        return input.includeContent
+          ? { debug, fragments: preparedRequestFragments(preparedRequest), preparedRequest }
+          : debug;
+      }
+    }
     const cwd = await this.resolveExistingSessionCwd(input.sessionId, input.cwd);
     const modelState = await this.resolveSessionModelState(input.sessionId);
     const prompt = await this.resolvePromptAssembly({
@@ -981,6 +1049,7 @@ export class RuntimeService {
       if (!/^[^\u0000-\u0020\u007f]{1,512}$/u.test(submissionId)) throw new TypeError("Invalid submissionId");
       const mode = input.mode ?? "start";
       if (!["start", "queue", "steer"].includes(mode)) throw new TypeError("Invalid input mode");
+      this.assertControlOwner(input.sessionId);
       const previous = store.sessionInput(input.sessionId, submissionId);
       if (!previous && mode === "steer" && input.expectedExecutionRef !== undefined) {
         this.assertExecutionRef(input.sessionId, input.expectedExecutionRef);
@@ -1065,17 +1134,21 @@ export class RuntimeService {
 
   cancelInput(input: { sessionId: SessionId; inputId: string; expectedRevision: number }): RuntimeInputQueue {
     this.assertOpen();
+    this.assertControlOwner(input.sessionId);
     const store = this.inputStore();
     if (!store) throw new Error("Durable inputs are unavailable");
     return store.mutateSessionInputs({ kind: "cancel", ...input }).queue;
   }
 
   cancelInputsFromSource(sessionId: SessionId, source: string): void {
+    this.assertOpen();
+    this.assertControlOwner(sessionId);
     this.inputStore()?.mutateSessionInputs({ kind: "cancel-source", sessionId, source });
   }
 
   async resumeInputs(sessionId: SessionId): Promise<RuntimeInputQueue> {
     return this.withMutationAdmission(async () => {
+      this.assertControlOwner(sessionId);
       const before = this.inputQueue(sessionId);
       await this.assertSessionTurnAllowed(sessionId);
       const goal = await this.goals.getGoal({ sessionId });
@@ -1106,8 +1179,24 @@ export class RuntimeService {
     for (const session of await this.options.store.sessions()) {
       if (session.status !== "active" || this.running.has(session.id)) continue;
       if (store.sessionInputQueue(session.id).items.some((item) => item.state !== "settled")) {
+        this.assertControlOwner(session.id);
         store.mutateSessionInputs({ kind: "recover", sessionId: session.id });
       }
+    }
+  }
+
+  private assertControlOwner(sessionId: SessionId): void {
+    const store = this.options.store as typeof this.options.store & Partial<RuntimeAtomicSessionStore>;
+    const claim = store.sessionRunClaim?.(sessionId);
+    if (claim && claim.leaseExpiresAt > Date.now()
+      && this.running.get(sessionId)?.durableClaimId !== claim.claimId) {
+      throw new RuntimeForeignOwnerError(sessionId);
+    }
+    // Older durable-input adapters expose claimed input state but no lease
+    // inspection. Never pretend a remote input's execution is locally owned.
+    if (!store.sessionRunClaim && !this.running.has(sessionId)
+      && this.inputStore()?.sessionInputQueue(sessionId).items.some((input) => input.state === "claimed")) {
+      throw new RuntimeForeignOwnerError(sessionId);
     }
   }
 
@@ -1209,8 +1298,17 @@ export class RuntimeService {
       let supervisedAllConfirmationRequired = false;
       let supervisedWorkflowActive = false;
       let previousGoalUsageScope: GoalUsageScope | undefined;
+      let childRepairAttempted = false;
+      let extraChildRepairTurn = false;
+      const delegationProjection = {
+        baseline: new Map((await this.options.store.agentTasks?.({ parentSessionId: promptInput.sessionId, limit: 10_001 }) ?? [])
+          .map((task) => [task.id, taskLifecycleVersion(task)])),
+        callIds: new Set<string>(),
+        taskIds: new Set<string>(),
+      };
 
-      for (let index = 0; index < maxTurns; index++) {
+      for (let index = 0; index < maxTurns || extraChildRepairTurn; index++) {
+        extraChildRepairTurn = false;
         if (controller.signal.aborted) {
           return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
         }
@@ -1261,8 +1359,12 @@ export class RuntimeService {
         }
 
         const assistantMessage = await this.assistantMessage(promptInput.sessionId, result.assistantMessageId);
+        if (controller.signal.aborted) {
+          return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
+        }
         if (assistantMessage) {
-          const activity = delegationTurnActivity(assistantMessage);
+          const activity = await this.projectedDelegationActivity(assistantMessage, promptInput.sessionId, delegationProjection)
+            ?? legacyDelegationTurnActivity(assistantMessage);
           await this.recoverUnreadableSupervisedActivity(
             activity,
             promptInput.sessionId,
@@ -1307,7 +1409,26 @@ export class RuntimeService {
             .some((batchKey) => !confirmedSupervisedBatches.has(batchKey));
         }
 
+        if (controller.signal.aborted) {
+          return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
+        }
+
         if (!isToolUseFinishReason(result.finishReason)) {
+          if (this.options.allowSubagentSessions) {
+            const completion = assessSubagentCompletion(assistantText(assistantMessage));
+            if (completion.status === "incomplete") {
+              if (childRepairAttempted) {
+                return await this.incompleteChildCompletion(promptInput, turns, result.turnId, completion.issue);
+              }
+              childRepairAttempted = true;
+              await this.options.runtime.appendUserMessage({
+                sessionId: promptInput.sessionId,
+                text: subagentCompletionRepairPrompt(completion),
+              });
+              if (index + 1 >= maxTurns) extraChildRepairTurn = true;
+              continue;
+            }
+          }
           const openTaskIds = [...requiredOpenTaskIds];
           const assessment = delegationIntegrationRequired && openTaskIds.length === 0
             ? assessDelegationIntegration(assistantText(assistantMessage), {
@@ -1421,8 +1542,21 @@ export class RuntimeService {
       }
 
       if (!isToolUseFinishReason(finalResult.finishReason)) {
+        if (this.options.allowSubagentSessions) {
+          const finalMessage = await this.assistantMessage(promptInput.sessionId, finalResult.assistantMessageId);
+          if (controller.signal.aborted) {
+            return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
+          }
+          const completion = assessSubagentCompletion(assistantText(finalMessage));
+          if (completion.status === "incomplete") {
+            return await this.incompleteChildCompletion(promptInput, turns, finalResult.turnId, completion.issue);
+          }
+        }
         if (delegationIntegrationRequired) {
           const finalMessage = await this.assistantMessage(promptInput.sessionId, finalResult.assistantMessageId);
+          if (controller.signal.aborted) {
+            return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
+          }
           if (assessDelegationIntegration(assistantText(finalMessage), {
             supervised: supervisedWorkflowActive,
             supervisedResults: [...delegatedResultsByTask.values()],
@@ -1466,6 +1600,17 @@ export class RuntimeService {
         error: err,
       };
     }
+  }
+
+  private async incompleteChildCompletion(
+    input: SubmitPromptInput,
+    turns: RunTurnResult[],
+    turnId: TurnId,
+    issue: string,
+  ): Promise<SubmitPromptResult> {
+    const finishReason = `subagent_completion_${issue}`;
+    await this.publishStatus({ sessionId: input.sessionId, turnId, status: "failed", reason: finishReason });
+    return { status: "max_turns", turns, finishReason, error: new Error(`Subagent completion incomplete: ${issue}`) };
   }
 
   private async completedPromptWithGoalContinuation(
@@ -2117,6 +2262,65 @@ export class RuntimeService {
     return messages.find((message) => message.id === messageId);
   }
 
+  /** Current Task/Run projections are authoritative, regardless of tool aliases
+   * or model-visible truncation. The message decoder below serves old adapters
+   * that did not persist lifecycle facts; it cannot overwrite projected state. */
+  private async projectedDelegationActivity(
+    message: Message,
+    parentSessionId: SessionId,
+    state: { baseline: Map<string, string>; callIds: Set<string>; taskIds: Set<string> },
+  ): Promise<DelegationTurnActivity | undefined> {
+    if (!this.options.store.agentTasks) return undefined;
+    for (const part of message.parts) if (part.type === "tool_call") state.callIds.add(part.callId);
+    const tasks = await this.options.store.agentTasks({ parentSessionId, limit: 10_001 });
+    if (tasks.length > 10_000) throw new Error("Delegation task projection exceeds its safe inspection limit");
+    for (const task of tasks) {
+      if ((task.sourceCallId && state.callIds.has(task.sourceCallId))
+        || state.baseline.get(task.id) !== taskLifecycleVersion(task)) state.taskIds.add(task.id);
+    }
+    const relevant = tasks.filter((task) => state.taskIds.has(task.id));
+    if (relevant.length === 0) return undefined;
+    const activity = emptyDelegationTurnActivity();
+    const batches = new Map<string, AgentTaskRow[]>();
+    for (const task of relevant) {
+      const previous = state.baseline.get(task.id);
+      const followedUp = previous !== undefined && previous !== taskLifecycleVersion(task);
+      const required = followedUp || task.completionPolicy === "join" || task.completionPolicy === "supervised"
+        || (!task.completionPolicy && task.mode !== "background");
+      if (!required) continue;
+      activity.requiresIntegration = true;
+      activity.taskResults.push({ taskId: task.id, status: task.status,
+        ...(task.summary ? { summary: task.summary } : {}), ...(task.error ? { error: task.error } : {}) });
+      if (isFinalDelegatedTaskStatus(task.status)) activity.terminalTaskIds.add(task.id);
+      else activity.openTaskIds.add(task.id);
+      if (followedUp && !isFinalDelegatedTaskStatus(task.status)) {
+        activity.followupObserved = true;
+        activity.followupTaskIds.add(task.id);
+      }
+      if (task.completionPolicy === "supervised") {
+        activity.supervisedObserved = true;
+        activity.supervisedBatchTaskIds.add(task.id);
+        const key = task.batchId ?? task.sourceCallId ?? task.id;
+        const batch = batches.get(key) ?? [];
+        batch.push(task);
+        batches.set(key, batch);
+      }
+    }
+    for (const [batchKey, batch] of batches) {
+      const taskIds = new Set(batch.map((task) => task.id));
+      activity.supervisedBatches.push({ batchKey, taskIds });
+      const expected = Math.max(...batch.map((task) => task.expectedBatchSize ?? 1));
+      if (taskIds.size < expected) {
+        activity.unreadableTaskResultCallIds.add(batch[0]?.sourceCallId ?? batchKey);
+      } else if (batch.every((task) => isFinalDelegatedTaskStatus(task.status))) {
+        // Durable terminal state is the all-task confirmation; a particular
+        // tool name or extra model round-trip is no longer required.
+        activity.supervisedAllWaits.push({ taskIds });
+      }
+    }
+    return activity;
+  }
+
   private async recoverUnreadableSupervisedActivity(
     activity: DelegationTurnActivity,
     parentSessionId: SessionId,
@@ -2417,6 +2621,8 @@ export class RuntimeService {
 
   async interrupt(sessionId: SessionId, reason = "user_interrupt", expectedExecutionRef?: string): Promise<boolean> {
     return this.withMutationAdmission(async () => {
+      this.assertControlOwner(sessionId);
+      if (this.options.executionIdentityResolver && !this.running.has(sessionId)) await this.assertSessionIdentity(sessionId);
       if (expectedExecutionRef !== undefined) this.assertExecutionRef(sessionId, expectedExecutionRef);
       const steering = reason === "desktop_steer" || reason === "steer";
       if (!steering) this.inputStore()?.mutateSessionInputs({ kind: "pause", sessionId });
@@ -2647,7 +2853,7 @@ export class RuntimeService {
   ): Promise<T> {
     const context = this.running.get(sessionId)?.operationContext;
     if (!context) throw new RuntimeBusyError(sessionId);
-    return (async () => {
+    return this.inExecutionContext(async () => {
       try {
         context.capability.assertCurrent();
         return await this.sessionOperationStorage.run(
@@ -2676,6 +2882,10 @@ export class RuntimeService {
           const run = this.running.get(sessionId);
           if (run?.operationContext === context) {
             await run.resourceStop;
+            if (run.purpose === "operation" && run.controlInterrupted && !context.lost) {
+              await this.publishStatus({ sessionId, status: "cancelled", reason: "operation_interrupted" },
+                context.capability.runClaim ? { runClaim: context.capability.runClaim } : undefined);
+            }
             if (run.input?.claimId && !context.lost) {
               const result = run.inputResult;
               const outcome = this.lifecycle !== "open" ? "interrupted"
@@ -2692,7 +2902,7 @@ export class RuntimeService {
           this.releaseRunController(sessionId, context);
         }
       }
-    })();
+    });
   }
 
   private trackNestedSessionOperation<T>(
@@ -2816,12 +3026,16 @@ export class RuntimeService {
     if (this.lifecycle !== "open") throw new RuntimeServiceClosedError();
   }
 
+  private inExecutionContext<T>(operation: () => T): T {
+    return this.options.executionContext ? this.options.executionContext(operation) : operation();
+  }
+
   private async withMutationAdmission<T>(operation: () => Promise<T> | T): Promise<T> {
     this.assertOpen();
     const mutationSettlement = createSettlement();
     this.mutationSettlements.add(mutationSettlement.promise);
     try {
-      return await operation();
+      return await this.inExecutionContext(operation);
     } finally {
       mutationSettlement.settle();
       this.mutationSettlements.delete(mutationSettlement.promise);
@@ -2835,6 +3049,7 @@ export class RuntimeService {
     pauseGoal = true,
   ): Promise<void> {
     if (this.running.get(sessionId) !== run) return;
+    run.controlInterrupted = true;
     let cancellingPublication: Promise<void> | undefined;
     let goalPausePublication: Promise<void> | undefined;
     if (run.interruptMetadataAdmissionOpen) {
@@ -3074,8 +3289,8 @@ interface DelegatedTaskStateDecode {
   readable: boolean;
 }
 
-function delegationTurnActivity(message: Message): DelegationTurnActivity {
-  const activity: DelegationTurnActivity = {
+function emptyDelegationTurnActivity(): DelegationTurnActivity {
+  return {
     requiresIntegration: false,
     openTaskIds: new Set(),
     terminalTaskIds: new Set(),
@@ -3088,6 +3303,14 @@ function delegationTurnActivity(message: Message): DelegationTurnActivity {
     taskResults: [],
     unreadableTaskResultCallIds: new Set(),
   };
+}
+
+function taskLifecycleVersion(task: AgentTaskRow): string {
+  return `${task.generation}:${task.currentRunId ?? ""}:${task.status}:${task.updatedAt}`;
+}
+
+function legacyDelegationTurnActivity(message: Message): DelegationTurnActivity {
+  const activity = emptyDelegationTurnActivity();
   const results = new Map(
     message.parts.flatMap((part) => part.type === "tool_result" ? [[part.callId, part] as const] : []),
   );
@@ -3662,6 +3885,10 @@ function errorSessionId(error: unknown): SessionId | undefined {
 
 function isRuntimeSessionBoundaryError(error: Error): boolean {
   return error instanceof RuntimeServiceClosedError
+    || error instanceof RuntimeForeignOwnerError
+    || error.name === "RuntimeForeignOwnerError"
+    || error instanceof RuntimeSessionIdentityError
+    || error.name === "RuntimeSessionIdentityError"
     || error instanceof RuntimeSessionInactiveError
     || error instanceof RuntimeSubagentSessionAccessError
     || error instanceof RuntimeSessionNotFoundError

@@ -1,5 +1,5 @@
 import { mkdir, realpath } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   AgentRunnerSubagentRunner,
   AgentMailboxDeliveryPump,
@@ -27,8 +27,9 @@ import {
   type RuntimePromptTurnContext,
   type WorkerToolPolicy,
 } from "@chili/core";
-import type { AgentPath, ApprovalDecision, ChiliEvent, EventEnvelope, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId, TaskId, TeamId } from "@chili/protocol";
-import { ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
+import type { AgentPath, ChiliEvent, EventEnvelope, ExecutionIdentity, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId, TaskId, TeamId } from "@chili/protocol";
+import { compactRuntimeEvent } from "@chili/protocol";
+import { HostOwnerClaim, ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
 import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
   DeferredApprovalQueue,
@@ -37,6 +38,9 @@ import {
   FileSystemSnapshotProvider,
   InMemoryToolRegistry,
   ManagedProcessManager,
+  observeProcessGuardianLifecycle,
+  resolveFileResourceDenials,
+  withProcessOwner,
   PolicyApprovalBroker,
   PolicyApprovalState,
   type AgentMessageRecord,
@@ -97,6 +101,7 @@ import {
   createToolSearchTool,
   createWriteFileTool,
   type BashRunner,
+  type BashRunRequest,
   type DelegationToolController,
   type GoalToolController,
   type MailboxListToolInput,
@@ -130,7 +135,10 @@ import {
   type SkillResourceListing,
   type SkillRegistry,
 } from "@chili/skills";
-import { defaultChiliHome } from "@chili/providers";
+import { defaultAuthPath, FileAuthStorage } from "@chili/providers";
+import { resolveHostExecutionIdentity } from "./identity.js";
+import { targetPathsForSession } from "./context-targets.js";
+import { evaluatePolicy } from "@chili/policy";
 import { createFilesystemPromptCommandControl, type PromptCommandControl } from "@chili/commands";
 import {
   assertSupportedPermissionProfile,
@@ -190,6 +198,7 @@ export interface ChiliHostOptions {
   approvalQueue?: DeferredApprovalQueue;
   userInputQueue?: DeferredUserInputQueue;
   chiliHome?: string;
+  projectRoot?: string;
   deferMcpConnect?: boolean;
   mcpConnectMode?: "eager" | "background" | "manual";
   bashRunner?: BashRunner;
@@ -207,6 +216,7 @@ export interface ChiliHostOptions {
 
 export interface ChiliHost {
   cwd: string;
+  identity: ExecutionIdentity;
   store: SqliteEventStore;
   events: ObservableEventStore;
   runtime: SingleAgentRuntime;
@@ -236,12 +246,28 @@ export interface HostPermissionProfileControl {
 
 export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliHost> {
   assertSupportedPermissionProfile(options.permissionProfile ?? "default");
-  const cwd = resolve(options.cwd);
+  const identity = await resolveHostExecutionIdentity(options);
+  const cwd = identity.workspaceRoot;
   const stateDir = join(cwd, ".chili");
   await mkdir(stateDir, { recursive: true });
 
   const createId = createIdFactory();
-  const chiliHome = options.chiliHome ?? defaultChiliHome();
+  const chiliHome = identity.profilePath;
+  const executionIdentityForCwd = async (requestedCwd: string): Promise<ExecutionIdentity> => {
+    const canonicalCwd = await canonicalSkillWorkspace(requestedCwd);
+    const relation = relative(identity.projectRoot, canonicalCwd);
+    const withinHostProject = relation === "" || (!isAbsolute(relation) && relation !== ".." && !relation.startsWith("../"));
+    return resolveHostExecutionIdentity({
+      cwd: canonicalCwd, chiliHome,
+      ...(withinHostProject ? { projectRoot: identity.projectRoot } : {}),
+      ...(identity.authPath ? { authPath: identity.authPath } : {}),
+    });
+  };
+  const memoryOptionsForCwd = async (requestedCwd: string) => {
+    const current = await executionIdentityForCwd(requestedCwd);
+    return { chiliHome, projectRoot: current.projectRoot, projectId: current.projectId };
+  };
+  const memoryOptions = { chiliHome, optionsForCwd: memoryOptionsForCwd };
   const baseCommands = createFilesystemPromptCommandControl({ cwd, chiliHome });
   let commands: PromptCommandControl = baseCommands;
   let sqliteStore: SqliteEventStore;
@@ -249,9 +275,21 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     groupByCwd: true,
     resolveSessionCwd: async (sessionId) => (await sqliteStore.sessions()).find((session) => session.id === sessionId)?.cwd,
   });
-  sqliteStore = new SqliteEventStore(join(stateDir, "chili.sqlite"), { mirror: sessionMirror });
+  const owner = new HostOwnerClaim(join(stateDir, "chili.sqlite"));
+  let unsubscribeGuardians: (() => void) | undefined;
+  try {
+    sqliteStore = new SqliteEventStore(join(stateDir, "chili.sqlite"), { mirror: sessionMirror });
+    unsubscribeGuardians = observeProcessGuardianLifecycle((event) => {
+      if (event.ownerId !== owner.token) return;
+      if (event.type === "started") owner.registerGuardian(event.pid);
+      else owner.unregisterGuardian(event.pid);
+    });
+  } catch (error) {
+    owner.release();
+    throw error;
+  }
   const eventStore = new ObservableEventStore(sqliteStore);
-  const unsubscribeObserver = options.onEvent ? eventStore.subscribe(options.onEvent) : undefined;
+  const unsubscribeObserver = options.onEvent ? eventStore.subscribe((event) => options.onEvent!(compactRuntimeEvent(event))) : undefined;
   const initializationDrains: Array<() => unknown> = [];
   let cleanupMcp: (() => unknown) | undefined;
   try {
@@ -343,7 +381,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       modelInput.provider = persistedUserModelSelection.provider;
       modelInput.model = persistedUserModelSelection.model;
     }
-    const model = options.modelRouter ?? await createHostModel(modelInput);
+    const model = options.modelRouter ?? await createHostModel(modelInput, { authStorage: new FileAuthStorage(identity.authPath ?? defaultAuthPath(chiliHome)), profileId: identity.profileId });
     const runtimeModelSelection = explicitModelSelection ? resolveHostRuntimeModelSelection(hostModelInput) : undefined;
     const serviceDefaultModelSelection = runtimeModelSelection ?? persistedUserModelSelection;
     const persistUserModelSelection = async (input: { modelSelection: ModelSelection }): Promise<void> => {
@@ -351,7 +389,8 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     };
     const skillRegistryForCwd = async (requestedCwd: string): Promise<SkillRegistry> => {
       const canonicalCwd = await canonicalSkillWorkspace(requestedCwd);
-      return discoverSkills({ cwd: canonicalCwd });
+      const current = await executionIdentityForCwd(canonicalCwd);
+      return discoverSkills({ cwd: canonicalCwd, chiliHome, projectRoot: current.projectRoot });
     };
     await skillRegistryForCwd(cwd);
     const config = await loadHostConfig(cwd, { chiliHome });
@@ -393,8 +432,17 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       approvalState.linkSession(rootSessionId, request.sessionId);
       return rulesets;
     };
-    const bashRunner = options.bashRunner ?? createHostBashRunner({
+    const resolveResourceDenials = async (request: BashRunRequest) => {
+      const sessionCwd = request.workspaceRoot ?? request.cwd;
+      const latestConfig = await loadHostConfig(sessionCwd, { chiliHome });
+      return resolveFileResourceDenials(sessionCwd, createApprovalRulesets(
+        permissions.get().profile, latestConfig, { sandboxedShell },
+      ));
+    };
+    const bashRunner = createHostBashRunner({
       permissionProfile: () => permissions.get().profile,
+      resolveResourceDenials,
+      ...(options.bashRunner ? { sandboxedRunner: options.bashRunner, unsandboxedRunner: options.bashRunner } : {}),
     });
     const processes = new ManagedProcessManager();
     initializationDrains.push(() => processes.close("runtime_closed"));
@@ -406,9 +454,10 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       : createHostBashRunner({
           permissionProfile: () => permissions.get().profile,
           allowHostSandboxEscape: false,
+          resolveResourceDenials,
         });
-    const registry = createToolRegistry(skillRegistryForCwd, bashRunner, processes);
-    const childRegistry = createChildToolRegistry(skillRegistryForCwd, childBashRunner);
+    const registry = createToolRegistry(skillRegistryForCwd, bashRunner, processes, memoryOptions);
+    const childRegistry = createChildToolRegistry(skillRegistryForCwd, childBashRunner, memoryOptions);
     if (options.userInputQueue) {
       const userInputTool = createRequestUserInputTool(
         options.userInputQueue,
@@ -420,22 +469,40 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     }
     let mcpRuntime: HostMcpRuntime | undefined;
     cleanupMcp = () => mcpRuntime?.close();
-    const promptFragments = async (context: { cwd: string; turn?: RuntimePromptTurnContext }) =>
+    const allowedMemoryScopes = async (sessionCwd: string): Promise<Array<"user" | "project">> => {
+      const current = await executionIdentityForCwd(sessionCwd);
+      const latestConfig = await loadHostConfig(sessionCwd, { chiliHome });
+      const rulesets = createApprovalRulesets(permissions.get().profile, latestConfig, { sandboxedShell });
+      return (["user", "project"] as const).filter((scope) => evaluatePolicy(
+        "memory.read",
+        scope === "user" ? `profile:${chiliHome}/user` : `profile:${chiliHome}/project:${current.projectId}`,
+        rulesets,
+      ).action === "allow");
+    };
+    const promptFragments = async (context: { sessionId: SessionId; cwd: string; turn?: RuntimePromptTurnContext }) =>
       buildHostPromptFragments({
         cwd: context.cwd,
+        ...(await memoryOptionsForCwd(context.cwd)),
+        memoryScopes: await allowedMemoryScopes(context.cwd),
+        targetPaths: await targetPathsForSession(eventStore, context.sessionId, context.cwd),
         skillRegistry: await skillRegistryForCwd(context.cwd),
         ...(context.turn ? { turn: context.turn } : {}),
       });
     const childPromptFragments = async (context: { sessionId: SessionId; cwd: string; turn?: RuntimePromptTurnContext }) =>
       buildHostChildPromptFragments({
         cwd: context.cwd,
+        ...(await memoryOptionsForCwd(context.cwd)),
+        memoryScopes: await allowedMemoryScopes(context.cwd),
         sessionId: context.sessionId,
+        targetPaths: await targetPathsForSession(eventStore, context.sessionId, context.cwd),
         skillRegistry: await skillRegistryForCwd(context.cwd),
         store: eventStore,
         ...(context.turn ? { turn: context.turn } : {}),
       });
     const subagentPromptFragments = async (context: { cwd: string }) => buildHostPromptFragments({
       cwd: context.cwd,
+      ...(await memoryOptionsForCwd(context.cwd)),
+      memoryScopes: await allowedMemoryScopes(context.cwd),
       skillRegistry: await skillRegistryForCwd(context.cwd),
     });
     const snapshotProvider = new FileSystemSnapshotProvider({
@@ -444,8 +511,9 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     });
     const childToolExecutor = new ToolExecutor({
       registry: childRegistry,
+      executionContext: (operation) => withProcessOwner(owner.token, operation),
       events: { publish: (event: ChiliEvent) => eventStore.append(event) },
-      approvals: createApprovalBroker(options, config, approvalState, permissions, approvalRulesetsForRequest),
+      approvals: createApprovalBroker({ ...options, chiliHome }, config, approvalState, permissions, approvalRulesetsForRequest),
       policyResolver: combinedChildToolPolicyResolver,
       snapshotProvider,
       createId,
@@ -476,6 +544,8 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     });
     const childService = new RuntimeService({
       runtime: childRuntime,
+      executionContext: (operation) => withProcessOwner(owner.token, operation),
+      executionIdentityResolver: executionIdentityForCwd,
       store: eventStore,
       cwd,
       createId,
@@ -496,6 +566,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       store: eventStore,
       runner: new AgentRunnerSubagentRunner({
         runner: childRuntime,
+        runtime: childService,
         store: eventStore,
         maxTurns: DEV_MAX_TURNS,
         promptFragments: subagentPromptFragments,
@@ -520,8 +591,9 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     childRegistry.register(createCompleteTaskTool(completeTaskController));
     const toolExecutor = new ToolExecutor({
       registry,
+      executionContext: (operation) => withProcessOwner(owner.token, operation),
       events: { publish: (event) => eventStore.append(event) },
-      approvals: createApprovalBroker(options, config, approvalState, permissions, approvalRulesetsForRequest),
+      approvals: createApprovalBroker({ ...options, chiliHome }, config, approvalState, permissions, approvalRulesetsForRequest),
       policyResolver: delegationToolPolicyResolver,
       snapshotProvider,
       createId,
@@ -550,13 +622,10 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       },
       maxConcurrentToolCalls: DEV_MAX_CONCURRENT_TOOL_CALLS,
     });
-    const recovery = new SnapshotRecoveryService({
-      store: eventStore,
-      snapshotProvider,
-      createId,
-    });
     const service = new RuntimeService({
       runtime,
+      executionContext: (operation) => withProcessOwner(owner.token, operation),
+      executionIdentityResolver: executionIdentityForCwd,
       store: eventStore,
       cwd,
       createId,
@@ -571,6 +640,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       ...(options.sessionClaimLeaseMs !== undefined ? { sessionClaimLeaseMs: options.sessionClaimLeaseMs } : {}),
       ...(options.sessionClaimHeartbeatMs !== undefined ? { sessionClaimHeartbeatMs: options.sessionClaimHeartbeatMs } : {}),
     });
+    const recovery = new SnapshotRecoveryService({ store: eventStore, snapshotProvider, createId, sessionOperations: service });
     initializationDrains.push(() => service.shutdown("runtime_closed"));
     const teams = new TeamControlService({
       store: eventStore,
@@ -676,6 +746,10 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       cwd,
       chiliHome,
       registries: [registry, childRegistry],
+      guardianLifecycle: (event) => {
+        if (event.type === "started") owner.registerGuardian(event.pid);
+        else owner.unregisterGuardian(event.pid);
+      },
       events: { publish: (event: ChiliEvent) => eventStore.append(event) },
       createId,
       connectMode: options.mcpConnectMode ?? (options.deferMcpConnect === true ? "background" : "eager"),
@@ -735,7 +809,11 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
         } finally {
           try {
             unsubscribeObserver?.();
-            try { await sqliteStore.flushInputMirrors(); } finally { sqliteStore.close(); }
+            try { await sqliteStore.flushInputMirrors(); } finally {
+              sqliteStore.close();
+              unsubscribeGuardians?.();
+              owner.release();
+            }
           } catch (error) {
             errors.push(error);
           }
@@ -751,6 +829,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
 
     return {
       cwd,
+      identity,
       store: sqliteStore,
       events: eventStore,
       runtime,
@@ -787,7 +866,13 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     }
     unsubscribeObserver?.();
     try {
-      try { await sqliteStore.flushInputMirrors(); } finally { sqliteStore.close(); }
+      try {
+        await sqliteStore.flushInputMirrors();
+      } finally {
+        sqliteStore.close();
+        unsubscribeGuardians?.();
+        owner.release();
+      }
     } catch (closeError) {
       errors.push(closeError);
     }
@@ -969,13 +1054,22 @@ export async function buildHostPromptFragments(input: {
   skillRegistry: SkillRegistry;
   turn?: RuntimePromptTurnContext;
   homeDir?: string;
+  chiliHome?: string;
+  projectId?: string;
   projectRoot?: string;
+  targetPaths?: readonly string[];
+  memoryScopes?: readonly ("user" | "project")[];
 }): Promise<PromptFragment[]> {
   const context: PromptFragment[] = [
     chiliBasePromptFragment(),
     ...(await buildChiliMemoryPromptFragments({
       cwd: input.cwd,
       ...(input.homeDir ? { homeDir: input.homeDir } : {}),
+      ...(input.chiliHome ? { chiliHome: input.chiliHome } : {}),
+      ...(input.projectId ? { projectId: input.projectId } : {}),
+      ...(input.turn?.text ? { query: input.turn.text } : {}),
+      ...(input.targetPaths ? { targetPaths: input.targetPaths } : {}),
+      ...(input.memoryScopes ? { memoryScopes: input.memoryScopes } : {}),
       ...(input.projectRoot ? { projectRoot: input.projectRoot } : {}),
     })),
   ];
@@ -983,7 +1077,7 @@ export async function buildHostPromptFragments(input: {
   if (skillsPrompt) {
     context.push({
       id: "chili.skills.catalog",
-      layer: "developer",
+      layer: "contextual_user",
       source: "skills",
       priority: 100,
       lifecycle: "session",
@@ -1003,7 +1097,11 @@ export async function buildHostChildPromptFragments(input: {
   store: ObservableEventStore;
   turn?: RuntimePromptTurnContext;
   homeDir?: string;
+  chiliHome?: string;
+  projectId?: string;
   projectRoot?: string;
+  targetPaths?: readonly string[];
+  memoryScopes?: readonly ("user" | "project")[];
 }): Promise<PromptFragment[]> {
   return [
     ...(await buildHostPromptFragments({
@@ -1011,6 +1109,11 @@ export async function buildHostChildPromptFragments(input: {
       skillRegistry: input.skillRegistry,
       ...(input.turn ? { turn: input.turn } : {}),
       ...(input.homeDir ? { homeDir: input.homeDir } : {}),
+      ...(input.chiliHome ? { chiliHome: input.chiliHome } : {}),
+      ...(input.projectId ? { projectId: input.projectId } : {}),
+      ...(input.turn?.text ? { query: input.turn.text } : {}),
+      ...(input.targetPaths ? { targetPaths: input.targetPaths } : {}),
+      ...(input.memoryScopes ? { memoryScopes: input.memoryScopes } : {}),
       ...(input.projectRoot ? { projectRoot: input.projectRoot } : {}),
     })),
     chiliChildRuntimeBasePromptFragment(),
@@ -1146,13 +1249,14 @@ function createToolRegistry(
   skillRegistryForCwd: (cwd: string) => Promise<SkillRegistry>,
   bashRunner: BashRunner,
   processes: ManagedProcessManager,
+  memoryOptions: Parameters<typeof createMemoryTool>[0],
 ): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool({ defaultMaxBytes: DEFAULT_READ_MAX_BYTES, maxBytesLimit: READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
-  registry.register(createMemoryTool());
+  registry.register(createMemoryTool(memoryOptions));
   registry.register(createActivateSkillTool((context) => skillRegistryForCwd(context.cwd)));
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
@@ -1176,14 +1280,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function createChildToolRegistry(
   skillRegistryForCwd: (cwd: string) => Promise<SkillRegistry>,
-  bashRunner?: BashRunner,
+  bashRunner: BashRunner | undefined,
+  memoryOptions: Parameters<typeof createMemoryTool>[0],
 ): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool({ defaultMaxBytes: DEFAULT_READ_MAX_BYTES, maxBytesLimit: READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
-  registry.register(createMemoryTool());
+  registry.register(createMemoryTool(memoryOptions));
   registry.register(createActivateSkillTool((context) => skillRegistryForCwd(context.cwd)));
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
@@ -1290,19 +1395,17 @@ function createApprovalBroker(
       permissions?.get().profile ?? (options.permissionProfile ?? "default")
     ) === "full-access",
     ask: async (request, signal) => {
-      const decision: ApprovalDecision = options.approvalQueue
+      return options.approvalQueue
         ? await options.approvalQueue.ask(request, signal)
         : options.askApproval
           ? await options.askApproval(request, signal)
           : { action: "deny", feedback: "No approval interface available." };
-      return persistAllowAlwaysDecision(request, decision, {
-        ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
-        onPersisted: (persistedRequest) => approvalState.addPersistentGrant({
-          permission: persistedRequest.permission,
-          patterns: persistedRequest.patterns,
-        }),
-      });
     },
+    // The broker validates the latest policy before this commit. Never cache
+    // persistent grants: the request resolver rereads config so removal revokes.
+    onApproved: (request, decision) => persistAllowAlwaysDecision(request, decision, {
+      ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
+    }),
     onSessionGrant: async () => {
       await options.approvalQueue?.recheckPending((request) => broker.preflight(request));
     },

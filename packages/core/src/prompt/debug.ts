@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { RenderedPromptFragment } from "./fragment.js";
 
 export interface PromptDebugManifestItem {
@@ -6,6 +7,7 @@ export interface PromptDebugManifestItem {
   layer: RenderedPromptFragment["layer"];
   priority: number;
   chars: number;
+  contentVersion?: string;
   lifecycle: RenderedPromptFragment["lifecycle"];
   trust: RenderedPromptFragment["trust"];
   metadata?: Record<string, unknown>;
@@ -26,6 +28,7 @@ export function buildPromptDebugManifest(
       layer: fragment.layer,
       priority: fragment.priority,
       chars: fragment.chars,
+      contentVersion: createHash("sha256").update(fragment.content).digest("hex"),
       lifecycle: fragment.lifecycle,
       trust: fragment.trust,
     };

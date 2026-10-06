@@ -190,6 +190,7 @@ test("keeps a 5 MiB tool Error bounded through executor, runtime, SQLite events,
     );
     expect(finished?.type).toBe("tool.call_finished");
     if (!finished || finished.type !== "tool.call_finished") return;
+    expect(finished.payload.callId).not.toBe(finished.payload.providerCallId);
     expect(Buffer.byteLength(finished.payload.error ?? "", "utf8"))
       .toBeLessThanOrEqual(PERSISTED_ERROR_LIMITS.messageBytes);
     expect(finished.payload.error).not.toContain("\uFFFD");
@@ -497,10 +498,11 @@ test("normalizes a Proxy-wrapped 5 MiB model Error before usage, mutation, retur
     expect(Buffer.byteLength(result.error.message, "utf8")).toBeLessThanOrEqual(PERSISTED_ERROR_LIMITS.messageBytes);
     const events = await store.events({ sessionId, limit: 100 }) as ChiliEvent[];
     const finished = events.find(
-      (event) => event.type === "tool.call_finished" && event.payload.callId === "tool_proxy_error",
+      (event) => event.type === "tool.call_finished" && event.payload.providerCallId === "tool_proxy_error",
     );
     expect(finished?.type).toBe("tool.call_finished");
     if (!finished || finished.type !== "tool.call_finished") return;
+    expect(finished.payload.callId).not.toBe(finished.payload.providerCallId);
     expect(Buffer.byteLength(finished.payload.error ?? "", "utf8"))
       .toBeLessThanOrEqual(PERSISTED_ERROR_LIMITS.messageBytes);
     expect(JSON.stringify(events)).not.toContain("PROXY_CAUSE_SECRET");
@@ -587,10 +589,11 @@ test("treats an aborted signal with a 5 MiB non-AbortError reason as a bounded c
       payload: expect.objectContaining({ status: "cancelled" }),
     }));
     const finished = events.find(
-      (event) => event.type === "tool.call_finished" && event.payload.callId === "tool_signal_cancel",
+      (event) => event.type === "tool.call_finished" && event.payload.providerCallId === "tool_signal_cancel",
     );
     expect(finished?.type).toBe("tool.call_finished");
     if (finished?.type === "tool.call_finished") {
+      expect(finished.payload.callId).not.toBe(finished.payload.providerCallId);
       expect(finished.payload.status).toBe("cancelled");
       expect(Buffer.byteLength(finished.payload.error ?? "", "utf8"))
         .toBeLessThanOrEqual(PERSISTED_ERROR_LIMITS.messageBytes);
