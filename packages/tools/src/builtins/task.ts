@@ -59,6 +59,7 @@ export function createTaskTool(controller: SubagentController): ChiliToolDefinit
     aliases: ["agent"],
     description:
       "Spawn one ad-hoc local subagent. For work required by the current response, use one-shot/resumable so the final result returns inline, or use task_batch (default join) for parallel work. Background defaults to completion_policy=notify: it returns a handle immediately and wakes the parent at terminal state; detached never wakes. Do not answer the original request with only a launch status: wait/read the result, follow up or verify gaps, and integrate it. Use team_task_dispatch for persistent team-board work.",
+    resourcePolicy: "internal",
     risk: "execute",
     inputSchema: {
       type: "object",
@@ -123,6 +124,7 @@ export function createTaskBatchTool(
     aliases: ["agent_batch", "spawn_tasks", "spawn_agents"],
     description:
       "Spawn independent ad-hoc subagents in parallel. Use default join for one-pass work required by the current response; it waits inline and returns terminal summaries. Use completion_policy=supervised for multi-stage collaboration or quality review: it returns handles immediately but keeps this parent turn responsible for task_wait_batch(any), result review/task_followup, a final task_wait_batch(all), verification, and integration. notify is intentionally asynchronous and wakes a later parent turn; detached never wakes. max_concurrency defaults to 3 and is also runtime-capped. Do not finish with only a launch/completion status. Persistent team tasks should use team_task_dispatch.",
+    resourcePolicy: "internal",
     risk: "execute",
     isConcurrencySafe: true,
     inputSchema: {
@@ -255,6 +257,7 @@ export function createCompleteTaskTool(
   return {
     name: "complete_task",
     description: "Complete the current local subagent task through the injected subagent controller.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -295,6 +298,7 @@ export function createTaskListTool(
     aliases: ["list_tasks", "agent_list"],
     description:
       "List local subagent tasks. Results are scoped to the current session unless all=true; task_ids can inspect an exact set of handles returned by task or task_batch.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -327,6 +331,7 @@ export function createTaskWaitTool(
     aliases: ["wait_task", "agent_wait"],
     description:
       "Wait until one local subagent reaches a final state, then integrate its summary before responding. A timeout is an error; use task_wait_batch for partial batch snapshots.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -360,6 +365,7 @@ export function createTaskWaitBatchTool(
     aliases: ["wait_tasks", "agent_wait_batch"],
     description:
       "Wait for any or all task_ids to reach a final state. Defaults to all. Timeout returns the latest partial statuses and preserves every handle; integrate completed summaries and report pending, failed, incomplete, or cancelled work.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -404,6 +410,7 @@ export function createTaskFollowupTool(
     name: "task_followup",
     aliases: ["followup_task", "agent_followup"],
     description: "Send a follow-up prompt to an existing resumable subagent task.",
+    resourcePolicy: "internal",
     risk: "execute",
     inputSchema: {
       type: "object",
@@ -453,6 +460,7 @@ export function createTaskCloseTool(
     name: "task_close",
     aliases: ["close_task", "agent_close"],
     description: "Close a local subagent task, usually cancelling or marking it completed.",
+    resourcePolicy: "internal",
     risk: "execute",
     inputSchema: {
       type: "object",
@@ -502,6 +510,7 @@ export function createMailboxListTool(
     name: "mailbox_list",
     aliases: ["list_mailbox", "agent_mailbox"],
     description: "List queued or consumed mailbox messages for local subagents.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -534,6 +543,7 @@ export function createMailboxConsumeTool(
     name: "mailbox_consume",
     aliases: ["consume_mailbox", "agent_mailbox_consume"],
     description: "Consume a queued subagent mailbox message and deliver it to the child session if required.",
+    resourcePolicy: "internal",
     risk: "execute",
     inputSchema: {
       type: "object",

@@ -1,8 +1,10 @@
 import { normalizePersistedError, type ToolResultContent, type ToolRisk, type ToolResult } from "@chili/protocol";
+import { validateStructuredToolData } from "@chili/tools";
 import type { ChiliToolDefinition, ChiliToolExecutionContext, ToolApprovalSpec } from "@chili/tools";
 import type { McpServerConfig } from "./config.js";
 import type { McpCallToolResult, McpTool, McpToolAnnotations } from "./client.js";
 import type { McpClientManager } from "./manager.js";
+import { mcpServerIdentity, mcpDefinitionFingerprint } from "./identity.js";
 import { createMcpModelToolName } from "./names.js";
 
 const MAX_MCP_CONTENT_ITEMS = 64;
@@ -30,7 +32,7 @@ export interface McpChiliToolDefinition extends ChiliToolDefinition {
 export interface McpToolAdapterOptions {
   server: McpServerConfig;
   tool: McpTool;
-  manager: Pick<McpClientManager, "callTool">;
+  manager: Pick<McpClientManager, "callTool"> & Partial<Pick<McpClientManager, "getToolRevision">>;
   modelName?: string;
 }
 
@@ -38,11 +40,13 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
   const names = createMcpModelToolName(options.server.name, options.tool.name);
   const modelName = options.modelName ?? names.modelName;
   const annotations = options.tool.annotations ?? {};
+  const preparedRevision = options.manager.getToolRevision?.(options.server.name, options.tool.name);
   const isReadOnly = annotations.readOnlyHint === true;
   const isConcurrencySafe = inferConcurrencySafe(annotations);
 
   return {
     name: modelName,
+    revision: preparedRevision ?? `${mcpServerIdentity(options.server)}:${mcpDefinitionFingerprint(options.tool)}`,
     description: sanitizeMcpToolDescription(
       options.tool.description ?? `MCP tool ${options.server.name}/${options.tool.name}`,
       options.server.name,
@@ -70,12 +74,13 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
           tool: options.tool.name,
           modelName,
           annotations,
+          resourceIdentity: mcpServerIdentity(options.server),
         },
       };
     },
     async execute(input: unknown, context: ChiliToolExecutionContext): Promise<ToolResult> {
       try {
-        const rawResult = await options.manager.callTool(options.server.name, options.tool.name, input, context.signal);
+        const rawResult = await options.manager.callTool(options.server.name, options.tool.name, input, context.signal, preparedRevision);
         const result = boundMcpToolResult(rawResult);
         if (result.isError) {
           const error = new Error(formatMcpToolOutput(result)) as Error & { code?: string };
@@ -86,6 +91,7 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
         return {
           title: `${options.server.name}/${options.tool.name}`,
           output: formatMcpToolOutput(result),
+          ...(rawResult.structuredContent === undefined ? {} : { structuredData: validateStructuredToolData(rawResult.structuredContent) }),
           ...optionalContent(mcpToolResultContent(result)),
           metadata: {
             server: options.server.name,
@@ -126,7 +132,7 @@ function isToolUseDirectiveParagraph(paragraph: string): boolean {
 export function createMcpChiliTools(
   server: McpServerConfig,
   tools: readonly McpTool[],
-  manager: Pick<McpClientManager, "callTool">,
+  manager: Pick<McpClientManager, "callTool"> & Partial<Pick<McpClientManager, "getToolRevision">>,
 ): McpChiliToolDefinition[] {
   const modelNames = uniqueModelNames(server, tools);
   return tools.map((tool, index) => {
@@ -144,7 +150,7 @@ export function inferRisk(annotations: McpToolAnnotations): ToolRisk {
 
 export function inferConcurrencySafe(annotations: McpToolAnnotations): boolean {
   if (annotations.destructiveHint === true) return false;
-  return annotations.readOnlyHint === true || annotations.idempotentHint === true;
+  return annotations.readOnlyHint === true;
 }
 
 function formatMcpToolOutput(result: McpCallToolResult): string {

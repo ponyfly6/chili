@@ -1,14 +1,11 @@
 import { parseRuntimeString, type RuntimeCommandInvocation } from "@chili/protocol";
-import type { PromptCommandControl, PromptCommandRunResult } from "./control.js";
+import type { PromptCommandControl } from "./control.js";
+import { commandToolPolicy, type CommandToolPolicy } from "./policy-metadata.js";
 
 export interface PromptCommandSubmission {
   text: string;
   displayText: string;
-  toolPolicy?: {
-    allowedTools?: string[];
-    writeScope?: string[];
-    executeScope?: string[];
-  };
+  toolPolicy?: CommandToolPolicy;
 }
 
 /**
@@ -35,24 +32,4 @@ export async function preparePromptCommandSubmission(
     displayText,
     ...(toolPolicy ? { toolPolicy } : {}),
   };
-}
-
-function commandToolPolicy(
-  metadata: PromptCommandRunResult["metadata"],
-): PromptCommandSubmission["toolPolicy"] {
-  const allowedTools = metadataStringArray(metadata.allowedTools);
-  const writeScope = metadataStringArray(metadata.writeScope);
-  const executeScope = metadataStringArray(metadata.executeScope);
-  if (!allowedTools && !writeScope && !executeScope) return undefined;
-  return {
-    ...(allowedTools ? { allowedTools } : {}),
-    ...(writeScope ? { writeScope } : {}),
-    ...(executeScope ? { executeScope } : {}),
-  };
-}
-
-function metadataStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const strings = value.map((item) => typeof item === "string" ? item.trim() : "").filter(Boolean);
-  return strings.length > 0 ? strings : undefined;
 }

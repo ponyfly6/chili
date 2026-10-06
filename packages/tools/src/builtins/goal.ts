@@ -29,6 +29,7 @@ export function createGetGoalTool(controller: GoalToolController): ChiliToolDefi
   return {
     name: "get_goal",
     description: "Read the persistent goal for this session, including status, budget, and usage.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -49,6 +50,7 @@ export function createCreateGoalTool(controller: GoalToolController): ChiliToolD
     name: "create_goal",
     description:
       "Create a persistent goal only when the user explicitly asks for one. Fails if a goal already exists for the session.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -76,6 +78,7 @@ export function createUpdateGoalTool(controller: GoalToolController): ChiliToolD
     name: "update_goal",
     description:
       "Update the persistent goal. The model may only mark it complete after verifying the objective is actually satisfied.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",

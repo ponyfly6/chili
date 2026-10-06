@@ -13,6 +13,7 @@ export function createToolSearchTool(registry: ToolRegistry): ChiliToolDefinitio
     alwaysLoad: true,
     description: "Search available tools by capability or name.",
     risk: "read",
+    resourcePolicy: "internal",
     isReadOnly: true,
     isConcurrencySafe: true,
     maxResultOutputBytes: 20_000,

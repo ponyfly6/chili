@@ -1,3 +1,6 @@
+import { canonicalResourcePattern } from "../resource-policy.js";
+import { readFileContentVersion } from "../file-read-state.js";
+import { withFileOperationLocks } from "../file-operation-lock.js";
 import { createReadStream } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
@@ -36,6 +39,7 @@ export function createReadFileTool(options: ReadFileToolOptions = {}): ChiliTool
     searchHint: "Read text files with optional line offsets and byte limits.",
     description: "Read a UTF-8 text file within the current workspace.",
     risk: "read",
+    resourcePolicy: "filesystem",
     isReadOnly: true,
     isConcurrencySafe: true,
     maxResultOutputBytes: Infinity,
@@ -84,6 +88,9 @@ export function createReadFileTool(options: ReadFileToolOptions = {}): ChiliTool
         value,
       };
     },
+    async prepareInput(input, context) {
+      return { ...input, filePath: await canonicalResourcePattern(context.cwd, input.filePath, true) };
+    },
     approval(input) {
       return {
         permission: "read",
@@ -94,38 +101,42 @@ export function createReadFileTool(options: ReadFileToolOptions = {}): ChiliTool
     async execute(input, context) {
       const workspace = context.cwd;
       const target = resolveWorkspacePath(workspace, input.filePath);
-      await assertExistingPathInsideWorkspace(workspace, target, input.filePath);
+      return withFileOperationLocks([target.absolutePath], context.signal, async () => {
+        await context.assertCurrentAuthorization?.();
+        await assertExistingPathInsideWorkspace(workspace, target, input.filePath);
 
-      const maxBytes = input.maxBytes ?? defaultMaxBytes;
-      if (maxBytes > maxBytesLimit) {
-        throw new Error(`maxBytes must be <= ${maxBytesLimit}`);
-      }
-      const rangeOptions: { offset?: number; limit?: number; maxBytes: number } = { maxBytes };
-      if (input.offset !== undefined) rangeOptions.offset = input.offset;
-      if (input.limit !== undefined) rangeOptions.limit = input.limit;
-      const selection = input.offset === undefined && input.limit === undefined
-        ? await readPrefix(target.absolutePath, maxBytes)
-        : await readLineRange(target.absolutePath, rangeOptions);
-      const { content, truncated, bytes } = selection;
-      const fullRead = !truncated && input.offset === undefined && input.limit === undefined;
-      if (fullRead) {
-        await context.fileReads?.recordTextRead(workspace, target.absolutePath, content);
-      } else {
-        await context.fileReads?.recordTextRangeRead(workspace, target.absolutePath, content, {
-          ...(input.offset !== undefined ? { offset: input.offset } : {}),
-          ...(input.limit !== undefined ? { limit: input.limit } : {}),
-        });
-      }
+        const maxBytes = input.maxBytes ?? defaultMaxBytes;
+        if (maxBytes > maxBytesLimit) {
+          throw new Error(`maxBytes must be <= ${maxBytesLimit}`);
+        }
+        const rangeOptions: { offset?: number; limit?: number; maxBytes: number } = { maxBytes };
+        if (input.offset !== undefined) rangeOptions.offset = input.offset;
+        if (input.limit !== undefined) rangeOptions.limit = input.limit;
+        const observedVersion = context.fileReads ? await readFileContentVersion(target.absolutePath) : undefined;
+        const selection = input.offset === undefined && input.limit === undefined
+          ? await readPrefix(target.absolutePath, maxBytes)
+          : await readLineRange(target.absolutePath, rangeOptions);
+        const { content, truncated, bytes } = selection;
+        const fullRead = !truncated && input.offset === undefined && input.limit === undefined;
+        if (fullRead) {
+          await context.fileReads?.recordTextRead(workspace, target.absolutePath, content, observedVersion);
+        } else {
+          await context.fileReads?.recordTextRangeRead(workspace, target.absolutePath, content, {
+            ...(input.offset !== undefined ? { offset: input.offset } : {}),
+            ...(input.limit !== undefined ? { limit: input.limit } : {}),
+          }, observedVersion);
+        }
 
-      return {
-        title: target.relativePath,
-        output: truncated ? `${content}\n[truncated after ${maxBytes} bytes]` : content,
-        metadata: {
-          path: target.relativePath,
-          bytes,
-          truncated,
-        },
-      };
+        return {
+          title: target.relativePath,
+          output: truncated ? `${content}\n[truncated after ${maxBytes} bytes]` : content,
+          metadata: {
+            path: target.relativePath,
+            bytes,
+            truncated,
+          },
+        };
+      });
     },
   };
 }

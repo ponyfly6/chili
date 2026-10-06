@@ -1,3 +1,4 @@
+import { assertReadableFileResources, readableFileResources } from "../file-resource-access.js";
 import { opendir, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
@@ -16,6 +17,7 @@ export function createGlobTool(): ChiliToolDefinition<GlobInput> {
     searchHint: "Find workspace files by glob pattern such as **/*.ts or packages/*/package.json.",
     description: "Find files in the workspace using a glob pattern. Supports *, **, and ?; use separate calls instead of brace expansion.",
     risk: "read",
+    resourcePolicy: "filesystem",
     isReadOnly: true,
     isConcurrencySafe: true,
     maxResultOutputBytes: 20_000,
@@ -80,18 +82,33 @@ export function createGlobTool(): ChiliToolDefinition<GlobInput> {
       const matcher = globMatcher(input.pattern);
       const limit = input.limit ?? 100;
       const matches: string[] = [];
+      const resources: string[] = [];
       let truncated = false;
+      let candidates: string[] = [];
+      const flushCandidates = async () => {
+        for (const resource of await readableFileResources(context, candidates)) {
+          resources.push(resource);
+          matches.push(toPosixRelative(workspace, resource));
+          if (matches.length >= limit) {
+            truncated = true;
+            break;
+          }
+        }
+        candidates = [];
+      };
 
       for await (const file of walkFiles(root.absolutePath)) {
+        context.signal.throwIfAborted();
         const relativeToRoot = toPosixRelative(root.absolutePath, file);
         if (!matcher(relativeToRoot)) continue;
-        matches.push(toPosixRelative(workspace, file));
-        if (matches.length >= limit) {
-          truncated = true;
-          break;
-        }
+        candidates.push(file);
+        if (candidates.length < Math.min(128, limit - matches.length)) continue;
+        await flushCandidates();
+        if (truncated) break;
       }
+      if (candidates.length > 0) await flushCandidates();
 
+      await assertReadableFileResources(context, resources);
       matches.sort((left, right) => left.localeCompare(right));
       const output = matches.length ? matches.join("\n") : "(no matches)";
       return {

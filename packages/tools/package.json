@@ -12,7 +12,8 @@
   "dependencies": {
     "@chili/policy": "workspace:*",
     "@chili/protocol": "workspace:*",
-    "@chili/skills": "workspace:*"
+    "@chili/skills": "workspace:*",
+    "ajv": "^8.20.0"
   },
   "scripts": {
     "typecheck": "tsc -b"

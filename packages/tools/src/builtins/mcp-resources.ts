@@ -1,4 +1,4 @@
-import type { ChiliToolDefinition, ChiliToolExecutionContext, ValidationResult } from "../types.js";
+import type { ChiliToolDefinition, ChiliToolExecutionContext, ToolRegistryContext, ValidationResult } from "../types.js";
 
 export interface McpResourcesListInput {
   serverName?: string;
@@ -7,6 +7,9 @@ export interface McpResourcesListInput {
 export interface McpResourceReadInput {
   serverName: string;
   uri: string;
+  /** Prepared by the host; model-provided values are never accepted. */
+  resourceIdentity?: string;
+  revision?: string;
 }
 
 export interface McpResourceSummary {
@@ -31,9 +34,11 @@ export interface McpToolControllerContext {
   callId: ChiliToolExecutionContext["callId"];
   cwd: string;
   signal: AbortSignal;
+  assertCurrentAuthorization?: ChiliToolExecutionContext["assertCurrentAuthorization"];
 }
 
 export interface McpResourcesController {
+  prepareRead?(input: McpResourceReadInput, context: ToolRegistryContext): Promise<{ resourceIdentity: string; revision: string }>;
   listResources(input: McpResourcesListInput, context: McpToolControllerContext): Promise<readonly McpResourceSummary[]> | readonly McpResourceSummary[];
   readResource(input: McpResourceReadInput, context: McpToolControllerContext): Promise<McpResourceReadResult> | McpResourceReadResult;
 }
@@ -65,6 +70,7 @@ export function createMcpResourcesListTool(controller: McpResourcesController): 
       return {
         title: input.serverName ? `MCP resources: ${input.serverName}` : "MCP resources",
         output: formatResourceList(resources),
+        structuredData: resources,
         metadata: {
           count: resources.length,
           serverName: input.serverName,
@@ -91,13 +97,15 @@ export function createMcpResourceReadTool(controller: McpResourcesController): C
         uri: { type: "string" },
       },
     },
-    validate(input): ValidationResult<McpResourceReadInput> {
+    async validate(input, context): Promise<ValidationResult<McpResourceReadInput>> {
       if (!isRecord(input)) return { ok: false, message: "expected an object" };
       const serverName = requiredString(input.serverName, "serverName");
       if (typeof serverName !== "string") return serverName;
       const uri = requiredString(input.uri, "uri");
       if (typeof uri !== "string") return uri;
-      return { ok: true, value: { serverName, uri } };
+      if (controller.prepareRead && !context) return { ok: false, message: "MCP resource preparation requires session context" };
+      const prepared = controller.prepareRead && context ? await controller.prepareRead({ serverName, uri }, context) : undefined;
+      return { ok: true, value: { serverName, uri, ...prepared } };
     },
     approval(input) {
       return {
@@ -106,6 +114,7 @@ export function createMcpResourceReadTool(controller: McpResourcesController): C
         metadata: {
           serverName: input.serverName,
           uri: input.uri,
+          ...(input.resourceIdentity ? { resourceIdentity: input.resourceIdentity } : {}),
         },
       };
     },
@@ -115,6 +124,7 @@ export function createMcpResourceReadTool(controller: McpResourcesController): C
       return {
         title: `${resource.serverName}:${resource.uri}`,
         output,
+        structuredData: resource,
         metadata: {
           serverName: resource.serverName,
           uri: resource.uri,
@@ -133,6 +143,7 @@ function mcpControllerContext(context: ChiliToolExecutionContext): McpToolContro
     callId: context.callId,
     cwd: context.cwd,
     signal: context.signal,
+    ...(context.assertCurrentAuthorization ? { assertCurrentAuthorization: context.assertCurrentAuthorization } : {}),
   };
   return controllerContext;
 }

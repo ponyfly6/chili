@@ -131,6 +131,7 @@ export interface McpClient {
   listResources(options?: McpCursorOptions): Promise<McpListResourcesResult>;
   readResource(uri: string, options?: McpRequestOptions): Promise<McpReadResourceResult>;
   getPrompt(name: string, arguments_?: Record<string, string>, options?: McpRequestOptions): Promise<McpGetPromptResult>;
+  onClose?(handler: () => void): McpUnsubscribe;
   onToolsChanged?(handler: () => void): McpUnsubscribe;
   onPromptsChanged?(handler: () => void): McpUnsubscribe;
   onResourcesChanged?(handler: () => void): McpUnsubscribe;

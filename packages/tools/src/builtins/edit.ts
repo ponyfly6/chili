@@ -1,4 +1,7 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { canonicalResourcePattern } from "../resource-policy.js";
+import { writeFileTextIfUnchanged } from "../file-mutation.js";
+import { withFileOperationLocks } from "../file-operation-lock.js";
+import { mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 import { assertDirectWritablePathInsideWorkspace, resolveWorkspacePath } from "../workspace-path.js";
@@ -18,10 +21,10 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
     searchHint: "Replace exact literal text in a workspace file after reading it.",
     description: "Replace exact literal text in a workspace file.",
     risk: "write",
+    resourcePolicy: "filesystem",
     isReadOnly: false,
     isConcurrencySafe: false,
     isDestructive: false,
-    interruptBehavior: "block",
     maxResultOutputBytes: 100_000,
     inputSchema: {
       type: "object",
@@ -71,6 +74,9 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
       if (instruction !== undefined) value.instruction = instruction;
       return { ok: true, value };
     },
+    async prepareInput(input, context) {
+      return { ...input, filePath: await canonicalResourcePattern(context.cwd, input.filePath, true) };
+    },
     approval(input) {
       return {
         permission: "edit",
@@ -87,58 +93,61 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
     async execute(input, context) {
       const workspace = context.cwd;
       const target = resolveWorkspacePath(workspace, input.filePath);
-      await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
-      const existing = await readTextIfExists(target.absolutePath);
-
-      if (input.oldString === "") {
-        if (existing !== undefined) {
-          await context.fileReads?.assertFresh(workspace, target.absolutePath);
-        }
+      return withFileOperationLocks([target.absolutePath], context.signal, async () => {
         await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
+        const existing = await readTextIfExists(target.absolutePath);
+
+        if (input.oldString === "") {
+          if (existing !== undefined) {
+            await context.fileReads?.assertFresh(workspace, target.absolutePath);
+          }
+          await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
+          await context.assertCurrentAuthorization?.();
         await mkdir(dirname(target.absolutePath), { recursive: true });
-        await writeFile(target.absolutePath, input.newString, "utf8");
-        await context.fileReads?.recordTextRead(workspace, target.absolutePath, input.newString);
+          await writeFileTextIfUnchanged(target.absolutePath, input.newString, existing, context.assertCurrentAuthorization);
+          await context.fileReads?.recordTextRead(workspace, target.absolutePath, input.newString);
+          return {
+            title: target.relativePath,
+            output: existing === undefined ? "Created file successfully." : "Replaced file contents successfully.",
+            metadata: {
+              filePath: target.relativePath,
+              created: existing === undefined,
+              occurrences: 1,
+            },
+          };
+        }
+
+        if (existing === undefined) {
+          throw new Error(`File not found: ${target.relativePath}`);
+        }
+        await context.fileReads?.assertObservedText(workspace, target.absolutePath, input.oldString);
+
+        const lineEnding = detectLineEnding(existing);
+        const oldString = convertToLineEnding(normalizeLineEndings(input.oldString), lineEnding);
+        const newString = convertToLineEnding(normalizeLineEndings(input.newString), lineEnding);
+        const occurrences = countOccurrences(existing, oldString);
+
+        if (occurrences === 0) {
+          throw new Error(`Text to replace was not found in ${target.relativePath}`);
+        }
+        if (!input.replaceAll && occurrences !== 1) {
+          throw new Error(`Text to replace occurs ${occurrences} times in ${target.relativePath}; set replaceAll to true`);
+        }
+
+        const next = input.replaceAll ? existing.split(oldString).join(newString) : existing.replace(oldString, newString);
+        await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
+        await writeFileTextIfUnchanged(target.absolutePath, next, existing, context.assertCurrentAuthorization);
+        await context.fileReads?.recordTextRead(workspace, target.absolutePath, next);
+
         return {
           title: target.relativePath,
-          output: existing === undefined ? "Created file successfully." : "Replaced file contents successfully.",
+          output: `Edit applied successfully. Replaced ${input.replaceAll ? occurrences : 1} occurrence(s).`,
           metadata: {
             filePath: target.relativePath,
-            created: existing === undefined,
-            occurrences: 1,
+            occurrences: input.replaceAll ? occurrences : 1,
           },
         };
-      }
-
-      if (existing === undefined) {
-        throw new Error(`File not found: ${target.relativePath}`);
-      }
-      await context.fileReads?.assertObservedText(workspace, target.absolutePath, input.oldString);
-
-      const lineEnding = detectLineEnding(existing);
-      const oldString = convertToLineEnding(normalizeLineEndings(input.oldString), lineEnding);
-      const newString = convertToLineEnding(normalizeLineEndings(input.newString), lineEnding);
-      const occurrences = countOccurrences(existing, oldString);
-
-      if (occurrences === 0) {
-        throw new Error(`Text to replace was not found in ${target.relativePath}`);
-      }
-      if (!input.replaceAll && occurrences !== 1) {
-        throw new Error(`Text to replace occurs ${occurrences} times in ${target.relativePath}; set replaceAll to true`);
-      }
-
-      const next = input.replaceAll ? existing.split(oldString).join(newString) : existing.replace(oldString, newString);
-      await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
-      await writeFile(target.absolutePath, next, "utf8");
-      await context.fileReads?.recordTextRead(workspace, target.absolutePath, next);
-
-      return {
-        title: target.relativePath,
-        output: `Edit applied successfully. Replaced ${input.replaceAll ? occurrences : 1} occurrence(s).`,
-        metadata: {
-          filePath: target.relativePath,
-          occurrences: input.replaceAll ? occurrences : 1,
-        },
-      };
+      }, { sessionId: context.sessionId, authorize: () => context.assertCurrentAuthorization?.() ?? Promise.resolve() });
     },
   };
 }

@@ -1,5 +1,9 @@
-import type { ChiliToolDefinition, ValidationResult } from "../types.js";
+import { assertGitResourceAccess } from "../file-resource-access.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { ChiliToolDefinition, ChiliToolExecutionContext, ValidationResult } from "../types.js";
 import { runProcess, type RunProcessOptions } from "../process.js";
+
+const gitResourceContext = new AsyncLocalStorage<{ context: ChiliToolExecutionContext; mutates: boolean }>();
 
 const GIT_BASE_ARGS = ["--no-optional-locks", "-c", "core.quotepath=false"] as const;
 
@@ -127,41 +131,45 @@ export function createGitDiffTool(): ChiliToolDefinition<GitDiffInput> {
       };
     },
     async execute(input, context) {
-      const args = ["diff", "--no-ext-diff", "--no-color"];
-      if (input.staged) args.push("--cached");
-      if (input.stat) args.push("--stat");
-      if (input.base) args.push(input.base);
-      if (input.paths?.length) args.push("--", ...input.paths);
+      return gitResourceContext.run({ context, mutates: false }, async () => {
+        await assertGitResourceAccess(context, false);
+        const args = ["diff", "--no-ext-diff", "--no-textconv", "--no-color"];
+        if (input.staged) args.push("--cached");
+        if (input.stat) args.push("--stat");
+        if (input.base) args.push(input.base);
+        if (input.paths?.length) args.push("--", ...input.paths);
 
-      await assertGitRepository(context.cwd, context.signal);
-      const result = await runGit(args, {
-        cwd: context.cwd,
-        signal: context.signal,
-        timeoutMs: 15_000,
-        maxOutputBytes: input.maxOutputBytes ?? 512_000,
+        await assertGitRepository(context.cwd, context.signal);
+        const result = await runGit(args, {
+          cwd: context.cwd,
+          signal: context.signal,
+          timeoutMs: 15_000,
+          maxOutputBytes: input.maxOutputBytes ?? 512_000,
+        });
+
+        if (result.timedOut) {
+          throw new Error(`git diff timed out after 15000ms`);
+        }
+        if (result.exitCode !== 0) {
+          throw new Error(result.stderr || `git diff exited with code ${result.exitCode}`);
+        }
+
+        const output = result.stdout || "(no diff)";
+        await assertGitResourceAccess(context, false);
+        return {
+          title: input.stat ? "git diff --stat" : "git diff",
+          output,
+          metadata: {
+            staged: input.staged ?? false,
+            stat: input.stat ?? false,
+            base: input.base,
+            paths: input.paths ?? [],
+            durationMs: result.durationMs,
+            truncated: result.stdoutTruncated || result.stderrTruncated,
+            outputLimitBytes: result.outputLimitBytes,
+          },
+        };
       });
-
-      if (result.timedOut) {
-        throw new Error(`git diff timed out after 15000ms`);
-      }
-      if (result.exitCode !== 0) {
-        throw new Error(result.stderr || `git diff exited with code ${result.exitCode}`);
-      }
-
-      const output = result.stdout || "(no diff)";
-      return {
-        title: input.stat ? "git diff --stat" : "git diff",
-        output,
-        metadata: {
-          staged: input.staged ?? false,
-          stat: input.stat ?? false,
-          base: input.base,
-          paths: input.paths ?? [],
-          durationMs: result.durationMs,
-          truncated: result.stdoutTruncated || result.stderrTruncated,
-          outputLimitBytes: result.outputLimitBytes,
-        },
-      };
     },
   };
 }
@@ -212,61 +220,65 @@ export function createGitStatusTool(): ChiliToolDefinition<GitStatusInput> {
       };
     },
     async execute(input, context) {
-      await assertGitRepository(context.cwd, context.signal);
-      const pathArgs = input.paths?.length ? ["--", ...input.paths] : [];
-      const [branch, staged, unstaged, untracked] = await Promise.all([
-        readCurrentBranch(context.cwd, context.signal),
-        runGit(["diff", "--no-ext-diff", "--name-status", "-z", "--cached", ...pathArgs], {
-          cwd: context.cwd,
-          signal: context.signal,
-          timeoutMs: 15_000,
-          maxOutputBytes: input.maxOutputBytes ?? 256_000,
-        }),
-        runGit(["diff", "--no-ext-diff", "--name-status", "-z", ...pathArgs], {
-          cwd: context.cwd,
-          signal: context.signal,
-          timeoutMs: 15_000,
-          maxOutputBytes: input.maxOutputBytes ?? 256_000,
-        }),
-        runGit(["ls-files", "--others", "--exclude-standard", "-z", ...pathArgs], {
-          cwd: context.cwd,
-          signal: context.signal,
-          timeoutMs: 15_000,
-          maxOutputBytes: input.maxOutputBytes ?? 256_000,
-        }),
-      ]);
+      return gitResourceContext.run({ context, mutates: false }, async () => {
+        await assertGitResourceAccess(context, false);
+        await assertGitRepository(context.cwd, context.signal);
+        const pathArgs = input.paths?.length ? ["--", ...input.paths] : [];
+        const [branch, staged, unstaged, untracked] = await Promise.all([
+          readCurrentBranch(context.cwd, context.signal),
+          runGit(["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", "--cached", ...pathArgs], {
+            cwd: context.cwd,
+            signal: context.signal,
+            timeoutMs: 15_000,
+            maxOutputBytes: input.maxOutputBytes ?? 256_000,
+          }),
+          runGit(["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", ...pathArgs], {
+            cwd: context.cwd,
+            signal: context.signal,
+            timeoutMs: 15_000,
+            maxOutputBytes: input.maxOutputBytes ?? 256_000,
+          }),
+          runGit(["ls-files", "--others", "--exclude-standard", "-z", ...pathArgs], {
+            cwd: context.cwd,
+            signal: context.signal,
+            timeoutMs: 15_000,
+            maxOutputBytes: input.maxOutputBytes ?? 256_000,
+          }),
+        ]);
 
-      assertGitSuccess(staged, "git diff --cached --name-status");
-      assertGitSuccess(unstaged, "git diff --name-status");
-      assertGitSuccess(untracked, "git ls-files --others");
+        assertGitSuccess(staged, "git diff --cached --name-status");
+        assertGitSuccess(unstaged, "git diff --name-status");
+        assertGitSuccess(untracked, "git ls-files --others");
 
-      const stagedItems = parseNameStatus(staged.stdout);
-      const unstagedItems = parseNameStatus(unstaged.stdout);
-      const untrackedItems = parsePathList(untracked.stdout).map((path): GitChangedItem => ({
-        path,
-        status: "untracked",
-        code: "??",
-      }));
-      const status = {
-        branch: branch.current,
-        detached: branch.detached,
-        head: branch.head,
-        clean: stagedItems.length === 0 && unstagedItems.length === 0 && untrackedItems.length === 0,
-        staged: stagedItems,
-        unstaged: unstagedItems,
-        untracked: untrackedItems,
-        paths: input.paths ?? [],
-      };
+        const stagedItems = parseNameStatus(staged.stdout);
+        const unstagedItems = parseNameStatus(unstaged.stdout);
+        const untrackedItems = parsePathList(untracked.stdout).map((path): GitChangedItem => ({
+          path,
+          status: "untracked",
+          code: "??",
+        }));
+        const status = {
+          branch: branch.current,
+          detached: branch.detached,
+          head: branch.head,
+          clean: stagedItems.length === 0 && unstagedItems.length === 0 && untrackedItems.length === 0,
+          staged: stagedItems,
+          unstaged: unstagedItems,
+          untracked: untrackedItems,
+          paths: input.paths ?? [],
+        };
 
-      return {
-        title: "git status",
-        output: JSON.stringify(status, null, 2),
-        metadata: {
-          ...status,
-          durationMs: Math.max(staged.durationMs, unstaged.durationMs, untracked.durationMs),
-          truncated: staged.stdoutTruncated || unstaged.stdoutTruncated || untracked.stdoutTruncated,
-        },
-      };
+        await assertGitResourceAccess(context, false);
+        return {
+          title: "git status",
+          output: JSON.stringify(status, null, 2),
+          metadata: {
+            ...status,
+            durationMs: Math.max(staged.durationMs, unstaged.durationMs, untracked.durationMs),
+            truncated: staged.stdoutTruncated || unstaged.stdoutTruncated || untracked.stdoutTruncated,
+          },
+        };
+      });
     },
   };
 }
@@ -280,7 +292,6 @@ export function createGitStageTool(): ChiliToolDefinition<GitStageInput> {
     isReadOnly: false,
     isConcurrencySafe: false,
     isDestructive: false,
-    interruptBehavior: "block",
     maxResultOutputBytes: 100_000,
     inputSchema: {
       type: "object",
@@ -319,41 +330,45 @@ export function createGitStageTool(): ChiliToolDefinition<GitStageInput> {
       };
     },
     async execute(input, context) {
-      await assertGitRepository(context.cwd, context.signal);
-      const args = ["add"];
-      if (input.all) args.push("-A");
-      args.push("--", ...(input.paths?.length ? input.paths : ["."]));
+      return gitResourceContext.run({ context, mutates: true }, async () => {
+        await assertGitResourceAccess(context, true);
+        await assertGitRepository(context.cwd, context.signal);
+        const args = ["add"];
+        if (input.all) args.push("-A");
+        args.push("--", ...(input.paths?.length ? input.paths : ["."]));
 
-      const result = await runGit(args, {
-        cwd: context.cwd,
-        signal: context.signal,
-        timeoutMs: 30_000,
-        maxOutputBytes: 256_000,
+        const result = await runGit(args, {
+          cwd: context.cwd,
+          signal: context.signal,
+          timeoutMs: 30_000,
+          maxOutputBytes: 256_000,
+        });
+        assertGitSuccess(result, "git add");
+
+        const staged = await runGit(["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", "--cached"], {
+          cwd: context.cwd,
+          signal: context.signal,
+          timeoutMs: 15_000,
+          maxOutputBytes: 256_000,
+        });
+        assertGitSuccess(staged, "git diff --cached --name-status");
+        const stagedItems = parseNameStatus(staged.stdout);
+        const output = {
+          staged: stagedItems,
+          paths: input.paths ?? [],
+          all: input.all ?? false,
+        };
+
+        await assertGitResourceAccess(context, true);
+        return {
+          title: "git stage",
+          output: JSON.stringify(output, null, 2),
+          metadata: {
+            ...output,
+            durationMs: result.durationMs,
+          },
+        };
       });
-      assertGitSuccess(result, "git add");
-
-      const staged = await runGit(["diff", "--no-ext-diff", "--name-status", "-z", "--cached"], {
-        cwd: context.cwd,
-        signal: context.signal,
-        timeoutMs: 15_000,
-        maxOutputBytes: 256_000,
-      });
-      assertGitSuccess(staged, "git diff --cached --name-status");
-      const stagedItems = parseNameStatus(staged.stdout);
-      const output = {
-        staged: stagedItems,
-        paths: input.paths ?? [],
-        all: input.all ?? false,
-      };
-
-      return {
-        title: "git stage",
-        output: JSON.stringify(output, null, 2),
-        metadata: {
-          ...output,
-          durationMs: result.durationMs,
-        },
-      };
     },
   };
 }
@@ -367,7 +382,6 @@ export function createGitCommitTool(): ChiliToolDefinition<GitCommitInput> {
     isReadOnly: false,
     isConcurrencySafe: false,
     isDestructive: false,
-    interruptBehavior: "block",
     maxResultOutputBytes: 100_000,
     inputSchema: {
       type: "object",
@@ -408,50 +422,54 @@ export function createGitCommitTool(): ChiliToolDefinition<GitCommitInput> {
       };
     },
     async execute(input, context) {
-      await assertGitRepository(context.cwd, context.signal);
-      if (!input.allowEmpty) {
-        const staged = await runGit(["diff", "--cached", "--quiet", "--exit-code"], {
+      return gitResourceContext.run({ context, mutates: true }, async () => {
+        await assertGitResourceAccess(context, true);
+        await assertGitRepository(context.cwd, context.signal);
+        if (!input.allowEmpty) {
+          const staged = await runGit(["diff", "--cached", "--quiet", "--exit-code"], {
+            cwd: context.cwd,
+            signal: context.signal,
+            timeoutMs: 15_000,
+            maxOutputBytes: 256_000,
+          });
+          if (staged.exitCode === 0) {
+            throw new Error("No staged changes to commit. Stage files first or set allowEmpty=true.");
+          }
+          if (staged.exitCode !== 1) {
+            throw new Error(staged.stderr || `git diff --cached --quiet exited with code ${staged.exitCode}`);
+          }
+        }
+
+        const args = ["commit", "--no-gpg-sign"];
+        if (input.allowEmpty) args.push("--allow-empty");
+              // Add "Co-Authored-By: chili🌶️" attribution as trailer to commit message
+        const attribution = `Co-Authored-By: chili🌶️ <noreply@chili.ai>`;
+        const commitMessage = `${input.message}\n\n${attribution}`;
+        args.push("-m", commitMessage);
+        const result = await runGit(args, {
           cwd: context.cwd,
           signal: context.signal,
-          timeoutMs: 15_000,
+          timeoutMs: 30_000,
           maxOutputBytes: 256_000,
         });
-        if (staged.exitCode === 0) {
-          throw new Error("No staged changes to commit. Stage files first or set allowEmpty=true.");
-        }
-        if (staged.exitCode !== 1) {
-          throw new Error(staged.stderr || `git diff --cached --quiet exited with code ${staged.exitCode}`);
-        }
-      }
+        assertGitSuccess(result, "git commit");
 
-      const args = ["commit", "--no-gpg-sign"];
-      if (input.allowEmpty) args.push("--allow-empty");
-            // Add "Co-Authored-By: chili🌶️" attribution as trailer to commit message
-      const attribution = `Co-Authored-By: chili🌶️ <noreply@chili.ai>`;
-      const commitMessage = `${input.message}\n\n${attribution}`;
-      args.push("-m", commitMessage);
-      const result = await runGit(args, {
-        cwd: context.cwd,
-        signal: context.signal,
-        timeoutMs: 30_000,
-        maxOutputBytes: 256_000,
+        const info = await readCommitInfo(context.cwd, context.signal);
+        const output = {
+          hash: info.hash,
+          subject: info.subject,
+        };
+
+        await assertGitResourceAccess(context, true);
+        return {
+          title: `git commit ${info.hash.slice(0, 12)}`,
+          output: JSON.stringify(output, null, 2),
+          metadata: {
+            ...output,
+            durationMs: result.durationMs,
+          },
+        };
       });
-      assertGitSuccess(result, "git commit");
-
-      const info = await readCommitInfo(context.cwd, context.signal);
-      const output = {
-        hash: info.hash,
-        subject: info.subject,
-      };
-
-      return {
-        title: `git commit ${info.hash.slice(0, 12)}`,
-        output: JSON.stringify(output, null, 2),
-        metadata: {
-          ...output,
-          durationMs: result.durationMs,
-        },
-      };
     },
   };
 }
@@ -465,7 +483,6 @@ export function createGitBranchTool(): ChiliToolDefinition<GitBranchInput> {
     isReadOnly: (input) => branchAction(input) === "current" || branchAction(input) === "list",
     isConcurrencySafe: (input) => branchAction(input) === "current" || branchAction(input) === "list",
     isDestructive: false,
-    interruptBehavior: "block",
     maxResultOutputBytes: 100_000,
     inputSchema: {
       type: "object",
@@ -541,58 +558,63 @@ export function createGitBranchTool(): ChiliToolDefinition<GitBranchInput> {
       };
     },
     async execute(input, context) {
-      await assertGitRepository(context.cwd, context.signal);
-      const action = branchAction(input);
-      const before = await readCurrentBranch(context.cwd, context.signal);
+      return gitResourceContext.run({ context, mutates: branchAction(input) !== "current" && branchAction(input) !== "list" }, async () => {
+        await assertGitResourceAccess(context, branchAction(input) !== "current" && branchAction(input) !== "list");
+        await assertGitRepository(context.cwd, context.signal);
+        const action = branchAction(input);
+        const before = await readCurrentBranch(context.cwd, context.signal);
 
-      if (action === "current" || action === "list") {
-        const branches = action === "list" ? await listBranches(context.cwd, context.signal) : undefined;
-        const output = {
-          current: before.current,
-          detached: before.detached,
-          head: before.head,
-          branches,
-        };
+        if (action === "current" || action === "list") {
+          const branches = action === "list" ? await listBranches(context.cwd, context.signal) : undefined;
+          const output = {
+            current: before.current,
+            detached: before.detached,
+            head: before.head,
+            branches,
+          };
+          await assertGitResourceAccess(context, branchAction(input) !== "current" && branchAction(input) !== "list");
         return {
-          title: action === "list" ? "git branch --list" : "git branch",
-          output: JSON.stringify(output, null, 2),
-          metadata: output,
+            title: action === "list" ? "git branch --list" : "git branch",
+            output: JSON.stringify(output, null, 2),
+            metadata: output,
+          };
+        }
+
+        if (!input.name) throw new Error(`git_branch action ${action} requires name`);
+        await assertValidBranchName(input.name, context.cwd, context.signal);
+
+        const args =
+          action === "create"
+            ? ["branch", input.name, ...(input.startPoint ? [input.startPoint] : [])]
+            : action === "switch"
+              ? ["switch", input.name]
+              : ["switch", "-c", input.name, ...(input.startPoint ? [input.startPoint] : [])];
+        const result = await runGit(args, {
+          cwd: context.cwd,
+          signal: context.signal,
+          timeoutMs: 30_000,
+          maxOutputBytes: 256_000,
+        });
+        assertGitSuccess(result, `git ${args[0]}`);
+
+        const after = await readCurrentBranch(context.cwd, context.signal);
+        const output = {
+          action,
+          name: input.name,
+          startPoint: input.startPoint,
+          before,
+          after,
         };
-      }
-
-      if (!input.name) throw new Error(`git_branch action ${action} requires name`);
-      await assertValidBranchName(input.name, context.cwd, context.signal);
-
-      const args =
-        action === "create"
-          ? ["branch", input.name, ...(input.startPoint ? [input.startPoint] : [])]
-          : action === "switch"
-            ? ["switch", input.name]
-            : ["switch", "-c", input.name, ...(input.startPoint ? [input.startPoint] : [])];
-      const result = await runGit(args, {
-        cwd: context.cwd,
-        signal: context.signal,
-        timeoutMs: 30_000,
-        maxOutputBytes: 256_000,
+        await assertGitResourceAccess(context, branchAction(input) !== "current" && branchAction(input) !== "list");
+        return {
+          title: `git branch ${action}`,
+          output: JSON.stringify(output, null, 2),
+          metadata: {
+            ...output,
+            durationMs: result.durationMs,
+          },
+        };
       });
-      assertGitSuccess(result, `git ${args[0]}`);
-
-      const after = await readCurrentBranch(context.cwd, context.signal);
-      const output = {
-        action,
-        name: input.name,
-        startPoint: input.startPoint,
-        before,
-        after,
-      };
-      return {
-        title: `git branch ${action}`,
-        output: JSON.stringify(output, null, 2),
-        metadata: {
-          ...output,
-          durationMs: result.durationMs,
-        },
-      };
     },
   };
 }
@@ -621,17 +643,48 @@ async function runGit(
     maxOutputBytes: number;
   },
 ) {
+  const scope = gitResourceContext.getStore();
+  const readOnly = scope !== undefined && !scope.mutates;
   const processOptions: RunProcessOptions = {
     cwd: options.cwd,
     timeoutMs: options.timeoutMs,
     maxOutputBytes: options.maxOutputBytes,
+    beforeSpawn: async () => {
+      if (!scope) return;
+      await assertGitResourceAccess(scope.context, scope.mutates);
+      if (readOnly) await assertReadOnlyGitConfiguration(scope.context);
+      await assertGitResourceAccess(scope.context, scope.mutates);
+    },
     env: {
       GIT_PAGER: "cat",
       GIT_TERMINAL_PROMPT: "0",
     },
   };
   if (options.signal) processOptions.signal = options.signal;
-  return runProcess("git", [...GIT_BASE_ARGS, ...args], processOptions);
+  return runProcess("git", [...GIT_BASE_ARGS, ...(readOnly ? ["-c", "core.fsmonitor=false"] : []), ...args], processOptions);
+}
+
+async function assertReadOnlyGitConfiguration(context: ChiliToolExecutionContext): Promise<void> {
+  // Reading effective configuration never invokes repository filters. Do this
+  // inside the dispatch barrier, including after the guardian has registered,
+  // so a filter added while preparing a read cannot gain execution authority.
+  const result = await runProcess("git", [
+    ...GIT_BASE_ARGS, "-c", "core.fsmonitor=false", "config", "--null", "--includes",
+    "--get-regexp", "^filter\\..*\\.(clean|process|smudge)$",
+  ], {
+    cwd: context.cwd,
+    signal: context.signal,
+    timeoutMs: 10_000,
+    maxOutputBytes: 64_000,
+    env: { GIT_PAGER: "cat", GIT_TERMINAL_PROMPT: "0" },
+    beforeSpawn: () => assertGitResourceAccess(context, false),
+  });
+  if (result.timedOut || result.stdoutTruncated || result.stderrTruncated || (result.exitCode !== 0 && result.exitCode !== 1)) {
+    throw new Error("Cannot verify that Git configuration permits a read-only operation.");
+  }
+  if (result.exitCode === 0) {
+    throw new Error("Read-only Git tools refuse configured repository filters because they can execute commands. Use Bash with its execution isolation and approval policy.");
+  }
 }
 
 function assertGitSuccess(result: Awaited<ReturnType<typeof runGit>>, command: string): void {

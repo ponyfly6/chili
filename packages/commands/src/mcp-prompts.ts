@@ -1,5 +1,6 @@
 import { createPromptNamespace, createPromptRoot, normalizeCommandSegment } from "./prompt-tree.js";
 import { defineCommand } from "./registry.js";
+import { commandToolPolicy } from "./policy-metadata.js";
 import { splitCommandArguments } from "./template.js";
 import type { CommandContext, CommandDefinition, CommandRunInput, CommandRunResult } from "./types.js";
 
@@ -140,7 +141,7 @@ async function runMcpPromptCommand(
     arguments: parseMcpPromptArguments(args.raw, prompt.arguments ?? []),
   }, context);
   const model = stringMetadata(rendered.metadata?.model);
-  const allowedTools = stringArrayMetadata(rendered.metadata?.allowedTools);
+  const toolPolicy = commandToolPolicy(rendered.metadata ?? {});
   return {
     type: "prompt",
     prompt: formatMcpPromptResult(rendered),
@@ -149,7 +150,7 @@ async function runMcpPromptCommand(
       commandPath,
       source: "mcp",
       ...(model !== undefined ? { model } : {}),
-      ...(allowedTools !== undefined ? { allowedTools } : {}),
+      ...toolPolicy,
     },
   };
 }
@@ -170,8 +171,4 @@ function messageContentText(content: McpPromptMessage["content"]): string {
 
 function stringMetadata(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
-}
-
-function stringArrayMetadata(value: unknown): readonly string[] | undefined {
-  return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : undefined;
 }

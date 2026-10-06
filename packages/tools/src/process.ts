@@ -1,6 +1,9 @@
 import { spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { EventEmitter } from "node:events";
 import { StringDecoder } from "node:string_decoder";
+import { spawnGuardedProcess } from "./process-guardian.js";
+export { PROCESS_GUARDIAN_MODE, runProcessGuardianEntrypoint } from "./process-guardian.js";
 
 export type RunProcessOutputStream = "stdout" | "stderr";
 
@@ -17,6 +20,8 @@ export interface RunProcessRawOutputChunk {
 }
 
 export interface RunProcessOptions {
+  /** Last authority check before the guardian receives permission to execute. */
+  beforeSpawn?: () => Promise<void>;
   cwd: string;
   env?: Record<string, string | undefined>;
   signal?: AbortSignal;
@@ -36,6 +41,44 @@ export interface RunProcessLifecycleEvent {
 }
 
 export type RunProcessLifecycleObserver = (event: RunProcessLifecycleEvent) => void;
+
+export interface ProcessGuardianLifecycleEvent {
+  type: "started" | "finished";
+  pid: number;
+  cwd: string;
+  ownerId?: string;
+}
+
+const processOwner = new AsyncLocalStorage<string>();
+
+export function withProcessOwner<T>(ownerId: string, operation: () => T): T {
+  return processOwner.run(ownerId, operation);
+}
+
+const guardianLifecycleObservers = new Set<(event: ProcessGuardianLifecycleEvent) => void>();
+
+/** Started is a required durable registration barrier, before any tool can run. */
+export function observeProcessGuardianLifecycle(observer: (event: ProcessGuardianLifecycleEvent) => void): () => void {
+  guardianLifecycleObservers.add(observer);
+  return () => guardianLifecycleObservers.delete(observer);
+}
+
+/** Register before the helper receives permission to start; release only after its OS exit. */
+export function registerProcessGuardian(input: { pid: number; cwd: string }): () => void {
+  const ownerId = processOwner.getStore();
+  const event = { ...input, type: "started" as const, ...(ownerId ? { ownerId } : {}) };
+  let released = false;
+  const release = (): void => {
+    if (released) return;
+    released = true;
+    for (const observer of guardianLifecycleObservers) {
+      try { observer({ ...event, type: "finished" }); } catch { /* A stale registration fails closed on recovery. */ }
+    }
+  };
+  try { for (const observer of guardianLifecycleObservers) observer(event); }
+  catch (error) { release(); throw error; }
+  return release;
+}
 
 const processLifecycleObservers = new Set<RunProcessLifecycleObserver>();
 
@@ -76,15 +119,64 @@ export async function runProcess(
   options: RunProcessOptions,
 ): Promise<RunProcessResult> {
   if (options.signal?.aborted) throw abortError("Process aborted");
+  if (process.platform === "win32") {
+    await awaitProcessAuthorization(options);
+    if (options.signal?.aborted) throw abortError("Process aborted");
+  }
 
   const started = Date.now();
-  const child = spawn(command, [...args], {
+  const killGraceMs = options.killGraceMs ?? 1_000;
+  const guarded = process.platform !== "win32" ? spawnGuardedProcess(command, args, {
+    cwd: options.cwd,
+    env: normalizeEnv(options.env),
+    killGraceMs,
+  }) : undefined;
+  const child = guarded?.child ?? spawn(command, [...args], {
     cwd: options.cwd,
     env: normalizeEnv(options.env),
     detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
   });
-  const childPid = child.pid;
+  let releaseGuardian: (() => void) | undefined;
+  const finishGuardian = async (): Promise<void> => {
+    if (!guarded) return;
+    guarded.stop();
+    await guarded.closed;
+    if (child.pid && !await waitForProcessGroupExit(child.pid, Math.max(250, killGraceMs))) {
+      throw new Error(`Process group ${child.pid} remained alive after guardian cleanup`);
+    }
+    releaseGuardian?.();
+  };
+  if (guarded && child.pid) {
+    try {
+      releaseGuardian = registerProcessGuardian({ pid: child.pid, cwd: options.cwd });
+      await awaitProcessAuthorization(options);
+      if (options.signal?.aborted) throw abortError("Process aborted");
+      guarded.start();
+    } catch (error) {
+      guarded.stop();
+      await finishGuardian();
+      throw error;
+    }
+  }
+  let childPid: number | undefined;
+  const abortStartup = (): void => { if (guarded) terminateProcessGroup(child, "SIGKILL"); };
+  let startupTimedOut = false;
+  const startupTimer = guarded ? setTimeout(() => {
+    startupTimedOut = true;
+    abortStartup();
+  }, Math.min(options.timeoutMs || 10_000, 10_000)) : undefined;
+  options.signal?.addEventListener("abort", abortStartup, { once: true });
+  try { childPid = guarded ? await guarded.started : child.pid; }
+  catch (error) {
+    await finishGuardian();
+    if (options.signal?.aborted) throw abortError("Process aborted");
+    if (startupTimedOut) throw new Error("Process guardian startup timed out before command readiness");
+    throw error;
+  } finally {
+    if (startupTimer) clearTimeout(startupTimer);
+    options.signal?.removeEventListener("abort", abortStartup);
+  }
   if (childPid) publishProcessLifecycle({ type: "started", pid: childPid });
 
   let timedOut = false;
@@ -92,7 +184,6 @@ export async function runProcess(
   let exited = false;
   let escalation: NodeJS.Timeout | undefined;
   const maxOutputBytes = options.maxOutputBytes ?? 256_000;
-  const killGraceMs = options.killGraceMs ?? 1_000;
   const outputDispatcher = options.onOutput
     ? new OutputDeltaDispatcher(options.onOutput, {
         flushIntervalMs: options.outputFlushIntervalMs ?? DEFAULT_OUTPUT_FLUSH_INTERVAL_MS,
@@ -105,19 +196,25 @@ export async function runProcess(
   const timeout = options.timeoutMs
     ? setTimeout(() => {
         timedOut = true;
-        terminateProcessGroup(child, "SIGTERM");
-        escalation = setTimeout(() => {
-          if (!exited) terminateProcessGroup(child, "SIGKILL");
-        }, killGraceMs);
-      }, options.timeoutMs)
+        if (guarded) guarded.stop();
+        else {
+          terminateProcessGroup(child, "SIGTERM");
+          escalation = setTimeout(() => {
+            if (!exited) terminateProcessGroup(child, "SIGKILL");
+          }, killGraceMs);
+        }
+      }, Math.max(1, options.timeoutMs - (Date.now() - started)))
     : undefined;
 
   const abort = () => {
     aborted = true;
-    terminateProcessGroup(child, "SIGTERM");
-    escalation = setTimeout(() => {
-      if (!exited) terminateProcessGroup(child, "SIGKILL");
-    }, killGraceMs);
+    if (guarded) guarded.stop();
+    else {
+      terminateProcessGroup(child, "SIGTERM");
+      escalation = setTimeout(() => {
+        if (!exited) terminateProcessGroup(child, "SIGKILL");
+      }, killGraceMs);
+    }
   };
 
   if (options.signal) {
@@ -126,14 +223,14 @@ export async function runProcess(
   }
 
   try {
-    const statusPromise = waitForExit(child).then(async (status) => {
+    const statusPromise = (guarded?.status ?? waitForExit(child)).then(async (status) => {
       exited = true;
-      if (childPid) await terminateResidualProcessGroup(childPid, killGraceMs);
+      if (!guarded && childPid) await terminateResidualProcessGroup(childPid, killGraceMs);
       return status;
     });
     const [stdout, stderr, status] = await Promise.all([
-      collect(child.stdout, maxOutputBytes, "stdout", outputDispatcher, options.onRawOutput),
-      collect(child.stderr, maxOutputBytes, "stderr", outputDispatcher, options.onRawOutput),
+      collect(guarded?.stdout ?? child.stdout, maxOutputBytes, "stdout", outputDispatcher, options.onRawOutput),
+      collect(guarded?.stderr ?? child.stderr, maxOutputBytes, "stderr", outputDispatcher, options.onRawOutput),
       statusPromise,
     ]);
     await outputDispatcher?.flushAll();
@@ -157,13 +254,17 @@ export async function runProcess(
       aborted,
     };
   } catch (error) {
+    if (guarded && childPid) await terminateResidualProcessGroup(childPid, killGraceMs);
     await outputDispatcher?.flushAll();
     throw error;
   } finally {
     if (timeout) clearTimeout(timeout);
     if (escalation) clearTimeout(escalation);
     options.signal?.removeEventListener("abort", abort);
-    if (childPid) await terminateResidualProcessGroup(childPid, killGraceMs);
+    if (guarded) {
+      await finishGuardian();
+    }
+    else if (childPid) await terminateResidualProcessGroup(childPid, killGraceMs);
     if (childPid && !processGroupStillExists(childPid)) {
       publishProcessLifecycle({ type: "finished", pid: childPid });
     }
@@ -407,6 +508,22 @@ function abortError(message: string): Error {
   const error = new Error(message);
   error.name = "AbortError";
   return error;
+}
+
+async function awaitProcessAuthorization(options: RunProcessOptions): Promise<void> {
+  if (!options.beforeSpawn) return;
+  if (options.signal?.aborted) throw abortError("Process aborted");
+  await new Promise<void>((resolve, reject) => {
+    const abort = (): void => finish(abortError("Process aborted"));
+    const timer = setTimeout(() => finish(new Error("Process authorization deadline exceeded before command startup")), options.timeoutMs || 10_000);
+    const finish = (error?: unknown): void => {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+      if (error) reject(error); else resolve();
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
+    Promise.resolve().then(() => options.beforeSpawn!()).then(() => finish(), finish);
+  });
 }
 
 function terminateProcessGroup(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {

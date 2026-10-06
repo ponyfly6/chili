@@ -1,3 +1,6 @@
+import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mcpDefinitionFingerprint, mcpServerIdentity } from "./identity.js";
 import type { McpConfig, McpDiagnostic, McpServerConfig } from "./config.js";
 import type {
   McpCallToolResult,
@@ -69,6 +72,12 @@ export interface McpServerState {
 
 export class McpClientManager {
   private config: McpConfig;
+  private readonly identity = randomUUID();
+  private generation = 0;
+  private readonly connections = new Map<McpServerState, Promise<void>>();
+  private readonly connectionAborts = new Map<McpServerState, AbortController>();
+  private readonly revisions = new Map<McpServerState, number>();
+  private readonly refreshes = new Map<McpServerState, { tools: number; prompts: number; resources: number }>();
   private readonly states = new Map<string, McpServerState>();
   private readonly subscriptions = new Map<string, McpUnsubscribe[]>();
 
@@ -135,26 +144,68 @@ export class McpClientManager {
     return this.listResources();
   }
 
-  async callTool(serverName: string, toolName: string, input: unknown, signal?: AbortSignal): Promise<McpCallToolResult> {
-    const state = this.requireConnectedState(serverName);
-    return withTimeout((operationSignal) => state.client.callTool(toolName, input, { signal: operationSignal }), state.server.toolTimeoutMs, signal);
+  getToolRevision(serverName: string, toolName: string): string | undefined {
+    const state = this.requireState(serverName);
+    const tool = state.tools.find((candidate) => candidate.name === toolName);
+    if (state.status !== "connected" || !tool) return undefined;
+    return `${this.identity}:${mcpServerIdentity(state.server)}:${this.revisions.get(state) ?? 0}:${mcpDefinitionFingerprint(tool)}`;
   }
 
-  async readResource(serverName: string, uri: string, signal?: AbortSignal): Promise<McpReadResourceResult> {
+  async callTool(serverName: string, toolName: string, input: unknown, signal?: AbortSignal, revision?: string): Promise<McpCallToolResult> {
     const state = this.requireConnectedState(serverName);
-    return state.client.readResource(uri, signal ? { signal } : {});
+    const client = state.client;
+    return withTimeout((operationSignal) => {
+      if (state.client !== client || state.status !== "connected"
+        || revision !== undefined && this.getToolRevision(serverName, toolName) !== revision) {
+        throw new Error("MCP tool definition or connection changed; prepare the call again");
+      }
+      return client.callTool(toolName, input, { signal: operationSignal });
+    }, state.server.toolTimeoutMs, signal, this.connectionAborts.get(state)?.signal);
   }
 
-  async getPrompt(serverName: string, name: string, arguments_?: Record<string, string>, signal?: AbortSignal): Promise<McpGetPromptResult> {
+  getResourceRevision(serverName: string, uri: string): string | undefined {
+    const state = this.requireState(serverName);
+    if (state.status !== "connected") return undefined;
+    const resource = state.resources.find((candidate) => candidate.uri === uri);
+    return `${this.identity}:${mcpServerIdentity(state.server)}:${this.revisions.get(state) ?? 0}:resource:${this.refreshes.get(state)?.resources ?? 0}:${mcpDefinitionFingerprint({ uri, resource })}`;
+  }
+
+  getPromptRevision(serverName: string, name: string): string | undefined {
+    const state = this.requireState(serverName);
+    if (state.status !== "connected") return undefined;
+    const prompt = state.prompts.find((candidate) => candidate.name === name);
+    return `${this.identity}:${mcpServerIdentity(state.server)}:${this.revisions.get(state) ?? 0}:prompt:${this.refreshes.get(state)?.prompts ?? 0}:${mcpDefinitionFingerprint({ name, prompt })}`;
+  }
+
+  async readResource(serverName: string, uri: string, signal?: AbortSignal, revision?: string): Promise<McpReadResourceResult> {
     const state = this.requireConnectedState(serverName);
-    return state.client.getPrompt(name, arguments_, signal ? { signal } : {});
+    const client = state.client;
+    return withTimeout((operationSignal) => {
+      if (state.client !== client || revision !== undefined && revision !== this.getResourceRevision(serverName, uri)) {
+        throw new Error("MCP resource definition or connection changed; prepare the read again");
+      }
+      return client.readResource(uri, { signal: operationSignal });
+    }, state.server.toolTimeoutMs, signal, this.connectionAborts.get(state)?.signal);
+  }
+
+  async getPrompt(serverName: string, name: string, arguments_?: Record<string, string>, signal?: AbortSignal, revision?: string): Promise<McpGetPromptResult> {
+    const state = this.requireConnectedState(serverName);
+    const client = state.client;
+    return withTimeout((operationSignal) => {
+      if (state.client !== client || revision !== undefined && revision !== this.getPromptRevision(serverName, name)) {
+        throw new Error("MCP prompt definition or connection changed; prepare the command again");
+      }
+      return client.getPrompt(name, arguments_, { signal: operationSignal });
+    }, state.server.toolTimeoutMs, signal, this.connectionAborts.get(state)?.signal);
   }
 
   private resetStates(): void {
     this.states.clear();
+    this.revisions.clear();
+    this.refreshes.clear();
     for (const server of Object.values(this.config.servers)) {
       this.states.set(server.name, {
-        server,
+        server: server.type === "stdio" ? { ...server, cwd: resolve(server.cwd ?? process.cwd()) } : server,
         status: server.enabled ? "disconnected" : "disabled",
         tools: [],
         prompts: [],
@@ -163,7 +214,18 @@ export class McpClientManager {
     }
   }
 
-  private async connectState(state: McpServerState): Promise<void> {
+  private connectState(state: McpServerState): Promise<void> {
+    const active = this.connections.get(state);
+    if (active) return active;
+    const operation = this.initializeState(state);
+    this.connections.set(state, operation);
+    void operation.finally(() => {
+      if (this.connections.get(state) === operation) this.connections.delete(state);
+    }).catch(() => undefined);
+    return operation;
+  }
+
+  private async initializeState(state: McpServerState): Promise<void> {
     if (!state.server.enabled) {
       state.status = "disabled";
       return;
@@ -171,20 +233,23 @@ export class McpClientManager {
     if (state.status === "connected" || state.status === "connecting") return;
 
     state.status = "connecting";
+    this.revisions.set(state, ++this.generation);
+    const controller = new AbortController();
+    this.connectionAborts.set(state, controller);
     delete state.error;
     let client: McpClient | undefined;
     try {
       client = this.options.createClient(state.server);
       state.client = client;
       const connectingClient = client;
-      await withTimeout((signal) => connectingClient.initialize({ signal }), state.server.startupTimeoutMs);
+      await withTimeout((signal) => connectingClient.initialize({ signal }), state.server.startupTimeoutMs, controller.signal);
       if (state.client !== client) return;
       this.subscribe(state);
       await withTimeout((signal) => Promise.all([
         this.refreshStateTools(state, signal),
         this.refreshStatePrompts(state, signal),
         this.refreshStateResources(state, signal),
-      ]), state.server.startupTimeoutMs);
+      ]), state.server.startupTimeoutMs, controller.signal);
       if (state.client !== client) return;
       state.status = "connected";
     } catch (error) {
@@ -199,19 +264,26 @@ export class McpClientManager {
 
   private async disconnectState(state: McpServerState): Promise<void> {
     this.unsubscribe(state.server.name);
-    if (state.client) {
-      await state.client.close();
-    }
+    const client = state.client;
+    // Invalidate before awaiting close: late initialization/catalog responses
+    // cannot resurrect the old connection or overwrite its replacement.
     delete state.client;
+    this.connectionAborts.get(state)?.abort(new Error("MCP server disconnected"));
+    this.connectionAborts.delete(state);
+    this.connections.delete(state);
+    this.revisions.set(state, ++this.generation);
     state.tools = [];
     state.prompts = [];
     state.resources = [];
     delete state.error;
     state.status = state.server.enabled ? "disconnected" : "disabled";
+    if (client) await client.close();
   }
 
   private async closeFailedStateClient(state: McpServerState): Promise<void> {
     this.unsubscribe(state.server.name);
+    this.connectionAborts.get(state)?.abort(state.error);
+    this.connectionAborts.delete(state);
     const client = state.client;
     delete state.client;
     state.tools = [];
@@ -228,6 +300,16 @@ export class McpClientManager {
   private subscribe(state: McpServerState): void {
     this.unsubscribe(state.server.name);
     const subscriptions: McpUnsubscribe[] = [];
+    const subscribedClient = state.client;
+    if (subscribedClient?.onClose) {
+      subscriptions.push(subscribedClient.onClose(() => {
+        if (state.client !== subscribedClient) return;
+        void this.disconnectState(state).catch((error: unknown) => {
+          this.emitDiagnostic(state.server, "close_failed", toError(error).message);
+        });
+        this.options.onToolsChanged?.({ server: state.server, tools: [] });
+      }));
+    }
     if (state.client?.onToolsChanged) {
       subscriptions.push(state.client.onToolsChanged(() => {
         void this.refreshStateTools(state).then(() => {
@@ -276,37 +358,53 @@ export class McpClientManager {
   private async refreshStateTools(state: McpServerState, signal?: AbortSignal): Promise<void> {
     const client = state.client;
     if (!client) return;
-    const tools = await listAllTools(client, signal);
+    const generation = this.beginRefresh(state, "tools");
+    const tools = signal ? await listAllTools(client, signal) : await withTimeout((operationSignal) => listAllTools(client, operationSignal),
+      state.server.toolTimeoutMs, signal, this.connectionAborts.get(state)?.signal);
     signal?.throwIfAborted();
-    if (state.client === client) state.tools = filterTools(state.server, tools);
+    if (state.client === client && this.refreshes.get(state)?.tools === generation) {
+      state.tools = filterTools(state.server, tools);
+    }
   }
 
   private async refreshStatePrompts(state: McpServerState, signal?: AbortSignal): Promise<void> {
     const client = state.client;
     if (!client) return;
+    const generation = this.beginRefresh(state, "prompts");
     try {
-      const prompts = await listAllPrompts(client, signal);
+      const prompts = signal ? await listAllPrompts(client, signal) : await withTimeout((operationSignal) => listAllPrompts(client, operationSignal),
+        state.server.toolTimeoutMs, signal, this.connectionAborts.get(state)?.signal);
       signal?.throwIfAborted();
-      if (state.client === client) state.prompts = prompts;
+      if (state.client === client && this.refreshes.get(state)?.prompts === generation) state.prompts = prompts;
     } catch (error) {
       signal?.throwIfAborted();
       if (!isUnsupportedCapabilityError(error)) throw error;
-      if (state.client === client) state.prompts = [];
+      if (state.client === client && this.refreshes.get(state)?.prompts === generation) state.prompts = [];
     }
   }
 
   private async refreshStateResources(state: McpServerState, signal?: AbortSignal): Promise<void> {
     const client = state.client;
     if (!client) return;
+    const generation = this.beginRefresh(state, "resources");
     try {
-      const resources = await listAllResources(client, signal);
+      const resources = signal ? await listAllResources(client, signal) : await withTimeout((operationSignal) => listAllResources(client, operationSignal),
+        state.server.toolTimeoutMs, signal, this.connectionAborts.get(state)?.signal);
       signal?.throwIfAborted();
-      if (state.client === client) state.resources = resources;
+      if (state.client === client && this.refreshes.get(state)?.resources === generation) state.resources = resources;
     } catch (error) {
       signal?.throwIfAborted();
       if (!isUnsupportedCapabilityError(error)) throw error;
-      if (state.client === client) state.resources = [];
+      if (state.client === client && this.refreshes.get(state)?.resources === generation) state.resources = [];
     }
+  }
+
+  private beginRefresh(state: McpServerState, kind: "tools" | "prompts" | "resources"): number {
+    const versions = this.refreshes.get(state) ?? { tools: 0, prompts: 0, resources: 0 };
+    versions[kind] += 1;
+    this.refreshes.set(state, versions);
+    if (kind === "tools") this.revisions.set(state, ++this.generation);
+    return versions[kind];
   }
 
   private requireState(serverName: string): McpServerState {
@@ -383,7 +481,7 @@ async function listAllResources(client: McpClient, signal?: AbortSignal): Promis
   return resources;
 }
 
-async function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
+async function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, timeoutMs?: number, signal?: AbortSignal, lifetime?: AbortSignal): Promise<T> {
   const controller = new AbortController();
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let cancel: (error: Error) => void = () => {};
@@ -396,7 +494,8 @@ async function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, ti
   });
   const onAbort = () => cancel(new Error("MCP operation aborted"));
   signal?.addEventListener("abort", onAbort, { once: true });
-  if (signal?.aborted) onAbort();
+  lifetime?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted || lifetime?.aborted) onAbort();
   if (timeoutMs) {
     timeout = setTimeout(() => cancel(new Error(`MCP operation timed out after ${timeoutMs}ms`)), timeoutMs);
   }
@@ -415,6 +514,7 @@ async function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, ti
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
     signal?.removeEventListener("abort", onAbort);
+    lifetime?.removeEventListener("abort", onAbort);
   }
 }
 

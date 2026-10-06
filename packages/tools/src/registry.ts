@@ -15,9 +15,14 @@ interface RegisteredTool {
 }
 
 export class InMemoryToolRegistry implements MutableToolRegistry {
+  private revision = 0;
   private readonly canonical = new Map<string, RegisteredTool>();
   private readonly lookup = new Map<string, RegisteredTool>();
   private readonly contextualSources = new Map<string, ContextualToolProvider>();
+
+  getRevision(): number {
+    return this.revision;
+  }
 
   register(tool: ChiliToolDefinition, options: ToolRegistryRegisterOptions = {}): void {
     const existing = this.lookup.get(tool.name);
@@ -36,14 +41,15 @@ export class InMemoryToolRegistry implements MutableToolRegistry {
     for (const alias of tool.aliases ?? []) {
       this.lookup.set(alias, registered);
     }
+    this.revision += 1;
   }
 
   get(name: string): ChiliToolDefinition | undefined {
     return this.lookup.get(name)?.tool;
   }
 
-  list(_options: ToolRegistryListOptions = {}): ChiliToolDefinition[] {
-    return this.sortedEntries().map((entry) => entry.tool);
+  list(options: ToolRegistryListOptions = {}): ChiliToolDefinition[] {
+    return this.sortedEntries().map((entry) => entry.tool).filter((tool) => includeTool(tool, options));
   }
 
   async getForContext(name: string, context: ToolRegistryContext): Promise<ChiliToolDefinition | undefined> {
@@ -52,7 +58,7 @@ export class InMemoryToolRegistry implements MutableToolRegistry {
 
   async listForContext(
     context: ToolRegistryContext,
-    _options: ToolRegistryListOptions = {},
+    options: ToolRegistryListOptions = {},
   ): Promise<ChiliToolDefinition[]> {
     const tools = this.list();
     const lookup = contextualLookup(tools);
@@ -65,11 +71,11 @@ export class InMemoryToolRegistry implements MutableToolRegistry {
         for (const alias of tool.aliases ?? []) lookup.set(alias, tool);
       }
     }
-    return tools.sort((left, right) => left.name.localeCompare(right.name));
+    return tools.filter((tool) => includeTool(tool, options)).sort((left, right) => left.name.localeCompare(right.name));
   }
 
-  entries(_options: ToolRegistryListOptions = {}): ToolRegistryEntry[] {
-    return this.sortedEntries().map((entry) => {
+  entries(options: ToolRegistryListOptions = {}): ToolRegistryEntry[] {
+    return this.sortedEntries().filter((entry) => includeTool(entry.tool, options)).map((entry) => {
       const value: ToolRegistryEntry = { tool: entry.tool };
       if (entry.source !== undefined) value.source = entry.source;
       return value;
@@ -126,10 +132,13 @@ export class InMemoryToolRegistry implements MutableToolRegistry {
 
   replaceContextualSource(source: string, provider: ContextualToolProvider): void {
     this.contextualSources.set(source, provider);
+    this.revision += 1;
   }
 
   unregisterContextualSource(source: string): boolean {
-    return this.contextualSources.delete(source);
+    const removed = this.contextualSources.delete(source);
+    if (removed) this.revision += 1;
+    return removed;
   }
 
   private sortedEntries(): RegisteredTool[] {
@@ -144,6 +153,7 @@ export class InMemoryToolRegistry implements MutableToolRegistry {
     for (const alias of existing.tool.aliases ?? []) {
       this.lookup.delete(alias);
     }
+    this.revision += 1;
   }
 
   private matchingNames(selector: ToolRegistrySelector): string[] {
@@ -179,6 +189,10 @@ export class InMemoryToolRegistry implements MutableToolRegistry {
       }
     }
   }
+}
+
+function includeTool(tool: ChiliToolDefinition, options: ToolRegistryListOptions): boolean {
+  return options.includeDeferred !== false || tool.shouldDefer !== true || tool.alwaysLoad === true;
 }
 
 function contextualLookup(tools: readonly ChiliToolDefinition[]): Map<string, ChiliToolDefinition> {

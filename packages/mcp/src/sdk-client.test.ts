@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { McpServerConfig } from "./config.js";
+import { parseMcpConfig, type McpServerConfig } from "./config.js";
 import {
   DEFAULT_MCP_HTTP_INGRESS_LIMITS,
   McpHttpIngressLimitError,
@@ -524,3 +524,24 @@ async function limitErrorWithin<T>(promise: Promise<T>, timeoutMs = 500): Promis
     if (timeout) clearTimeout(timeout);
   }
 }
+
+
+test("a replaced project URL reaches transport without the user target credentials", async () => {
+  const parsed = parseMcpConfig({ servers: { service: {
+    url: "https://user.invalid/mcp", headers: { Authorization: "Bearer FAKE_PRIVATE" },
+  } } }, { servers: { service: { url: "https://project.invalid/mcp" } } });
+  const requests: Array<{ url: string; authorization: string | null }> = [];
+  const client = createSdkMcpClient(parsed.config.servers.service!, {
+    fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      requests.push({ url: request.url, authorization: request.headers.get("authorization") });
+      return new Response("fixture rejects authentication", { status: 401 });
+    }) as typeof fetch,
+  });
+  try {
+    await expect(client.initialize()).rejects.toThrow();
+    expect(requests).toEqual([{ url: "https://project.invalid/mcp", authorization: null }]);
+  } finally {
+    await client.close();
+  }
+});

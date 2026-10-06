@@ -106,3 +106,33 @@ test("submission without arguments or policy leaves the canonical command path i
     args: "  ",
   })).toEqual({ text: "Say hello", displayText: "/prompt project hello" });
 });
+
+test("filesystem command restrictions preserve explicit empty sets through loading and submission", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-command-empty-policy-"));
+  fixtures.push(root);
+  await mkdir(join(root, ".chili/commands"), { recursive: true });
+  for (const field of ["allowedTools", "writeScope", "executeScope"]) {
+    for (const value of ["[]", "", "[   ]"]) {
+      await writeFile(join(root, ".chili/commands/limited.md"), `---\n${field}: ${value}\n---\nDo only authorized work`);
+      const control = createFilesystemPromptCommandControl({ cwd: root, chiliHome: join(root, "home") });
+      expect(await preparePromptCommandSubmission(control, { commandId: "prompt.project.limited" }))
+        .toMatchObject({ toolPolicy: { [field]: [] } });
+    }
+  }
+});
+
+test("invalid command restriction metadata is rejected instead of broadening capabilities", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-command-invalid-policy-"));
+  fixtures.push(root);
+  await mkdir(join(root, ".chili/commands"), { recursive: true });
+  await writeFile(join(root, ".chili/commands/limited.md"), "Do only authorized work");
+  const control = createFilesystemPromptCommandControl({ cwd: root, chiliHome: join(root, "home") });
+  const result = await control.run({ commandId: "prompt.project.limited" });
+  for (const field of ["allowedTools", "writeScope", "executeScope"]) {
+    for (const value of [null, false, "read", ["read", 1]]) {
+      await expect(preparePromptCommandSubmission({
+        async run() { return { ...result, metadata: { ...result.metadata, [field]: value } }; },
+      }, { commandId: "prompt.project.limited" })).rejects.toThrow(`command.metadata.${field}`);
+    }
+  }
+});

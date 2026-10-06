@@ -1,3 +1,12 @@
+import { fileURLToPath } from "node:url";
+import { ToolExecutor } from "./executor.js";
+import { InMemoryToolRegistry } from "./registry.js";
+import { createReadFileTool } from "./builtins/read-file.js";
+import { createWriteFileTool } from "./builtins/write-file.js";
+import type { SessionId, TurnId } from "@chili/protocol";
+import { createHash } from "node:crypto";
+import { withFileOperationLocks, recordOwnedFileVersion } from "./file-operation-lock.js";
+import { writeFileTextIfUnchanged } from "./file-mutation.js";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +22,7 @@ afterEach(async () => {
   await Promise.allSettled(cleanupPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-test("creates a version 2 manifest and reverts regular and missing files with normalized modes", async () => {
+test("creates a version 3 manifest and reverts regular and missing files with normalized modes", async () => {
   const workspace = await temporaryDirectory("chili-snapshot-normal-");
   await mkdir(join(workspace, "src"));
   await writeFile(join(workspace, "src", "regular.txt"), "before\n");
@@ -25,7 +34,7 @@ test("creates a version 2 manifest and reverts regular and missing files with no
   expect(snapshot?.paths).toEqual(["src/executable.sh", "src/missing.txt", "src/regular.txt"]);
   const manifest = JSON.parse(await readFile(join(workspace, ".chili", "snapshots", "snapshot_normal", "manifest.json"), "utf8"));
   expect(manifest).toMatchObject({
-    version: 2,
+    version: 3,
     id: "snapshot_normal",
     cwd: await realpath(workspace),
     entries: [
@@ -36,10 +45,9 @@ test("creates a version 2 manifest and reverts regular and missing files with no
   });
   expect(manifest.entries[1].mode).toBeUndefined();
 
-  await writeFile(join(workspace, "src", "regular.txt"), "after\n");
-  await writeFile(join(workspace, "src", "executable.sh"), "changed\n");
-  await chmod(join(workspace, "src", "executable.sh"), 0o600);
-  await writeFile(join(workspace, "src", "missing.txt"), "created later\n");
+  await trackedWrite(join(workspace, "src", "regular.txt"), "after\n");
+  await trackedWrite(join(workspace, "src", "executable.sh"), "changed\n", "session_snapshot", 0o600);
+  await trackedWrite(join(workspace, "src", "missing.txt"), "created later\n");
   await expect(provider.revert(snapshot!.id, { cwd: workspace })).resolves.toMatchObject({
     restored: ["src/executable.sh", "src/regular.txt"],
     removed: ["src/missing.txt"],
@@ -134,7 +142,7 @@ test("roundtrips a multi-megabyte file through bounded streaming", async () => {
   await writeFile(target, baseline);
   const provider = providerFor("snapshot_streaming");
   const snapshot = await provider.create(request(workspace, ["large.bin"]));
-  await writeFile(target, "changed");
+  await trackedWrite(target, "changed");
   await provider.revert(snapshot!.id, { cwd: workspace });
   expect(await readFile(target)).toEqual(baseline);
 });
@@ -272,3 +280,253 @@ async function collectRegularFileContents(root: string): Promise<string[]> {
   }
   return result;
 }
+
+async function trackedWrite(path: string, content: string, sessionId = "session_snapshot", mode?: number): Promise<void> {
+  await withFileOperationLocks([path], new AbortController().signal, async () => {
+    const before = await readFile(path, "utf8").catch((error: unknown) => {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    await writeFileTextIfUnchanged(path, content, before);
+    if (mode !== undefined) {
+      await chmod(path, mode);
+      await recordOwnedFileVersion(path, createHash("sha256").update(content).digest("hex"));
+    }
+  }, { sessionId });
+}
+
+test("snapshot restore takes the same locks as file tools and cancelled waits preserve current contents", async () => {
+  const fixture = await snapshotFixture("chili-snapshot-resource-lock-");
+  await trackedWrite(fixture.target, "owned change");
+  let release!: () => void;
+  let entered!: () => void;
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const holder = withFileOperationLocks([fixture.target], new AbortController().signal, async () => { entered(); await gate; });
+  await ready;
+  const controller = new AbortController();
+  let settled = false;
+  const revert = fixture.provider.revert(fixture.id, { cwd: fixture.workspace, signal: controller.signal })
+    .finally(() => { settled = true; });
+  // Attach the rejection handler before aborting the operation.
+  const outcome = revert.catch((error: unknown) => error);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    expect(await readFile(fixture.target, "utf8")).toBe("owned change");
+    controller.abort(new Error("cancelled restore wait"));
+    expect(await outcome).toMatchObject({ message: "cancelled restore wait" });
+  } finally {
+    release();
+    await holder;
+  }
+  await fixture.provider.revert(fixture.id, { cwd: fixture.workspace });
+  expect(await readFile(fixture.target, "utf8")).toBe("snapshot baseline\n");
+});
+
+test("snapshot restore rejects another session's later write before restoring any file", async () => {
+  const workspace = await temporaryDirectory("chili-snapshot-other-session-");
+  await writeFile(join(workspace, "a.txt"), "before A");
+  await writeFile(join(workspace, "b.txt"), "before B");
+  const provider = providerFor("snapshot_sessions");
+  const snapshot = await provider.create(request(workspace, ["a.txt", "b.txt"]));
+  const tools = fileTools();
+  await observedWrite(tools, workspace, "session_snapshot", "a.txt", "owned A");
+  await observedWrite(tools, workspace, "other_session", "b.txt", "other B");
+  await expect(provider.revert(snapshot!.id, { cwd: workspace })).rejects.toThrow("another session changed");
+  expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("owned A");
+  expect(await readFile(join(workspace, "b.txt"), "utf8")).toBe("other B");
+});
+
+test("snapshot restore cannot erase a competing builtin writer and invalidates older reads after restore", async () => {
+  const fixture = await snapshotFixture("chili-snapshot-writer-race-");
+  const tools = fileTools();
+  await observedWrite(tools, fixture.workspace, "session_snapshot", "victim.txt", "owned change");
+  const base = { cwd: fixture.workspace, sessionId: "other_session" as SessionId, turnId: "turn" as TurnId };
+  expect((await tools.execute({ ...base, toolName: "read", input: { filePath: "victim.txt" } })).status).toBe("completed");
+  const [restore, write] = await Promise.allSettled([
+    fixture.provider.revert(fixture.id, { cwd: fixture.workspace }),
+    tools.execute({ ...base, toolName: "write", input: { filePath: "victim.txt", content: "other change" } }),
+  ]);
+  expect(write.status).toBe("fulfilled");
+  if (write.status !== "fulfilled") return;
+  if (write.value.status === "completed") {
+    expect(restore.status).toBe("rejected");
+    expect(await readFile(fixture.target, "utf8")).toBe("other change");
+  } else {
+    expect(restore.status).toBe("fulfilled");
+    expect(await readFile(fixture.target, "utf8")).toBe("snapshot baseline\n");
+    expect(write.value.error.message).toContain("File changed since it was read");
+  }
+});
+
+test("snapshot restore rejects untracked external modifications and same-size backup tampering", async () => {
+  const fixture = await snapshotFixture("chili-snapshot-untracked-");
+  await writeFile(fixture.target, "untracked editor change");
+  await expect(fixture.provider.revert(fixture.id, { cwd: fixture.workspace })).rejects.toThrow("not recorded for this session");
+  expect(await readFile(fixture.target, "utf8")).toBe("untracked editor change");
+  await writeFile(join(fixture.snapshotDir, "0.blob"), "tampered baseline\n");
+  await expect(fixture.provider.revert(fixture.id, { cwd: fixture.workspace })).rejects.toThrow("backup content changed");
+  expect(await readFile(fixture.target, "utf8")).toBe("untracked editor change");
+});
+
+test("legacy snapshots allow an unchanged no-op but do not infer missing mutation ownership", async () => {
+  const fixture = await snapshotFixture("chili-snapshot-legacy-");
+  const manifest = JSON.parse(await readFile(fixture.manifestPath, "utf8"));
+  manifest.version = 2;
+  delete manifest.ownership;
+  for (const entry of manifest.entries) delete entry.beforeVersion;
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  const before = await lstat(fixture.target);
+  await fixture.provider.revert(fixture.id, { cwd: fixture.workspace });
+  expect((await lstat(fixture.target)).ino).toBe(before.ino);
+  await writeFile(fixture.target, "later change");
+  await expect(fixture.provider.revert(fixture.id, { cwd: fixture.workspace })).rejects.toThrow("older snapshot has no record");
+  expect(await readFile(fixture.target, "utf8")).toBe("later change");
+});
+
+test("the executor creates a restorable snapshot and restored versions invalidate its previous observation", async () => {
+  const workspace = await temporaryDirectory("chili-snapshot-executor-");
+  await writeFile(join(workspace, "victim.txt"), "before");
+  let snapshotSequence = 0;
+  const provider = new FileSystemSnapshotProvider({ createId: () => `snapshot_executor_${++snapshotSequence}` });
+  const tools = fileTools(provider);
+  await observedWrite(tools, workspace, "session_snapshot", "victim.txt", "after");
+  // A fresh provider instance can verify durable ownership from the shared journal.
+  await new FileSystemSnapshotProvider().revert("snapshot_executor_1" as SnapshotId, { cwd: workspace });
+  expect(await readFile(join(workspace, "victim.txt"), "utf8")).toBe("before");
+  const stale = await tools.execute({
+    cwd: workspace, sessionId: "session_snapshot" as SessionId, turnId: "next_turn" as TurnId,
+    toolName: "write", input: { filePath: "victim.txt", content: "stale" },
+  });
+  expect(stale.status).toBe("failed");
+  if (stale.status === "failed") expect(stale.error.message).toContain("File changed since it was read");
+});
+
+function fileTools(snapshotProvider?: FileSystemSnapshotProvider): ToolExecutor {
+  const registry = new InMemoryToolRegistry();
+  registry.register(createReadFileTool());
+  registry.register(createWriteFileTool());
+  return new ToolExecutor({
+    registry,
+    events: { publish: async () => undefined },
+    approvals: { decide: async () => ({ action: "allow_once" }) },
+    ...(snapshotProvider ? { snapshotProvider } : {}),
+  });
+}
+
+async function observedWrite(tools: ToolExecutor, cwd: string, sessionId: string, filePath: string, content: string): Promise<void> {
+  const base = { cwd, sessionId: sessionId as SessionId, turnId: "turn" as TurnId };
+  expect((await tools.execute({ ...base, toolName: "read", input: { filePath } })).status).toBe("completed");
+  expect((await tools.execute({ ...base, toolName: "write", input: { filePath, content } })).status).toBe("completed");
+}
+
+test("snapshot creation waits for an active file mutation and backs up the committed version", async () => {
+  const workspace = await temporaryDirectory("chili-snapshot-create-lock-");
+  const path = join(workspace, "victim.txt");
+  await writeFile(path, "initial");
+  let release!: () => void;
+  let entered!: () => void;
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const holder = withFileOperationLocks([path], new AbortController().signal, async () => {
+    entered();
+    await gate;
+    await writeFileTextIfUnchanged(path, "committed", "initial");
+  }, { sessionId: "writer" });
+  await ready;
+  const provider = providerFor("snapshot_wait_create");
+  let settled = false;
+  const creating = provider.create(request(workspace, ["victim.txt"])).finally(() => { settled = true; });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+  } finally {
+    release();
+    await holder;
+  }
+  await creating;
+  expect(await readFile(join(workspace, ".chili", "snapshots", "snapshot_wait_create", "0.blob"), "utf8")).toBe("committed");
+});
+
+test("mutation ownership survives the actual writer process exiting", async () => {
+  const workspace = await temporaryDirectory("chili-snapshot-process-owner-");
+  await writeFile(join(workspace, "a.txt"), "baseline");
+  const provider = providerFor("snapshot_process");
+  const snapshot = await provider.create(request(workspace, ["a.txt"]));
+  const child = Bun.spawn([process.execPath, fileURLToPath(new URL("./fixtures/file-observation-worker.ts", import.meta.url)), "write", workspace, "session_snapshot"], {
+    stdin: "pipe", stdout: "pipe", stderr: "pipe",
+  });
+  const reader = child.stdout.getReader();
+  try {
+    const ready = await reader.read();
+    expect(new TextDecoder().decode(ready.value)).toBe("ready\n");
+    child.stdin.write("go\n");
+    child.stdin.end();
+    let output = "";
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      output += new TextDecoder().decode(chunk.value);
+    }
+    expect(output.trim()).toBe("completed");
+    expect(await child.exited).toBe(0);
+    await new FileSystemSnapshotProvider().revert(snapshot!.id, { cwd: workspace });
+    expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("baseline");
+  } finally {
+    reader.releaseLock();
+    child.kill("SIGKILL");
+    await child.exited;
+  }
+});
+
+test("a later same-session write does not hide an intervening other-session change", async () => {
+  const fixture = await snapshotFixture("chili-snapshot-intervening-owner-");
+  await trackedWrite(fixture.target, "other", "other_session");
+  await trackedWrite(fixture.target, "latest owned");
+  await expect(fixture.provider.revert(fixture.id, { cwd: fixture.workspace })).rejects.toThrow("another session changed");
+  expect(await readFile(fixture.target, "utf8")).toBe("latest owned");
+});
+
+test("a final untracked image cannot be claimed as the session's completed mutation", async () => {
+  const fixture = await snapshotFixture("chili-snapshot-unowned-postimage-");
+  await withFileOperationLocks([fixture.target], new AbortController().signal, async () => {
+    await writeFileTextIfUnchanged(fixture.target, "known own output", "snapshot baseline\n");
+    await writeFile(fixture.target, "untracked output arrived later");
+  }, { sessionId: "session_snapshot" });
+  await expect(fixture.provider.revert(fixture.id, { cwd: fixture.workspace })).rejects.toThrow("not recorded for this session");
+  expect(await readFile(fixture.target, "utf8")).toBe("untracked output arrived later");
+});
+
+test("a missing journal epoch cannot authorize restoration of changed content", async () => {
+  const fixture = await snapshotFixture("chili-snapshot-journal-epoch-");
+  await trackedWrite(fixture.target, "owned content");
+  const manifest = JSON.parse(await readFile(fixture.manifestPath, "utf8"));
+  manifest.ownership.epoch = "a-journal-that-no-longer-exists";
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  await expect(fixture.provider.revert(fixture.id, { cwd: fixture.workspace })).rejects.toThrow("history is no longer available");
+  expect(await readFile(fixture.target, "utf8")).toBe("owned content");
+});
+
+test("snapshot creation rechecks revoked authorization after waiting for its file locks", async () => {
+  const workspace = await temporaryDirectory("chili-snapshot-policy-wait-");
+  const path = join(workspace, "victim.txt");
+  await writeFile(path, "private");
+  let release!: () => void;
+  let entered!: () => void;
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const holder = withFileOperationLocks([path], new AbortController().signal, async () => { entered(); await gate; });
+  await ready;
+  let allowed = true;
+  const creating = providerFor("snapshot_revoked").create({
+    ...request(workspace, ["victim.txt"]),
+    assertCurrentAuthorization: async () => { if (!allowed) throw new Error("permission revoked"); },
+  });
+  const outcome = creating.catch((error: unknown) => error);
+  allowed = false;
+  release();
+  await holder;
+  expect(await outcome).toMatchObject({ message: "permission revoked" });
+  await expect(lstat(join(workspace, ".chili", "snapshots"))).rejects.toMatchObject({ code: "ENOENT" });
+});

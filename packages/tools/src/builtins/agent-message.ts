@@ -21,6 +21,7 @@ export function createAgentMessageSendTool(
     aliases: ["send_agent_message", "send_message"],
     description:
       "Send a durable message to an ad-hoc agent by task id, canonical path, task name, or 'parent'. queueOnly records without starting a turn; triggerTurn wakes only a live recipient.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -65,6 +66,7 @@ export function createAgentMessageListTool(
     name: "agent_message_list",
     aliases: ["list_agent_messages"],
     description: "List durable ad-hoc agent messages visible to the current agent tree in FIFO order.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,

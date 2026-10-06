@@ -161,6 +161,66 @@ test("macOS Seatbelt runner fails closed on dangling protected symlinks", async 
 
 const macOsTest = process.platform === "darwin" ? test : test.skip;
 
+macOsTest("macOS Seatbelt enforces scoped writes even inside an authorized command", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-seatbelt-scope-"));
+  try {
+    await mkdir(join(workspace, "allowed"));
+    await mkdir(join(workspace, "denied"));
+    await symlink("denied", join(workspace, "allowed", "alias"));
+    const runner = createMacOsSeatbeltBashRunner();
+    const result = await runner.run({
+      ...bashRequest(workspace, "printf ok > allowed/result; printf unsafe > denied/result; printf alias > allowed/alias/result"),
+      executionPolicy: { writeScope: ["allowed"], executeScope: ["*"] },
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(await readFile(join(workspace, "allowed", "result"), "utf8")).toBe("ok");
+    await expect(readFile(join(workspace, "denied", "result"))).rejects.toThrow();
+    const noWrites = await runner.run({
+      ...bashRequest(workspace, "printf unsafe > new-file"),
+      executionPolicy: { writeScope: [], executeScope: ["*"] },
+    });
+    expect(noWrites.exitCode).not.toBe(0);
+    await expect(readFile(join(workspace, "new-file"))).rejects.toThrow();
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+macOsTest("macOS scoped writes reject existing hard links and cannot create cross-scope aliases", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-seatbelt-scope-hardlink-"));
+  try {
+    await mkdir(join(workspace, "allowed"));
+    await writeFile(join(workspace, "denied"), "original");
+    const runner = createMacOsSeatbeltBashRunner();
+    const request = {
+      ...bashRequest(workspace, "ln denied allowed/alias && printf unsafe > allowed/alias"),
+      executionPolicy: { writeScope: ["allowed"], executeScope: ["*"] },
+    };
+    expect((await runner.run(request)).exitCode).not.toBe(0);
+    expect(await readFile(join(workspace, "denied"), "utf8")).toBe("original");
+    await link(join(workspace, "denied"), join(workspace, "allowed", "existing"));
+    await expect(runner.run({ ...request, command: "printf unsafe > allowed/existing" }))
+      .rejects.toThrow("writable file has hard-link aliases");
+    expect(await readFile(join(workspace, "denied"), "utf8")).toBe("original");
+  } finally { await rm(workspace, { recursive: true, force: true }); }
+});
+
+test("macOS scoped runner rejects symlink scope targets outside its workspace", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-seatbelt-scope-outside-"));
+  try {
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    await symlink(root, join(workspace, "outside"));
+    const runner = createMacOsSeatbeltBashRunner({ processRunner: async () => { throw new Error("must not launch"); } });
+    await expect(runner.run({
+      ...bashRequest(workspace, "printf unsafe"),
+      executionPolicy: { writeScope: ["outside/new-dir"], executeScope: ["*"] },
+    })).rejects.toThrow("Shell write scope must stay inside its workspace");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 macOsTest("macOS Seatbelt permits workspace writes and blocks metadata and parent writes", async () => {
   const root = await mkdtemp(join(tmpdir(), "chili-seatbelt-real-"));
   const workspace = join(root, "workspace");
@@ -360,7 +420,7 @@ macOsTest("macOS Seatbelt runs common coding tools without sandbox diagnostics",
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
-});
+}, 15_000);
 
 macOsTest("macOS Seatbelt derives isolation from each request workspace", async () => {
   const root = await mkdtemp(join(tmpdir(), "chili-seatbelt-workspaces-"));

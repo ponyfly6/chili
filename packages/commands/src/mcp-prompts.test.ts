@@ -67,3 +67,16 @@ test("MCP prompt argument parser supports named and positional arguments", () =>
   expect(() => parseMcpPromptArguments("", [{ name: "target", required: true }]))
     .toThrow("Missing required MCP prompt argument: target");
 });
+
+test("MCP command metadata keeps empty resource restrictions and rejects invalid restrictions", async () => {
+  const metadata: Record<string, unknown> = { allowedTools: [], writeScope: [], executeScope: [] };
+  const registry = createCommandRegistry(createMcpPromptCommands([{ serverName: "docs", name: "limited" }], {
+    renderPrompt: () => ({ prompt: "Limited work", metadata }),
+  }));
+  const resolved = resolveCommand(registry, {}, "/prompt mcp docs limited");
+  expect(resolved.status).toBe("matched");
+  if (resolved.status !== "matched" || !resolved.command.run) throw new Error("Missing test command");
+  expect((await resolved.command.run({}, resolved.args)).metadata).toMatchObject(metadata);
+  metadata.allowedTools = false;
+  await expect(resolved.command.run({}, resolved.args)).rejects.toThrow("command.metadata.allowedTools");
+});

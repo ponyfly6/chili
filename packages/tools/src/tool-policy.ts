@@ -1,6 +1,7 @@
 import { relative, resolve } from "node:path";
 import { TEAM_TASK_RUNTIME_METADATA_KEYS } from "@chili/protocol";
 import { ToolDeniedError } from "./errors.js";
+import { canonicalResourcePattern } from "./resource-policy.js";
 import type {
   ChiliToolDefinition,
   ExecuteToolInput,
@@ -37,6 +38,7 @@ export function isToolVisible(tool: ChiliToolDefinition, policy: ToolAccessPolic
   // This lets callers disable a narrow set of tools without accidentally
   // removing root filesystem, execution, or team-inspection capabilities.
   if (!hasScopedWorkerConstraints(policy)) return true;
+  if (hasResourceScopeConstraints(policy) && tool.resourcePolicy === undefined) return false;
   if (isScopedTeamTool(tool) && !policy.teamId) return false;
   if (isFilesystemWriteTool(tool) && normalizedList(policy.writeScope).length === 0) return false;
   return true;
@@ -59,6 +61,10 @@ export async function authorizeToolByPolicy<Input>(input: {
 
   if (!hasScopedWorkerConstraints(policy)) return;
 
+  if (hasResourceScopeConstraints(policy) && input.tool.resourcePolicy === undefined) {
+    throw new ToolDeniedError(input.tool.name, "This tool does not declare a trusted implementation of the current resource scopes.");
+  }
+
   authorizeTeamToolByPolicy(input.tool, input.validatedInput, policy);
   authorizeAgentMessageToolByPolicy(input.tool, input.validatedInput, policy);
 
@@ -70,7 +76,8 @@ export async function authorizeToolByPolicy<Input>(input: {
   }
 
   if (isFilesystemWriteRequest(input.tool, input.approvalSpec)) {
-    const writeScope = normalizedList(policy.writeScope);
+    const writeScope = await Promise.all(normalizedList(policy.writeScope)
+      .map((scope) => canonicalResourcePattern(input.executeInput.cwd, scope)));
     if (writeScope.length === 0) {
       throw new ToolDeniedError(input.tool.name, "This worker does not have write scope.");
     }
@@ -87,7 +94,9 @@ export async function authorizeToolByPolicy<Input>(input: {
 
   if (input.tool.risk === "execute") {
     const isReadOnly = await input.isReadOnly(input.tool, input.validatedInput);
-    if (isReadOnly) return;
+    // Read-only is a scheduling hint, not proof of OS resource isolation. An
+    // explicit execute scope always applies, including to read-only commands.
+    if (isReadOnly && (normalizeToolName(input.tool.name) !== "bash" || policy.executeScope === undefined)) return;
 
     const executeScope = normalizedList(policy.executeScope);
     if (executeScope.length === 0) {
@@ -327,8 +336,37 @@ function commandWithinScopes(command: string, scopes: readonly string[]): boolea
   const normalizedCommand = command.trim();
   return scopes.some((scope) => {
     const normalizedScope = scope.trim();
-    return normalizedScope === "*" || normalizedCommand === normalizedScope || normalizedCommand.startsWith(`${normalizedScope} `);
+    return normalizedScope === "*" || normalizedCommand === normalizedScope;
   });
+}
+
+/** Intersect every restriction before passing it to an enforcing process backend. */
+export async function executionPolicyFor(cwd: string, policies: readonly ToolAccessPolicy[]): Promise<ToolAccessPolicy | undefined> {
+  const scoped = policies.filter(hasResourceScopeConstraints);
+  if (scoped.length === 0) return undefined;
+  let writeScope = ["*"];
+  let executeScope = ["*"];
+  for (const policy of scoped) {
+    const writes = await Promise.all(normalizedList(policy.writeScope).map((path) => canonicalResourcePattern(cwd, path)));
+    writeScope = intersectScopes(writeScope, writes, true);
+    executeScope = intersectScopes(executeScope, normalizedList(policy.executeScope), false);
+  }
+  return { writeScope, executeScope };
+}
+
+function hasResourceScopeConstraints(policy: ToolAccessPolicy): boolean {
+  return policy.writeScope !== undefined || policy.executeScope !== undefined || policy.teamId !== undefined || policy.taskId !== undefined || policy.memberPath !== undefined;
+}
+
+function intersectScopes(left: readonly string[], right: readonly string[], paths: boolean): string[] {
+  const result = new Set<string>();
+  for (const first of left) for (const second of right) {
+    if (first === "*") result.add(second);
+    else if (second === "*" || first === second) result.add(first);
+    else if (paths && pathScopeContains(first, second)) result.add(second);
+    else if (paths && pathScopeContains(second, first)) result.add(first);
+  }
+  return [...result];
 }
 
 function normalizedList(items: readonly string[] | undefined): string[] {

@@ -151,3 +151,63 @@ test("one failed startup request cancels its pending siblings", async () => {
   await tick();
   expect(manager.listTools()).toEqual([]);
 });
+
+test("concurrent manager connects await one initialization and disconnect cancels pending calls", async () => {
+  const ready = deferred<McpInitializeResult>();
+  let starts = 0;
+  let callSignal: AbortSignal | undefined;
+  const { manager } = fixture({
+    initialize: async () => { starts += 1; return ready.promise; },
+    callTool: async (_name, _input, options) => {
+      callSignal = options?.signal;
+      return new Promise(() => {});
+    },
+  });
+  const first = manager.connect();
+  let secondSettled = false;
+  const second = manager.connect().then(() => { secondSettled = true; });
+  await tick();
+  expect(starts).toBe(1);
+  expect(secondSettled).toBe(false);
+  ready.resolve({});
+  await Promise.all([first, second]);
+  const call = manager.callTool("test", "write", {});
+  void call.catch(() => undefined);
+  await tick();
+  await manager.disconnect();
+  await expect(call).rejects.toThrow("MCP operation aborted");
+  expect(callSignal?.aborted).toBe(true);
+});
+
+test("out-of-order catalog refreshes cannot revive removed tools", async () => {
+  const pending = [deferred<McpListToolsResult>(), deferred<McpListToolsResult>()];
+  let calls = 0;
+  const { manager } = fixture({ listTools: async () => {
+    calls += 1;
+    if (calls === 1) return { tools: [{ name: "initial" }] };
+    return pending[calls - 2]!.promise;
+  } });
+  await manager.connect();
+  const first = manager.refreshTools();
+  const second = manager.refreshTools();
+  await tick();
+  pending[1]!.resolve({ tools: [{ name: "new" }] });
+  await second;
+  pending[0]!.resolve({ tools: [{ name: "removed" }] });
+  await first;
+  expect(manager.listTools().map((entry) => entry.tool.name)).toEqual(["new"]);
+  await manager.disconnect();
+});
+
+test("disconnect during pending initialize settles immediately and late completion cannot reconnect", async () => {
+  const ready = deferred<McpInitializeResult>();
+  const { manager } = fixture({ initialize: async () => ready.promise });
+  const connection = manager.connect();
+  await tick();
+  await manager.disconnect();
+  await connection;
+  ready.resolve({});
+  await tick();
+  expect(manager.getState("test")?.status).toBe("disconnected");
+  expect(manager.listTools()).toEqual([]);
+});

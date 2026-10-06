@@ -1090,7 +1090,7 @@ test("scoped worker policy enforces write scope for write and apply_patch", asyn
   }
 });
 
-test("scoped worker policy allows only read-only bash without execute scope", async () => {
+test("scoped worker policy treats an explicit empty execute scope as no shell execution", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-tools-policy-bash-"));
   try {
     const registry = new InMemoryToolRegistry();
@@ -1103,11 +1103,11 @@ test("scoped worker policy allows only read-only bash without execute scope", as
     });
 
     const readOnly = await executor.execute(toolInput("bash", { command: "pwd" }, workspace));
-    expect(readOnly.status).toBe("completed");
+    expect(readOnly.status).toBe("failed");
 
     for (const command of ["git branch", "git branch --list", "git status", "git diff"]) {
       const result = await executor.execute(toolInput("bash", { command }, workspace));
-      expect(result.status).toBe("completed");
+      expect(result.status).toBe("failed");
     }
 
     const build = await executor.execute(toolInput("bash", { command: "bun test" }, workspace));
@@ -1162,6 +1162,7 @@ test("scoped worker policy also rejects dynamic unsandboxed approval requests", 
       name: "dynamic_approval",
       description: "Request another permission while executing.",
       risk: "execute",
+      resourcePolicy: "internal",
       inputSchema: { type: "object" },
       approval: () => false,
       async execute(_input, context) {
@@ -1854,6 +1855,7 @@ function fakeTeamTaskUpdateTool() {
     name: "team_task_update",
     description: "Update status, owner, summary, or metadata for a team task.",
     risk: "write" as const,
+    resourcePolicy: "internal" as const,
     inputSchema: { type: "object" },
     approval: (): false => false,
     execute: async () => ({ title: "team_task_update", output: "updated" }),
@@ -1865,6 +1867,7 @@ function fakeTeamMessageSendTool() {
     name: "team_message_send",
     description: "Send a durable message to a team member or broadcast to the team.",
     risk: "write" as const,
+    resourcePolicy: "internal" as const,
     inputSchema: { type: "object" },
     approval: (): false => false,
     execute: async () => ({ title: "team_message_send", output: "sent" }),
@@ -1876,6 +1879,7 @@ function fakeAgentMessageSendTool() {
     name: "agent_message_send",
     description: "Send a direct agent message.",
     risk: "write" as const,
+    resourcePolicy: "internal" as const,
     inputSchema: { type: "object" },
     approval: (): false => false,
     execute: async () => ({ title: "agent_message_send", output: "sent" }),

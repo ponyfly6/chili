@@ -1,5 +1,7 @@
+import { assertReadableFileResources, readableFileResources } from "../file-resource-access.js";
+import { withFileOperationLocks } from "../file-operation-lock.js";
 import { stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 import { runProcess } from "../process.js";
 import { assertExistingPathInsideWorkspace, resolveWorkspacePath, type WorkspacePath } from "../workspace-path.js";
@@ -30,6 +32,7 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
     searchHint: "Search file contents with ripgrep, optional path/paths, glob/type filters, context lines, counts, or file names.",
     description: "Search workspace file contents using ripgrep. Use paths for multiple search roots.",
     risk: "read",
+    resourcePolicy: "filesystem",
     isReadOnly: true,
     isConcurrencySafe: true,
     maxResultOutputBytes: 20_000,
@@ -152,20 +155,59 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
     async execute(input, context) {
       const workspace = resolve(context.cwd);
       const searchPaths = await resolveSearchPaths(workspace, input);
-      const args = buildRipgrepArgs(input, searchPaths.map((path) => path.relativePath));
-      const result = await runProcess("rg", args, {
-        cwd: workspace,
-        signal: context.signal,
-        timeoutMs: 15_000,
-        maxOutputBytes: input.maxOutputBytes ?? 512_000,
+      await context.assertCurrentAuthorization?.();
+      // Enumerate names without consulting ignore/config files (which can themselves
+      // be denied). Never hand a directory to the content-reading process.
+      const listArgs = ["--no-config", "--files", "--null", "--no-ignore", "--glob", "!.git/**", "--glob", "!**/node_modules/**"];
+      if (input.glob) listArgs.push("--glob", input.glob);
+      if (input.type) listArgs.push("--type", input.type);
+      listArgs.push("--", ...searchPaths.map((path) => path.relativePath));
+      const listed = await runProcess("rg", listArgs, {
+        cwd: workspace, signal: context.signal, timeoutMs: 15_000, maxOutputBytes: 2_000_000,
+        beforeSpawn: async () => { await context.assertCurrentAuthorization?.(); },
       });
-
-      if (result.timedOut) {
-        throw new Error(`rg timed out after 15000ms`);
+      if (listed.timedOut || (listed.exitCode !== 0 && listed.exitCode !== 1) || listed.stdoutTruncated || listed.stderrTruncated) {
+        throw new Error("Cannot safely enumerate this search. Narrow its paths or file filters.");
       }
-      if (result.exitCode !== 0 && result.exitCode !== 1) {
-        throw new Error(result.stderr || `rg exited with code ${result.exitCode}`);
+      const candidates = [...new Set(listed.stdout.split("\0").filter(Boolean))];
+      if (candidates.length > 20_000) throw new Error("Search has too many candidate files. Narrow its paths or file filters.");
+      const permitted: string[] = [];
+      for (let offset = 0; offset < candidates.length; offset += 128) {
+        permitted.push(...await readableFileResources(context, candidates.slice(offset, offset + 128)));
       }
+      const outputLimitBytes = input.maxOutputBytes ?? 512_000;
+      let stdout = "";
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
+      let durationMs = listed.durationMs;
+      const searched: string[] = [];
+      for (let offset = 0; offset < permitted.length; offset += 128) {
+        const paths = permitted.slice(offset, offset + 128);
+        const remaining = Math.max(0, outputLimitBytes - Buffer.byteLength(stdout, "utf8"));
+        if (remaining === 0) { stdoutTruncated = true; break; }
+        const batch = await withFileOperationLocks(paths, context.signal, async () => {
+          const relativePaths = paths.map((path) => relative(workspace, path));
+          const args = buildRipgrepArgs(input, relativePaths);
+          const result = await runProcess("rg", args, {
+            cwd: workspace, signal: context.signal, timeoutMs: 15_000, maxOutputBytes: remaining,
+            beforeSpawn: () => assertReadableFileResources(context, paths),
+          });
+          // Stderr may name resources; do not expose an unverified process error.
+          if (result.timedOut || (result.exitCode !== 0 && result.exitCode !== 1)) {
+            throw new Error("The authorized file search could not complete.");
+          }
+          await assertReadableFileResources(context, paths);
+          return result;
+        });
+        searched.push(...paths);
+        stdout += batch.stdout;
+        stdoutTruncated ||= batch.stdoutTruncated;
+        stderrTruncated ||= batch.stderrTruncated;
+        durationMs += batch.durationMs;
+        if (stdoutTruncated || stderrTruncated) break;
+      }
+      await assertReadableFileResources(context, searched);
+      const result = { stdout, stdoutTruncated, stderrTruncated, durationMs, outputLimitBytes };
 
       const lines = result.stdout.trimEnd().split("\n").filter((line) => line.length > 0);
       const headLimit = input.headLimit ?? 250;
@@ -193,14 +235,12 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
 }
 
 function buildRipgrepArgs(input: GrepInput, searchPaths: string[]): string[] {
-  const args = ["--color=never", "--no-heading", "--max-columns", "500"];
+  const args = ["--no-config", "--no-ignore", "--with-filename", "--color=never", "--no-heading", "--max-columns", "500"];
   const outputMode = input.outputMode ?? "content";
   if (outputMode === "content" && input.lineNumbers !== false) args.push("--line-number");
   if (outputMode === "files_with_matches") args.push("--files-with-matches");
   if (outputMode === "count") args.push("--count");
   if (input.caseInsensitive) args.push("--ignore-case");
-  if (input.glob) args.push("--glob", input.glob);
-  if (input.type) args.push("--type", input.type);
   if (input.multiline) args.push("--multiline");
   if (input.context !== undefined) args.push("--context", String(input.context));
   else {

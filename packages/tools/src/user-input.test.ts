@@ -78,7 +78,6 @@ test("request_user_input publishes lifecycle events and returns structured answe
 
   expect(tool.risk).toBe("read");
   expect(tool.isConcurrencySafe).toBe(false);
-  expect(tool.interruptBehavior).toBe("cancel");
   const validation = await tool.validate?.({ questions });
   expect(validation).toEqual({ ok: true, value: { questions } });
   expect((await tool.validate?.({ questions: [] }))).toMatchObject({ ok: false });

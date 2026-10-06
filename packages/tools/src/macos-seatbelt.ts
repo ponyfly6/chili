@@ -5,6 +5,8 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { BashRunner } from "./builtins/bash.js";
 import { bashArguments } from "./bash-invocation.js";
 import { runProcess, type RunProcessOptions, type RunProcessResult } from "./process.js";
+import type { ToolResourceDenials } from "./types.js";
+import { canonicalAbsoluteResourcePath } from "./resource-policy.js";
 
 export const MACOS_SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
 const MAX_PROTECTED_METADATA_ENTRIES = 100_000;
@@ -57,6 +59,8 @@ const BASE_POLICY = String.raw`(version 1)
 export function buildMacOsSeatbeltProfile(
   canonicalWorkspaceRoot: string,
   protectedSymlinkTargets: readonly string[] = [],
+  writablePaths?: readonly string[],
+  resourceDenials?: ToolResourceDenials,
 ): string {
   const workspace = resolve(canonicalWorkspaceRoot);
   assertProfileSafePath(workspace);
@@ -77,12 +81,19 @@ export function buildMacOsSeatbeltProfile(
     })
     .join("\n");
   const dynamicDenials = symlinkTargetDenials.length > 0 ? `\n${symlinkTargetDenials}` : "";
+  const writeFilter = writablePaths === undefined
+    ? '(subpath (param "WORKSPACE_ROOT"))'
+    : writablePaths.length === 0 ? undefined : `(require-any ${writablePaths.map((path) => {
+        assertProfileSafePath(path);
+        const literal = seatbeltStringLiteral(path);
+        return `(literal "${literal}") (subpath "${literal}")`;
+      }).join(" ")})`;
 
   return `${BASE_POLICY}
 ; Workspace writes are allowed except for agent and VCS control metadata.
-(allow file-write*
+${writeFilter ? `(allow file-write*
   (require-all
-    (subpath (param "WORKSPACE_ROOT"))
+    ${writeFilter}
     (require-not (literal (param "PROTECTED_GIT")))
     (require-not (subpath (param "PROTECTED_GIT")))
     (require-not (literal (param "PROTECTED_GIT_TARGET")))
@@ -92,10 +103,11 @@ export function buildMacOsSeatbeltProfile(
     (require-not (literal (param "PROTECTED_CHILI_TARGET")))
     (require-not (subpath (param "PROTECTED_CHILI_TARGET")))
     (require-not (regex #"${gitRegex}"))
-    (require-not (regex #"${chiliRegex}"))${dynamicDenials}))
+    (require-not (regex #"${chiliRegex}"))${dynamicDenials}))` : "; No workspace writes are authorized for this execution."}
 
 ; Each invocation receives a private temporary directory that is removed by Chili.
 (allow file-write* (subpath (param "TEMP_ROOT")))
+${resourceDenyProfile(workspace, resourceDenials)}
 `;
 }
 
@@ -103,8 +115,17 @@ export function createMacOsSeatbeltBashRunner(options: MacOsSeatbeltBashRunnerOp
   const processRunner = options.processRunner ?? runProcess;
 
   return {
+    supportsExecutionPolicy: true,
+    supportsResourceDenials: true,
     async run(request) {
+      if ((request.executionPolicy || request.resourceDenials) && request.sandboxPermissions === "require_escalated") {
+        throw new Error("Scoped execution cannot escape the shell sandbox.");
+      }
       const workspaceRoot = realpathSync.native(resolve(request.workspaceRoot));
+      const resourceDenials = request.resourceDenials ? {
+        readPaths: await Promise.all(request.resourceDenials.readPaths.map((path) => canonicalAbsoluteResourcePath(workspaceRoot, path))),
+        writePaths: await Promise.all(request.resourceDenials.writePaths.map((path) => canonicalAbsoluteResourcePath(workspaceRoot, path))),
+      } : undefined;
       assertCwdInsideWorkspace(workspaceRoot, request.cwd);
       const gitPath = join(workspaceRoot, ".git");
       const chiliPath = join(workspaceRoot, ".chili");
@@ -118,7 +139,16 @@ export function createMacOsSeatbeltBashRunner(options: MacOsSeatbeltBashRunnerOp
       ]);
       // Exact canonical symlink targets preserve compatible metadata layouts while
       // preventing writes through aliases that resolve outside the protected roots.
-      const profile = buildMacOsSeatbeltProfile(workspaceRoot, protectedSymlinkTargets);
+      const writablePaths = request.executionPolicy
+        ? resolveWritablePaths(workspaceRoot, request.executionPolicy.writeScope ?? [])
+        : undefined;
+      if (writablePaths && !writablePaths.includes(workspaceRoot)) {
+        await assertScopedFilesHaveNoHardLinks(writablePaths);
+      }
+      if (resourceDenials) {
+        await assertScopedFilesHaveNoHardLinks([...resourceDenials.readPaths, ...resourceDenials.writePaths]);
+      }
+      const profile = buildMacOsSeatbeltProfile(workspaceRoot, protectedSymlinkTargets, writablePaths, resourceDenials);
       const temporaryRoot = realpathSync.native(await mkdtemp(join(tmpdir(), "chili-seatbelt-")));
       const definitions = [
         `-DWORKSPACE_ROOT=${workspaceRoot}`,
@@ -129,6 +159,7 @@ export function createMacOsSeatbeltBashRunner(options: MacOsSeatbeltBashRunnerOp
         `-DPROTECTED_CHILI_TARGET=${chiliTarget}`,
       ];
       const processOptions: RunProcessOptions = {
+        ...(request.assertCurrentAuthorization ? { beforeSpawn: request.assertCurrentAuthorization } : {}),
         cwd: request.cwd,
         signal: request.signal,
         timeoutMs: request.timeoutMs,
@@ -146,6 +177,7 @@ export function createMacOsSeatbeltBashRunner(options: MacOsSeatbeltBashRunnerOp
       if (request.onOutput) processOptions.onOutput = request.onOutput;
       if (request.onRawOutput) processOptions.onRawOutput = request.onRawOutput;
       try {
+        await request.assertCurrentAuthorization?.();
         const result = await processRunner(
           MACOS_SANDBOX_EXEC_PATH,
           ["-p", profile, ...definitions, "--", "/bin/bash", ...bashArguments(request.command)],
@@ -157,6 +189,87 @@ export function createMacOsSeatbeltBashRunner(options: MacOsSeatbeltBashRunnerOp
       }
     },
   };
+}
+
+function resourceDenyProfile(workspace: string, denials?: ToolResourceDenials): string {
+  if (!denials) return "";
+  const read = [...new Set(denials.readPaths)];
+  // Read denial also needs mutation protection: rename or hard-link creation
+  // must not turn the same unreadable resource into a readable alias.
+  const write = [...new Set([...read, ...denials.writePaths])];
+  const ancestors = new Set<string>();
+  const filters = (paths: readonly string[]): string => paths.map((path) => {
+    if (!isAbsolute(path)) throw new Error(`Resource deny must be an absolute canonical path: ${path}`);
+    assertProfileSafePath(path);
+    let ancestor = dirname(path);
+    while (ancestor !== dirname(ancestor)) {
+      const local = relative(workspace, ancestor);
+      if (isAbsolute(local) || local === ".." || local.startsWith(`..${sep}`)) break;
+      ancestors.add(ancestor);
+      if (ancestor === workspace) break;
+      ancestor = dirname(ancestor);
+    }
+    const literal = seatbeltStringLiteral(path);
+    return `(literal "${literal}") (subpath "${literal}")`;
+  }).join(" ");
+  const readFilters = filters(read);
+  const writeFilters = filters(write);
+  return [
+    "; Explicit resource denies dominate tool choice and profile allowances.",
+    ...(readFilters ? [`(deny file-read* ${readFilters})`] : []),
+    ...(writeFilters ? [`(deny file-write* ${writeFilters})`] : []),
+    ...(ancestors.size ? [`(deny file-write-unlink ${[...ancestors].map((path) => `(literal "${seatbeltStringLiteral(path)}")`).join(" ")})`] : []),
+  ].join("\n");
+}
+
+function resolveWritablePaths(workspace: string, scopes: readonly string[]): string[] {
+  return [...new Set(scopes.map((scope) => {
+    if (scope === "*" || scope === "." || scope === "/") return workspace;
+    if (/[?*\[\]{}]/u.test(scope)) throw new Error(`Shell write scope must name a concrete path: ${scope}`);
+    const requested = resolve(workspace, scope);
+    const missing: string[] = [];
+    let ancestor = requested;
+    while (true) {
+      try {
+        const canonical = resolve(realpathSync.native(ancestor), ...missing.reverse());
+        const local = relative(workspace, canonical);
+        if (isAbsolute(local) || local === ".." || local.startsWith(`..${sep}`)) {
+          throw new Error(`Shell write scope must stay inside its workspace: ${scope}`);
+        }
+        return canonical;
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+        const parent = dirname(ancestor);
+        if (parent === ancestor) throw error;
+        missing.push(relative(parent, ancestor));
+        ancestor = parent;
+      }
+    }
+  }))];
+}
+
+async function assertScopedFilesHaveNoHardLinks(roots: readonly string[]): Promise<void> {
+  const pending = [...roots];
+  const seen = new Set<string>();
+  while (pending.length > 0) {
+    const path = pending.pop()!;
+    if (seen.has(path)) continue;
+    seen.add(path);
+    if (seen.size > MAX_PROTECTED_METADATA_ENTRIES) {
+      throw new Error("Refusing scoped shell execution: write scopes exceed the hard-link inspection limit.");
+    }
+    let info: Stats;
+    try { info = await lstat(path); }
+    catch (error) { if (isNotFound(error)) continue; throw error; }
+    if (info.isFile() && info.nlink > 1) {
+      throw new Error(`Refusing scoped shell execution: writable file has hard-link aliases: ${path}`);
+    }
+    // Seatbelt resolves symlinks at access time against the canonical write
+    // filter; following them here would incorrectly widen the inspected scope.
+    if (!info.isDirectory()) continue;
+    const directory = await opendir(path);
+    for await (const item of directory) pending.push(join(path, item.name));
+  }
 }
 
 interface ProtectedMetadataRoot {

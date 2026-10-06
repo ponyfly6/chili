@@ -46,6 +46,7 @@ export function createDelegationStatusTool(
     name: "delegation_status",
     description:
       "Read this session's effective delegation policy and its source. This reports policy only; use task or team status tools to inspect live agents.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -71,6 +72,7 @@ export function createDelegationSetTool(
       "Map requests such as '开启代理', '默认用代理', '以后主动委派', or '自动并行' to proactive; map requests to stop/disable agents to off; use explicit when delegation should happen only when the user asks for it.",
       "Do not change policy merely because the user asks to open several subagents for the current task (for example '本次开多个 sub'); under explicit policy, spawn those tasks directly and leave policy unchanged.",
     ].join(" "),
+    resourcePolicy: "internal",
     risk: "write",
     isConcurrencySafe: false,
     alwaysLoad: true,

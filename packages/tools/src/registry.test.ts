@@ -53,7 +53,7 @@ test("registry can replace a reconnecting source atomically", async () => {
   expect(await searchOutput(registry, "current projects")).toContain("mcp__linear__issue_search:");
 });
 
-test("deferred dynamic tools remain listed and searchable until runtime filtering is enabled", async () => {
+test("complete catalog is the default and explicit deferred filtering preserves always-loaded tools", async () => {
   const registry = new InMemoryToolRegistry();
   registry.register(createToolSearchTool(registry));
   const deferred = tool("mcp__slow__lookup", ["slow_lookup"], "Lookup slow dynamic records.");
@@ -62,6 +62,9 @@ test("deferred dynamic tools remain listed and searchable until runtime filterin
 
   expect(registry.list().map((entry) => entry.name)).toContain("mcp__slow__lookup");
   expect(registry.list({ includeDeferred: true }).map((entry) => entry.name)).toContain("mcp__slow__lookup");
+  expect(registry.list({ includeDeferred: false }).map((entry) => entry.name)).not.toContain("mcp__slow__lookup");
+  deferred.alwaysLoad = true;
+  expect(registry.list({ includeDeferred: false }).map((entry) => entry.name)).toContain("mcp__slow__lookup");
   expect(await searchOutput(registry, "slow dynamic")).toContain("mcp__slow__lookup:");
 });
 

@@ -60,6 +60,7 @@ export function createTeamCreateTool(controller: TeamToolController): ChiliToolD
     name: "team_create",
     aliases: ["create_team"],
     description: "Create a persistent agent team with a leader member.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -95,6 +96,7 @@ export function createTeamListTool(controller: TeamToolController): ChiliToolDef
     name: "team_list",
     aliases: ["list_teams"],
     description: "List persistent agent teams.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -118,6 +120,7 @@ export function createTeamSnapshotTool(controller: TeamToolController): ChiliToo
     name: "team_snapshot",
     aliases: ["snapshot_team", "team_status"],
     description: "Read a joined snapshot of a team, including members, tasks, messages, deliveries, and board stats.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -144,6 +147,7 @@ export function createTeamMemberAddTool(
     name: "team_member_add",
     aliases: ["add_team_member"],
     description: "Add or update a persistent team member record.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -180,6 +184,7 @@ export function createTeamMemberListTool(
     name: "team_member_list",
     aliases: ["list_team_members"],
     description: "List members in a persistent agent team.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -208,6 +213,7 @@ export function createTeamTaskCreateTool(
     name: "team_task_create",
     aliases: ["create_team_task"],
     description: "Create a task on a persistent team task board. Declare writeScope, executeScope, and requiredTools when they are known so independent tasks can run in parallel safely.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -253,6 +259,7 @@ export function createTeamTaskCreateBatchTool(
     name: "team_task_create_batch",
     aliases: ["create_team_tasks", "team_tasks_create"],
     description: "Create multiple persistent team tasks in one call. Prefer this when planning independent slices; include writeScope, executeScope, and requiredTools for each task.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -313,6 +320,7 @@ export function createTeamTaskListTool(
     name: "team_task_list",
     aliases: ["list_team_tasks", "team_tasks"],
     description: "List tasks on a persistent team task board.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -343,6 +351,7 @@ export function createTeamTaskAssignTool(
     name: "team_task_assign",
     aliases: ["assign_team_task"],
     description: "Assign a team task to a team member.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -380,6 +389,7 @@ export function createTeamTaskClaimTool(
     name: "team_task_claim",
     aliases: ["claim_team_task"],
     description: "Atomically claim a pending unblocked team task for a team member.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -411,6 +421,7 @@ export function createTeamTaskUpdateTool(
     name: "team_task_update",
     aliases: ["update_team_task"],
     description: "Update status, owner, summary, or metadata for a team task.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -448,6 +459,7 @@ export function createTeamTaskDispatchTool(
     name: "team_task_dispatch",
     aliases: ["dispatch_team_task", "team_dispatch"],
     description: "Dispatch a persistent team task to its assigned local subagent.",
+    resourcePolicy: "internal",
     risk: "execute",
     isConcurrencySafe(input) {
       return isBackgroundDispatchInput(input);
@@ -508,6 +520,7 @@ export function createTeamTaskDispatchBatchTool(
     aliases: ["dispatch_team_tasks", "team_dispatch_batch"],
     description:
       "Dispatch multiple persistent team tasks to background local subagents. max_concurrency defaults to 3 and caps the full child execution lifetime for this batch; the runtime-wide agent limit may reduce actual live concurrency further.",
+    resourcePolicy: "internal",
     risk: "execute",
     isConcurrencySafe: true,
     inputSchema: {
@@ -609,6 +622,7 @@ export function createTeamTaskSyncTool(
     name: "team_task_sync",
     aliases: ["sync_team_task"],
     description: "Sync a dispatched team task from its bound local subagent result.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -636,6 +650,7 @@ export function createTeamTaskReconcileTool(
     name: "team_task_reconcile",
     aliases: ["reconcile_team_tasks", "team_reconcile"],
     description: "Reconcile dispatched in-progress team tasks with their local subagent task state.",
+    resourcePolicy: "internal",
     risk: "write",
     isConcurrencySafe: false,
     inputSchema: {
@@ -663,6 +678,7 @@ export function createTeamRunLoopTool(
     aliases: ["run_team", "team_run"],
     description:
       "Run the persistent team scheduler: reconcile running tasks, auto-assign scoped pending tasks, dispatch eligible tasks in parallel, and verify or merge completed work. max_concurrent_dispatches defaults to 3; explicit higher values remain subject to the runtime-wide child limit. Defaults to one scheduling cycle; set until_drained to run until stable.",
+    resourcePolicy: "internal",
     risk: "execute",
     inputSchema: {
       type: "object",
@@ -752,6 +768,7 @@ export function createTeamMessageSendTool(
     aliases: ["send_team_message"],
     description:
       "Send a durable message to a team member by canonical path or unique member name, or broadcast with *. queueOnly (default) records without waking; triggerTurn starts a live member turn.",
+    resourcePolicy: "internal",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -791,6 +808,7 @@ export function createTeamMessageListTool(
     name: "team_message_list",
     aliases: ["list_team_messages"],
     description: "List durable team messages for a team, member path, or task.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,

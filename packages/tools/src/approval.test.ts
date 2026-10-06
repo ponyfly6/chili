@@ -301,7 +301,7 @@ test("a tree-scoped grant rechecks pending approvals from another broker", async
   });
 
   const pending = pendingBroker.decide(approvalRequest("npm test", childSessionId));
-  await Promise.resolve();
+  await waitFor(() => queue.list().length === 1);
   expect(queue.list()).toHaveLength(1);
 
   await grantingBroker.decide(approvalRequest("npm test", parentSessionId));
@@ -368,7 +368,7 @@ test("approval decisions recheck policy before resolving", async () => {
   });
   const request = approvalRequest("npm test");
   const pending = broker.decide(request);
-  await Promise.resolve();
+  await waitFor(() => resolveAsk !== undefined);
   rules.push({ permission: "bash(npm test)", pattern: "*", action: "deny" });
   if (!resolveAsk) throw new Error("approval was not requested");
   resolveAsk({ action: "allow_once" });
@@ -397,4 +397,9 @@ function approvalRequest(command: string, sessionId: SessionId = "session_test" 
 function preflightRequest(request: ApprovalBrokerRequest) {
   const { approvalId: _approvalId, ...preflight } = request;
   return preflight;
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100 && !predicate(); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+  expect(predicate()).toBe(true);
 }

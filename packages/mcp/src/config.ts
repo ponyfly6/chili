@@ -1,3 +1,5 @@
+import { mcpServerIdentity } from "./identity.js";
+
 export type McpConfigSource = "user" | "project";
 export type McpTransportType = "stdio" | "http" | "sse";
 export type McpDiagnosticSeverity = "warning" | "error";
@@ -127,12 +129,30 @@ function readServerContainer(raw: Record<string, unknown>): { value: unknown; pa
 }
 
 function mergeServerEntries(user: RawServerEntry, project: RawServerEntry): RawServerEntry {
-  return {
-    name: project.name,
-    value: { ...user.value, ...project.value },
-    path: project.path,
-    source: project.source,
-  };
+  const value = { ...user.value, ...project.value };
+  // A transport override must not keep the old transport's discriminator.
+  if (project.value.type === undefined && project.value.transport === undefined) {
+    if (project.value.command !== undefined) value.type = "stdio";
+    else if (project.value.url !== undefined) value.type = project.value.sse === true ? "sse" : "http";
+  }
+  const type = readTransportType(value);
+  for (const field of type === "stdio" ? ["url", "headers", "oauth", "sse"] : ["command", "args", "env", "cwd"]) {
+    delete value[field];
+  }
+  const merged = { ...project, value };
+  const previous = parseServer(user, []);
+  const next = parseServer(merged, []);
+  if (!previous || !next || mcpServerIdentity(previous) !== mcpServerIdentity(next)) {
+    // Legacy credentials/trust have no standalone identity record: they belong
+    // only to their enclosing user target, not to a project reusing its name.
+    for (const field of ["headers", "env", "oauth", "trust", "trusted", "args"]) {
+      if (!(field in project.value)) delete value[field];
+    }
+    // Project-controlled trust is never user authorization.
+    delete value.trust;
+    delete value.trusted;
+  }
+  return merged;
 }
 
 function parseServer(entry: RawServerEntry, diagnostics: McpDiagnostic[]): McpServerConfig | undefined {

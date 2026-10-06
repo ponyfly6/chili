@@ -129,10 +129,10 @@ export function createRequestUserInputTool(
     name: "request_user_input",
     description:
       "Ask the user one to three short questions and wait for their answers. Use only when continuing requires a user choice.",
+    resourcePolicy: "internal",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: false,
-    interruptBehavior: "cancel",
     inputSchema: {
       type: "object",
       additionalProperties: false,

@@ -26,12 +26,17 @@ export interface ChiliToolDefinition<Input = any, Output extends ToolResult = To
   searchHint?: string;
   alwaysLoad?: boolean;
   shouldDefer?: boolean;
-  interruptBehavior?: "cancel" | "block";
   maxResultOutputBytes?: number;
+  /** Stable identity for contextual tools whose handler is recreated on lookup. */
+  revision?: string;
+  /** Trusted host declaration; remote annotations must not populate this field. */
+  resourcePolicy?: "filesystem" | "process" | "internal";
   isReadOnly?: ToolBooleanPredicate<Input>;
   isConcurrencySafe?: ToolBooleanPredicate<Input>;
   isDestructive?: ToolBooleanPredicate<Input>;
-  validate?(input: unknown): Promise<ValidationResult<Input>> | ValidationResult<Input>;
+  validate?(input: unknown, context?: ToolRegistryContext): Promise<ValidationResult<Input>> | ValidationResult<Input>;
+  /** Resolve trusted resource identities without performing the operation. */
+  prepareInput?(input: Input, context: ToolRegistryContext): Promise<Input> | Input;
   approval?(input: Input): false | ToolApprovalSpec;
   execute(input: Input, context: ChiliToolExecutionContext): Promise<Output>;
 }
@@ -59,6 +64,12 @@ export interface PersistedToolOutputRegistration {
 
 export interface ChiliToolExecutionContext extends ToolExecutionContext {
   outputArtifactId: ToolCallId;
+  /** Backend-enforced resource constraints; approval is not an isolation boundary. */
+  executionPolicy?: ToolAccessPolicy;
+  /** Recheck revocation after waiting on a resource lock, immediately before effects. */
+  assertCurrentAuthorization?: () => Promise<void>;
+  currentResourceDenials?: () => Promise<ToolResourceDenials | undefined>;
+  assertFileResourceAccess?: (paths: readonly string[], access: "read" | "write") => Promise<void>;
   fileReads?: FileReadStateStore;
   visibleTools?: () => Promise<ChiliToolDefinition[]> | ChiliToolDefinition[];
   persistedOutputLimits?: {
@@ -84,6 +95,7 @@ export interface ToolRegistrySelector {
 }
 
 export interface ToolRegistryListOptions {
+  /** Defaults to true: runtime advertises the complete catalog, without hidden activation. */
   includeDeferred?: boolean;
 }
 
@@ -98,6 +110,7 @@ export type ContextualToolProvider = (
 ) => Promise<readonly ChiliToolDefinition[]> | readonly ChiliToolDefinition[];
 
 export interface ToolRegistry {
+  getRevision?(): number;
   register(tool: ChiliToolDefinition, options?: ToolRegistryRegisterOptions): void;
   get(name: string): ChiliToolDefinition | undefined;
   list(options?: ToolRegistryListOptions): ChiliToolDefinition[];
@@ -133,19 +146,43 @@ export interface ApprovalBrokerRequest {
   patterns: string[];
   maxApprovalScope?: ApprovalScope;
   metadata?: Record<string, unknown>;
+  workspaceRoot?: string;
 }
 
 export type ApprovalPreflightAction = "allow" | "ask" | "deny";
 
 export interface ApprovalPreflightDecision extends Omit<PermissionDecision, "action"> {
   action: ApprovalPreflightAction;
+  revision?: string;
 }
 
 export interface ApprovalPreflightRequest extends Omit<ApprovalBrokerRequest, "approvalId"> {}
 
+/**
+ * One ruleset observation shared by checks at a single execution boundary.
+ * Capture again after waiting; this is not authority for the lifetime of a call.
+ */
+export interface ApprovalPolicySnapshot {
+  preflight(): Promise<ApprovalPreflightDecision>;
+  resourceDenials(): Promise<ToolResourceDenials | undefined>;
+  assertFileResourceAccess(paths: readonly string[], access: "read" | "write"): Promise<void>;
+}
+
+export interface ApprovalResolution {
+  decision: ApprovalDecision;
+  /** The exact policy observation that accepted the decision. */
+  authority: ApprovalPreflightDecision;
+}
+
 export interface ApprovalBroker {
+  /** Optional snapshot API; simple brokers may implement only the legacy hooks. */
+  capturePolicy?(request: ApprovalPreflightRequest): Promise<ApprovalPolicySnapshot>;
+  /** Return the accepted version with its decision instead of rereading it later. */
+  resolve?(request: ApprovalBrokerRequest, signal?: AbortSignal): Promise<ApprovalResolution>;
   preflight?(request: ApprovalPreflightRequest): Promise<ApprovalPreflightDecision>;
   decide(request: ApprovalBrokerRequest, signal?: AbortSignal): Promise<ApprovalDecision>;
+  resourceDenials?(request: ApprovalPreflightRequest): Promise<ToolResourceDenials | undefined>;
+  assertFileResourceAccess?(request: ApprovalPreflightRequest, paths: readonly string[], access: "read" | "write"): Promise<void>;
 }
 
 export interface ToolExecutorOptions {
@@ -161,17 +198,27 @@ export interface ToolExecutorOptions {
   maxPersistedOutputDirectoryBytes?: number;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
+  executionContext?: <T>(operation: () => T) => T;
 }
 
 export interface ExecuteToolInput {
   sessionId: SessionId;
   turnId: TurnId;
   callId?: ToolCallId;
+  providerCallId?: string;
   toolName: string;
   input: unknown;
   cwd: string;
   policy?: ToolAccessPolicy;
   signal?: AbortSignal;
+  prepared?: PreparedToolCall;
+}
+
+export interface PreparedToolCall {
+  readonly toolName: string;
+  readonly validatedInput: unknown;
+  readonly registryRevision?: number;
+  readonly isConcurrencySafe: boolean;
 }
 
 export interface ToolPolicyContext {
@@ -191,6 +238,12 @@ export interface ToolAccessPolicy {
   metadata?: Record<string, unknown>;
 }
 
+/** Explicit filesystem denials shared by direct tools and enforcing process backends. */
+export interface ToolResourceDenials {
+  readPaths: readonly string[];
+  writePaths: readonly string[];
+}
+
 export interface ToolAccessPolicyResolver {
   resolve(context: ToolPolicyContext): Promise<ToolAccessPolicy | undefined> | ToolAccessPolicy | undefined;
 }
@@ -208,6 +261,8 @@ export interface SnapshotCreateRequest {
   patterns: string[];
   reason: string;
   metadata?: Record<string, unknown>;
+  signal?: AbortSignal;
+  assertCurrentAuthorization?: () => Promise<void>;
 }
 
 export interface SnapshotRecord {
@@ -226,6 +281,7 @@ export interface SnapshotRevertResult {
 
 export interface SnapshotRevertOptions {
   cwd?: string;
+  signal?: AbortSignal;
 }
 
 export interface SnapshotProvider {

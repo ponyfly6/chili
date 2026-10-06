@@ -1,3 +1,4 @@
+import type { McpStdioGuardianOwner } from "./stdio-guardian.js";
 import { Client, SSEClientTransport, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import type { Transport, RequestOptions } from "@modelcontextprotocol/client";
 import type {
@@ -41,6 +42,7 @@ import {
 } from "./stdio-client-transport.js";
 
 export interface SdkMcpClientOptions {
+  stdioGuardian?: McpStdioGuardianOwner;
   clientInfo?: McpClientInfo;
   capabilities?: McpClientCapabilities;
   fetch?: typeof fetch;
@@ -48,6 +50,7 @@ export interface SdkMcpClientOptions {
 }
 
 export interface SdkMcpTransportOptions {
+  stdioGuardian?: McpStdioGuardianOwner;
   fetch?: typeof fetch;
   ingressLimits?: Partial<McpHttpIngressLimits>;
   onIngressLimit?: (error: McpHttpIngressLimitError) => void;
@@ -65,6 +68,7 @@ export class SdkMcpClient implements McpClient {
   private activeTransport: Transport | undefined;
   private fatalIngressError: McpFatalIngressError | undefined;
   private connected = false;
+  private readonly closeHandlers = new Set<() => void>();
   private connecting: Promise<McpInitializeResult> | undefined;
   private connectionAbort: AbortController | undefined;
   private connectionEpoch = 0;
@@ -103,8 +107,14 @@ export class SdkMcpClient implements McpClient {
       if (this.client !== client) return;
       this.connected = false;
       this.activeTransport = undefined;
+      for (const handler of this.closeHandlers) handler();
     };
     return client;
+  }
+
+  onClose(handler: () => void): McpUnsubscribe {
+    this.closeHandlers.add(handler);
+    return () => { this.closeHandlers.delete(handler); };
   }
 
   async initialize(options: McpInitializeOptions = {}): Promise<McpInitializeResult> {
@@ -133,6 +143,7 @@ export class SdkMcpClient implements McpClient {
         if (options.signal?.aborted) onAbort();
         let transport: Transport;
         transport = createSdkMcpTransport(this.server, {
+          ...(this.options.stdioGuardian ? { stdioGuardian: this.options.stdioGuardian } : {}),
           // Auto-discovery precedes the SDK's normal connection ownership.
           // Bind its HTTP probe to cancellation and explicit close as well.
           fetch: ((input: RequestInfo | URL, init?: RequestInit) => {
@@ -281,18 +292,27 @@ export function createSdkMcpClient(server: McpServerConfig, options: SdkMcpClien
 
 export function createSdkMcpTransport(server: McpServerConfig, options: SdkMcpTransportOptions = {}): Transport {
   if (server.type === "stdio") {
-    return createBoundedStdioClientTransport({
+    const parameters = {
       command: server.command,
       args: server.args,
       // MCP stdio uses stdout for protocol messages; server diagnostics commonly go to stderr.
       // Keep child stderr out of Chili's CLI/TUI output so noisy MCP startups (for example uv/uvx
       // dependency resolution or Python logging) do not pollute user-visible agent responses.
-      stderr: "ignore",
+      stderr: "ignore" as const,
       ...(server.env ? { env: server.env } : {}),
       ...(server.cwd ? { cwd: server.cwd } : {}),
-    }, {
+    };
+    const guarded = options.stdioGuardian?.wrap(parameters);
+    const transport = createBoundedStdioClientTransport(guarded?.parameters ?? parameters, {
       ...(options.onStdioIngressLimit ? { onFatalError: options.onStdioIngressLimit } : {}),
-    }) as unknown as Transport;
+    });
+    if (guarded) {
+      const close = transport.close.bind(transport);
+      transport.close = async () => {
+        try { await close(); } finally { guarded.revoke(); }
+      };
+    }
+    return transport as unknown as Transport;
   }
 
   const boundedFetch = createBoundedMcpFetch(options.fetch ?? fetch, {

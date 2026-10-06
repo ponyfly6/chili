@@ -168,6 +168,8 @@ export class ManagedProcessManager {
   ): Promise<void> {
     try {
       throwIfAborted(entry.controller.signal);
+      if (request.assertCurrentAuthorization) await request.assertCurrentAuthorization();
+      throwIfAborted(entry.controller.signal);
       entry.result = await runner.run({
         ...request,
         signal: entry.controller.signal,

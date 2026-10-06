@@ -1,4 +1,7 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { canonicalResourcePattern } from "../resource-policy.js";
+import { assertFileTextUnchanged, writeFileTextIfUnchanged } from "../file-mutation.js";
+import { recordOwnedFileVersion, withFileOperationLocks } from "../file-operation-lock.js";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChiliToolDefinition, ChiliToolExecutionContext, ValidationResult } from "../types.js";
 import {
@@ -61,10 +64,10 @@ export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
     searchHint: "Apply structured create, replace, delete, or raw patch operations to workspace files.",
     description: "Apply structured patch text to files inside the workspace.",
     risk: "write",
+    resourcePolicy: "filesystem",
     isReadOnly: false,
     isConcurrencySafe: false,
     isDestructive: (input) => input.operations.some((operation) => operation.type === "delete"),
-    interruptBehavior: "block",
     maxResultOutputBytes: 100_000,
     inputSchema: {
       type: "object",
@@ -106,6 +109,15 @@ export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
 
       return { ok: true, value: { operations } };
     },
+    async prepareInput(input, context) {
+      const operations = await Promise.all(input.operations.map(async (operation) => ({
+        ...operation,
+        path: await canonicalResourcePattern(context.cwd, operation.path, true),
+        ...(operation.type === "raw_update" && operation.movePath
+          ? { movePath: await canonicalResourcePattern(context.cwd, operation.movePath, true) } : {}),
+      })));
+      return { ...input, operations };
+    },
     approval(input) {
       return {
         permission: "edit",
@@ -123,40 +135,45 @@ export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
     },
     async execute(input, context) {
       const workspace = context.cwd;
-      const applied: AppliedOperation[] = [];
+      const paths = input.operations.flatMap((operation) => operation.type === "raw_update" && operation.movePath
+        ? [operation.path, operation.movePath] : [operation.path]);
+      return withFileOperationLocks(paths.map((path) => resolveWorkspacePath(workspace, path).absolutePath), context.signal, async () => {
+        const applied: AppliedOperation[] = [];
 
-      for (const operation of input.operations) {
-        const target = resolveWorkspacePath(workspace, operation.path);
-        await assertPatchWorkspacePath(workspace, target, operation);
-        await assertPatchReadState(workspace, target, operation, context.fileReads);
-        if (operation.type === "create") {
-          applied.push(await createFile(workspace, target, operation));
-        } else if (operation.type === "replace") {
-          applied.push(await replaceText(workspace, target, operation));
-        } else if (operation.type === "delete") {
-          applied.push(await deleteFile(workspace, target, operation));
-        } else {
-          applied.push(await applyRawUpdate(workspace, target, operation));
+        for (const operation of input.operations) {
+          await context.assertCurrentAuthorization?.();
+          const target = resolveWorkspacePath(workspace, operation.path);
+          await assertPatchWorkspacePath(workspace, target, operation);
+          await assertPatchReadState(workspace, target, operation, context.fileReads);
+          if (operation.type === "create") {
+            applied.push(await createFile(workspace, target, operation, context.assertCurrentAuthorization));
+          } else if (operation.type === "replace") {
+            applied.push(await replaceText(workspace, target, operation, context.assertCurrentAuthorization));
+          } else if (operation.type === "delete") {
+            applied.push(await deleteFile(workspace, target, operation, context.assertCurrentAuthorization));
+          } else {
+            applied.push(await applyRawUpdate(workspace, target, operation, context.assertCurrentAuthorization));
+          }
+          await updatePatchReadState(workspace, operation, context.fileReads);
         }
-        await updatePatchReadState(workspace, operation, context.fileReads);
-      }
 
-      const changed = applied.filter((operation) => operation.changed);
-      const output = [
-        `Applied ${changed.length}/${applied.length} operation(s).`,
-        "",
-        ...applied.map((operation) => `- ${operation.type} ${operation.path}: ${operation.detail}`),
-      ].join("\n");
+        const changed = applied.filter((operation) => operation.changed);
+        const output = [
+          `Applied ${changed.length}/${applied.length} operation(s).`,
+          "",
+          ...applied.map((operation) => `- ${operation.type} ${operation.path}: ${operation.detail}`),
+        ].join("\n");
 
-      return {
-        title: `patched ${changed.length} file operation(s)`,
-        output,
-        metadata: {
-          files: [...new Set(applied.map((operation) => operation.path))],
-          operationCount: applied.length,
-          changedCount: changed.length,
-        },
-      };
+        return {
+          title: `patched ${changed.length} file operation(s)`,
+          output,
+          metadata: {
+            files: [...new Set(applied.map((operation) => operation.path))],
+            operationCount: applied.length,
+            changedCount: changed.length,
+          },
+        };
+      }, { sessionId: context.sessionId, authorize: () => context.assertCurrentAuthorization?.() ?? Promise.resolve() });
     },
   };
 }
@@ -342,6 +359,7 @@ async function createFile(
   workspace: string,
   target: WorkspacePath,
   operation: CreateFileOperation,
+  authorize?: () => Promise<void>,
 ): Promise<AppliedOperation> {
   const existing = await readTextIfExists(target.absolutePath);
   if (existing !== undefined && !operation.overwrite) {
@@ -349,8 +367,9 @@ async function createFile(
   }
 
   await assertDirectWritablePathInsideWorkspace(workspace, target, operation.path);
+  await authorize?.();
   await mkdir(dirname(target.absolutePath), { recursive: true });
-  await writeFile(target.absolutePath, operation.content, "utf8");
+  await writeFileTextIfUnchanged(target.absolutePath, operation.content, existing, authorize);
 
   return {
     type: operation.type,
@@ -405,7 +424,7 @@ async function updatePatchReadState(
 
   if (operation.type === "delete") {
     const target = resolveWorkspacePath(workspace, operation.path);
-    fileReads.forget(workspace, target.absolutePath);
+    await fileReads.forget(workspace, target.absolutePath);
     return;
   }
 
@@ -415,7 +434,7 @@ async function updatePatchReadState(
   if (content !== undefined) await fileReads.recordTextRead(workspace, target.absolutePath, content);
   if (operation.type === "raw_update" && operation.movePath) {
     const source = resolveWorkspacePath(workspace, operation.path);
-    if (source.absolutePath !== target.absolutePath) fileReads.forget(workspace, source.absolutePath);
+    if (source.absolutePath !== target.absolutePath) await fileReads.forget(workspace, source.absolutePath);
   }
 }
 
@@ -423,9 +442,12 @@ async function deleteFile(
   workspace: string,
   target: WorkspacePath,
   operation: DeleteFileOperation,
+  authorize?: () => Promise<void>,
 ): Promise<AppliedOperation> {
   await assertDirectWritablePathInsideWorkspace(workspace, target, operation.path);
+  await authorize?.();
   await rm(target.absolutePath);
+  await recordOwnedFileVersion(target.absolutePath, null);
   return {
     type: operation.type,
     path: target.relativePath,
@@ -438,6 +460,7 @@ async function replaceText(
   workspace: string,
   target: WorkspacePath,
   operation: ReplaceTextOperation,
+  authorize?: () => Promise<void>,
 ): Promise<AppliedOperation> {
   const current = await readFile(target.absolutePath, "utf8");
   const occurrences = countOccurrences(current, operation.oldText);
@@ -453,7 +476,7 @@ async function replaceText(
     : current.replace(operation.oldText, operation.newText);
 
   await assertDirectWritablePathInsideWorkspace(workspace, target, operation.path);
-  await writeFile(target.absolutePath, next, "utf8");
+  await writeFileTextIfUnchanged(target.absolutePath, next, current, authorize);
 
   return {
     type: operation.type,
@@ -463,7 +486,7 @@ async function replaceText(
   };
 }
 
-async function applyRawUpdate(workspace: string, target: WorkspacePath, operation: RawPatchUpdateOperation): Promise<AppliedOperation> {
+async function applyRawUpdate(workspace: string, target: WorkspacePath, operation: RawPatchUpdateOperation, authorize?: () => Promise<void>): Promise<AppliedOperation> {
   const source = await readFile(target.absolutePath, "utf8");
   const lineEnding = detectLineEnding(source);
   let next = normalizeLineEndings(source);
@@ -474,10 +497,15 @@ async function applyRawUpdate(workspace: string, target: WorkspacePath, operatio
 
   await assertPatchWorkspacePath(workspace, target, operation);
   const outputPath = operation.movePath ? resolveWorkspacePath(workspace, operation.movePath) : target;
+  await authorize?.();
   await mkdir(dirname(outputPath.absolutePath), { recursive: true });
-  await writeFile(outputPath.absolutePath, convertToLineEnding(next, lineEnding), "utf8");
+  const outputBefore = outputPath.absolutePath === target.absolutePath ? source : await readTextIfExists(outputPath.absolutePath);
+  await assertFileTextUnchanged(target.absolutePath, source);
+  await writeFileTextIfUnchanged(outputPath.absolutePath, convertToLineEnding(next, lineEnding), outputBefore, authorize);
   if (operation.movePath && outputPath.absolutePath !== target.absolutePath) {
+    await authorize?.();
     await rm(target.absolutePath);
+    await recordOwnedFileVersion(target.absolutePath, null);
   }
 
   return {

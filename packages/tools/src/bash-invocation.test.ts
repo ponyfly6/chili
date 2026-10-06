@@ -15,6 +15,7 @@ test("scoped read-only Bash rejects environment changes before invoking the runn
   const tool = createBashTool({
     allowEscalation: false,
     runner: {
+      supportsExecutionPolicy: true,
       async run(request) {
         requests.push(request);
         return {
@@ -29,7 +30,7 @@ test("scoped read-only Bash rejects environment changes before invoking the runn
   const registry = new InMemoryToolRegistry();
   registry.register(tool);
   let nextId = 0;
-  let executeScope: string[] = [];
+  let executeScope: string[] = ["pwd"];
   const executor = new ToolExecutor({
     registry,
     events: { publish: async () => undefined },
@@ -53,6 +54,7 @@ test("scoped read-only Bash rejects environment changes before invoking the runn
 
     // No startup script or alternate executable is run: the fake runner must
     // never receive these requests, even with the normal snapshot provider.
+    executeScope = [];
     const environmentOverrides: Record<string, string>[] = [
       { BASH_ENV: join(workspace, "startup.sh") },
       { PATH: join(workspace, "bin") },

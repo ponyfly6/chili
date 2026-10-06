@@ -56,7 +56,7 @@ test("infers MCP tool risk and concurrency from annotations", () => {
   expect(inferRisk({})).toBe("network");
 
   expect(inferConcurrencySafe({ destructiveHint: true, idempotentHint: true })).toBe(false);
-  expect(inferConcurrencySafe({ idempotentHint: true })).toBe(true);
+  expect(inferConcurrencySafe({ idempotentHint: true })).toBe(false);
   expect(inferConcurrencySafe({ readOnlyHint: true })).toBe(true);
   expect(inferConcurrencySafe({})).toBe(false);
 });
@@ -152,7 +152,7 @@ test("bounds MCP resource, structured strings, depth, and content item count", a
           { type: "resource", resource: circular },
           ...Array.from({ length: 100 }, (_, index) => ({ type: "text", text: `item-${index}` })),
         ],
-        structuredContent: { huge, circular },
+        structuredContent: { huge },
       }),
     },
   });
@@ -162,6 +162,7 @@ test("bounds MCP resource, structured strings, depth, and content item count", a
   expect(result.content?.at(-1)).toMatchObject({ type: "text" });
   expect(result.output).toContain("truncated");
   expect(result.output).toContain("circular structured content");
+  expect(result.structuredData).toEqual({ huge });
   expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThan(2_000_000);
 });
 
@@ -212,7 +213,7 @@ test("normalizes 5 MiB MCP manager rejections without copying cause or stack", a
   expect(error.message).not.toContain("\uFFFD");
 });
 
-test("caps actual serialized MCP structured content including escaped strings", async () => {
+test("rejects oversized structured program data instead of changing its value", async () => {
   const structuredContent: Record<string, unknown> = {};
   for (let index = 0; index < 128; index += 1) {
     structuredContent[`${"S".repeat(500)}-${index}`] = "\u0000\n\t\"\\".repeat(40_000);
@@ -223,9 +224,7 @@ test("caps actual serialized MCP structured content including escaped strings", 
     manager: { callTool: async () => ({ content: [], structuredContent }) },
   });
 
-  const result = await tool.execute({}, executionContext());
-  const bounded = result.metadata?.structuredContent;
-  expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(512_000);
+  await expect(tool.execute({}, executionContext())).rejects.toThrow("Tool structured data exceeds");
 });
 
 test("preserves prototype-named MCP keys without changing the bounded object prototype", async () => {

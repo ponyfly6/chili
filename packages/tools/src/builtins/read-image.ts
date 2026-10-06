@@ -1,6 +1,9 @@
+import { assertReadableFileResources } from "../file-resource-access.js";
+import { withFileOperationLocks } from "../file-operation-lock.js";
 import { readFile, stat } from "node:fs/promises";
 import { extname } from "node:path";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
+import { canonicalResourcePattern } from "../resource-policy.js";
 import { assertExistingPathInsideWorkspace, resolveWorkspacePath } from "../workspace-path.js";
 
 export interface ReadImageInput {
@@ -24,6 +27,7 @@ export function createReadImageTool(): ChiliToolDefinition<ReadImageInput> {
     searchHint: "Read an image file from the workspace and send it to vision-capable models. For text-only pasted-image prompts, prefer an OCR or image-understanding MCP tool that returns text.",
     description: "Read a PNG, JPEG, GIF, or WebP image within the current workspace and return it as an image block for vision-capable models.",
     risk: "read",
+    resourcePolicy: "filesystem",
     isReadOnly: true,
     isConcurrencySafe: true,
     inputSchema: {
@@ -48,6 +52,9 @@ export function createReadImageTool(): ChiliToolDefinition<ReadImageInput> {
       if (maxBytes !== undefined) value.maxBytes = maxBytes;
       return { ok: true, value };
     },
+    async prepareInput(input, context) {
+      return { ...input, filePath: await canonicalResourcePattern(context.cwd, input.filePath, true) };
+    },
     approval(input) {
       return {
         permission: "read",
@@ -58,37 +65,41 @@ export function createReadImageTool(): ChiliToolDefinition<ReadImageInput> {
     async execute(input, context) {
       const workspace = context.cwd;
       const target = resolveWorkspacePath(workspace, input.filePath);
-      await assertExistingPathInsideWorkspace(workspace, target, input.filePath);
+      return withFileOperationLocks([target.absolutePath], context.signal, async () => {
+        await assertExistingPathInsideWorkspace(workspace, target, input.filePath);
 
-      const mimeType = mimeTypeForPath(target.absolutePath);
-      if (!mimeType) {
-        throw new Error(`read_image supports PNG, JPEG, GIF, and WebP images: ${input.filePath}`);
-      }
+        const mimeType = mimeTypeForPath(target.absolutePath);
+        if (!mimeType) {
+          throw new Error(`read_image supports PNG, JPEG, GIF, and WebP images: ${input.filePath}`);
+        }
 
-      const info = await stat(target.absolutePath);
-      if (!info.isFile()) throw new Error(`read_image only supports files: ${input.filePath}`);
-      const maxBytes = input.maxBytes ?? DEFAULT_MAX_IMAGE_BYTES;
-      if (info.size > maxBytes) {
-        throw new Error(`image is ${info.size} bytes, above the ${maxBytes} byte limit`);
-      }
+        const info = await stat(target.absolutePath);
+        if (!info.isFile()) throw new Error(`read_image only supports files: ${input.filePath}`);
+        const maxBytes = input.maxBytes ?? DEFAULT_MAX_IMAGE_BYTES;
+        if (info.size > maxBytes) {
+          throw new Error(`image is ${info.size} bytes, above the ${maxBytes} byte limit`);
+        }
 
-      const buffer = await readFile(target.absolutePath);
-      const data = buffer.toString("base64");
-      return {
-        title: target.relativePath,
-        output: [
-          `Image read: ${target.relativePath}`,
-          `MIME type: ${mimeType}`,
-          `Bytes: ${buffer.byteLength}`,
-          "The visual image content is attached to this tool result as an image block. Inspect that image block directly; do not treat this as metadata-only output.",
-        ].join("\n"),
-        content: [{ type: "image", data, mimeType }],
-        metadata: {
-          path: target.relativePath,
-          bytes: buffer.byteLength,
-          mimeType,
-        },
-      };
+        await assertReadableFileResources(context, [target.absolutePath]);
+        const buffer = await readFile(target.absolutePath);
+        await assertReadableFileResources(context, [target.absolutePath]);
+        const data = buffer.toString("base64");
+        return {
+          title: target.relativePath,
+          output: [
+            `Image read: ${target.relativePath}`,
+            `MIME type: ${mimeType}`,
+            `Bytes: ${buffer.byteLength}`,
+            "The visual image content is attached to this tool result as an image block. Inspect that image block directly; do not treat this as metadata-only output.",
+          ].join("\n"),
+          content: [{ type: "image", data, mimeType }],
+          metadata: {
+            path: target.relativePath,
+            bytes: buffer.byteLength,
+            mimeType,
+          },
+        };
+      });
     },
   };
 }

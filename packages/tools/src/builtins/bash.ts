@@ -1,5 +1,5 @@
 import { normalizePersistedError } from "@chili/protocol";
-import type { ChiliToolDefinition, ValidationResult } from "../types.js";
+import type { ChiliToolDefinition, ChiliToolExecutionContext, ToolAccessPolicy, ToolResourceDenials, ValidationResult } from "../types.js";
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { bashArguments } from "../bash-invocation.js";
@@ -30,6 +30,9 @@ export interface BashInput {
 export type BashSandboxPermissions = "use_default" | "require_escalated";
 
 export interface BashRunRequest {
+  executionPolicy?: ToolAccessPolicy;
+  resourceDenials?: ToolResourceDenials;
+  assertCurrentAuthorization?: () => Promise<void>;
   command: string;
   workspaceRoot: string;
   cwd: string;
@@ -47,6 +50,9 @@ export interface BashRunResult extends RunProcessResult {
 }
 
 export interface BashRunner {
+  /** Promises to enforce the supplied filesystem, network, and escalation limits. */
+  supportsExecutionPolicy?: boolean;
+  supportsResourceDenials?: boolean;
   run(request: BashRunRequest): Promise<BashRunResult>;
 }
 
@@ -58,7 +64,11 @@ export interface BashToolOptions {
 
 const DEFAULT_BASH_RUNNER: BashRunner = {
   async run(request) {
+    if (request.executionPolicy || request.resourceDenials?.readPaths.length || request.resourceDenials?.writePaths.length) {
+      throw new Error("Scoped execution requires an enforcing shell sandbox; the unsandboxed runner is unavailable.");
+    }
     const processOptions: RunProcessOptions = {
+      ...(request.assertCurrentAuthorization ? { beforeSpawn: request.assertCurrentAuthorization } : {}),
       cwd: request.cwd,
       signal: request.signal,
       timeoutMs: request.timeoutMs,
@@ -82,6 +92,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
   const allowEscalation = options.allowEscalation ?? true;
   return {
     name: "bash",
+    resourcePolicy: "process",
     aliases: ["run_shell_command"],
     searchHint: options.processes
       ? "Run shell commands or start managed background servers; inspect and stop them with process."
@@ -96,7 +107,6 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
     isReadOnly: isReadOnlyBashInput,
     isConcurrencySafe: isReadOnlyBashInput,
     isDestructive: (input) => !isReadOnlyBashInput(input),
-    interruptBehavior: "cancel",
     maxResultOutputBytes: 64 * 1024,
     inputSchema: {
       type: "object",
@@ -250,6 +260,9 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       };
     },
     async execute(input, context) {
+      if (context.executionPolicy && !runner.supportsExecutionPolicy) {
+        throw new Error("This shell backend cannot enforce the current execution policy.");
+      }
       const cwd = input.cwd ? (await resolveWorkspaceDirectory(context.cwd, input.cwd)).absolutePath : resolve(context.cwd);
       const sandboxPermissions = input.sandboxPermissions ?? "use_default";
       await context.metadata({
@@ -260,6 +273,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
           ...(input.justification ? { justification: input.justification } : {}),
         },
       });
+      const authority = await prepareBashAuthority(context, runner);
 
       if (input.background) {
         const processes = options.processes;
@@ -270,6 +284,8 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
           owner,
           runner,
           request: {
+            ...authority,
+            ...(context.executionPolicy ? { executionPolicy: context.executionPolicy } : {}),
             command: input.command,
             workspaceRoot: resolve(context.cwd),
             cwd,
@@ -310,6 +326,8 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
           : {}),
       });
       const runRequest: BashRunRequest = {
+        ...authority,
+        ...(context.executionPolicy ? { executionPolicy: context.executionPolicy } : {}),
         command: input.command,
         workspaceRoot: resolve(context.cwd),
         cwd,
@@ -323,6 +341,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       if (input.env) runRequest.env = input.env;
       let result: BashRunResult;
       try {
+        await authority.assertCurrentAuthorization?.();
         result = await runner.run(runRequest);
       } catch (error) {
         await outputAccumulator.finish();
@@ -393,6 +412,36 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       };
     },
   };
+}
+
+async function prepareBashAuthority(
+  context: ChiliToolExecutionContext,
+  runner: BashRunner,
+): Promise<Pick<BashRunRequest, "resourceDenials" | "assertCurrentAuthorization">> {
+  const current = await context.currentResourceDenials?.();
+  const resourceDenials = current && current.readPaths.length + current.writePaths.length > 0
+    ? { readPaths: [...current.readPaths], writePaths: [...current.writePaths] }
+    : undefined;
+  if (resourceDenials && !runner.supportsResourceDenials) {
+    throw new Error("This shell backend cannot enforce explicit file resource denies.");
+  }
+  const version = resourceDenialVersion(resourceDenials);
+  const assertCurrentAuthorization = context.assertCurrentAuthorization || context.currentResourceDenials
+    ? async (): Promise<void> => {
+        await context.assertCurrentAuthorization?.();
+        if (resourceDenialVersion(await context.currentResourceDenials?.()) !== version) {
+          throw new Error("File resource policy changed during shell preparation; prepare the command again before executing.");
+        }
+      }
+    : undefined;
+  return {
+    ...(resourceDenials ? { resourceDenials } : {}),
+    ...(assertCurrentAuthorization ? { assertCurrentAuthorization } : {}),
+  };
+}
+
+function resourceDenialVersion(denials?: ToolResourceDenials): string {
+  return JSON.stringify([[...new Set(denials?.readPaths ?? [])].sort(), [...new Set(denials?.writePaths ?? [])].sort()]);
 }
 
 function isReadOnlyBashInput(input: BashInput): boolean {

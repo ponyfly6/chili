@@ -22,8 +22,12 @@ import {
 import { randomUUID } from "node:crypto";
 import { ToolDeniedError, ToolValidationError, UnknownToolError, isAbortError, toError } from "./errors.js";
 import { approvalDecisionWithinScope } from "./approval.js";
+import { assertApprovalAuthority, captureApprovalPolicy } from "./authorization.js";
+import { validateToolSchema } from "./input-schema.js";
+import { canonicalApprovalSpec } from "./resource-policy.js";
+import { validateStructuredToolData } from "./structured-data.js";
 import { FileReadStateStore } from "./file-read-state.js";
-import { authorizeToolByPolicy, filterToolsByPolicy, toolPolicyContext } from "./tool-policy.js";
+import { authorizeToolByPolicy, filterToolsByPolicy, executionPolicyFor, toolPolicyContext } from "./tool-policy.js";
 import {
   persistToolOutput,
   truncateUtf8,
@@ -36,12 +40,15 @@ import type {
   ExecuteToolInput,
   ExecuteToolResult,
   ApprovalPreflightDecision,
+  ApprovalBrokerRequest,
+  ApprovalResolution,
   SnapshotRecord,
   ToolAccessPolicy,
   ToolApprovalSpecWithDefaults,
   ToolExecutorOptions,
   PersistedToolOutputRegistration,
   ToolRegistryContext,
+  PreparedToolCall,
 } from "./types.js";
 
 type ExecutableApprovalSpec = ToolApprovalSpecWithDefaults & { maxApprovalScope: ApprovalScope };
@@ -79,6 +86,13 @@ const MAX_APPROVAL_PATTERNS_BYTES = 64_000;
 
 export class ToolExecutor {
   private readonly fileReads: FileReadStateStore;
+  private readonly preparedCalls = new WeakMap<PreparedToolCall, {
+    tool: ChiliToolDefinition;
+    context: string;
+    fingerprint: string;
+    spec: false | ExecutableApprovalSpec;
+    originalSpec: false | ExecutableApprovalSpec;
+  }>();
   private readonly activeCallIds = new Set<string>();
   private readonly eventPublishFailures = new WeakSet<object>();
 
@@ -87,6 +101,12 @@ export class ToolExecutor {
   }
 
   async execute(input: ExecuteToolInput): Promise<ExecuteToolResult> {
+    return this.options.executionContext
+      ? this.options.executionContext(() => this.executeOwned(input))
+      : this.executeOwned(input);
+  }
+
+  private async executeOwned(input: ExecuteToolInput): Promise<ExecuteToolResult> {
     const callId = input.callId === undefined
       ? this.id<ToolCallId>("toolcall")
       : normalizeToolCallId(input.callId);
@@ -95,6 +115,7 @@ export class ToolExecutor {
     await this.publish("tool.call_started", input, {
       turnId: input.turnId,
       callId,
+      ...(input.providerCallId === undefined ? {} : { providerCallId: input.providerCallId }),
       toolName: boundToolEventName(input.toolName),
       input: boundToolEventValue(input.input, "tool input"),
     });
@@ -108,40 +129,20 @@ export class ToolExecutor {
       if (input.signal?.aborted) {
         return await this.cancel(input, callId, abortReason(input.signal));
       }
-      let tool: ChiliToolDefinition | undefined;
       try {
-        tool = await this.toolForContext(input.toolName, toolRegistryContext(input));
-        throwIfAborted(input.signal);
-      } catch (error) {
-        const normalizedError = input.signal?.aborted
-          ? abortReason(input.signal)
-          : toError(error);
-        if (input.signal?.aborted || isAbortError(normalizedError)) {
-          return await this.cancel(input, callId, normalizedError);
-        }
-        return await this.fail(input, callId, normalizedError);
-      }
-      if (!tool) {
-        return await this.fail(input, callId, new UnknownToolError(input.toolName));
-      }
-      try {
+        const prepared = input.prepared ?? await this.prepare(input);
         await this.update(input, callId, "validating");
-        const validated = await this.validate(tool, input.input);
-        const spec = this.approvalSpec(tool, validated);
-        for (const policy of await this.policies(input)) {
-          await authorizeToolByPolicy({
-            tool,
-            executeInput: input,
-            validatedInput: validated,
-            approvalSpec: spec === false
-              ? { permission: tool.name, patterns: ["*"], maxApprovalScope: "persistent", metadata: {} }
-              : spec,
-            policy,
-            isReadOnly: (definition, toolInput) => this.resolvePredicate(definition.isReadOnly, toolInput),
-          });
+        const details = this.preparedCalls.get(prepared);
+        if (!details || details.context !== preparationContext(input)) {
+          throw new ToolValidationError(input.toolName, "Prepared call does not belong to this execution context.");
         }
+        const { tool, spec } = details;
+        const validated = prepared.validatedInput;
+        await this.assertPreparedCurrent(prepared, input);
+        const executionPolicy = await this.authorizeWorkerPolicy(tool, validated, input, spec);
 
-        const approval = await this.requestLifecycleApproval(tool, input, callId, spec);
+        const authorization = await this.requestLifecycleApproval(tool, input, callId, spec);
+        const approval = authorization.decision;
         if (!isApprovalDecisionAction(approval.action)) {
           throw new ToolDeniedError(tool.name, `Invalid approval decision action: ${String(approval.action)}`);
         }
@@ -149,9 +150,10 @@ export class ToolExecutor {
           throw new ToolDeniedError(tool.name, approval.feedback);
         }
 
-        throwIfAborted(input.signal);
-        await this.createSnapshotIfNeeded(tool, input, callId, validated, spec);
-
+        const assertCurrentAuthorization = () => this.assertExecutionAuthorized(
+          prepared, input, callId, authorization.authority, executionPolicy,
+        );
+        await this.createSnapshotIfNeeded(tool, input, callId, validated, spec, assertCurrentAuthorization);
         throwIfAborted(input.signal);
         await this.update(input, callId, "running");
         let registeredOutput: PersistedOutput | undefined;
@@ -174,10 +176,11 @@ export class ToolExecutor {
             throw error;
           }
         };
-        const rawResult = await tool.execute(
-          validated,
-          this.context(tool, validated, input, callId, outputArtifactId, registerPersistedOutput),
-        );
+        const context = this.context(tool, validated, input, callId, outputArtifactId, registerPersistedOutput,
+          executionPolicy, assertCurrentAuthorization);
+        // No lifecycle event or policy preparation may await after this final check.
+        await context.assertCurrentAuthorization?.();
+        const rawResult = await tool.execute(validated, context);
         throwIfAborted(input.signal);
         if (registeredOutput) {
           try {
@@ -192,11 +195,16 @@ export class ToolExecutor {
             registeredOutput = undefined;
           }
         }
+        const descriptor = Object.getOwnPropertyDescriptor(rawResult, "structuredData");
+        if (descriptor && !("value" in descriptor)) throw new Error("Tool structured data cannot contain accessors.");
+        const programResult = descriptor?.value === undefined ? rawResult : {
+          ...boundToolResult(rawResult), structuredData: validateStructuredToolData(descriptor.value),
+        };
         const result = boundToolResult(await this.processResult(
           tool,
           input,
           outputArtifactId,
-          rawResult,
+          programResult,
           registeredOutput,
           invalidRegisteredOutputError,
         ));
@@ -204,6 +212,7 @@ export class ToolExecutor {
         throwIfAborted(input.signal);
         await this.publish("tool.call_finished", input, {
           callId,
+          ...(input.providerCallId === undefined ? {} : { providerCallId: input.providerCallId }),
           status: "completed",
           output: result.output,
         });
@@ -224,25 +233,121 @@ export class ToolExecutor {
     }
   }
 
-  async canRunConcurrently(
-    toolName: string,
-    input: unknown,
-    context?: ToolRegistryContext,
-  ): Promise<boolean> {
-    const tool = context
-      ? await this.toolForContext(toolName, context)
-      : this.options.registry.get(toolName);
-    if (!tool) return false;
-    const explicit = await this.resolvePredicate(tool.isConcurrencySafe, input);
-    if (explicit !== undefined) return explicit;
-    return (await this.resolvePredicate(tool.isReadOnly, input)) ?? false;
+  async prepare(input: ExecuteToolInput): Promise<PreparedToolCall> {
+    throwIfAborted(input.signal);
+    const registryRevision = this.options.registry.getRevision?.();
+    const tool = await this.toolForContext(input.toolName, toolRegistryContext(input));
+    if (!tool) throw new UnknownToolError(input.toolName);
+    const validated = await this.validate(tool, input.input, toolRegistryContext(input));
+    const originalSpec = this.approvalSpec(tool, validated);
+    if (originalSpec !== false) await canonicalApprovalSpec(input.cwd, originalSpec);
+    const preparedInput = tool.prepareInput ? await tool.prepareInput(validated, toolRegistryContext(input)) : validated;
+    validateToolSchema(tool, preparedInput);
+    const validatedInput = freezePreparedValue(preparedInput);
+    const preparedSpec = this.approvalSpec(tool, validatedInput);
+    const spec = preparedSpec === false ? false : await canonicalApprovalSpec(input.cwd, preparedSpec);
+    const explicit = await this.resolvePredicate(tool.isConcurrencySafe, validatedInput);
+    const isConcurrencySafe = explicit ?? (await this.resolvePredicate(tool.isReadOnly, validatedInput)) ?? false;
+    throwIfAborted(input.signal);
+    const prepared: PreparedToolCall = Object.freeze({
+      toolName: tool.name,
+      validatedInput,
+      ...(registryRevision === undefined ? {} : { registryRevision }),
+      isConcurrencySafe,
+    });
+    this.preparedCalls.set(prepared, {
+      tool: { ...tool },
+      context: preparationContext(input),
+      fingerprint: toolFingerprint(tool),
+      originalSpec,
+      spec,
+    });
+    return prepared;
   }
 
-  private async validate<Input>(tool: ChiliToolDefinition<Input>, input: unknown): Promise<Input> {
-    if (!tool.validate) return input as Input;
-    const result = await tool.validate(input);
+  async canRunConcurrently(toolName: string, input: unknown, context?: ToolRegistryContext): Promise<boolean> {
+    if (context) return (await this.prepare({ ...context, toolName, input })).isConcurrencySafe;
+    const tool = this.options.registry.get(toolName);
+    if (!tool) return false;
+    const validated = await this.validate(tool, input);
+    return (await this.resolvePredicate(tool.isConcurrencySafe, validated))
+      ?? (await this.resolvePredicate(tool.isReadOnly, validated)) ?? false;
+  }
+
+  private async validate<Input>(tool: ChiliToolDefinition<Input>, input: unknown, context?: ToolRegistryContext): Promise<Input> {
+    const result = tool.validate ? await tool.validate(input, context) : { ok: true as const, value: input as Input };
     if (!result.ok) throw new ToolValidationError(tool.name, result.message);
+    validateToolSchema(tool, result.value);
     return result.value;
+  }
+
+  private async assertPreparedCurrent(prepared: PreparedToolCall, input: ExecuteToolInput): Promise<void> {
+    const details = this.preparedCalls.get(prepared)!;
+    const current = await this.toolForContext(input.toolName, toolRegistryContext(input));
+    if (!current || prepared.registryRevision !== this.options.registry.getRevision?.()
+      || details.fingerprint !== toolFingerprint(current)) {
+      throw new ToolDeniedError(prepared.toolName, "Tool catalog changed after preparation; prepare a new call.");
+    }
+    if (details.originalSpec !== false) {
+      const resolved = await canonicalApprovalSpec(input.cwd, details.originalSpec);
+      if (JSON.stringify(resolved.patterns) !== JSON.stringify(details.spec && details.spec.patterns)) {
+        throw new ToolDeniedError(prepared.toolName, "Resource target changed after preparation; prepare a new call.");
+      }
+    }
+  }
+
+  private async authorizeWorkerPolicy<Input>(
+    tool: ChiliToolDefinition<Input>, validatedInput: Input, input: ExecuteToolInput,
+    spec: false | ExecutableApprovalSpec,
+  ): Promise<ToolAccessPolicy | undefined> {
+    const policies = await this.policies(input);
+    for (const policy of policies) {
+      await authorizeToolByPolicy({
+        tool, executeInput: input, validatedInput,
+        approvalSpec: spec === false ? { permission: tool.name, patterns: ["*"], metadata: {} } : spec,
+        policy, isReadOnly: (definition, value) => this.resolvePredicate(definition.isReadOnly, value),
+      });
+    }
+    // Backend scopes and the worker decision must describe the same observation.
+    return executionPolicyFor(input.cwd, policies);
+  }
+
+  private async assertExecutionAuthorized(
+    prepared: PreparedToolCall, input: ExecuteToolInput, callId: ToolCallId,
+    authority: ApprovalPreflightDecision | undefined, executionPolicy: ToolAccessPolicy | undefined,
+  ): Promise<void> {
+    throwIfAborted(input.signal);
+    await this.assertPreparedCurrent(prepared, input);
+    const { tool, spec } = this.preparedCalls.get(prepared)!;
+    const current = await this.authorizeWorkerPolicy(tool, prepared.validatedInput, input, spec);
+    if (JSON.stringify(current) !== JSON.stringify(executionPolicy)) {
+      throw new ToolDeniedError(tool.name, "Execution resource scope changed; prepare a new operation and backend isolation profile.");
+    }
+    if (spec === false && tool.resourcePolicy !== undefined) {
+      throwIfAborted(input.signal);
+      return;
+    }
+    // Resource denials, cross-tool file checks and approval all share one fresh
+    // ruleset. Never retain this snapshot across a wait or an effect boundary.
+    const policy = await captureApprovalPolicy(this.options.approvals, {
+      sessionId: input.sessionId, callId, toolName: tool.name, risk: tool.risk,
+      ...(spec === false ? { permission: tool.name, patterns: ["*"] } : spec),
+      workspaceRoot: input.cwd,
+    });
+    if (tool.resourcePolicy === undefined) {
+      const denials = await policy.resourceDenials();
+      if (denials && (denials.readPaths.length > 0 || denials.writePaths.length > 0)) {
+        throw new ToolDeniedError(tool.name, "This tool cannot enforce the current filesystem resource denials.");
+      }
+    }
+    if (spec !== false) {
+      if (spec.permission === "read" || spec.permission === "read_image" || spec.permission === "write" || spec.permission === "edit") {
+        await policy.assertFileResourceAccess(spec.patterns,
+          spec.permission === "write" || spec.permission === "edit" ? "write" : "read");
+      }
+      assertApprovalAuthority(tool.name, await policy.preflight(), authority);
+    }
+    throwIfAborted(input.signal);
   }
 
   private async requestLifecycleApproval<Input>(
@@ -250,12 +355,12 @@ export class ToolExecutor {
     input: ExecuteToolInput,
     callId: ToolCallId,
     spec: false | ExecutableApprovalSpec,
-  ): Promise<ApprovalDecision> {
-    if (spec === false) return { action: "allow_once" };
+  ): Promise<{ decision: ApprovalDecision; authority?: ApprovalPreflightDecision }> {
+    if (spec === false) return { decision: { action: "allow_once" } };
 
     const preflight = await this.preflightApproval(input, callId, tool, spec);
-    if (preflight.action === "allow") return { action: "allow_once" };
-    if (preflight.action === "deny") return denyDecision(preflight);
+    if (preflight.action === "allow") return { decision: { action: "allow_once" }, authority: preflight };
+    if (preflight.action === "deny") return { decision: denyDecision(preflight), authority: preflight };
 
     await this.update(input, callId, "waiting_for_approval");
     return this.createApprovalRequest(input, callId, tool, spec, preflight);
@@ -278,6 +383,7 @@ export class ToolExecutor {
     callId: ToolCallId,
     validated: Input,
     spec: false | ExecutableApprovalSpec,
+    assertCurrentAuthorization?: () => Promise<void>,
   ): Promise<SnapshotRecord | undefined> {
     if (spec === false) return undefined;
     if (!this.options.snapshotProvider) return undefined;
@@ -287,7 +393,9 @@ export class ToolExecutor {
       : tool.risk === "write" || tool.risk === "dangerous";
     if (!shouldSnapshot) return undefined;
 
-    const snapshot = await this.createSnapshot(tool, input, callId, spec);
+    // A custom snapshot provider may have effects before using its callback.
+    await assertCurrentAuthorization?.();
+    const snapshot = await this.createSnapshot(tool, input, callId, spec, assertCurrentAuthorization);
     if (!snapshot) return undefined;
 
     const rawSnapshotId = safeRecordValue(snapshot, "id");
@@ -326,6 +434,7 @@ export class ToolExecutor {
     input: ExecuteToolInput,
     callId: ToolCallId,
     spec: ExecutableApprovalSpec,
+    assertCurrentAuthorization?: () => Promise<void>,
   ): Promise<SnapshotRecord | undefined> {
     try {
       return await this.options.snapshotProvider?.create({
@@ -336,6 +445,8 @@ export class ToolExecutor {
         patterns: spec.patterns,
         reason: `before ${tool.name}`,
         metadata: spec.metadata,
+        ...(input.signal ? { signal: input.signal } : {}),
+        ...(assertCurrentAuthorization ? { assertCurrentAuthorization } : {}),
       });
     } catch (error) {
       const err = toError(error);
@@ -470,9 +581,15 @@ export class ToolExecutor {
     callId: ToolCallId,
     outputArtifactId: ToolCallId,
     registerPersistedOutput: (output: PersistedToolOutputRegistration) => Promise<void>,
+    executionPolicy?: ToolAccessPolicy,
+    assertCurrentAuthorization?: () => Promise<void>,
   ): ChiliToolExecutionContext {
     let outputSequence = 0;
     let streamedOutputBytes = 0;
+    const resourceRequest: import("./types.js").ApprovalPreflightRequest = {
+      sessionId: input.sessionId, callId, toolName: tool.name, risk: tool.risk,
+      permission: tool.name, patterns: ["*"], workspaceRoot: input.cwd,
+    };
     return {
       sessionId: input.sessionId,
       turnId: input.turnId,
@@ -480,7 +597,15 @@ export class ToolExecutor {
       outputArtifactId,
       signal: input.signal ?? new AbortController().signal,
       cwd: input.cwd,
-      fileReads: this.fileReads,
+      fileReads: this.fileReads.forSession(input.sessionId),
+      ...(executionPolicy ? { executionPolicy } : {}),
+      ...(assertCurrentAuthorization ? { assertCurrentAuthorization } : {}),
+      currentResourceDenials: () => this.options.approvals.resourceDenials?.(resourceRequest) ?? Promise.resolve(undefined),
+      assertFileResourceAccess: async (paths, access) => {
+        throwIfAborted(input.signal);
+        await this.options.approvals.assertFileResourceAccess?.(resourceRequest, paths, access);
+        throwIfAborted(input.signal);
+      },
       visibleTools: () => this.visibleTools(input),
       persistedOutputLimits: {
         ...(this.options.maxPersistedOutputBytes !== undefined
@@ -503,22 +628,13 @@ export class ToolExecutor {
         return this.streamOutput(input, callId, outputSequence, bounded);
       },
       requestApproval: async (request) => {
-        const spec = validateApprovalSpec(tool.name, {
+        const spec = await canonicalApprovalSpec(input.cwd, validateApprovalSpec(tool.name, {
           permission: request.permission,
           patterns: request.patterns,
           maxApprovalScope: request.maxApprovalScope ?? "persistent",
           metadata: request.metadata ?? {},
-        });
-        for (const policy of await this.policies(input)) {
-          await authorizeToolByPolicy({
-            tool,
-            executeInput: input,
-            validatedInput,
-            approvalSpec: spec,
-            policy,
-            isReadOnly: (definition, toolInput) => this.resolvePredicate(definition.isReadOnly, toolInput),
-          });
-        }
+        }));
+        await this.authorizeWorkerPolicy(tool, validatedInput, input, spec);
         return this.approveOrRequest(input, callId, tool, spec);
       },
     };
@@ -533,7 +649,7 @@ export class ToolExecutor {
     const preflight = await this.preflightApproval(input, callId, tool, spec);
     if (preflight.action === "allow") return { action: "allow_once" };
     if (preflight.action === "deny") return denyDecision(preflight);
-    return this.createApprovalRequest(input, callId, tool, spec, preflight);
+    return (await this.createApprovalRequest(input, callId, tool, spec, preflight)).decision;
   }
 
   private async createApprovalRequest(
@@ -542,7 +658,7 @@ export class ToolExecutor {
     tool: ChiliToolDefinition,
     spec: ExecutableApprovalSpec,
     preflight?: ApprovalPreflightDecision,
-  ): Promise<ApprovalDecision> {
+  ): Promise<{ decision: ApprovalDecision; authority: ApprovalPreflightDecision }> {
     const approvalId = this.id<ApprovalId>("approval");
 
     await this.publish("approval.requested", input, {
@@ -554,9 +670,9 @@ export class ToolExecutor {
       ...metadataPayload(approvalRequestMetadata(spec, preflight)),
     });
 
-    let rawDecision: ApprovalDecision;
+    let resolution: ApprovalResolution;
     try {
-      rawDecision = await withAbort(this.options.approvals.decide({
+      const request: ApprovalBrokerRequest = {
         approvalId,
         sessionId: input.sessionId,
         callId,
@@ -566,7 +682,15 @@ export class ToolExecutor {
         patterns: spec.patterns,
         maxApprovalScope: spec.maxApprovalScope,
         metadata: spec.metadata,
-      }, input.signal), input.signal);
+        workspaceRoot: input.cwd,
+      };
+      const broker = this.options.approvals;
+      if (broker.resolve) {
+        resolution = await withAbort(broker.resolve(request, input.signal), input.signal);
+      } else {
+        const decision = await withAbort(broker.decide(request, input.signal), input.signal);
+        resolution = { decision, authority: await this.preflightApproval(input, callId, tool, spec) };
+      }
       throwIfAborted(input.signal);
     } catch (error) {
       if (input.signal?.aborted || isAbortError(error)) {
@@ -578,7 +702,9 @@ export class ToolExecutor {
       }
       throw error;
     }
-    const decision = normalizeApprovalDecision(rawDecision, spec.maxApprovalScope);
+    let decision = normalizeApprovalDecision(resolution.decision, spec.maxApprovalScope);
+    const authority = resolution.authority;
+    if (decision.action !== "deny" && authority.action === "deny") decision = denyDecision(authority);
 
     await this.publish("approval.resolved", input, {
       approvalId,
@@ -586,7 +712,7 @@ export class ToolExecutor {
       ...(decision.feedback ? { feedback: decision.feedback } : {}),
     });
 
-    return decision;
+    return { decision, authority };
   }
 
   private async preflightApproval(
@@ -615,6 +741,7 @@ export class ToolExecutor {
       patterns: spec.patterns,
       maxApprovalScope: spec.maxApprovalScope,
       metadata: spec.metadata,
+      workspaceRoot: input.cwd,
     });
   }
 
@@ -670,9 +797,9 @@ export class ToolExecutor {
 
   private async policies(input: ExecuteToolInput): Promise<ToolAccessPolicy[]> {
     const policies: ToolAccessPolicy[] = [];
-    if (input.policy) policies.push(input.policy);
+    if (input.policy) policies.push(structuredClone(input.policy));
     const resolved = await this.options.policyResolver?.resolve(toolPolicyContext(input));
-    if (resolved) policies.push(resolved);
+    if (resolved) policies.push(structuredClone(resolved));
     return policies;
   }
 
@@ -688,6 +815,7 @@ export class ToolExecutor {
     const normalizedError = toError(error);
     await this.publish("tool.call_finished", input, {
       callId,
+      ...(input.providerCallId === undefined ? {} : { providerCallId: input.providerCallId }),
       status: "failed",
       error: normalizedError.message,
       ...errorDetailsPayload(normalizedError),
@@ -700,6 +828,7 @@ export class ToolExecutor {
     const normalizedError = toError(error);
     await this.publish("tool.call_finished", input, {
       callId,
+      ...(input.providerCallId === undefined ? {} : { providerCallId: input.providerCallId }),
       status: "cancelled",
       error: normalizedError.message,
       ...errorDetailsPayload(normalizedError),
@@ -929,6 +1058,7 @@ function boundToolResult(result: ToolResult): ToolResult {
   const rawContent = safeRecordValue(result, "content");
   const rawMetadata = safeRecordValue(result, "metadata");
   const rawArtifactIds = safeRecordValue(result, "artifactIds");
+  const structuredData = Object.getOwnPropertyDescriptor(result, "structuredData")?.value as unknown;
   const boundedContent = boundToolResultContent(Array.isArray(rawContent) ? rawContent : undefined);
   const boundedMetadata = isPlainRecord(rawMetadata)
     ? boundToolMetadata(rawMetadata)
@@ -944,6 +1074,7 @@ function boundToolResult(result: ToolResult): ToolResult {
   return {
     title: truncateUtf8WithoutFullCopy(typeof rawTitle === "string" ? rawTitle : "Tool result", MAX_TOOL_RESULT_TITLE_BYTES),
     output: typeof rawOutput === "string" ? rawOutput : safeString(rawOutput),
+    ...(structuredData === undefined ? {} : { structuredData }),
     ...(boundedContent.content === undefined ? {} : { content: boundedContent.content }),
     ...(metadata === undefined ? {} : { metadata }),
     ...boundArtifactIds(Array.isArray(rawArtifactIds) ? rawArtifactIds : undefined),
@@ -1451,4 +1582,23 @@ function appendRegisteredOutputNotice(
 function denyDecision(decision: ApprovalPreflightDecision): ApprovalDecision {
   const feedback = decision.feedback ?? decision.reason;
   return feedback ? { action: "deny", feedback } : { action: "deny" };
+}
+
+function preparationContext(input: ExecuteToolInput): string {
+  return [input.sessionId, input.turnId, input.cwd, input.toolName].join("\0");
+}
+
+function toolFingerprint(tool: ChiliToolDefinition): string {
+  return JSON.stringify([tool.name, tool.revision, tool.inputSchema, tool.risk, tool.aliases, tool.resourcePolicy]);
+}
+
+function freezePreparedValue(value: unknown): unknown {
+  const copy = structuredClone(value);
+  function freeze(item: unknown): void {
+    if (typeof item !== "object" || item === null || Object.isFrozen(item)) return;
+    Object.freeze(item);
+    for (const child of Object.values(item)) freeze(child);
+  }
+  freeze(copy);
+  return copy;
 }

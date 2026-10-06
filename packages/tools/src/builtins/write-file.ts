@@ -1,4 +1,7 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { canonicalResourcePattern } from "../resource-policy.js";
+import { writeFileTextIfUnchanged } from "../file-mutation.js";
+import { withFileOperationLocks } from "../file-operation-lock.js";
+import { mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 import { assertDirectWritablePathInsideWorkspace, resolveWorkspacePath } from "../workspace-path.js";
@@ -16,10 +19,10 @@ export function createWriteFileTool(): ChiliToolDefinition<WriteFileInput> {
     searchHint: "Write full UTF-8 file contents; existing files must be read first.",
     description: "Write full UTF-8 text content to a workspace file.",
     risk: "write",
+    resourcePolicy: "filesystem",
     isReadOnly: false,
     isConcurrencySafe: false,
     isDestructive: true,
-    interruptBehavior: "block",
     maxResultOutputBytes: 100_000,
     inputSchema: {
       type: "object",
@@ -50,6 +53,9 @@ export function createWriteFileTool(): ChiliToolDefinition<WriteFileInput> {
       if (instruction !== undefined) value.instruction = instruction;
       return { ok: true, value };
     },
+    async prepareInput(input, context) {
+      return { ...input, filePath: await canonicalResourcePattern(context.cwd, input.filePath, true) };
+    },
     approval(input) {
       return {
         permission: "write",
@@ -64,27 +70,30 @@ export function createWriteFileTool(): ChiliToolDefinition<WriteFileInput> {
     async execute(input, context) {
       const workspace = context.cwd;
       const target = resolveWorkspacePath(workspace, input.filePath);
-      await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
-      const existing = await readTextIfExists(target.absolutePath);
-      if (existing !== undefined) {
-        await context.fileReads?.assertFresh(workspace, target.absolutePath);
-      }
+      return withFileOperationLocks([target.absolutePath], context.signal, async () => {
+        await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
+        const existing = await readTextIfExists(target.absolutePath);
+        if (existing !== undefined) {
+          await context.fileReads?.assertFresh(workspace, target.absolutePath);
+        }
 
-      // Re-resolve metadata aliases and link count after reads, immediately before mutation.
-      await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
-      await mkdir(dirname(target.absolutePath), { recursive: true });
-      await writeFile(target.absolutePath, input.content, "utf8");
-      await context.fileReads?.recordTextRead(workspace, target.absolutePath, input.content);
+        // Re-resolve metadata aliases and link count after reads, immediately before mutation.
+        await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
+        await context.assertCurrentAuthorization?.();
+        await mkdir(dirname(target.absolutePath), { recursive: true });
+        await writeFileTextIfUnchanged(target.absolutePath, input.content, existing, context.assertCurrentAuthorization);
+        await context.fileReads?.recordTextRead(workspace, target.absolutePath, input.content);
 
-      return {
-        title: target.relativePath,
-        output: existing === undefined ? "Created file successfully." : "Wrote file successfully.",
-        metadata: {
-          filePath: target.relativePath,
-          created: existing === undefined,
-          bytes: Buffer.byteLength(input.content, "utf8"),
-        },
-      };
+        return {
+          title: target.relativePath,
+          output: existing === undefined ? "Created file successfully." : "Wrote file successfully.",
+          metadata: {
+            filePath: target.relativePath,
+            created: existing === undefined,
+            bytes: Buffer.byteLength(input.content, "utf8"),
+          },
+        };
+      }, { sessionId: context.sessionId, authorize: () => context.assertCurrentAuthorization?.() ?? Promise.resolve() });
     },
   };
 }

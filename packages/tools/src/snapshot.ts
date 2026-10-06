@@ -1,10 +1,12 @@
+import { assertFileMutationOwnership, fileMutationCheckpoint, readOptionalFileVersion, recordOwnedFileVersion, withFileMutationJournal, withFileOperationLocks, type FileMutationCheckpoint } from "./file-operation-lock.js";
+import { readFileContentVersion, sameFileVersion, type FileContentVersion } from "./file-read-state.js";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, realpath, rename, rm, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, parse, relative, resolve, sep } from "node:path";
 import { timestampNow, type SnapshotId, type TimestampMs } from "@chili/protocol";
 import type { SnapshotCreateRequest, SnapshotProvider, SnapshotRecord, SnapshotRevertOptions, SnapshotRevertResult } from "./types.js";
 
-const SNAPSHOT_VERSION = 2 as const;
+const SNAPSHOT_VERSION = 3 as const;
 const MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
 const MAX_PATTERN_COUNT = 2_048;
 const MAX_SNAPSHOT_ENTRIES = 1_024;
@@ -14,7 +16,8 @@ const SNAPSHOT_ID_PATTERN = /^snapshot_[A-Za-z0-9_-]{1,120}$/u;
 const BACKUP_NAME_PATTERN = /^[0-9]+\.blob$/u;
 
 interface SnapshotManifest {
-  version: typeof SNAPSHOT_VERSION;
+  version: 2 | typeof SNAPSHOT_VERSION;
+  ownership?: FileMutationCheckpoint;
   id: SnapshotId;
   cwd: string;
   createdAt: TimestampMs;
@@ -30,6 +33,7 @@ interface RegularSnapshotEntry {
   existed: true;
   backupName: string;
   mode: 0o100644 | 0o100755;
+  beforeVersion?: FileContentVersion;
 }
 
 interface MissingSnapshotEntry {
@@ -68,6 +72,16 @@ export class FileSystemSnapshotProvider implements SnapshotProvider {
 
   async create(request: SnapshotCreateRequest): Promise<SnapshotRecord | undefined> {
     const cwd = await canonicalDirectory(request.cwd, "snapshot cwd");
+    if (request.patterns.length > MAX_PATTERN_COUNT) throw new Error(`Snapshot has too many patterns (maximum ${MAX_PATTERN_COUNT})`);
+    const paths = request.patterns.map((pattern) => resolvePattern(cwd, pattern))
+      .filter((path): path is string => path !== undefined).map((path) => resolve(cwd, path));
+    return withFileOperationLocks(paths, request.signal ?? new AbortController().signal, () => this.createLocked({ ...request, cwd }));
+  }
+
+  private async createLocked(request: SnapshotCreateRequest): Promise<SnapshotRecord | undefined> {
+    await request.assertCurrentAuthorization?.();
+    request.signal?.throwIfAborted();
+    const cwd = await canonicalDirectory(request.cwd, "snapshot cwd");
     const entries = await this.collectEntries(cwd, request.patterns);
     if (entries.length === 0) return undefined;
 
@@ -89,12 +103,16 @@ export class FileSystemSnapshotProvider implements SnapshotProvider {
         cwd,
         createdAt: this.now(),
         reason: request.reason,
+        ownership: await fileMutationCheckpoint(request.sessionId),
         entries: [],
       };
 
       for (const [index, entry] of entries.entries()) {
+        await request.assertCurrentAuthorization?.();
+        request.signal?.throwIfAborted();
         if (entry.kind === "regular") {
           const backupName = `${index}.blob`;
+          const beforeVersion = await readFileContentVersion(entry.path);
           await assertSecureDirectory(snapshotDir, "snapshot directory");
           const source = await openSecureRegularFile(entry.path, "snapshot source");
           try {
@@ -105,7 +123,12 @@ export class FileSystemSnapshotProvider implements SnapshotProvider {
           } finally {
             await source.handle.close();
           }
+          if (!sameFileVersion(beforeVersion, await readFileContentVersion(entry.path))
+            || (await readFileContentVersion(join(snapshotDir, backupName))).contentHash !== beforeVersion.contentHash) {
+            throw new Error(`Snapshot source changed during backup: ${entry.relativePath}`);
+          }
           manifest.entries.push({
+            beforeVersion,
             relativePath: entry.relativePath,
             kind: "regular",
             existed: true,
@@ -117,6 +140,7 @@ export class FileSystemSnapshotProvider implements SnapshotProvider {
         }
       }
 
+      request.signal?.throwIfAborted();
       await writeExclusiveRegularFile(
         join(snapshotDir, "manifest.json"),
         Buffer.from(JSON.stringify(manifest, null, 2), "utf8"),
@@ -138,58 +162,83 @@ export class FileSystemSnapshotProvider implements SnapshotProvider {
   async revert(snapshotId: SnapshotId, options: SnapshotRevertOptions = {}): Promise<SnapshotRevertResult> {
     requireSnapshotId(snapshotId);
     const { manifest, snapshotDir } = await this.readManifest(snapshotId, options.cwd);
-    const backupSizes = await validateSnapshotBackups(manifest, snapshotDir);
-    const restored: string[] = [];
-    const removed: string[] = [];
-
-    for (const entry of manifest.entries) {
-      const target = resolve(manifest.cwd, entry.relativePath);
-      assertContained(manifest.cwd, target, "snapshot target");
-      if (entry.kind === "regular") {
-        await ensureSecureDirectory(dirname(target), manifest.cwd, "snapshot target parent");
+    const paths = manifest.entries.map((entry) => resolve(manifest.cwd, entry.relativePath));
+    const signal = options.signal ?? new AbortController().signal;
+    return withFileOperationLocks(paths, signal, async () => {
+      const backupSizes = await validateSnapshotBackups(manifest, snapshotDir);
+      const expected = new Map<string, FileContentVersion | null>();
+      const backupHashes = new Map<string, string>();
+      const unchanged = new Set<string>();
+      // Validate every target before changing any target. A later conflict must
+      // not cause a partially applied rollback of earlier, unrelated files.
+      for (const entry of manifest.entries) {
+        signal.throwIfAborted();
+        const target = resolve(manifest.cwd, entry.relativePath);
+        assertContained(manifest.cwd, target, "snapshot target");
+        await assertSafeAncestors(manifest.cwd, entry.relativePath);
         await assertSafeTarget(target);
-        const backupPath = join(snapshotDir, entry.backupName);
-        assertContained(snapshotDir, backupPath, "snapshot backup");
-        await assertSecureDirectory(snapshotDir, "snapshot directory");
-        const backup = await openSecureRegularFile(backupPath, "snapshot backup");
-        try {
-          if (backup.size !== backupSizes.get(entry.backupName)) {
-            throw new Error(`Snapshot backup changed before restore: ${entry.backupName}`);
+        const current = await readOptionalFileVersion(target);
+        expected.set(target, current);
+        if (entry.kind === "regular") {
+          const backup = await readFileContentVersion(join(snapshotDir, entry.backupName));
+          if (entry.beforeVersion && backup.contentHash !== entry.beforeVersion.contentHash) {
+            throw new Error(`Snapshot backup content changed: ${entry.relativePath}`);
           }
-          await restoreSecureFile(backup, target, entry.mode, MAX_SNAPSHOT_FILE_BYTES);
-        } finally {
-          await backup.handle.close();
+          backupHashes.set(target, backup.contentHash);
+          if (current?.contentHash === backup.contentHash && normalizeRegularMode((await lstat(target)).mode) === entry.mode) {
+            unchanged.add(target);
+            continue;
+          }
+        } else if (current === null) {
+          unchanged.add(target);
+          continue;
         }
-        restored.push(entry.relativePath);
-      } else {
-        const ancestorsExist = await assertSafeAncestors(manifest.cwd, entry.relativePath);
-        if (ancestorsExist) {
-          const info = await lstat(target).catch((error: unknown) => {
-            if (isNotFound(error)) return undefined;
-            throw error;
-          });
-          if (info?.isSymbolicLink() || (info && !info.isFile())) {
-            throw new Error(`Snapshot target is not a regular file: ${entry.relativePath}`);
-          }
-          if (info) {
-            const before = identity(info);
-            const after = await lstat(target);
-            if (!sameIdentity(before, identity(after)) || after.isSymbolicLink() || !after.isFile()) {
-              throw new Error(`Snapshot target changed while reverting: ${entry.relativePath}`);
-            }
-            await unlink(target);
-          }
+        if (!manifest.ownership || (entry.kind === "regular" && !entry.beforeVersion)) {
+          throw new Error(`Cannot safely restore ${entry.relativePath}: this older snapshot has no record of who changed the file. Current files were preserved.`);
         }
-        removed.push(entry.relativePath);
+        await assertFileMutationOwnership(target, manifest.ownership, entry.kind === "regular" ? entry.beforeVersion! : null, current);
       }
-    }
 
-    return {
-      snapshotId,
-      paths: manifest.entries.map((entry) => entry.relativePath),
-      restored,
-      removed,
-    };
+      const apply = async (): Promise<SnapshotRevertResult> => {
+        const restored: string[] = [];
+        const removed: string[] = [];
+        for (const entry of manifest.entries) {
+          signal.throwIfAborted();
+          const target = resolve(manifest.cwd, entry.relativePath);
+          await assertExpectedTargetVersion(target, expected.get(target) ?? null);
+          if (!unchanged.has(target)) {
+            if (entry.kind === "regular") {
+              await ensureSecureDirectory(dirname(target), manifest.cwd, "snapshot target parent");
+              await assertSafeTarget(target);
+              const backupPath = join(snapshotDir, entry.backupName);
+              assertContained(snapshotDir, backupPath, "snapshot backup");
+              await assertSecureDirectory(snapshotDir, "snapshot directory");
+              const backup = await openSecureRegularFile(backupPath, "snapshot backup");
+              try {
+                if (backup.size !== backupSizes.get(entry.backupName)) {
+                  throw new Error(`Snapshot backup changed before restore: ${entry.backupName}`);
+                }
+                const backupHash = backupHashes.get(target)!;
+                await restoreSecureFile(backup, target, entry.mode, MAX_SNAPSHOT_FILE_BYTES, expected.get(target) ?? null, backupHash, signal);
+                await recordOwnedFileVersion(target, backupHash);
+              } finally {
+                await backup.handle.close();
+              }
+            } else {
+              await assertSafeAncestors(manifest.cwd, entry.relativePath);
+              await assertExpectedTargetVersion(target, expected.get(target) ?? null);
+              signal.throwIfAborted();
+              if (expected.get(target) !== null) await unlink(target);
+              await recordOwnedFileVersion(target, null);
+            }
+          }
+          if (entry.kind === "regular") restored.push(entry.relativePath);
+          else removed.push(entry.relativePath);
+        }
+        return { snapshotId, paths: manifest.entries.map((entry) => entry.relativePath), restored, removed };
+      };
+      return manifest.ownership ? withFileMutationJournal(paths, manifest.ownership.sessionId, apply) : apply();
+    });
   }
 
   private async collectEntries(cwd: string, patterns: string[]): Promise<CollectedEntry[]> {
@@ -398,7 +447,7 @@ async function assertSafeAncestors(cwd: string, relativePath: string): Promise<b
     });
     if (!info) return false;
     if (info.isSymbolicLink() || !info.isDirectory() || await realpath(current) !== current) {
-      throw new Error(`Snapshot path ancestor is unsafe: ${relativePath}`);
+      throw new Error(`Snapshot path ancestor is unsafe (symbolic link or non-directory): ${relativePath}`);
     }
   }
   return true;
@@ -506,6 +555,9 @@ async function restoreSecureFile(
   target: string,
   mode: 0o100644 | 0o100755,
   maxBytes: number,
+  expectedTarget: FileContentVersion | null,
+  expectedBackupHash: string,
+  signal: AbortSignal,
 ): Promise<void> {
   await assertOpenFileIdentity(source, "snapshot backup");
   if (source.size > maxBytes) throw new Error(`Snapshot backup exceeds ${maxBytes} bytes`);
@@ -548,6 +600,11 @@ async function restoreSecureFile(
     } else if (current) {
       throw new Error("Snapshot target appeared before it was restored");
     }
+    if ((await readFileContentVersion(temporary)).contentHash !== expectedBackupHash) {
+      throw new Error("Snapshot backup contents changed before restore");
+    }
+    await assertExpectedTargetVersion(target, expectedTarget);
+    signal.throwIfAborted();
     await rename(temporary, target);
     temporaryExists = false;
   } finally {
@@ -599,7 +656,7 @@ async function removePartialSnapshot(root: string, snapshotDir: string): Promise
 
 function validateManifest(value: unknown, requestedId: SnapshotId): SnapshotManifest {
   if (!isRecord(value)
-    || value.version !== SNAPSHOT_VERSION
+    || (value.version !== 2 && value.version !== SNAPSHOT_VERSION)
     || typeof value.id !== "string"
     || value.id !== requestedId
     || typeof value.cwd !== "string"
@@ -611,6 +668,9 @@ function validateManifest(value: unknown, requestedId: SnapshotId): SnapshotMani
     throw new Error("Invalid snapshot manifest");
   }
   requireSnapshotId(value.id);
+  if (value.version === SNAPSHOT_VERSION && !validOwnership(value.ownership)) {
+    throw new Error("Snapshot manifest has invalid modification ownership");
+  }
   const paths = new Set<string>();
   const backups = new Set<string>();
   const entries: SnapshotEntry[] = value.entries.map((candidate) => {
@@ -630,6 +690,9 @@ function validateManifest(value: unknown, requestedId: SnapshotId): SnapshotMani
         || (candidate.mode !== 0o100644 && candidate.mode !== 0o100755)) {
         throw new Error("Snapshot regular entry is inconsistent");
       }
+      if (value.version === SNAPSHOT_VERSION && !validFileVersion(candidate.beforeVersion)) {
+        throw new Error("Snapshot regular entry has no valid content version");
+      }
       if (backups.has(candidate.backupName)) throw new Error("Snapshot manifest contains duplicate backups");
       backups.add(candidate.backupName);
       return {
@@ -638,6 +701,7 @@ function validateManifest(value: unknown, requestedId: SnapshotId): SnapshotMani
         existed: true,
         backupName: candidate.backupName,
         mode: candidate.mode,
+        ...(validFileVersion(candidate.beforeVersion) ? { beforeVersion: candidate.beforeVersion } : {}),
       };
     }
     if (candidate.existed !== false || candidate.backupName !== undefined || candidate.mode !== undefined) {
@@ -646,7 +710,8 @@ function validateManifest(value: unknown, requestedId: SnapshotId): SnapshotMani
     return { relativePath: candidate.relativePath, kind: "missing", existed: false };
   });
   return {
-    version: SNAPSHOT_VERSION,
+    version: value.version as SnapshotManifest["version"],
+    ...(validOwnership(value.ownership) ? { ownership: value.ownership } : {}),
     id: value.id as SnapshotId,
     cwd: value.cwd,
     createdAt: value.createdAt as TimestampMs,
@@ -699,4 +764,22 @@ function isNotFound(error: unknown): boolean {
 
 function defaultCreateId(prefix: string): string {
   return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+async function assertExpectedTargetVersion(path: string, expected: FileContentVersion | null): Promise<void> {
+  const current = await readOptionalFileVersion(path);
+  if (current === null || expected === null ? current !== expected : !sameFileVersion(current, expected)) {
+    throw new Error(`Snapshot target changed before restore: ${path}. Current files were preserved where not already restored.`);
+  }
+}
+
+function validOwnership(value: unknown): value is FileMutationCheckpoint {
+  return isRecord(value) && typeof value.epoch === "string" && value.epoch.length > 0
+    && typeof value.revision === "number" && Number.isSafeInteger(value.revision) && value.revision >= 0
+    && typeof value.sessionId === "string" && value.sessionId.length > 0;
+}
+
+function validFileVersion(value: unknown): value is FileContentVersion {
+  return isRecord(value) && typeof value.contentHash === "string" && /^[a-f0-9]{64}$/.test(value.contentHash)
+    && ["size", "mtimeMs", "ctimeMs", "dev", "ino"].every((key) => typeof value[key] === "number" && Number.isFinite(value[key]));
 }

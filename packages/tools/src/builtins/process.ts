@@ -11,13 +11,13 @@ export type ProcessInput =
 export function createProcessTool(processes: ManagedProcessManager): ChiliToolDefinition<ProcessInput> {
   return {
     name: "process",
+    resourcePolicy: "process",
     searchHint: "Read logs and status, list, or stop this task's managed background commands.",
     description: "Inspect or stop background commands started by bash(background=true) in this task. read returns the latest bounded stdout/stderr tail and actual status; waitMs optionally waits for exit before taking the snapshot (maximum 30000 ms). Repeated reads can contain the same output. list finds this task's handles. stop terminates the owned command and its process group. Handles and logs are local to this host lifetime; no stdin or arbitrary PID control is available.",
     risk: "execute",
     isReadOnly: (input) => input.action !== "stop",
     isConcurrencySafe: (input) => input.action !== "stop",
     isDestructive: (input) => input.action === "stop",
-    interruptBehavior: "cancel",
     maxResultOutputBytes: 64 * 1024,
     inputSchema: {
       type: "object",
