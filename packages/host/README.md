@@ -128,9 +128,11 @@ Host resolves canonical profile, authentication path, project and workspace
 identities. Git worktrees share the common repository project ID while retaining
 separate workspace IDs. Session-specific cwd selection continues to work: skills,
 Memory and child execution follow that session's project rather than the
-initial Host directory. The identity is persisted when a session is created;
-legacy sessions bind on their first owned execution. Resume and execution reject
-a changed profile/project/workspace binding before model or tool effects.
+initial Host directory. Creation-time environment metadata is stored separately
+from the session ID. Resume looks up the original ID only in the current Host's
+`<workspace>/.chili/chili.sqlite`; a missing ID fails. Environment changes do not
+rebind or replace the session. Historical identity bindings remain readable but
+do not restrict execution or become the identity of a new model request.
 
 An explicit `chiliHome` isolates auth, Memory, skills, commands, MCP and model
 selection. Without one, `CHILI_HOME` and the legacy `CHILI_AUTH_FILE` override
@@ -261,6 +263,5 @@ must include `chili.sqlite` and `contents/chili.sqlite/` together.
 A second Host is rejected until the current owner and its resources have stopped.
 There is no control forwarding or attach protocol. Stores without durable input
 support retain the legacy runtime behavior; they do not provide these receipt
-guarantees. A synchronous accepted receipt may precede asynchronous identity
-validation; a mismatch settles as a failure before execution and is never allowed
-to silently switch the queued task's profile.
+guarantees. Execution uses the current Host configuration and the session's
+stored cwd; accepting an input does not bypass ownership or permission checks.

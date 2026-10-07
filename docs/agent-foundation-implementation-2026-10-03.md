@@ -21,7 +21,7 @@
 
 ## 第二批：共同执行契约
 
-- Host 保存 profile/auth path/project/workspace 身份；Git worktree 共用项目 ID，保留独立工作区 ID。同一 Host 的不同 cwd 仍各自解析项目规则、skills 和 Memory。旧会话首次持有执行权时绑定身份；后续恢复拒绝不匹配身份。
+- Host 保存 profile/auth path/project/workspace 元数据；Git worktree 共用项目 ID，保留独立工作区 ID。同一 Host 的不同 cwd 仍各自解析项目规则、skills 和 Memory。会话恢复现仅查当前工作区存储并沿用原 ID，历史环境元数据不再限制恢复或继续执行。
 - 权限资源、审批决定、OS 隔离分开。文件 deny 同时进入文件工具及 Bash backend；macOS Seatbelt 落实实际读写禁止、scoped 写入和网络边界。存在文件 deny 时 full-access 也不能绕过；不支持隔离的 backend 拒绝，无法精确落实的复杂 deny glob 拒绝。executeScope 是完整命令准入规则，不是系统调用 allowlist。
 - PreparedToolCall 固定定义、已校验参数、分类、资源与目录版本。统一 JSON Schema 校验拒绝非法参数及不支持的异步 schema。最新撤销规则仍在效果边界复核。无效的 interruptBehavior 声明移除，实际取消沿 signal。
 - 资源限制必须由本地工具实现显式支持；远端 MCP 的 read-only 标注不能证明可以落实文件或执行范围。受限调用拒绝未知能力工具；Git 无法安全过滤历史对象和 hooks 时也保守拒绝。搜索先过滤实际文件，再读取内容，返回前重新核对授权。

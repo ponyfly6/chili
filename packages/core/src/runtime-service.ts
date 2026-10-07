@@ -112,6 +112,7 @@ export interface RuntimeServiceOptions {
   runtime: AgentRunner;
   store: EventStore;
   cwd: string;
+  /** Creation-time metadata; does not bind a session to an execution environment. */
   executionIdentityResolver?: (cwd: string) => ExecutionIdentity | Promise<ExecutionIdentity>;
   executionContext?: <T>(operation: () => T) => T;
   maxTurns?: number;
@@ -384,13 +385,6 @@ export class RuntimeSessionClaimCapabilityError extends Error {
   }
 }
 
-export class RuntimeSessionIdentityError extends Error {
-  constructor(readonly sessionId: SessionId, readonly dimensions: readonly string[]) {
-    super(`Session ${sessionId} belongs to a different execution identity (${dimensions.join(", ")}); use its original profile, project and workspace.`);
-    this.name = "RuntimeSessionIdentityError";
-  }
-}
-
 export class RuntimeSessionInactiveError extends Error {
   constructor(readonly sessionId: SessionId, readonly status: string) {
     super(`Session is not active: ${sessionId} (${status})`);
@@ -591,32 +585,6 @@ export class RuntimeService {
   async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
     this.assertControlOwner(sessionId);
     await this.assertSessionAccessAllowed(sessionId, true);
-    await this.assertSessionIdentity(sessionId);
-  }
-
-  private async assertSessionIdentity(sessionId: SessionId): Promise<void> {
-    if (!this.options.executionIdentityResolver) return;
-    const session = (await this.options.store.sessions()).find((candidate) => candidate.id === sessionId);
-    if (!session) throw new RuntimeSessionNotFoundError(sessionId);
-    const expected = await this.options.executionIdentityResolver(await canonicalWorkspacePath(session.cwd));
-    const bound = await this.options.store.events({ sessionId, type: "session.identity_bound", tail: true, limit: 1 });
-    const created = bound.length === 0
-      ? await this.options.store.events({ sessionId, type: "session.created", tail: true, limit: 1 })
-      : [];
-    const recorded = ((bound[0] ?? created[0])?.payload as { identity?: ExecutionIdentity } | undefined)?.identity;
-    if (recorded) {
-      const dimensions = (["profileId", "projectId", "workspaceId"] as const).filter((key) => recorded[key] !== expected[key]);
-      if (dimensions.length > 0) throw new RuntimeSessionIdentityError(sessionId, dimensions);
-      return;
-    }
-    // Legacy sessions bind once at the first fenced execution. Merely reading
-    // or accepting an input never grants a different profile permission to run.
-    const run = this.running.get(sessionId);
-    if (run) {
-      run.operationContext.capability.assertCurrent();
-      await this.append({ sessionId }, "session.identity_bound", { sessionId, identity: expected },
-        run.operationContext.capability.runClaim ? { runClaim: run.operationContext.capability.runClaim } : undefined);
-    }
   }
 
   private async assertSessionAccessAllowed(sessionId: SessionId, requireActive: boolean): Promise<void> {
@@ -1865,10 +1833,9 @@ export class RuntimeService {
   async interrupt(sessionId: SessionId, reason = "user_interrupt", expectedExecutionRef?: string): Promise<boolean> {
     return this.withMutationAdmission(async () => {
       this.assertControlOwner(sessionId);
-      // A local run already passed identity admission. Preserve synchronous
+      // A local run already passed access admission. Preserve synchronous
       // cancellation of its controller while validating idle control targets.
       if (!this.running.has(sessionId)) await this.assertSessionAccessAllowed(sessionId, true);
-      if (this.options.executionIdentityResolver && !this.running.has(sessionId)) await this.assertSessionIdentity(sessionId);
       if (expectedExecutionRef !== undefined) this.assertExecutionRef(sessionId, expectedExecutionRef);
       const steering = reason === "desktop_steer" || reason === "steer";
       if (!steering) this.mutateSessionInputs({ kind: "pause", sessionId });
@@ -2708,8 +2675,6 @@ function isRuntimeSessionBoundaryError(error: Error): boolean {
   return error instanceof RuntimeServiceClosedError
     || error instanceof RuntimeForeignOwnerError
     || error.name === "RuntimeForeignOwnerError"
-    || error instanceof RuntimeSessionIdentityError
-    || error.name === "RuntimeSessionIdentityError"
     || error instanceof RuntimeSessionInactiveError
     || error instanceof RuntimeSessionAccessError
     || error instanceof RuntimeSessionNotFoundError

@@ -10,7 +10,6 @@ import {
   RuntimeSessionAlreadyExistsError,
   RuntimeSessionCreationConflictError,
   RuntimeSessionInactiveError,
-  RuntimeSessionIdentityError,
   RuntimeForeignOwnerError,
   RuntimeSessionNotFoundError,
   RuntimeSessionAccessError,
@@ -1045,19 +1044,18 @@ test("returns 409 when an explicit session id is created more than once", async 
   );
 });
 
-test("returns conflicts for foreign execution owners and mismatched session identity", async () => {
+test("returns conflicts for foreign execution owners", async () => {
   const store = new ObservableEventStore(new MemoryEventStore());
   const service = new FakeRuntimeService(store);
   const { sessionId } = await service.createSession({ cwd: "/workspace" });
   const handler = createRuntimeHttpHandler({ service, store });
-  for (const error of [new RuntimeForeignOwnerError(sessionId), new RuntimeSessionIdentityError(sessionId, ["profile"])]) {
-    service.assertSessionTurnAllowed = async () => { throw error; };
-    const response = await handler(new Request(`http://chili.test/sessions/${sessionId}/prompt`, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: "Continue" }),
-    }));
-    expect(response.status).toBe(409);
-    expect(await response.json()).toEqual({ error: { message: error.message } });
-  }
+  const error = new RuntimeForeignOwnerError(sessionId);
+  service.assertSessionTurnAllowed = async () => { throw error; };
+  const response = await handler(new Request(`http://chili.test/sessions/${sessionId}/prompt`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: "Continue" }),
+  }));
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ error: { message: error.message } });
 });
 
 test("returns 503 when runtime admission closes during an HTTP mutation", async () => {

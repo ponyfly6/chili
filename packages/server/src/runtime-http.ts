@@ -1996,7 +1996,6 @@ function toHttpError(error: unknown): HttpError {
     err.name === "RuntimeSessionAlreadyExistsError" ||
     err.name === "RuntimeSessionCreationConflictError" ||
     err.name === "RuntimeSessionInactiveError"
-    || err.name === "RuntimeSessionIdentityError"
   ) {
     return { status: 409, message: err.message };
   }

@@ -190,15 +190,39 @@ test("safe startup retries reuse one prepared content version and record each ac
       yield { type: "finish", reason: "stop" };
     },
   });
-  const identity = { profileId: "profile", profilePath: f.cwd, projectId: "project", projectRoot: f.cwd, workspaceId: "workspace", workspaceRoot: f.cwd };
-  const sessionId = await f.runtime.createSession({ cwd: f.cwd, identity });
+  const sessionId = await f.runtime.createSession({ cwd: f.cwd });
   expect((await f.runtime.runTurn({ sessionId, cwd: f.cwd })).status).toBe("completed");
   const records = (await f.store.events({ sessionId, type: "model.request_prepared" })).map((event) => event.payload as { requestId: string; attempt: number; contentVersion: string; request: PreparedModelRequest });
   expect(records).toHaveLength(2);
   expect(records.map((record) => record.attempt)).toEqual([1, 2]);
   expect(records[0]!.requestId).toBe(records[1]!.requestId);
   expect(records[0]!.contentVersion).toBe(records[1]!.contentVersion);
-  expect(records[1]!.request.executionIdentity).toEqual(identity);
+});
+
+test.each([false, true])("new requests do not inherit historical execution identity (legacy binding: %p)", async (bound) => {
+  const modelIdentity = { provider: "fake", model: "current-model", profileId: "current-profile" };
+  const f = await fixture({
+    async *stream(input): AsyncIterable<ModelStreamEvent> {
+      await input.onRequestIdentity?.(modelIdentity);
+      yield { type: "text_delta", text: "done" };
+      yield { type: "finish", reason: "stop" };
+    },
+  });
+  const identity = { profileId: "old-profile", profilePath: f.cwd, projectId: "old-project", projectRoot: f.cwd, workspaceId: "old-workspace", workspaceRoot: f.cwd };
+  const sessionId = await f.runtime.createSession({ cwd: f.cwd, identity });
+  if (bound) {
+    await f.store.append({
+      id: "legacy_binding", type: "session.identity_bound", time: Date.now() as TimestampMs,
+      sessionId, payload: { sessionId, identity },
+    });
+  }
+  expect((await f.runtime.runTurn({ sessionId, cwd: f.cwd })).status).toBe("completed");
+  const request = await latestPreparedRequest(f.store, sessionId);
+  expect(request).toBeDefined();
+  expect(request).not.toHaveProperty("executionIdentity");
+  expect(request?.modelIdentity).toEqual(modelIdentity);
+  expect((await f.store.events({ sessionId, type: "session.created" }))[0]?.payload).toMatchObject({ identity });
+  expect(await f.store.events({ sessionId, type: "session.identity_bound" })).toHaveLength(bound ? 1 : 0);
 });
 
 test("a provider cannot silently overwrite an unfinished streamed call by repeating its live identifier", async () => {
