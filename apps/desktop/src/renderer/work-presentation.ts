@@ -1,14 +1,15 @@
 import type { ChatToolCallRow, ChatToolDisplayStatus, ChatTranscriptItem } from "@chili/sdk";
 import type { DesktopWorkItem } from "./view-model.js";
 
-type WorkCategory = "read" | "edit" | "command" | "web" | "delegate" | "other";
+type WorkCategory = "read" | "edit" | "command" | "web" | "delegate" | "deliver" | "other";
 
 const categories: Record<WorkCategory, { label: string; active: string }> = {
   read: { label: "读取与搜索", active: "正在查看项目内容" },
   edit: { label: "修改文件", active: "正在修改文件" },
   command: { label: "运行命令", active: "正在运行命令" },
   web: { label: "查阅资料", active: "正在查阅资料" },
-  delegate: { label: "协作任务", active: "正在处理协作任务" },
+  delegate: { label: "后台工作", active: "正在处理任务" },
+  deliver: { label: "交付文件", active: "正在准备交付文件" },
   other: { label: "工具操作", active: "正在使用工具" },
 };
 
@@ -28,6 +29,7 @@ export function workToolCategory(name: string): WorkCategory {
   if (/^(bash|run_shell_command|exec_command|write_stdin)$/.test(value)) return "command";
   if (/^(web_search|search_query|web_fetch|fetch_url)$/.test(value)) return "web";
   if (/^agent_/.test(value)) return "delegate";
+  if (value === "present_file") return "deliver";
   return "other";
 }
 
@@ -43,6 +45,7 @@ export function workToolTitle(tool: ChatToolCallRow): string {
 }
 
 export function workToolSubject(tool: ChatToolCallRow): string | undefined {
+  if (workToolCategory(tool.toolName) === "delegate") return undefined;
   if (tool.input && typeof tool.input === "object") {
     const description = (tool.input as Record<string, unknown>).description;
     if (typeof description === "string" && description.trim()) return description.trim();

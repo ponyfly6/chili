@@ -1,0 +1,9 @@
+.delivery-card { display: flex; align-items: flex-start; gap: 12px; width: min(100%, 460px); padding: 14px 16px; margin: 12px 0 18px; text-align: left; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-raised); color: var(--text); }
+.delivery-card:hover { border-color: var(--muted); background: var(--panel-hover); }
+.delivery-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.delivery-card-icon { flex: none; color: var(--muted); font-size: 22px; line-height: 1.2; }
+.delivery-card-content { min-width: 0; flex: 1; }
+.delivery-card-content strong { display: block; font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+.delivery-card-description { display: block; margin-top: 5px; color: var(--text-secondary); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.delivery-card-type { display: block; margin-top: 7px; color: var(--muted); font-size: 10px; }
+.delivery-card-open { flex: none; color: var(--muted); font-size: 16px; }

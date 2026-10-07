@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { RESULT_PREVIEW_ESCAPE_EVENT } from "../shared/result-preview.js";
 import {
   app,
   BrowserWindow,
@@ -127,6 +128,16 @@ export function createDesktopWindow(): BrowserWindow {
   });
   trustedWebContents.add(window.webContents.id);
   window.webContents.once("destroyed", () => trustedWebContents.delete(window.webContents.id));
+
+  // A sandboxed preview cannot bubble keyboard events to the renderer. Route
+  // only Escape through the native window, keeping its sandbox fully intact.
+  window.webContents.on("before-input-event", (event, input) => {
+    if (input.type !== "keyDown" || input.key !== "Escape" || input.isComposing) return;
+    const focused = window.webContents.focusedFrame;
+    if (!focused || focused === window.webContents.mainFrame || !isResultPreviewDocumentUrl(focused.url)) return;
+    event.preventDefault();
+    window.webContents.send(RESULT_PREVIEW_ESCAPE_EVENT);
+  });
 
   window.webContents.setWindowOpenHandler(({ url, referrer }) => {
     if (isAllowedExternalWindowOpen(url, referrer.url, currentRendererTrustPolicy())) void shell.openExternal(url);

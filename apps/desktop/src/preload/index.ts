@@ -13,6 +13,7 @@ import {
   type DesktopResponse,
 } from "../shared/contracts.js";
 import { DesktopEventReadyLifecycle, DesktopEventStreamReceiver } from "./event-stream-receiver.js";
+import { RESULT_PREVIEW_ESCAPE_EVENT } from "../shared/result-preview.js";
 import {
   REMOTE_DESKTOP_CHANNEL,
   parseRemoteDesktopRequest,
@@ -38,6 +39,7 @@ const readyLifecycle = new DesktopEventReadyLifecycle({
 });
 
 ipcRenderer.on(DESKTOP_EVENT_CHANNEL, (_event: IpcRendererEvent, value: unknown) => receiver.accept(value));
+ipcRenderer.on(RESULT_PREVIEW_ESCAPE_EVENT, () => window.dispatchEvent(new Event(RESULT_PREVIEW_ESCAPE_EVENT)));
 
 const api: ChiliDesktopApi = Object.freeze({
   async invoke<Request extends DesktopRequest>(value: Request): Promise<DesktopResponse<Request>> {

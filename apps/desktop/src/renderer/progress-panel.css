@@ -1,0 +1,29 @@
+.progress-panel { box-sizing: border-box; height: 100%; min-width: 0; min-height: 0; padding: 18px 22px; overflow: auto; scrollbar-width: thin; }
+.progress-overview > p, .progress-section-label { margin: 0 0 12px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.progress-work { margin-top: 26px; }
+.progress-list { margin: 0; padding: 0; list-style: none; }
+.progress-list > li + li { margin-top: 6px; }
+.progress-entry { min-width: 0; border-radius: 12px; }
+.progress-entry > summary { display: flex; align-items: flex-start; min-height: 62px; gap: 11px; padding: 13px 10px; border-radius: 10px; cursor: pointer; list-style: none; }
+.progress-entry > summary::-webkit-details-marker { display: none; }
+.progress-entry > summary:hover { background: var(--panel-hover); }
+.progress-entry > summary:focus-visible, .progress-entry-detail button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.progress-dot { flex: 0 0 7px; height: 7px; margin-top: 6px; border-radius: 50%; background: var(--muted); }
+.progress-running .progress-dot { background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 10%, transparent); }
+.progress-completed .progress-dot { background: var(--green); }
+.progress-attention .progress-dot, .progress-paused .progress-dot { background: var(--yellow); }
+.progress-failed .progress-dot { background: var(--red); }
+.progress-entry-copy { display: grid; flex: 1; min-width: 0; gap: 5px; }
+.progress-entry-copy strong { color: var(--text); font-size: 13px; font-weight: 550; line-height: 1.55; overflow-wrap: anywhere; }
+.progress-entry-copy > span { color: var(--muted); font-size: 11px; line-height: 1.5; }
+.progress-running .progress-entry-copy > span { color: var(--accent); }
+.progress-chevron { color: var(--muted); font-size: 18px; line-height: 20px; transition: transform 120ms ease; }
+.progress-entry[open] > summary .progress-chevron { transform: rotate(90deg); }
+.progress-entry-detail { margin: 0 10px 12px 28px; padding: 0 0 8px; color: var(--text-secondary); font-size: 12px; line-height: 1.75; overflow-wrap: anywhere; }
+.progress-entry-detail > p { margin: 0 0 10px; }
+.progress-entry-detail button { min-height: 32px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 7px; background: transparent; color: var(--text-secondary); font: inherit; cursor: pointer; }
+.progress-entry-detail button:hover:enabled { background: var(--panel-hover); }
+.progress-entry-detail button:disabled { opacity: .55; cursor: default; }
+.progress-entry-detail [role="alert"] { color: var(--red); }
+.progress-empty { margin: 20px 10px 0; color: var(--muted); font-size: 12px; line-height: 1.75; }
+@media (prefers-reduced-motion: reduce) { .progress-chevron { transition: none; } }

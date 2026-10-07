@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import type { ChatTranscriptItem } from "@chili/sdk";
+import { useEffect, useState, type ReactNode } from "react";
 import { isResultPreviewUrl, type DesktopResultRead } from "../shared/result-preview.js";
-import { discoverDesktopResults } from "./result-model.js";
+import type { DesktopResult } from "./result-model.js";
 import type { ControlTransport } from "./transport.js";
 import "./results-panel.css";
 
@@ -9,7 +8,9 @@ export interface ResultsPanelProps {
   transport: ControlTransport;
   sessionId: string;
   workspace: string | undefined;
-  items: readonly ChatTranscriptItem[];
+  results: readonly DesktopResult[];
+  selectedPath?: string;
+  onSelect?: (path: string) => void;
   renderMarkdown?: (text: string) => ReactNode;
   onContinue?: (path: string) => void;
 }
@@ -19,16 +20,17 @@ export function ResultsPanel(props: ResultsPanelProps) {
   return <ResultsPanelContent key={`${props.workspace ?? ""}:${props.sessionId}`} {...props} />;
 }
 
-function ResultsPanelContent({ transport, workspace, items, renderMarkdown, onContinue }: ResultsPanelProps) {
-  const results = useMemo(() => discoverDesktopResults(items, workspace), [items, workspace]);
-  const [selectedId, setSelectedId] = useState<string>();
-  const selected = results.find((result) => result.id === selectedId) ?? results[0];
+function ResultsPanelContent({ transport, results, selectedPath, onSelect, renderMarkdown, onContinue }: ResultsPanelProps) {
+  const [localPath, setLocalPath] = useState<string>();
+  const selected = results.find((result) => result.path === (selectedPath ?? localPath)) ?? results[0];
   const [read, setRead] = useState<{ path: string; revision: string; result: DesktopResultRead }>();
   const [error, setError] = useState<string>();
   const [source, setSource] = useState(false);
   const [refresh, setRefresh] = useState(0);
   const path = selected?.path;
   const revision = `${selected?.messageId ?? ""}:${selected?.updatedAt ?? 0}:${refresh}`;
+
+  useEffect(() => { setSource(false); }, [path]);
 
   useEffect(() => {
     let active = true;
@@ -48,30 +50,30 @@ function ResultsPanelContent({ transport, workspace, items, renderMarkdown, onCo
   const loading = Boolean(path && !result && !error);
   const canPreview = ready && ["markdown", "html"].includes(ready.kind);
 
-  return <section className="results-panel" aria-label="会话结果" aria-busy={loading}>
+  return <section className="results-panel" aria-label="交付文件" aria-busy={loading}>
     <header className="results-panel-header">
-      <div><p>交付内容</p><h2>{selected ? selected.label : "结果会出现在这里"}</h2></div>
-      {selected ? <button className="results-refresh" type="button" disabled={loading} onClick={() => setRefresh((value) => value + 1)} aria-label="刷新结果">↻</button> : null}
+      <div><h2>{selected ? selected.label : "还没有交付文件"}</h2>{selected?.description ? <p className="results-description">{selected.description}</p> : null}</div>
+      {selected ? <button className="results-refresh" type="button" disabled={loading} onClick={() => setRefresh((value) => value + 1)} aria-label="刷新交付文件">↻</button> : null}
     </header>
-    {results.length > 1 ? <nav className="results-tabs" aria-label="结果文件">{results.map((candidate) =>
-      <button key={candidate.id} type="button" aria-pressed={candidate.id === selected?.id} title={candidate.path}
-        onClick={() => { setSelectedId(candidate.id); setSource(false); }}>{candidate.label}</button>)}</nav> : null}
+    {results.length > 1 ? <nav className="results-tabs" aria-label="交付文件列表">{results.map((candidate) =>
+      <button key={candidate.id} type="button" aria-pressed={candidate.path === selected?.path} title={candidate.path}
+        onClick={() => { setLocalPath(candidate.path); onSelect?.(candidate.path); setSource(false); }}>{candidate.label}</button>)}</nav> : null}
     {selected ? <div className="results-file-toolbar">
       <span className="results-file-path" title={selected.path}>{selected.path}</span>
-      {canPreview ? <div className="results-display-modes" role="group" aria-label="结果显示方式">
+      {canPreview ? <div className="results-display-modes" role="group" aria-label="文件显示方式">
         <button type="button" aria-pressed={!source} onClick={() => setSource(false)}>预览</button>
         <button type="button" aria-pressed={source} onClick={() => setSource(true)}>源码</button>
       </div> : null}
     </div> : null}
     <div className={`results-preview${ready?.kind === "html" && !source ? " results-preview-html" : ""}`}>
-      {!selected ? <div className="results-empty"><span aria-hidden="true">↗</span><h3>从一次对话，到一个成果</h3><p>助手交付的本地文件会汇集在这里。可以预览网页、图片、文档与代码，再继续提出修改。</p></div> : null}
+      {!selected ? <div className="results-empty"><span aria-hidden="true">↗</span><h3>交付后，在这里查看</h3><p>Chili 交付的文件会汇集在这里。打开文件后，可以继续提出修改。</p></div> : null}
       {loading ? <p className="results-status" role="status">正在读取文件…</p> : null}
       {error ? <p className="results-status" role="alert">{error}</p> : null}
       {result?.status === "unavailable" ? <p className="results-status" role="status">{unavailableLabel(result.reason)}</p> : null}
-      {ready ? <ResultPreviewContent result={ready} label={selected?.label ?? "结果预览"} source={source} {...(renderMarkdown ? { renderMarkdown } : {})} /> : null}
+      {ready ? <ResultPreviewContent result={ready} label={selected?.label ?? "文件预览"} source={source} {...(renderMarkdown ? { renderMarkdown } : {})} /> : null}
     </div>
-    {selected ? <footer className="results-panel-footer"><span>{ready?.kind === "html" && !source ? "静态预览 · 脚本与外部资源已停用" : ready ? `${formatBytes(ready.bytes)} · 本地文件` : "来自当前会话的文件引用"}</span>
-      {onContinue ? <button type="button" onClick={() => onContinue(selected.path)}>继续修改 <span aria-hidden="true">↗</span></button> : null}
+    {selected ? <footer className="results-panel-footer"><span>{ready?.kind === "html" && !source ? "静态预览 · 脚本与外部资源已停用" : ready ? `${formatBytes(ready.bytes)} · 本地文件` : "本地交付文件"}</span>
+      {onContinue ? <button type="button" disabled={!ready} onClick={() => { if (ready) onContinue(selected.path); }}>继续修改 <span aria-hidden="true">↗</span></button> : null}
     </footer> : null}
   </section>;
 }
@@ -87,7 +89,7 @@ export function ResultPreviewContent({ result, label, source = false, renderMark
     return <iframe className="results-html-frame" title={label} src={result.previewUrl} sandbox="" referrerPolicy="no-referrer" />;
   }
   if (result.kind === "markdown" && !source && renderMarkdown) return <article className="results-markdown">{renderMarkdown(result.content)}</article>;
-  return <pre className="results-source" tabIndex={0} aria-label="结果文件内容"><code>{result.content}</code></pre>;
+  return <pre className="results-source" tabIndex={0} aria-label="交付文件内容"><code>{result.content}</code></pre>;
 }
 
 function unavailableLabel(reason: Extract<DesktopResultRead, { status: "unavailable" }>["reason"]): string {

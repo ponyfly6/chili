@@ -1,5 +1,5 @@
 import { useReadingPreferences } from "./useReadingPreferences.js";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { DesktopSettings, type SessionSettingsValues } from "./DesktopSettings.js";
 import { conversationTitle, matchingDesktopCommands,
@@ -12,14 +12,18 @@ import { createUserInputDraft, type UserInputDraft } from "./user-input-drafts.j
 import { ConversationActivityBar, ConversationQueue } from "./ConversationActivity.js";
 import { conversationActivity } from "./conversation-activity.js";
 import { ResultsPanel } from "./ResultsPanel.js";
+import { DeliveryCard } from "./DeliveryCard.js";
+import { ProgressPanel } from "./ProgressPanel.js";
+import { ChangesPanel } from "./ChangesPanel.js";
+import { latestFileChange } from "./latest-file-change.js";
 import { discoverDesktopResults } from "./result-model.js";
 import { TimelineViewport } from "./TimelineViewport.js";
-import { AgentDetailsPanel } from "./AgentDetailsPanel.js";
 import { sessionDescendantAgents } from "./agent-details-model.js";
 import { formatWorkDuration, workCurrentDetail, workHeadline, workStages, workToolStatus, workToolSubject, workToolTitle, type WorkStage } from "./work-presentation.js";
 import { eventMatchesProject, ProjectViewMemory } from "./project-view-state.js";
 import { useDesktopTheme } from "./useDesktopTheme.js";
 import { getDesktopBuildInfo } from "../shared/build-info.js";
+import { RESULT_PREVIEW_ESCAPE_EVENT } from "../shared/result-preview.js";
 import { SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import { hasRuntimePartStreamGap } from "@chili/sdk";
 import type {
@@ -104,7 +108,7 @@ import {
 type DesktopProjection = CoordinatedProjection<DesktopState, RuntimeSessionSummary, RuntimeSnapshot>;
 const MAX_OUTER_RESYNC_RETRIES = 4;
 const OUTER_RESYNC_RETRY_DELAY_MS = 500;
-type ConversationMode = "chat" | "result" | "split";
+type ConversationPanel = "progress" | "files" | "changes";
 
 export function App({ transport: hostTransport }: { transport: ControlTransport }) {
   const buildInfo = getDesktopBuildInfo();
@@ -125,9 +129,9 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   });
   const [composer, setComposer] = useState("");
   const [inputDrafts, setInputDrafts] = useState<Record<string, UserInputDraft>>({});
-  const [conversationModes, setConversationModes] = useState<Record<string, ConversationMode>>({});
+  const [sidePanel, setSidePanel] = useState<{ scope: string; view: ConversationPanel; path?: string }>();
+  const panelReturnFocus = useRef<HTMLElement | null>(null);
   const [resultTargets, setResultTargets] = useState<Record<string, string>>({});
-  const seenResults = useRef(new Map<string, string>());
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const transport = useMemo(() => projection.state.projectId && hostTransport.forProject
     ? hostTransport.forProject(projection.state.projectId) : hostTransport, [hostTransport, projection.state.projectId]);
@@ -306,21 +310,27 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     pendingQuestions: presentation?.pendingInputs.length ?? 0, readOnly: selectedReadOnly });
   const results = useMemo(() => desktop.workspace && presentation
     ? discoverDesktopResults(presentation.chat.items, desktop.workspace) : [], [desktop.workspace, presentation]);
+  const changeTarget = useMemo(() => snapshot?.sessionId === selectedId
+    ? latestFileChange(snapshot, presentation?.runtime) : undefined, [snapshot, selectedId, presentation]);
   const hasResults = results.length > 0 && Boolean(transport.readResult);
-  const savedMode = conversationModes[conversationScope] ?? "chat";
-  const conversationMode = !hasResults ? "chat" : savedMode === "split" && viewportWidth < 1000 ? "result" : savedMode;
-  const chooseConversationMode = (mode: ConversationMode) => setConversationModes((current) => ({ ...current, [conversationScope]: mode }));
-  const resultsRevision = results.map((result) => `${result.id}:${result.messageId}`).join("|");
-  useEffect(() => {
-    if (!hasResults || presentation?.chat.status !== "idle" || snapshot?.inputQueue?.paused
-      || loadingSession || resyncing || !healthy || presentation.pendingInputs.length || !resultsRevision) return;
-    if (seenResults.current.get(conversationScope) === resultsRevision) return;
-    seenResults.current.set(conversationScope, resultsRevision);
-    if (preferences.autoOpenResults) setConversationModes((current) => ({
-      ...current, [conversationScope]: current[conversationScope] === "split" ? "split" : "result",
-    }));
-  }, [conversationScope, hasResults, loadingSession, preferences.autoOpenResults, presentation?.chat.status, presentation?.pendingInputs.length, resultsRevision,
-    snapshot?.inputQueue?.paused, resyncing, healthy]);
+  const activePanel = sidePanel?.scope === conversationScope ? sidePanel : undefined;
+  const narrowPanel = viewportWidth <= 1000;
+  const workItems = useMemo(() => timelineItems.filter((item): item is DesktopWorkItem => item.kind === "work"), [timelineItems]);
+  const deliveriesByItem = useMemo(() => {
+    const bySource = new Map(results.map((result) => [result.messageId, result]));
+    return new Map(timelineItems.map((item) => [item.id, (item.kind === "work" ? item.items : [item])
+      .flatMap((entry) => { const result = bySource.get(entry.id); return result ? [result] : []; })]));
+  }, [results, timelineItems]);
+  const openPanel = (view: ConversationPanel, path?: string) => {
+    panelReturnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setSidePanel({ scope: conversationScope, view, ...(path ? { path } : {}) });
+  };
+  const closePanel = () => {
+    setSidePanel(undefined);
+    const target = panelReturnFocus.current;
+    requestAnimationFrame(() => { if (target?.isConnected) target.focus({ preventScroll: true }); });
+  };
+  useEffect(() => { setSidePanel(undefined); }, [conversationScope]);
   const commands = commandsOpen && !selectedReadOnly ? matchingDesktopCommands(composer.startsWith("/") ? composer : "/") : [];
   useEffect(() => {
     setCommandsOpen(false);
@@ -1206,6 +1216,9 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             <div className="conversation-title"><h1>{selectedId ? selectedTitle : "新会话"}</h1></div>
             <div className="conversation-heading-actions">
               {activity.kind !== "idle" && !selectedReadOnly ? <span className={`conversation-state state-${activity.kind}`}><span />{activity.label}</span> : null}
+              {selectedId ? <button type="button" className="conversation-panel-trigger" aria-pressed={activePanel?.view === "progress"} onClick={() => activePanel?.view === "progress" ? closePanel() : openPanel("progress")}><Icon name="activity" />进展</button> : null}
+              {hasResults ? <button type="button" className="conversation-panel-trigger" aria-pressed={activePanel?.view === "files"} onClick={() => activePanel?.view === "files" ? closePanel() : openPanel("files")}>交付文件</button> : null}
+              {changeTarget ? <button type="button" className="conversation-panel-trigger" aria-pressed={activePanel?.view === "changes"} onClick={() => activePanel?.view === "changes" ? closePanel() : openPanel("changes")}>改动</button> : null}
               {selectedId && !selectedReadOnly ? <button className="icon-button" aria-label="Task runtime settings" title="会话设置" disabled={runtimeActionsDisabled || !sessionConfig} onClick={() => openSettings("models")}><Icon name="more" /></button> : null}
             </div>
           </div>
@@ -1216,19 +1229,17 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             </div>
           ) : null}
 
-          {hasResults ? <nav className="conversation-viewbar" aria-label="查看方式">
-            <div><button type="button" aria-pressed={conversationMode === "result"} onClick={() => chooseConversationMode("result")}>成果 <span>{results.length}</span></button>
-              <button type="button" aria-pressed={conversationMode === "chat"} onClick={() => chooseConversationMode("chat")}>对话</button></div>
-            {viewportWidth >= 1000 ? <button type="button" className="split-view-button" aria-pressed={conversationMode === "split"} onClick={() => chooseConversationMode("split")}><Icon name="sidebar" />并排查看</button> : null}
-          </nav> : null}
-          <div className={`conversation-stage mode-${conversationMode}`}>
+          <div className={`conversation-stage ${activePanel && !narrowPanel ? "has-side-panel" : ""}`}>
           <div className="conversation-dialogue">
-          <div className="conversation-body" hidden={conversationMode === "result"}>
+          <div className="conversation-body">
           <div className="chat-surface">
           <TimelineViewport scopeKey={JSON.stringify([desktop.projectId, desktop.workspace, selectedId])}>
             {snapshot?.truncated ? <p className="transcript-warning" role="status">{snapshot.warning ?? "This large session was trimmed for desktop safety."}</p> : null}
             {loadingSession ? <p className="empty-copy centered">正在恢复会话…</p> : null}
-            {!loadingSession && timelineItems.map((item) => <TimelineItem key={`${item.kind}:${item.id}`} item={item} expandWork={preferences.expandWork} />)}
+            {!loadingSession && timelineItems.map((item) => <Fragment key={`${item.kind}:${item.id}`}>
+              <TimelineItem item={item} expandWork={preferences.expandWork} />
+              {transport.readResult && (deliveriesByItem.get(item.id) ?? []).map((result) => <DeliveryCard key={result.id} result={result} onOpen={(path) => openPanel("files", path)} />)}
+            </Fragment>)}
             {emptyConversation ? <div className="welcome-card">
               <div className="welcome-mark"><ChiliMark /></div>
               <h2>你想做点什么？</h2><p>从一个想法开始。</p>
@@ -1237,29 +1248,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           </TimelineViewport>
           </div>
           </div>
-
-          {selectedId && descendantAgents.length > 0 ? (
-            <details className="conversation-agents" hidden={conversationMode === "result"}>
-              <summary>分工协作 · {descendantAgents.length}</summary>
-              <div>
-                <AgentDetailsPanel
-                  projectId={desktop.projectId}
-                  sessionId={selectedId}
-                  agents={descendantAgents}
-                  inputQueues={Object.fromEntries(Object.entries(presentation?.runtime.sessions ?? {})
-                    .flatMap(([id, session]) => session.inputQueue ? [[id, session.inputQueue]] : []))}
-                  {...(!runtimeActionsDisabled ? {
-                    onStop: async (agentId: string) => { await transport.stopAgent(selectedId, agentId); await reloadSelected(); },
-                    onResume: async (agentId: string) => { await transport.resumeAgent(selectedId, agentId); await reloadSelected(); },
-                    onSend: async (agentId: string, text: string, mode: "queue" | "steer") => {
-                      await transport.sendAgent(selectedId, agentId, text, mode);
-                      await reloadSelected();
-                    },
-                  } : {})}
-                />
-              </div>
-            </details>
-          ) : null}
 
           {presentation && presentation.pendingInputs.length > 0 ? (
             <div className="blocking-dock">
@@ -1348,14 +1336,24 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             ].map(([label, prompt]) => <button key={label} disabled={!composerEditable} onClick={() => { setComposer(prompt!); composerRef.current?.focus(); }}>{label}<span aria-hidden="true">↗</span></button>)}</div> : null}
           </div>
           </div>
-          {hasResults && selectedId && desktop.workspace && presentation ? <div className="results-surface" hidden={conversationMode === "chat"}>
-            <ResultsPanel key={conversationScope} transport={transport} sessionId={selectedId} workspace={desktop.workspace}
-              items={presentation.chat.items} renderMarkdown={(text) => <MarkdownText text={text} />}
-              {...(!selectedReadOnly ? { onContinue: (path: string) => {
+          {activePanel && selectedId ? <ConversationSidePanel key={conversationScope} title={activePanel.view === "progress" ? "进展" : activePanel.view === "files" ? "交付文件" : "改动"}
+            narrow={narrowPanel} onClose={closePanel} returnFocus={panelReturnFocus.current}>
+            {activePanel.view === "progress" ? <ProgressPanel projectId={desktop.projectId} sessionId={selectedId} agents={descendantAgents}
+              workItems={workItems} pendingQuestions={presentation?.pendingInputs.length ?? 0} {...(presentation ? { runtime: presentation.runtime } : {})}
+              inputQueues={Object.fromEntries(Object.entries(presentation?.runtime.sessions ?? {})
+                .flatMap(([id, session]) => session.inputQueue ? [[id, session.inputQueue]] : []))} /> : null}
+            {activePanel.view === "changes" ? <ChangesPanel transport={transport} sessionId={changeTarget?.sessionId ?? selectedId}
+              {...(changeTarget ? { turnId: changeTarget.turnId } : {})} revision={projection.diffRevision} /> : null}
+            {activePanel.view === "files" && desktop.workspace ? <ResultsPanel key={conversationScope} transport={transport} sessionId={selectedId} workspace={desktop.workspace}
+              results={results} {...(activePanel.path ? { selectedPath: activePanel.path } : {})}
+              onSelect={(path) => setSidePanel({ scope: conversationScope, view: "files", path })} renderMarkdown={(text) => <MarkdownText text={text} />}
+              {...(!runtimeActionsDisabled ? { onContinue: (path: string) => {
                 setResultTargets((current) => ({ ...current, [conversationScope]: path }));
-                requestAnimationFrame(() => composerRef.current?.focus());
-              } } : {})} />
-          </div> : null}
+                if (narrowPanel) setSidePanel(undefined);
+                // The narrow drawer restores its opener on unmount; then move to the single composer.
+                requestAnimationFrame(() => requestAnimationFrame(() => composerRef.current?.focus()));
+              } } : {})} /> : null}
+          </ConversationSidePanel> : null}
           </div>
         </section>
       </main>
@@ -1684,6 +1682,7 @@ const MODAL_FOCUSABLE_SELECTOR = [
   "select:not([disabled])",
   "textarea:not([disabled])",
   "summary",
+  "iframe",
   "[tabindex]:not([tabindex='-1'])",
 ].join(",");
 
@@ -1712,6 +1711,33 @@ function useDialogEscape(close: () => void, disabled: boolean): void {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [close, disabled]);
+}
+
+function ConversationSidePanel({ title, narrow, onClose, returnFocus, children }: {
+  title: string;
+  narrow: boolean;
+  onClose: () => void;
+  returnFocus: HTMLElement | null;
+  children: ReactNode;
+}) {
+  const closeRef = useRef<HTMLButtonElement>(null);
+  useDialogEscape(onClose, !narrow);
+  useEffect(() => {
+    window.addEventListener(RESULT_PREVIEW_ESCAPE_EVENT, onClose);
+    return () => window.removeEventListener(RESULT_PREVIEW_ESCAPE_EVENT, onClose);
+  }, [onClose]);
+  useEffect(() => { closeRef.current?.focus({ preventScroll: true }); }, [narrow]);
+  const content = <>
+    <header className="conversation-side-header">
+      <h2 id="conversation-side-title">{title}</h2>
+      <button ref={closeRef} type="button" className="icon-button" aria-label="关闭侧栏" onClick={onClose}><Icon name="close" /></button>
+    </header>
+    <div className="conversation-side-content">{children}</div>
+  </>;
+  if (narrow) return <ModalFrame labelId="conversation-side-title" className="conversation-side-dialog" onClose={onClose} closeDisabled={false} returnFocus={returnFocus}>{content}</ModalFrame>;
+  return <aside className="conversation-side-panel" aria-label="会话侧栏" onKeyDown={(event) => {
+    if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); onClose(); }
+  }}>{content}</aside>;
 }
 
 function TimelineItem({ item, expandWork }: { item: DesktopTimelineItem; expandWork: boolean }) {

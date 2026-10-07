@@ -2,6 +2,7 @@
 .results-panel-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 24px 17px; flex: none; }
 .results-panel-header p { margin: 0 0 6px; color: var(--muted); font-size: 11px; letter-spacing: .04em; }
 .results-panel-header h2 { margin: 0; color: var(--text); font-size: 16px; font-weight: 500; overflow-wrap: anywhere; }
+.results-panel-header .results-description { margin: 8px 0 0; font-size: 12px; line-height: 1.6; letter-spacing: normal; overflow-wrap: anywhere; }
 .results-refresh { width: 30px; height: 30px; flex: none; padding: 0; color: var(--muted); background: none; font-size: 21px; }
 .results-refresh:hover { color: var(--text); background: var(--panel-hover); }
 .results-tabs { display: flex; overflow-x: auto; flex: none; gap: 5px; padding: 0 24px 14px; }
@@ -27,4 +28,5 @@
 .results-panel-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex: none; padding: 12px 24px; border-top: 1px solid var(--line); }
 .results-panel-footer > span { color: var(--muted); font-size: 10px; }
 .results-panel-footer button { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); background: var(--panel-hover); padding: 7px 10px; font-size: 11px; white-space: nowrap; }
+.results-panel-footer button:disabled { opacity: .45; cursor: not-allowed; }
 @media (max-width: 620px) { .results-panel-header { padding: 16px; } .results-tabs, .results-file-toolbar, .results-panel-footer { padding-left: 16px; padding-right: 16px; } .results-markdown, .results-source { padding: 20px 16px; } }

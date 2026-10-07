@@ -1,5 +1,7 @@
 export const MAX_RESULT_TEXT_BYTES = 512_000;
 export const MAX_RESULT_IMAGE_BYTES = 4_000_000;
+// UI-only signal from the native window when Escape originates in an isolated preview.
+export const RESULT_PREVIEW_ESCAPE_EVENT = "chili:result-preview-escape";
 
 export type DesktopResultKind = "text" | "markdown" | "code" | "html" | "image";
 export type DesktopResultRead = {

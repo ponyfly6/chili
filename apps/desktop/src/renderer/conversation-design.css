@@ -86,9 +86,6 @@ button { cursor: pointer; }
 .conversation-title { min-width: 0; }
 .conversation-heading h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-body { display: grid; flex: 1; min-height: 0; min-width: 0; grid-template-columns: minmax(0, 1fr); overflow: hidden; }
-.conversation-agents { margin: 0 18px 10px; border: 1px solid var(--line); border-radius: var(--radius-md); }
-.conversation-agents > summary { padding: 9px 12px; color: var(--text-secondary); font-size: 12px; cursor: pointer; }
-.conversation-agents > div { max-height: 40vh; padding: 0 12px 12px; overflow: auto; }
 .chat-surface { display: flex; min-height: 0; min-width: 0; }
 .timeline-viewport { width: 100%; }
 .timeline { width: 100%; padding: 28px max(28px, calc((100% - 660px) / 2)) 24px; gap: 22px; }
