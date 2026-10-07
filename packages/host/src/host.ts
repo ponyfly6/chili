@@ -8,9 +8,8 @@ import {
   RuntimeService,
   SingleAgentRuntime,
   SnapshotRecoveryService,
-  buildChiliMemoryPromptFragments,
   chiliBasePromptFragment,
-  createMemoryTool,
+  resolveChiliMemoryDirectories,
   type ModelRouter,
   type PromptFragment,
   type RuntimePromptTurnContext,
@@ -73,7 +72,6 @@ import {
 } from "@chili/skills";
 import { defaultAuthPath, FileAuthStorage } from "@chili/providers";
 import { resolveHostExecutionIdentity } from "./identity.js";
-import { targetPathsForSession } from "./context-targets.js";
 import { createFilesystemPromptCommandControl, type PromptCommandControl } from "@chili/commands";
 import {
   assertSupportedPermissionProfile,
@@ -198,7 +196,6 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     const current = await executionIdentityForCwd(requestedCwd);
     return { chiliHome, projectRoot: current.projectRoot, projectId: current.projectId };
   };
-  const memoryOptions = { chiliHome, optionsForCwd: memoryOptionsForCwd };
   const baseCommands = createFilesystemPromptCommandControl({ cwd, chiliHome });
   let commands: PromptCommandControl = baseCommands;
   let sqliteStore: SqliteEventStore;
@@ -338,8 +335,8 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     const processes = new ManagedProcessManager();
     initializationDrains.push(() => processes.close("runtime_closed"));
     const childRunLimiter = new LocalSubagentConcurrencyLimiter(config.agents.maxConcurrent);
-    const registry = createToolRegistry(skillRegistryForCwd, bashRunner, processes, memoryOptions, childRunLimiter);
-    const childRegistry = createToolRegistry(skillRegistryForCwd, bashRunner, processes, memoryOptions, childRunLimiter);
+    const registry = createToolRegistry(skillRegistryForCwd, bashRunner, processes, childRunLimiter);
+    const childRegistry = createToolRegistry(skillRegistryForCwd, bashRunner, processes, childRunLimiter);
     if (options.userInputQueue) {
       const userInputTool = createRequestUserInputTool(
         options.userInputQueue,
@@ -355,8 +352,6 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       buildHostPromptFragments({
         cwd: context.cwd,
         ...(await memoryOptionsForCwd(context.cwd)),
-        memoryScopes: ["user", "project"],
-        targetPaths: await targetPathsForSession(eventStore, context.sessionId, context.cwd),
         skillRegistry: await skillRegistryForCwd(context.cwd),
         ...(context.turn ? { turn: context.turn } : {}),
       }).then((fragments) => [...fragments, agentExpansionPromptFragment(config.agents), reviewPromptFragment(permissions.get())]);
@@ -364,9 +359,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       buildHostChildPromptFragments({
         cwd: context.cwd,
         ...(await memoryOptionsForCwd(context.cwd)),
-        memoryScopes: ["user", "project"],
         sessionId: context.sessionId,
-        targetPaths: await targetPathsForSession(eventStore, context.sessionId, context.cwd),
         skillRegistry: await skillRegistryForCwd(context.cwd),
         store: eventStore,
         ...(context.turn ? { turn: context.turn } : {}),
@@ -787,11 +780,25 @@ export async function buildHostPromptFragments(input: {
   chiliHome?: string;
   projectId?: string;
   projectRoot?: string;
-  targetPaths?: readonly string[];
-  memoryScopes?: readonly ("user" | "project")[];
 }): Promise<PromptFragment[]> {
+  const directories = await resolveChiliMemoryDirectories({
+    cwd: input.cwd,
+    ...(input.homeDir ? { homeDir: input.homeDir } : {}),
+    ...(input.chiliHome ? { chiliHome: input.chiliHome } : {}),
+    ...(input.projectId ? { projectId: input.projectId } : {}),
+    ...(input.projectRoot ? { projectRoot: input.projectRoot } : {}),
+  });
+  const base = chiliBasePromptFragment();
   const context: PromptFragment[] = [
-    chiliBasePromptFragment(),
+    {
+      ...base,
+      content: [base.content, "", "Memory locations (directories may not exist):",
+        `- Navigation root: ${JSON.stringify(directories.root)}`,
+        `- Personal Markdown: ${JSON.stringify(directories.personal)}`,
+        `- Current project Markdown: ${JSON.stringify(directories.project)}`,
+      ].join("\n"),
+      metadata: { memoryDirectories: directories },
+    },
     {
       id: "chili.tools.code-mode",
       layer: "developer",
@@ -805,16 +812,6 @@ export async function buildHostPromptFragments(input: {
         "Host execution review and worker scope still apply to every nested call, including writes. A failed script does not roll back completed actions; inspect what ran before retrying.",
       ].join("\n"),
     },
-    ...(await buildChiliMemoryPromptFragments({
-      cwd: input.cwd,
-      ...(input.homeDir ? { homeDir: input.homeDir } : {}),
-      ...(input.chiliHome ? { chiliHome: input.chiliHome } : {}),
-      ...(input.projectId ? { projectId: input.projectId } : {}),
-      ...(input.turn?.text ? { query: input.turn.text } : {}),
-      ...(input.targetPaths ? { targetPaths: input.targetPaths } : {}),
-      ...(input.memoryScopes ? { memoryScopes: input.memoryScopes } : {}),
-      ...(input.projectRoot ? { projectRoot: input.projectRoot } : {}),
-    })),
   ];
   const skillsPrompt = formatAvailableSkillsPrompt(input.skillRegistry.list());
   if (skillsPrompt) {
@@ -843,8 +840,6 @@ export async function buildHostChildPromptFragments(input: {
   chiliHome?: string;
   projectId?: string;
   projectRoot?: string;
-  targetPaths?: readonly string[];
-  memoryScopes?: readonly ("user" | "project")[];
 }): Promise<PromptFragment[]> {
   return [
     ...(await buildHostPromptFragments({
@@ -854,9 +849,6 @@ export async function buildHostChildPromptFragments(input: {
       ...(input.homeDir ? { homeDir: input.homeDir } : {}),
       ...(input.chiliHome ? { chiliHome: input.chiliHome } : {}),
       ...(input.projectId ? { projectId: input.projectId } : {}),
-      ...(input.turn?.text ? { query: input.turn.text } : {}),
-      ...(input.targetPaths ? { targetPaths: input.targetPaths } : {}),
-      ...(input.memoryScopes ? { memoryScopes: input.memoryScopes } : {}),
       ...(input.projectRoot ? { projectRoot: input.projectRoot } : {}),
     })),
     chiliChildRuntimeBasePromptFragment(),
@@ -959,7 +951,6 @@ function createToolRegistry(
   skillRegistryForCwd: (cwd: string) => Promise<SkillRegistry>,
   bashRunner: BashRunner,
   processes: ManagedProcessManager,
-  memoryOptions: Parameters<typeof createMemoryTool>[0],
   runLimiter: LocalSubagentConcurrencyLimiter,
 ): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
@@ -972,7 +963,6 @@ function createToolRegistry(
   registry.register(createReadImageTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
-  registry.register(createMemoryTool(memoryOptions));
   registry.register(createActivateSkillTool((context) => skillRegistryForCwd(context.cwd)));
   registry.register(createEditTool());
   registry.register(createWriteFileTool());

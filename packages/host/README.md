@@ -146,9 +146,12 @@ The actual budgeted model request is persisted, with sources and omission reason
 [providers](../providers/README.md), [MCP](../mcp/README.md) and
 [commands](../commands/README.md) document their shared contracts and migrations.
 Existing conversation history is retained. Internal tool IDs are now independent
-of provider IDs, and old history keeps its protocol mapping. Memory Markdown is
-imported transactionally once into the profile database and is thereafter an
-export format, not a second mutable authority.
+of provider IDs, and old history keeps its protocol mapping. Memory is ordinary
+Markdown under the active profile's `memory/personal` and
+`memory/projects/<projectId>` directories. Main and child prompts provide these
+paths without loading their bodies; normal file tools or Bash perform access
+under existing execution policy. There is no dedicated Memory tool or database
+authority, and no import or compatibility path for old Memory storage.
 
 ## Durable session inputs
 
