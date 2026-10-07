@@ -12,7 +12,7 @@ import {
 } from "./models.js";
 import { OpenAICompletionsModel, type OpenAICompletionsModelOptions } from "./openai-completions.js";
 
-export { ZAI_GLM_53_MODEL, ZAI_OPENAI_BASE_URL, ZAI_PROVIDER_ID } from "./models.js";
+export { ZAI_GLM_53_MODEL, ZAI_GLM_53_FLASH_MODEL, ZAI_GLM_53_FLASHX_MODEL, ZAI_OPENAI_BASE_URL, ZAI_PROVIDER_ID } from "./models.js";
 
 export interface ZaiModelOptions {
   apiKey?: string;

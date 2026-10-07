@@ -13,7 +13,10 @@ import type {
   ModelStreamInput,
   ModelTool,
   ModelUsage,
+  ReasoningLevel,
 } from "./types.js";
+import type { MessagesCompatibility } from "./compat.js";
+import { clampReasoningLevel } from "./model-selection.js";
 import { assertImageInputSupported } from "./image-input.js";
 import {
   sharedProviderBackpressureCoordinator,
@@ -40,6 +43,8 @@ export interface AnthropicCompatibleModelOptions {
   maxTokens?: number;
   temperature?: number;
   reasoning?: boolean;
+  reasoningEffort?: ReasoningLevel;
+  compatibility?: Partial<MessagesCompatibility>;
   serviceTier?: ServiceTier;
   fetch?: typeof fetch;
   headers?: Record<string, string>;
@@ -54,6 +59,8 @@ export interface AnthropicRequestBuildOptions {
   maxTokens?: number;
   temperature?: number;
   reasoning?: boolean;
+  reasoningEffort?: ReasoningLevel;
+  compatibility?: Partial<MessagesCompatibility>;
   serviceTier?: ServiceTier;
   stream?: boolean;
   inputCapabilities?: readonly ModelInputCapability[];
@@ -205,6 +212,9 @@ export class AnthropicCompatibleModel implements ChiliModel {
       ? input.serviceTier ?? this.options.serviceTier
       : this.options.serviceTier;
     if (requestReasoning !== undefined) requestOptions.reasoning = requestReasoning;
+    if (this.options.compatibility) requestOptions.compatibility = this.options.compatibility;
+    const effort = reasoningLevelForInput(input) ?? this.options.reasoningEffort;
+    if (effort !== undefined) requestOptions.reasoningEffort = effort;
     if (requestServiceTier !== undefined) requestOptions.serviceTier = requestServiceTier;
 
     const init: RequestInit = {
@@ -468,7 +478,13 @@ export function buildAnthropicRequestBody(
   const system = [...(input.system ?? []), ...(input.developer ?? []), ...systemMessages(messages)].filter(Boolean).join("\n\n");
   if (system) body.system = system;
   if (options.temperature !== undefined) body.temperature = options.temperature;
-  if (options.reasoning !== undefined) {
+  if (options.compatibility?.supportsAdaptiveReasoningEffort) {
+    body.thinking = { type: "adaptive" };
+    const requested = options.reasoning === false ? "off" : options.reasoningEffort;
+    if (requested !== undefined) {
+      body.output_config = { effort: clampReasoningLevel(requested, ["low", "medium", "high", "xhigh", "max"]) };
+    }
+  } else if (options.reasoning !== undefined) {
     body.thinking = { type: options.reasoning ? "adaptive" : "disabled" };
   }
   if (options.serviceTier === "fast") body.service_tier = "priority";
@@ -490,12 +506,16 @@ export function resolveMessagesUrl(baseUrl: string): string {
 }
 
 function reasoningEnabledForInput(input: ModelStreamInput): boolean | undefined {
-  const reasoning = input.reasoningLevel
+  const reasoning = reasoningLevelForInput(input);
+  return reasoning === undefined ? undefined : reasoning !== "off";
+}
+
+function reasoningLevelForInput(input: ModelStreamInput): ReasoningLevel | undefined {
+  return input.reasoningLevel
     ?? input.reasoning
     ?? input.thinking
     ?? input.selection?.reasoning
     ?? input.selection?.thinking;
-  return reasoning === undefined ? undefined : reasoning !== "off";
 }
 
 function toAnthropicMessages(messages: readonly Message[], includeImageContent = true): AnthropicMessage[] {

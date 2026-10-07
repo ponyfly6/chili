@@ -12,6 +12,7 @@ import {
 import { OpenAICompletionsModel, type OpenAICompletionsModelOptions } from "./openai-completions.js";
 
 export {
+  DEEPSEEK_FLASH_MODEL,
   DEEPSEEK_ANTHROPIC_BASE_URL,
   DEEPSEEK_OPENAI_BASE_URL,
   DEEPSEEK_PROVIDER_ID,

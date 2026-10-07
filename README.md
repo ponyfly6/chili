@@ -139,7 +139,7 @@ MINIMAX_BASE_URL=https://api.minimaxi.com/anthropic
 MINIMAX_MODEL=MiniMax-M3
 ```
 
-也兼容旧的 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL` 命名。当前只在目录中提供最新的 `MiniMax-M3`：1M context、524,288 最大输出；CLI 默认申请 131,072 输出 token。`--thinking off|high` 对应 disabled/adaptive thinking，`--service-tier fast` 对应 priority tier。
+也兼容旧的 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL` 命名。默认使用 `MiniMax-M3`：1M context、524,288 最大输出；CLI 默认申请 131,072 输出 token。`--thinking off|high` 对应 disabled/adaptive thinking，`--service-tier fast` 对应 priority tier。另可选择 `MiniMax-M3.1-Flash-Preview`（仅限 M Plan／MiniMax Code），支持 `low|medium|high|xhigh|max` 推理强度，不能关闭思考；它不会替换 M3 默认值。
 
 DeepSeek V4 使用 OpenAI-compatible 接入：
 
@@ -155,7 +155,7 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-pro
 ```
 
-可选模型为当前 V4 系列的 `deepseek-v4-pro` 和 `deepseek-v4-flash`。两者均为 1,048,576 context、384,000 最大输出，支持 `off|low|high|max` reasoning；兼容输入的 `medium|xhigh` 会映射到 `high`。官方 Anthropic 格式端点为 `https://api.deepseek.com/anthropic`，当前 CLI 默认使用 OpenAI 格式端点。
+可选模型为 `deepseek-v4-pro`（0813 版本）和 `deepseek-flash`（V4.1 Flash，支持图片）；旧名 `deepseek-v4-flash` 继续可用，官方会路由到 V4.1 Flash。两者均为 1,048,576 context、393,216 最大输出，支持 `off|low|high|max` reasoning；兼容输入的 `medium|xhigh` 会映射到 `high`。官方 Anthropic 格式端点为 `https://api.deepseek.com/anthropic`，当前 CLI 默认使用 OpenAI 格式端点。
 
 Kimi 使用月之暗面 OpenAI-compatible 接入，默认模型为当前官方推荐的 `kimi-k3`：
 
@@ -171,7 +171,7 @@ MOONSHOT_BASE_URL=https://api.moonshot.cn/v1
 MOONSHOT_MODEL=kimi-k3
 ```
 
-也兼容 `KIMI_API_KEY`、`KIMI_BASE_URL`、`KIMI_MODEL` 命名。K3 为固定 thinking 模型，支持 `low|high|max` effort，1,048,576 context；CLI 使用 `max_completion_tokens=131072` 作为请求默认值。
+也兼容 `KIMI_API_KEY`、`KIMI_BASE_URL`、`KIMI_MODEL` 命名。K3 为固定 thinking 模型，支持 `low|high|max` effort，1,048,576 context；CLI 使用 `max_completion_tokens=131072` 作为请求默认值。目录还提供 `kimi-k2.7-code` 和 `kimi-k2.7-code-highspeed`：262,144 context、支持图片，始终思考并保留历史推理，无可调 effort。
 
 Z.ai 默认使用最新 `glm-5.3`：
 
@@ -185,9 +185,9 @@ ZAI_BASE_URL=https://api.z.ai/api/paas/v4
 ZAI_MODEL=glm-5.3
 ```
 
-GLM-5.3 为固定 thinking 模型，支持 `low|high|max` effort，1M context、131,072 最大输出。目录同时保留官方 Coding Plan Anthropic 协议名 `glm-5.3[1m]`；它是同一代模型的协议 alias，不是旧模型。
+GLM-5.3 为固定 thinking 模型，支持 `low|high|max` effort，1M context、131,072 最大输出。新增 `glm-5.3-flash` 和 `glm-5.3-flashx`，同样为 1M context、131,072 最大输出，并支持图片。FlashX 当前不在 Coding Plan 中。目录同时保留官方 Coding Plan Anthropic 协议名 `glm-5.3[1m]`；它是同一代模型的协议 alias，不是旧模型。
 
-xAI 使用 OpenAI-compatible Chat Completions，默认模型为 `grok-4.6`：
+xAI 使用 OpenAI-compatible Chat Completions，默认模型为 `grok-4.7`：
 
 ```bash
 XAI_API_KEY=... bun run chili -- --model grok "总结这个仓库"
@@ -196,10 +196,12 @@ XAI_API_KEY=... bun run chili -- --model grok "总结这个仓库"
 ```bash
 XAI_API_KEY=
 XAI_BASE_URL=https://api.x.ai/v1
-XAI_MODEL=grok-4.6
+XAI_MODEL=grok-4.7
 ```
 
-`grok`、`xai` 和 `x.ai` 都可作为 provider alias。Grok 4.6 支持 text/image、500k context 与 `low|medium|high|xhigh` reasoning；reasoning 不能关闭。Chat Completions 未显式设置时使用 128,000 的可见输出默认值。
+`grok`、`xai` 和 `x.ai` 都可作为 provider alias。Grok 4.7 支持 text/image、500k context 与 `low|medium|high|xhigh` reasoning；reasoning 不能关闭。Chat Completions 未显式设置时使用 128,000 的可见输出默认值，仍可显式选择 Grok 4.6。
+
+以上目录于 2026-10-07 核对；官方来源、计价条件与接入限制见 [模型目录维护记录](packages/providers/README.md#model-catalog-verification-2026-10-07)。
 
 Codex 有两条独立的连接，通过 provider 明确区分：
 

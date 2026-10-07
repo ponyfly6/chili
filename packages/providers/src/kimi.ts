@@ -11,7 +11,7 @@ import {
 } from "./models.js";
 import { OpenAICompletionsModel, type OpenAICompletionsModelOptions } from "./openai-completions.js";
 
-export { KIMI_K3_MODEL, KIMI_OPENAI_BASE_URL, KIMI_PROVIDER_ID } from "./models.js";
+export { KIMI_K3_MODEL, KIMI_K27_CODE_MODEL, KIMI_K27_CODE_HIGHSPEED_MODEL, KIMI_OPENAI_BASE_URL, KIMI_PROVIDER_ID } from "./models.js";
 
 export interface KimiModelOptions {
   apiKey?: string;

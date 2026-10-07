@@ -1,6 +1,6 @@
 import { BUILTIN_PROVIDERS } from "./provider-definition.js";
 import type { ServiceTier } from "@chili/protocol";
-import type { ChiliModelProvider, ModelDescriptor } from "./types.js";
+import type { ChiliModelProvider, ModelDescriptor, ReasoningLevel } from "./types.js";
 import {
   AnthropicCompatibleModel,
   type AnthropicAuthScheme,
@@ -17,7 +17,7 @@ import {
   MINIMAX_PROVIDER_ID,
 } from "./models.js";
 
-export { MINIMAX_ANTHROPIC_BASE_URL, MINIMAX_M3_MODEL, MINIMAX_PROVIDER_ID } from "./models.js";
+export { MINIMAX_ANTHROPIC_BASE_URL, MINIMAX_M3_MODEL, MINIMAX_M31_FLASH_PREVIEW_MODEL, MINIMAX_PROVIDER_ID } from "./models.js";
 
 export interface MiniMaxModelOptions {
   apiKey?: string;
@@ -29,6 +29,7 @@ export interface MiniMaxModelOptions {
   headers?: Record<string, string>;
   authScheme?: AnthropicAuthScheme;
   reasoning?: boolean;
+  reasoningEffort?: ReasoningLevel;
   serviceTier?: ServiceTier;
   backpressureCoordinator?: ProviderBackpressureCoordinator;
   env?: EnvironmentSource;
@@ -118,6 +119,8 @@ export function createMiniMaxM3Model(options: MiniMaxModelOptions = {}): Anthrop
     maxTokens: options.maxTokens ?? BUILTIN_PROVIDERS.minimax.defaultRequestMaxTokens,
   };
   if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
+  if (descriptor?.compatibility?.messages) modelOptions.compatibility = descriptor.compatibility.messages;
+  if (options.reasoningEffort !== undefined) modelOptions.reasoningEffort = options.reasoningEffort;
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
   if (options.serviceTier !== undefined) modelOptions.serviceTier = options.serviceTier;
   if (options.fetch !== undefined) modelOptions.fetch = options.fetch;

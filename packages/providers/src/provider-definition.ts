@@ -15,7 +15,7 @@ export interface ProviderDefinition {
 const definitions = {
   minimax: {
     displayName: "MiniMax", aliases: [], modelPrefixes: ["minimax-"], auth: "api_key",
-    defaultRequestMaxTokens: 128 * 1024, reasoning: "toggle", serviceTier: true,
+    defaultRequestMaxTokens: 128 * 1024, reasoning: "toggle-effort", serviceTier: true,
   },
   deepseek: {
     displayName: "DeepSeek", aliases: [], modelPrefixes: ["deepseek-"], auth: "api_key",

@@ -10,7 +10,12 @@ export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 export const THINKING_LEVELS = REASONING_LEVELS;
 export type ThinkingLevel = ReasoningLevel;
 
+/** Reference prices per million tokens, not an invoice calculator. */
 export interface ModelCost {
+  /** USD when omitted, for compatibility with existing catalogs. */
+  currency?: "USD" | "CNY";
+  /** Endpoint, tier, context-length, TTL or time-of-day conditions on these rates. */
+  notes?: string;
   input: number;
   output: number;
   cacheRead: number;

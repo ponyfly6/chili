@@ -5,13 +5,13 @@ import {
   findDefaultKnownModel,
   findKnownModel,
   listKnownModels,
-  XAI_GROK_46_MODEL,
+  XAI_GROK_47_MODEL,
   XAI_OPENAI_BASE_URL,
   XAI_PROVIDER_ID,
 } from "./models.js";
 import { OpenAICompletionsModel, type OpenAICompletionsModelOptions } from "./openai-completions.js";
 
-export { XAI_GROK_46_MODEL, XAI_OPENAI_BASE_URL, XAI_PROVIDER_ID } from "./models.js";
+export { XAI_GROK_46_MODEL, XAI_GROK_47_MODEL, XAI_OPENAI_BASE_URL, XAI_PROVIDER_ID } from "./models.js";
 
 export interface XaiModelOptions {
   apiKey?: string;
@@ -68,7 +68,7 @@ export class XaiOpenAIProvider implements ChiliModelProvider {
 
   private defaultModel(): string {
     const env = readXaiEnvironment(this.options.env);
-    return this.options.model ?? env.model ?? XAI_GROK_46_MODEL;
+    return this.options.model ?? env.model ?? XAI_GROK_47_MODEL;
   }
 
   private defaultBaseUrl(): string {
@@ -88,7 +88,7 @@ export function createXaiRouter(options: XaiModelOptions = {}): OpenAICompletion
 
 export function createXaiModel(options: XaiModelOptions = {}): OpenAICompletionsModel {
   const env = readXaiEnvironment(options.env);
-  const model = options.model ?? env.model ?? XAI_GROK_46_MODEL;
+  const model = options.model ?? env.model ?? XAI_GROK_47_MODEL;
   const apiKey = options.apiKey ?? env.apiKey ?? "";
   if (!apiKey) throw new Error("xAI provider requires XAI_API_KEY");
 

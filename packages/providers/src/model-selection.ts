@@ -199,6 +199,8 @@ export function supportsXHighReasoning(model: ModelDescriptor | string | undefin
     id.includes("gpt-5.6") ||
     /^gpt-6(?:\.1)?-/.test(id) ||
     id.includes("grok-4.6") ||
+    id.includes("grok-4.7") ||
+    id.includes("minimax-m3.1-flash-preview") ||
     id.includes("opus-4-6") ||
     id.includes("opus-4.6") ||
     id.includes("opus-4-7") ||
@@ -213,6 +215,8 @@ export function supportsMaxReasoning(model: ModelDescriptor | string | undefined
   return id.includes("gpt-5.6")
     || /^gpt-6(?:\.1)?-/.test(id)
     || id.includes("deepseek-v4-")
+    || id === "deepseek-flash"
+    || id.includes("minimax-m3.1-flash-preview")
     || id.includes("kimi-k3")
     || id.includes("glm-5.3");
 }
