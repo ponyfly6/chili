@@ -40,6 +40,9 @@ import type {
   ToolResourceSpecWithDefaults,
   ToolReviewRequest,
   ToolReviewResult,
+  ToolLifecycleContext,
+  ToolLifecycleOutcome,
+  ToolLifecyclePhase,
   ToolExecutorOptions,
   PersistedToolOutputRegistration,
   ToolRegistryContext,
@@ -47,6 +50,18 @@ import type {
 } from "./types.js";
 
 type ExecutableResourceSpec = ToolResourceSpecWithDefaults;
+
+interface ToolLifecycleState {
+  context: ToolLifecycleContext;
+  phase: ToolLifecyclePhase;
+  status: ToolLifecycleOutcome["status"];
+  handlerEntered: boolean;
+  executionSucceeded: boolean;
+  result?: ToolResult;
+  canonicalResult?: ToolResult;
+  error?: Error;
+  resultProcessingError?: Error;
+}
 
 const MAX_TOOL_RESULT_CONTENT_ITEMS = 64;
 // The desktop outbox admits at most 2,000,000 bytes for one retained envelope.
@@ -111,26 +126,46 @@ export class ToolExecutor {
       : normalizeToolCallId(input.callId);
     const outputArtifactId = `tooloutput_${randomUUID()}` as ToolCallId;
     const activeCallKey = [input.cwd, input.sessionId, input.turnId, callId].join("\0");
-    await this.publish("tool.call_started", input, {
-      turnId: input.turnId,
-      callId,
-      ...(input.providerCallId === undefined ? {} : { providerCallId: input.providerCallId }),
-      ...(input.parentCallId === undefined ? {} : { parentCallId: input.parentCallId }),
-      toolName: boundToolEventName(input.toolName),
-      input: boundToolEventValue(input.input, "tool input"),
-    });
-
-    if (this.activeCallIds.has(activeCallKey)) {
-      return this.fail(input, callId, new Error(`Tool call id is already active: ${callId}`));
-    }
-    this.activeCallIds.add(activeCallKey);
+    const startedAt = this.now();
+    const attemptedInput = boundToolEventValue(input.input, "tool input");
+    const lifecycle: ToolLifecycleState = {
+      context: Object.freeze({
+        sessionId: input.sessionId, turnId: input.turnId, callId,
+        ...(input.providerCallId === undefined ? {} : { providerCallId: input.providerCallId }),
+        ...(input.parentCallId === undefined ? {} : { parentCallId: input.parentCallId }),
+        toolName: input.toolName, cwd: input.cwd, input: freezePreparedValue(attemptedInput),
+        invocationMode: input.parentCallId ? "code" : "direct", prepared: false,
+      }),
+      phase: "starting", status: "failed", handlerEntered: false, executionSucceeded: false,
+    };
+    let ownsCallId = false;
     let release: (() => void) | undefined;
 
     try {
+      // Lifecycle accounting starts at the attempted durable-start boundary, even
+      // when audit storage itself fails and execution must fail closed.
+      await this.publish("tool.call_started", input, {
+        turnId: input.turnId,
+        callId,
+        ...(input.providerCallId === undefined ? {} : { providerCallId: input.providerCallId }),
+        ...(input.parentCallId === undefined ? {} : { parentCallId: input.parentCallId }),
+        toolName: boundToolEventName(input.toolName),
+        input: attemptedInput,
+      });
+      if (this.activeCallIds.has(activeCallKey)) {
+        const error = new Error(`Tool call id is already active: ${callId}`);
+        lifecycle.error = toError(error);
+        return await this.fail(input, callId, error);
+      }
+      this.activeCallIds.add(activeCallKey);
+      ownsCallId = true;
       if (input.signal?.aborted) {
-        return await this.cancel(input, callId, abortReason(input.signal));
+        lifecycle.status = "cancelled";
+        lifecycle.error = abortReason(input.signal);
+        return await this.cancel(input, callId, lifecycle.error);
       }
       try {
+        lifecycle.phase = "validating";
         if (input.parentCallId) await input.dispatchScope?.checkNestedCall({ toolName: input.toolName, input: input.input });
         const prepared = input.prepared ?? await this.prepare(input);
         await this.update(input, callId, "validating");
@@ -140,6 +175,12 @@ export class ToolExecutor {
         }
         const { tool, spec } = details;
         const validated = prepared.validatedInput;
+        lifecycle.context = Object.freeze({
+          ...lifecycle.context, toolName: tool.name, toolDescription: tool.description,
+          risk: tool.risk, input: validated, prepared: true,
+          ...(spec === false ? {} : { resources: freezePreparedValue(spec) as ToolResourceSpecWithDefaults }),
+        });
+        lifecycle.phase = "authorizing";
         if (input.parentCallId && (tool.codeMode !== true || tool.isOrchestrator)) {
           throw new ToolDeniedError(tool.name, "Tool is not available to code mode.");
         }
@@ -150,10 +191,12 @@ export class ToolExecutor {
         const workerAuthorization = await this.authorizeWorkerPolicy(tool, validated, input, spec);
         const { executionPolicy, callerToolPolicy } = workerAuthorization;
 
+        lifecycle.phase = "reviewing";
         const review = await this.review(tool, validated, input, callId, spec);
         const assertCurrentAuthorization = () => this.assertExecutionAuthorized(
           prepared, input, review, workerAuthorization,
         );
+        lifecycle.phase = "snapshotting";
         await this.createSnapshotIfNeeded(tool, input, callId, validated, spec, assertCurrentAuthorization);
         throwIfAborted(input.signal);
         await this.update(input, callId, "running");
@@ -180,8 +223,13 @@ export class ToolExecutor {
         const context = this.context(tool, validated, input, callId, outputArtifactId, registerPersistedOutput,
           executionPolicy, assertCurrentAuthorization, callerToolPolicy);
         // No lifecycle event or policy preparation may await after this final check.
+        lifecycle.phase = "authorizing";
         await context.assertCurrentAuthorization?.();
+        lifecycle.phase = "executing";
+        lifecycle.handlerEntered = true;
         const rawResult = await tool.execute(validated, context);
+        lifecycle.executionSucceeded = true;
+        lifecycle.phase = "processing_result";
         input.dispatchScope?.throwIfFailed();
         throwIfAborted(input.signal);
         if (registeredOutput) {
@@ -202,7 +250,7 @@ export class ToolExecutor {
         const programResult = descriptor?.value === undefined ? rawResult : {
           ...boundToolResult(rawResult), structuredData: validateStructuredToolData(descriptor.value),
         };
-        const result = boundToolResult(await this.processResult(
+        const canonicalResult = boundToolResult(await this.processResult(
           tool,
           input,
           outputArtifactId,
@@ -210,15 +258,22 @@ export class ToolExecutor {
           registeredOutput,
           invalidRegisteredOutputError,
         ));
+        lifecycle.result = canonicalResult;
+        lifecycle.canonicalResult = canonicalResult;
+        const result = await this.processLifecycleResult(tool, lifecycle, canonicalResult, input.signal!);
+        lifecycle.result = result;
 
         throwIfAborted(input.signal);
+        lifecycle.phase = "publishing_result";
         await this.publish("tool.call_finished", input, {
           callId,
           ...(input.providerCallId === undefined ? {} : { providerCallId: input.providerCallId }),
           status: "completed",
-          output: result.output,
+          output: canonicalResult.output,
         });
 
+        lifecycle.status = "completed";
+        lifecycle.phase = "completed";
         return { status: "completed", callId, result };
       } catch (error) {
         if (this.isEventPublishFailure(error)) throw error;
@@ -226,14 +281,27 @@ export class ToolExecutor {
         const normalizedError = input.signal?.aborted
           ? abortReason(input.signal)
           : toError(error);
-        if (input.signal?.aborted || isAbortError(normalizedError)) {
-          return this.cancel(input, callId, normalizedError);
+        lifecycle.error = normalizedError;
+        if (lifecycle.phase === "processing_result" && lifecycle.executionSucceeded) {
+          lifecycle.resultProcessingError ??= normalizedError;
         }
-        return this.fail(input, callId, normalizedError);
+        if (input.signal?.aborted || isAbortError(normalizedError)) {
+          lifecycle.status = "cancelled";
+          return await this.cancel(input, callId, normalizedError);
+        }
+        lifecycle.status = normalizedError.name === "ToolDeniedError" ? "blocked" : "failed";
+        return await this.fail(input, callId, normalizedError);
       }
+    } catch (error) {
+      // Audit failures escape the ordinary tool-result path and retain their
+      // original failure even though they also abort the dispatch scope.
+      lifecycle.error = toError(error);
+      lifecycle.status = isAbortError(error) ? "cancelled" : "failed";
+      throw error;
     } finally {
       release?.();
-      this.activeCallIds.delete(activeCallKey);
+      if (ownsCallId) this.activeCallIds.delete(activeCallKey);
+      this.notifyLifecycleEnded(lifecycle, startedAt);
     }
   }
 
@@ -514,6 +582,71 @@ export class ToolExecutor {
       ...processed,
       output: boundToolWireOutput(processed.output),
     };
+  }
+
+  private async processLifecycleResult(
+    tool: ChiliToolDefinition,
+    lifecycle: ToolLifecycleState,
+    canonical: ToolResult,
+    signal: AbortSignal,
+  ): Promise<ToolResult> {
+    const process = this.options.lifecycle?.processResult;
+    if (!process) return canonical;
+    try {
+      const transformed = await withAbort(
+        process(lifecycle.context, freezePreparedValue(canonical) as ToolResult, signal),
+        signal,
+      );
+      throwIfAborted(signal);
+      const presentation = validateToolResultPresentation(transformed);
+      const limit = effectiveToolResultOutputLimit(tool.maxResultOutputBytes ?? this.options.maxResultOutputBytes);
+      const preview = truncateUtf8(presentation.output, limit);
+      const bounded = boundToolResult({
+        title: presentation.title,
+        output: boundToolWireOutput(preview.truncated
+          ? `${preview.text}\n[processed tool output truncated after ${limit} bytes]`
+          : presentation.output),
+        ...(presentation.content === undefined ? {} : { content: presentation.content }),
+      });
+      // These fields describe the executed operation and its canonical artifacts,
+      // not its display. A content processor cannot replace or forge them.
+      return {
+        ...bounded,
+        ...(canonical.structuredData === undefined ? {} : { structuredData: canonical.structuredData }),
+        ...(canonical.metadata === undefined ? {} : { metadata: canonical.metadata }),
+        ...(canonical.artifactIds === undefined ? {} : { artifactIds: canonical.artifactIds }),
+      };
+    } catch (error) {
+      if (signal.aborted) throw error;
+      const normalized = toError(error);
+      lifecycle.resultProcessingError = normalized;
+      const notice = `[Tool execution succeeded, but result content processing failed: ${normalized.message}. Do not rerun the tool solely because of this content-processing failure.]`;
+      return boundToolResult({
+        ...canonical,
+        output: boundToolWireOutput(`${notice}\n${canonical.output}`),
+        metadata: { ...canonical.metadata, resultProcessingError: normalized.message, executionSucceeded: true },
+      });
+    }
+  }
+
+  private notifyLifecycleEnded(lifecycle: ToolLifecycleState, startedAt: TimestampMs): void {
+    const ended = this.options.lifecycle?.ended;
+    if (!ended) return;
+    try {
+      const endedAt = this.now();
+      const outcome: ToolLifecycleOutcome = Object.freeze({
+        ...lifecycle,
+        ...(lifecycle.result ? { result: freezePreparedValue(lifecycle.result) as ToolResult } : {}),
+        ...(lifecycle.canonicalResult ? { canonicalResult: freezePreparedValue(lifecycle.canonicalResult) as ToolResult } : {}),
+        ...(lifecycle.error ? { error: copyLifecycleError(lifecycle.error) } : {}),
+        ...(lifecycle.resultProcessingError ? { resultProcessingError: copyLifecycleError(lifecycle.resultProcessingError) } : {}),
+        startedAt, endedAt, durationMs: Math.max(0, endedAt - startedAt),
+      });
+      // The public contract is synchronous. Absorb a JavaScript caller's accidental
+      // returned promise as well, without delaying or changing tool completion.
+      const returned: unknown = ended(outcome);
+      if (returned !== undefined) void Promise.resolve(returned).catch(() => undefined);
+    } catch { /* Observation cannot change an executed operation or its terminal event. */ }
   }
 
   private async processResultWithPersistence(
@@ -951,6 +1084,66 @@ function abortReason(signal: AbortSignal): Error {
     : toError(signal.reason);
   reason.name = "AbortError";
   return toError(reason);
+}
+
+/** Validate one processor's presentation before passing it to the next processor. */
+export function validateToolResultPresentation(result: unknown): Pick<ToolResult, "title" | "output" | "content"> {
+  if (!isPlainRecord(result)) throw new Error("Result processor must return a ToolResult object.");
+  const allowedKeys = new Set(["title", "output", "content", "metadata", "structuredData", "artifactIds"]);
+  for (const key of Reflect.ownKeys(result)) {
+    if (typeof key !== "string" || !allowedKeys.has(key)) {
+      throw new Error("Result processor cannot return execution status, errors, or unknown fields.");
+    }
+    if (!Object.hasOwn(Object.getOwnPropertyDescriptor(result, key)!, "value")) {
+      throw new Error("Result processor cannot return accessors.");
+    }
+  }
+  const title = resultPresentationField(result, "title");
+  const output = resultPresentationField(result, "output");
+  const content = resultPresentationField(result, "content");
+  if (typeof title !== "string" || typeof output !== "string") {
+    throw new Error("Result processor must return string title and output fields.");
+  }
+  let items: ToolResultContent[] | undefined;
+  if (content !== undefined) {
+    if (!Array.isArray(content)) throw new Error("Result processor content must be an array.");
+    const count = resultPresentationField(content, "length");
+    if (typeof count !== "number" || count > MAX_TOOL_RESULT_CONTENT_ITEMS) {
+      throw new Error(`Result processor content exceeds ${MAX_TOOL_RESULT_CONTENT_ITEMS} items.`);
+    }
+    items = [];
+    for (let index = 0; index < count; index++) {
+      const item = resultPresentationField(content, String(index));
+      const type = resultPresentationField(item, "type");
+      const text = resultPresentationField(item, "text");
+      if (type === "text" && typeof text === "string") {
+        items.push({ type, text });
+        continue;
+      }
+      const data = resultPresentationField(item, "data");
+      const mimeType = resultPresentationField(item, "mimeType");
+      if (type === "image" && typeof data === "string" && typeof mimeType === "string") {
+        items.push({ type, data, mimeType });
+        continue;
+      }
+      throw new Error("Result processor returned invalid content.");
+    }
+  }
+  return { title, output, ...(items === undefined ? {} : { content: items }) };
+}
+
+function resultPresentationField(value: unknown, key: string): unknown {
+  if (typeof value !== "object" || value === null) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor && !("value" in descriptor)) throw new Error("Result processor cannot return accessors.");
+  return descriptor?.value;
+}
+
+function copyLifecycleError(error: Error): Error {
+  const normalized = toError(error);
+  const copy = new Error(normalized.message);
+  copy.name = normalized.name;
+  return Object.freeze(copy);
 }
 
 function boundToolResult(result: ToolResult): ToolResult {

@@ -171,10 +171,65 @@ export interface ToolExecutionGate {
   review(request: ToolReviewRequest, signal?: AbortSignal): Promise<ToolReviewResult>;
 }
 
+export type ToolLifecyclePhase =
+  | "starting"
+  | "validating"
+  | "authorizing"
+  | "reviewing"
+  | "snapshotting"
+  | "executing"
+  | "processing_result"
+  | "publishing_result"
+  | "completed";
+
+/** A copied operation description, never an execution capability. */
+export interface ToolLifecycleContext {
+  readonly sessionId: SessionId;
+  readonly turnId: TurnId;
+  readonly callId: ToolCallId;
+  readonly parentCallId?: ToolCallId;
+  readonly providerCallId?: string;
+  readonly toolName: string;
+  readonly cwd: string;
+  /** Prepared input when available; otherwise a bounded attempted input. */
+  readonly input: unknown;
+  readonly invocationMode: "direct" | "code";
+  readonly prepared: boolean;
+  readonly toolDescription?: string;
+  readonly risk?: ChiliToolDefinition["risk"];
+  readonly resources?: ToolResourceSpecWithDefaults;
+}
+
+/** Executor-owned facts, including failures after an effect has already succeeded. */
+export interface ToolLifecycleOutcome {
+  readonly context: ToolLifecycleContext;
+  readonly phase: ToolLifecyclePhase;
+  readonly handlerEntered: boolean;
+  readonly executionSucceeded: boolean;
+  readonly status: "completed" | "failed" | "blocked" | "cancelled";
+  readonly startedAt: TimestampMs;
+  readonly endedAt: TimestampMs;
+  readonly durationMs: number;
+  /** The returned presentation, after optional content processing. */
+  readonly result?: ToolResult;
+  /** The canonical tool result, before presentation processing. */
+  readonly canonicalResult?: ToolResult;
+  readonly error?: Error;
+  readonly resultProcessingError?: Error;
+}
+
+export interface ToolLifecycleHooks {
+  /** Transform title/output/content only, after canonical artifact processing. */
+  processResult?(context: ToolLifecycleContext, result: ToolResult, signal: AbortSignal): Promise<ToolResult>;
+  /** Synchronous observation after permits are released; failures cannot change the outcome. */
+  ended?(outcome: ToolLifecycleOutcome): void;
+}
+
 export interface ToolExecutorOptions {
   registry: ToolRegistry;
   events: ToolEventSink;
   gate: ToolExecutionGate;
+  lifecycle?: ToolLifecycleHooks;
   policyResolver?: ToolAccessPolicyResolver;
   snapshotProvider?: SnapshotProvider;
   snapshotPolicy?: SnapshotPolicy;
