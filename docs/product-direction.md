@@ -8,7 +8,7 @@
 
 2026-10-01 更新：**当前以用户能将自己的真实日常工作从 Codex/ChatGPT 迁到本地 Chili 为产品标准。** 公开下载、签名、公证、更新渠道与商业分发后置。围绕持续增强的编码智能体打磨极简且完整的客户端，不限定为表格办公，不以一次演示作为完成。用户允许改变架构、语言和框架；取舍以产品收益及迭代效率为依据。共享 Host 的当前实现与迁移边界见 [`@chili/host`](../packages/host/README.md)。
 
-后续完成 Codex、DeepSeek Harness、Pi、OpenCode 的专项研究和独立设计复核，形成 [Host 重设计建议](chili-host-design-2026-10-01.md)：公共装配与执行状态统一，保留现有核心与存储；不引入各参考项目完整框架。批次 A 的公共装配已经归位：CLI 与 Desktop 使用同一 Host 工厂，TUI 沿用 HTTP/SSE，命令展开和工具限制共用逻辑。批次 B 已将持久接纳、提交去重、队列与 Goal 仲裁、停止/恢复接入公共 RuntimeService；桌面读取后端状态，重启恢复要求明确继续并核对未知操作结果。每个 store 一个逻辑 owner，不预先固定每项目一个后台进程。执行 owner 的冲突拒绝与 Memory/Context 基础重构已按本文开头的 2026-10-03 实施记录推进；跨进程 attach 与独立后台生命周期仍未实现。
+后续完成 Codex、DeepSeek Harness、Pi、OpenCode 的专项研究和独立设计复核，形成 [Host 重设计建议](chili-host-design-2026-10-01.md)：公共装配与执行状态统一，保留现有核心与存储；不引入各参考项目完整框架。批次 A 的公共装配已经归位：CLI 与 Desktop 使用同一 Host 工厂，TUI 沿用 HTTP/SSE，命令展开和工具限制共用逻辑。批次 B 已将持久接纳、提交去重、队列、停止/恢复接入公共 RuntimeService；桌面读取后端状态，重启恢复要求明确继续并核对未知操作结果。每个 store 一个逻辑 owner，不预先固定每项目一个后台进程。执行 owner 的冲突拒绝与 Memory/Context 基础重构已按本文开头的 2026-10-03 实施记录推进；跨进程 attach 与独立后台生命周期仍未实现。
 
 ## 核心承诺
 
@@ -40,7 +40,7 @@ flowchart LR
 
 ## 当前架构中真正值得推进的缺口
 
-现有多项目 runtime、历史、Goal、Queue / Steer / Stop、工具执行和统一 Agent 继续复用。Agent 以 Session 为身份，共用持久输入队列。按新的产品前提，优先级如下。
+现有多项目 runtime、历史、Queue / Steer / Stop、工具执行和统一 Agent 继续复用。目标和完成标准留在对话中，模型自行判断；运行时不维护独立 Goal 状态或自动续跑。Agent 以 Session 为身份，共用持久输入队列。按新的产品前提，优先级如下。
 
 | 当前接线 | 对自主工作的影响 | 演进方向 |
 | --- | --- | --- |

@@ -6,7 +6,6 @@ export * from "./prompt/index.js";
 export * from "./doom-loop-guard.js";
 export * from "./delegation.js";
 export * from "./failure-checkpoint.js";
-export * from "./goal.js";
 export * from "./recovery.js";
 export * from "./retry.js";
 export * from "./runner.js";

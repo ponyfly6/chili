@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { normalizeSessionTitle, SESSION_TITLE_MAX_CHARS } from "./runtime.js";
 
 test("normalizes session title whitespace through one canonical boundary", () => {
-  expect(normalizeSessionTitle("  Overnight   Goal\nconsole  ")).toBe("Overnight Goal console");
+  expect(normalizeSessionTitle("  Overnight   Agent\nconsole  ")).toBe("Overnight Agent console");
 });
 
 test("accepts the canonical session title limit after normalization", () => {

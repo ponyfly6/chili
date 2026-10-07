@@ -357,20 +357,6 @@ test("RuntimeService shutdown after a completed prompt preserves the final idle 
   ))).toEqual([]);
 });
 
-test("standalone goal failure terminalizes before releasing its exact run claim", async () => {
-  const sessionId = "session_goal_failure_claim_fence" as SessionId;
-  const store = new PeerTakeoverOnReleaseStore(sessionId);
-  store.addSession(sessionId);
-  const service = createRuntimeService(new ThrowingGoalRunner(), store);
-
-  await service.setGoal({ sessionId, objective: "fail inside the held claim" });
-  await waitUntil(() => !service.isRunning(sessionId));
-
-  expect(statuses(store)).toEqual(["running", "failed"]);
-  expect(store.postReleaseStatuses).toEqual([]);
-  expect(store.claims.get(sessionId)).toBe("peer_claim_after_release");
-});
-
 test("RuntimeService shutdown is idempotent while closing and after closure", async () => {
   const sessionId = "session_shutdown_idempotent" as SessionId;
   const runner = new AbortAwareSlowRunner();
@@ -512,18 +498,6 @@ test("RuntimeService rejects every public mutation after shutdown", async () => 
       invoke: () => service.setDelegationPolicy({ sessionId, policy: "off" }),
     },
     {
-      name: "setGoal",
-      invoke: () => service.setGoal({ sessionId, objective: "blocked" }),
-    },
-    {
-      name: "updateGoal",
-      invoke: () => service.updateGoal({ sessionId, status: "paused" }),
-    },
-    {
-      name: "clearGoal",
-      invoke: () => service.clearGoal({ sessionId }),
-    },
-    {
       name: "compactSession",
       invoke: () => service.compactSession({ sessionId }),
     },
@@ -603,14 +577,14 @@ test("RuntimeService applies the canonical session title normalization and limit
   const sessionId = "session_canonical_title" as SessionId;
   const { service, store } = runtimeFixture(new ImmediateAbortRunner(), sessionId);
 
-  await service.renameSession(sessionId, "  Overnight   Goal\nconsole  ");
+  await service.renameSession(sessionId, "  Overnight   Work\nconsole  ");
   await expect(service.renameSession(sessionId, "x".repeat(SESSION_TITLE_MAX_CHARS + 1)))
     .rejects.toThrow(`${SESSION_TITLE_MAX_CHARS} characters or fewer`);
 
   expect(store.items.filter((event) => event.type === "session.renamed")).toEqual([
     expect.objectContaining({
       sessionId,
-      payload: { sessionId, title: "Overnight Goal console" },
+      payload: { sessionId, title: "Overnight Work console" },
     }),
   ]);
 });
@@ -937,20 +911,6 @@ class AbortAwareBoundaryRunner implements AgentRunner {
   }
 }
 
-class ThrowingGoalRunner implements AgentRunner {
-  async createSession(input: CreateSessionInput): Promise<SessionId> {
-    return input.sessionId ?? ("session_shutdown_created" as SessionId);
-  }
-
-  async appendUserMessage(_input: AppendUserMessageInput): Promise<MessageId> {
-    return "message_goal_failure_user" as MessageId;
-  }
-
-  async runTurn(): Promise<RunTurnResult> {
-    throw new Error("goal continuation failed inside claim");
-  }
-}
-
 class ClaimTrackingEventStore implements EventStore {
   readonly items: ChiliEvent[] = [];
   readonly sessionRows: SessionRow[] = [];
@@ -1014,7 +974,7 @@ class ClaimTrackingEventStore implements EventStore {
     const session = this.sessionRows.find((candidate) => candidate.id === input.sessionId);
     if (!session) return { status: "not_found" };
     if (session.status !== "active") return { status: "inactive", sessionStatus: session.status };
-    if (session.readOnly || Boolean(session.agent) !== (input.sessionAccess === "child")) return { status: "forbidden" };
+    if (Boolean(session.agent) !== (input.sessionAccess === "child")) return { status: "forbidden" };
     if (this.claims.has(input.sessionId)) return { status: "busy" };
     this.claims.set(input.sessionId, input.claimId);
     return { status: "claimed" };
@@ -1096,29 +1056,6 @@ class RenameAppendGateStore extends ClaimTrackingEventStore {
       await this.allowRename.promise;
     }
     await super.append(event);
-  }
-}
-
-class PeerTakeoverOnReleaseStore extends ClaimTrackingEventStore {
-  readonly postReleaseStatuses: string[] = [];
-  private released = false;
-
-  constructor(private readonly fencedSessionId: SessionId) {
-    super();
-  }
-
-  override async append(event: ChiliEvent): Promise<void> {
-    if (this.released && event.type === "session.status_changed" && event.sessionId === this.fencedSessionId) {
-      this.postReleaseStatuses.push(event.payload.status);
-    }
-    await super.append(event);
-  }
-
-  override releaseSessionRun(input: { sessionId: SessionId; claimId: string }): void {
-    super.releaseSessionRun(input);
-    if (input.sessionId !== this.fencedSessionId) return;
-    this.released = true;
-    this.claims.set(input.sessionId, "peer_claim_after_release");
   }
 }
 

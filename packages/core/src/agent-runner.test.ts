@@ -127,13 +127,6 @@ test("root RuntimeService rejects child sessions while the child runtime admits 
   await expect(root.compactSession({ sessionId })).rejects.toBeInstanceOf(
     RuntimeSessionAccessError,
   );
-  await expect(root.setGoal({ sessionId, objective: "bypass through goal continuation" })).rejects.toBeInstanceOf(
-    RuntimeSessionAccessError,
-  );
-  await expect(root.updateGoal({ sessionId, status: "paused" })).rejects.toBeInstanceOf(
-    RuntimeSessionAccessError,
-  );
-  await expect(root.clearGoal({ sessionId })).rejects.toBeInstanceOf(RuntimeSessionAccessError);
   await expect(root.inspectPrompt({ sessionId })).rejects.toBeInstanceOf(RuntimeSessionAccessError);
   await expect(root.setModel({
     sessionId,
@@ -196,31 +189,6 @@ test("child runtimes reject root sessions and cannot create sessions outside ato
   expect(runner.userMessages).toEqual([]);
   expect(runner.turnInputs).toEqual([]);
   expect(store.items).toEqual([]);
-});
-
-test("historical sessions remain readable and reject execution and mutation in both runtimes", async () => {
-  const sessionId = "session_historical_read_only" as SessionId;
-  for (const sessionAccess of ["root", "child"] as const) {
-    const store = new SessionIdentityEventStore({ id: sessionId, cwd: "/history", readOnly: true,
-      status: "active", createdAt: 1, updatedAt: 1 });
-    const runner = new FakeAgentRunner();
-    const service = new RuntimeService({ runtime: runner, store, cwd: "/repo", sessionAccess });
-    await expect(service.assertSessionReadAllowed(sessionId)).resolves.toBeUndefined();
-    const mutations: Array<() => Promise<unknown>> = [
-      () => service.submitPrompt({ sessionId, text: "restart legacy work" }),
-      () => service.appendUserMessage({ sessionId, text: "change history" }),
-      () => service.compactSession({ sessionId }),
-      () => service.setGoal({ sessionId, objective: "restart legacy work" }),
-      () => service.updateGoal({ sessionId, status: "active" }),
-      () => service.setDelegationPolicy({ sessionId, policy: "proactive" }),
-      () => service.renameSession(sessionId, "changed"),
-      () => service.archiveSession(sessionId),
-    ];
-    for (const mutate of mutations) await expect(mutate()).rejects.toMatchObject({ name: "RuntimeSessionAccessError" });
-    expect(runner.userMessages).toEqual([]);
-    expect(runner.turnInputs).toEqual([]);
-    expect(store.items).toEqual([]);
-  }
 });
 
 test("RuntimeService allows archived root reads without reopening turn admission", async () => {
@@ -610,8 +578,6 @@ test("RuntimeService rethrows inactive prompt boundaries without status side eff
       () => service.setReasoning({ sessionId, reasoningLevel: "high" }),
       () => service.setServiceTier({ sessionId, serviceTier: "fast" }),
       () => service.setDelegationPolicy({ sessionId, policy: "off" }),
-      () => service.updateGoal({ sessionId, status: "paused" }),
-      () => service.clearGoal({ sessionId }),
       () => service.renameSession(sessionId, "blocked rename"),
       () => service.archiveSession(sessionId),
     ];
@@ -1853,12 +1819,11 @@ test("a detached async chain can acquire a fresh session operation after its inh
   expect(store.claimId).toBeUndefined();
 });
 
-test("prompt, standalone goal, and compaction expose their held claim to nested session operations", async () => {
+test("prompt and compaction expose their held claim to nested session operations", async () => {
   const store = new MemoryEventStore();
   const promptSessionId = "session_operation_prompt" as SessionId;
-  const goalSessionId = "session_operation_goal" as SessionId;
   const compactSessionId = "session_operation_compact" as SessionId;
-  for (const sessionId of [promptSessionId, goalSessionId, compactSessionId]) store.addSession(sessionId);
+  for (const sessionId of [promptSessionId, compactSessionId]) store.addSession(sessionId);
   const runner = new FakeAgentRunner() as FakeAgentRunner & {
     compactContext(input: { sessionId: SessionId }): Promise<{
       status: "skipped";
@@ -1873,9 +1838,6 @@ test("prompt, standalone goal, and compaction expose their held claim to nested 
       operation.assertCurrent();
       nestedSessions.push(input.sessionId);
     });
-    if (input.sessionId === goalSessionId) {
-      await service.updateGoal({ sessionId: goalSessionId, status: "complete" });
-    }
   };
   runner.compactContext = async (input) => {
     await service.withSessionOperation(input.sessionId, (operation) => {
@@ -1892,204 +1854,16 @@ test("prompt, standalone goal, and compaction expose their held claim to nested 
     runtime: runner,
     store,
     cwd: "/repo",
-    maxGoalTurns: 2,
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
   });
 
   await expect(service.submitPrompt({ sessionId: promptSessionId, text: "prompt" }))
     .resolves.toMatchObject({ status: "completed" });
-  await service.setGoal({ sessionId: goalSessionId, objective: "finish once" });
-  while (service.isRunning(goalSessionId)) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  }
   await expect(service.compactSession({ sessionId: compactSessionId }))
     .resolves.toMatchObject({ status: "skipped" });
 
-  expect(nestedSessions).toEqual([promptSessionId, goalSessionId, compactSessionId]);
-});
-
-test("immediate Goal resume waits for the interrupted run to settle and starts exactly once", async () => {
-  const store = new MemoryEventStore();
-  const sessionId = "session_goal_pause_immediate_resume" as SessionId;
-  store.addSession(sessionId);
-  const runner = new FakeAgentRunner();
-  const firstTurnStarted = deferred<void>();
-  const releaseFirstTurn = deferred<void>();
-  const resumedTurnStarted = deferred<void>();
-  let service: RuntimeService;
-  runner.onRunTurn = async () => {
-    const turnNumber = runner.turnInputs.length;
-    if (turnNumber === 1) {
-      firstTurnStarted.resolve();
-      await releaseFirstTurn.promise;
-      runner.runTurnResult = {
-        status: "completed",
-        turnId: "turn_goal_before_pause" as TurnId,
-        assistantMessageId: "message_goal_before_pause" as MessageId,
-        finishReason: "stop",
-      };
-      return;
-    }
-    if (turnNumber === 2) {
-      resumedTurnStarted.resolve();
-      await service.updateGoal({ sessionId, status: "complete" });
-      runner.runTurnResult = {
-        status: "completed",
-        turnId: "turn_goal_after_resume" as TurnId,
-        assistantMessageId: "message_goal_after_resume" as MessageId,
-        finishReason: "stop",
-      };
-      return;
-    }
-    throw new Error(`Unexpected Goal turn: ${turnNumber}`);
-  };
-  service = new RuntimeService({
-    runtime: runner,
-    store,
-    cwd: "/repo",
-    createId: createSequentialId(),
-    now: () => 1 as TimestampMs,
-  });
-
-  await service.setGoal({ sessionId, objective: "resume after pause" });
-  await firstTurnStarted.promise;
-  await service.updateGoal({ sessionId, status: "paused" });
-  await service.updateGoal({ sessionId, status: "active" });
-  await service.updateGoal({ sessionId, status: "active" });
-
-  expect(runner.turnInputs).toHaveLength(1);
-  releaseFirstTurn.resolve();
-  await resumedTurnStarted.promise;
-  while (service.isRunning(sessionId)) await Promise.resolve();
-  await Promise.resolve();
-
-  expect(runner.turnInputs).toHaveLength(2);
-  expect(await service.getGoal({ sessionId })).toMatchObject({ status: "complete" });
-  expect(statuses(store)).toEqual(["running", "cancelled", "running", "idle"]);
-});
-
-test("raising a budget-limited Goal during wrap-up defers one continuation until wrap-up settles", async () => {
-  const store = new MemoryEventStore();
-  const sessionId = "session_goal_budget_resume_during_wrapup" as SessionId;
-  store.addSession(sessionId);
-  const runner = new FakeAgentRunner();
-  const wrapUpStarted = deferred<void>();
-  const releaseWrapUp = deferred<void>();
-  const resumedTurnStarted = deferred<void>();
-  let service: RuntimeService;
-  runner.onRunTurn = async () => {
-    const turnNumber = runner.turnInputs.length;
-    if (turnNumber === 1) {
-      runner.runTurnResult = {
-        status: "completed",
-        turnId: "turn_goal_budget_limit" as TurnId,
-        assistantMessageId: "message_goal_budget_limit" as MessageId,
-        finishReason: "stop",
-        usage: { totalTokens: 1 },
-      };
-      return;
-    }
-    if (turnNumber === 2) {
-      wrapUpStarted.resolve();
-      await releaseWrapUp.promise;
-      runner.runTurnResult = {
-        status: "completed",
-        turnId: "turn_goal_budget_wrapup" as TurnId,
-        assistantMessageId: "message_goal_budget_wrapup" as MessageId,
-        finishReason: "stop",
-        usage: { totalTokens: 1 },
-      };
-      return;
-    }
-    if (turnNumber === 3) {
-      resumedTurnStarted.resolve();
-      await service.updateGoal({ sessionId, status: "complete" });
-      runner.runTurnResult = {
-        status: "completed",
-        turnId: "turn_goal_after_budget_resume" as TurnId,
-        assistantMessageId: "message_goal_after_budget_resume" as MessageId,
-        finishReason: "stop",
-        usage: { totalTokens: 0 },
-      };
-      return;
-    }
-    throw new Error(`Unexpected Goal turn: ${turnNumber}`);
-  };
-  service = new RuntimeService({
-    runtime: runner,
-    store,
-    cwd: "/repo",
-    createId: createSequentialId(),
-    now: () => 1 as TimestampMs,
-  });
-
-  await service.setGoal({ sessionId, objective: "resume after budget wrap-up", tokenBudget: 1 });
-  await wrapUpStarted.promise;
-  expect(await service.getGoal({ sessionId })).toMatchObject({
-    status: "budgetLimited",
-    tokenBudget: 1,
-    tokensUsed: 1,
-  });
-
-  await service.updateGoal({ sessionId, tokenBudget: 100, status: "active" });
-  expect(runner.turnInputs).toHaveLength(2);
-  releaseWrapUp.resolve();
-  await resumedTurnStarted.promise;
-  while (service.isRunning(sessionId)) await Promise.resolve();
-  await Promise.resolve();
-
-  expect(runner.turnInputs).toHaveLength(3);
-  expect(await service.getGoal({ sessionId })).toMatchObject({
-    status: "complete",
-    tokenBudget: 100,
-    tokensUsed: 2,
-  });
-  expect(statuses(store)).toEqual(["running", "idle", "running", "idle"]);
-});
-
-test("an owning prompt acknowledges the active Goal it continues without bypassing the turn fence", async () => {
-  const store = new MemoryEventStore();
-  const sessionId = "session_prompt_acknowledges_deferred_goal" as SessionId;
-  store.addSession(sessionId);
-  const runner = new FakeAgentRunner();
-  const promptTurnStarted = deferred<void>();
-  const releasePromptTurn = deferred<void>();
-  runner.onRunTurn = async () => {
-    const turnNumber = runner.turnInputs.length;
-    if (turnNumber === 1) {
-      promptTurnStarted.resolve();
-      await releasePromptTurn.promise;
-    }
-    runner.runTurnResult = {
-      status: "completed",
-      turnId: `turn_prompt_goal_ack_${turnNumber}` as TurnId,
-      assistantMessageId: `message_prompt_goal_ack_${turnNumber}` as MessageId,
-      finishReason: "stop",
-    };
-  };
-  const service = new RuntimeService({
-    runtime: runner,
-    store,
-    cwd: "/repo",
-    maxGoalTurns: 1,
-    createId: createSequentialId(),
-    now: () => 1 as TimestampMs,
-  });
-
-  const prompt = service.submitPrompt({ sessionId, text: "start ordinary work" });
-  await promptTurnStarted.promise;
-  await service.setGoal({ sessionId, objective: "continue inside the owning prompt" });
-  releasePromptTurn.resolve();
-
-  await expect(prompt).resolves.toMatchObject({ status: "max_turns" });
-  await Promise.resolve();
-  await Promise.resolve();
-
-  expect(service.isRunning(sessionId)).toBe(false);
-  expect(runner.turnInputs).toHaveLength(2);
-  expect(await service.getGoal({ sessionId })).toMatchObject({ status: "active" });
-  expect(statuses(store)).toEqual(["running", "running", "failed"]);
+  expect(nestedSessions).toEqual([promptSessionId, compactSessionId]);
 });
 
 test("withSessionOperation aborts and fails closed when its durable lease is lost", async () => {
@@ -2192,8 +1966,7 @@ test("session operation callers release reservations when the initial lease asse
   const directSessionId = "session_operation_initial_direct" as SessionId;
   const promptSessionId = "session_operation_initial_prompt" as SessionId;
   const compactSessionId = "session_operation_initial_compact" as SessionId;
-  const goalSessionId = "session_operation_initial_goal" as SessionId;
-  for (const sessionId of [directSessionId, promptSessionId, compactSessionId, goalSessionId]) {
+  for (const sessionId of [directSessionId, promptSessionId, compactSessionId]) {
     store.addSession(sessionId);
   }
   store.allowRenew = false;
@@ -2240,37 +2013,10 @@ test("session operation callers release reservations when the initial lease asse
   expect(compactCalled).toBe(false);
   expect(store.claimId).toBeUndefined();
 
-  await service.setGoal({ sessionId: goalSessionId, objective: "blocked before callback" });
-  while (service.isRunning(goalSessionId)) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  }
   expect(runner.turnInputs).toEqual([]);
-  expect(store.claimId).toBeUndefined();
 
   store.allowRenew = true;
   await expect(service.withSessionOperation(directSessionId, () => "reacquired")).resolves.toBe("reacquired");
-});
-
-test("goal continuation boundary rejections do not publish failed session status", async () => {
-  for (const boundary of ["inactive", "child", "missing"] as const) {
-    const sessionId = `session_goal_boundary_${boundary}` as SessionId;
-    const store = new GoalBoundaryEventStore(sessionId, boundary);
-    const runner = new FakeAgentRunner();
-    const service = new RuntimeService({
-      runtime: runner,
-      store,
-      cwd: "/repo",
-      createId: createSequentialId(),
-      now: () => 1 as TimestampMs,
-    });
-
-    await service.setGoal({ sessionId, objective: `stop at ${boundary} boundary` });
-    while (service.isRunning(sessionId)) await Promise.resolve();
-
-    expect(statuses(store)).toEqual([]);
-    expect(runner.turnInputs).toEqual([]);
-    expect(store.items.filter((event) => event.type === "goal.updated")).toHaveLength(1);
-  }
 });
 
 test("RuntimeService continues after OpenAI-compatible tool_calls finish reason", async () => {
@@ -2833,7 +2579,7 @@ class LeaseControlledEventStore extends MemoryEventStore {
     const session = this.sessionRows.find((candidate) => candidate.id === input.sessionId);
     if (!session) return { status: "not_found" };
     if (session.status !== "active") return { status: "inactive", sessionStatus: session.status };
-    if (session.readOnly || Boolean(session.agent) !== (input.sessionAccess === "child")) return { status: "forbidden" };
+    if (Boolean(session.agent) !== (input.sessionAccess === "child")) return { status: "forbidden" };
     if (this.claimId) return { status: "busy" };
     this.claimId = input.claimId;
     return { status: "claimed" };
@@ -2860,32 +2606,6 @@ class SessionIdentityEventStore extends MemoryEventStore {
 
   override async sessions(): Promise<SessionRow[]> {
     return [{ ...this.row }];
-  }
-}
-
-class GoalBoundaryEventStore extends MemoryEventStore {
-  private transitioned = false;
-
-  constructor(
-    private readonly sessionId: SessionId,
-    private readonly boundary: "inactive" | "child" | "missing",
-  ) {
-    super();
-    this.addSession(sessionId);
-  }
-
-  override async append(event: ChiliEvent): Promise<void> {
-    await super.append(event);
-    if (this.transitioned || event.type !== "goal.updated") return;
-    this.transitioned = true;
-    const row = this.sessionRows.find((candidate) => candidate.id === this.sessionId);
-    if (this.boundary === "missing") {
-      this.sessionRows.splice(0, this.sessionRows.length);
-    } else if (row && this.boundary === "inactive") {
-      row.status = "archived";
-    } else if (row) {
-      row.agent = childMetadata();
-    }
   }
 }
 

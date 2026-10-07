@@ -96,7 +96,9 @@ Agent 管理统一使用六个操作：`agent_spawn` 创建、`agent_list` 查�
 
 默认 delegation 策略为 `proactive`：对能改善速度或质量的独立工作主动分工，并遵守用户明确指定的分工、范围和限制。
 
-会话父子关系只由 `agent.parentSessionId` 表达。升级旧库时，一次性将旧工作流身份标记为 `readOnly`，并删除 8 张废弃的 Team/Task/Run/邮箱表；运行时只检查会话自身的只读字段。普通会话消息和原始事件保留，旧工作流事件不再解析或展示。
+会话父子关系只由 `agent.parentSessionId` 表达。数据库直接使用当前 Session、Input 和 Run 模型，不再兼容旧 Team/Task 数据库；使用新库启动。
+
+工作目标和完成标准由对话表达，Agent 自行判断如何推进及何时结束。运行时不维护独立 Goal 状态机，也不会在一轮完成后自动注入续跑指令；后续工作通过同一输入队列交给原 Agent。
 
 通过配置中的 `[agents]` 设置 `max_children`（每个 Agent 的直接子 Agent 数量）、`max_depth`（主 Agent 为第 0 层的最大深度）和 `max_concurrent`（共享并发数量），控制横向与纵向扩展。[配置示例](packages/host/AGENT_CONFIG.md)。
 

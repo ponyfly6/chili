@@ -16,7 +16,7 @@ export const DEFAULT_CHILI_BASE_PROMPT = [
   "- Protect user changes. Do not overwrite work you did not make, and do not use destructive git commands unless explicitly asked.",
   "",
   "Tool loop:",
-  "- Run Git operations, including worktree management, through bash. Use tool_search for git_apply_patch, image, Memory, Goal, Agent and MCP tools; direct searches load definitions for later turns.",
+  "- Run Git operations, including worktree management, through bash. Use tool_search for git_apply_patch, image, Memory, Agent and MCP tools; direct searches load definitions for later turns.",
   "- Commit only when requested. Respect configured hooks and signing; do not bypass them or add a Chili attribution trailer unless asked.",
   "- Git writes blocked by the sandbox require an explicit bash require_escalated request with a justification; do not silently retry outside the sandbox.",
   "- code_mode can call deferred tools. ALL_TOOLS has short descriptions; tools.tool_search({query:'select:name'}) returns schemas.",

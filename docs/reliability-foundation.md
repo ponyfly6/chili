@@ -14,7 +14,7 @@ This intentionally changes compatibility: providers that silently close a stream
 
 ## A logical prompt spans multiple model turns
 
-RuntimeService passes one prompt execution scope through ordinary turns, repair/final-response turns, and automatic Goal continuation. Child-agent runs do the same. A fresh submitted prompt or independently resumed Goal gets a fresh scope.
+RuntimeService passes one prompt execution scope through ordinary turns and repair/final-response turns. Child-agent runs do the same. Each submitted input gets its own scope. A completed response does not trigger an automatic continuation; further work arrives through another input.
 
 Repeated identical tool inputs are counted across turns in a bounded recent-call window. The per-turn total still resets at each turn. This detects repeated calls, not semantic lack of progress, and its default repetition threshold remains 20.
 
@@ -22,9 +22,7 @@ Initial child-agent execution now resolves the same session model configuration 
 
 ## Message order follows event creation
 
-SQLite message projections retain the sequence of their first `message.created` event. Reads and previews use that order rather than wall-clock timestamps or random message IDs. Updates do not move a message. Migration reconstructs known sequences and preserves deterministic ordering for historical rows without creation events.
-
-An insert trigger also fills the sequence for older processes that continue writing the previous projection format. It uses the creation event already written in the same transaction and leaves existing historical orphan rows unchanged.
+SQLite message projections retain the sequence of their first `message.created` event. Reads and previews use that order rather than wall-clock timestamps or random message IDs. Updates do not move a message. The creation sequence is required in the current schema and written in the same transaction as the event.
 
 ## Agents own delegation and review
 
@@ -46,7 +44,7 @@ See [evaluation/README.md](evaluation/README.md) for provenance, usage and limit
 
 ## Validation
 
-Focused behavioral tests cover protocol endings and cancellation, event ordering and migration, prompt scopes, child model configuration, read-only shell boundaries, real Git dependency chains, and evaluation isolation.
+Focused behavioral tests cover protocol endings and cancellation, event ordering and persistence, prompt scopes, child model configuration, read-only shell boundaries, real Git dependency chains, and evaluation isolation.
 
 Final local validation on 2026-09-08:
 
@@ -89,7 +87,7 @@ The SSE application queue has a UTF-8 byte high-water mark. The producer waits
 for `pull()`/available capacity and stops reading additional database pages while
 blocked. SQLite checks the compact payload size before bringing a row into JS;
 pages have a separate byte budget. A legal larger event may occupy its own page.
-An oversized legacy row produces a bounded `chili.resync` control frame.
+An oversized row produces a bounded `chili.resync` control frame.
 
 Temporary output has an independent byte budget, including during initial
 replay. Durable notifications coalesce into one dirty flag instead of retaining

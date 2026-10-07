@@ -11,7 +11,6 @@ export * from "./builtins/edit.js";
 export * from "./builtins/glob.js";
 export * from "./builtins/grep.js";
 export * from "./builtins/git-apply-patch.js";
-export * from "./builtins/goal.js";
 export * from "./builtins/mcp-resources.js";
 export * from "./builtins/process.js";
 export * from "./builtins/read-file.js";

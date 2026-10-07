@@ -504,11 +504,6 @@ export class DesktopControlService {
         if (isChildAgentSession(session)) throw new Error("Use Agent controls to resume a child Agent");
         if (session.status !== "active") throw new Error("Archived tasks cannot be resumed");
         const sessionId = request.sessionId as SessionId;
-        const goal = await lease.client.getGoal({ sessionId, signal: lease.signal });
-        this.assertClientLease(lease);
-        if (goal?.status === "budgetLimited") {
-          throw new Error("Increase the Goal token budget before resuming this task");
-        }
         const queue = await lease.client.resumeInputs({ sessionId, signal: lease.signal });
         this.assertClientLease(lease);
         this.observeInputQueue(queue);
@@ -534,12 +529,6 @@ export class DesktopControlService {
           throw new Error("Stop the current run before archiving this task");
         }
         const sessionId = request.sessionId as SessionId;
-        const goal = await lease.client.getGoal({ sessionId, signal: lease.signal });
-        this.assertClientLease(lease);
-        if (goal?.status === "active") {
-          await lease.client.updateGoal({ sessionId, status: "paused", signal: lease.signal });
-          this.assertClientLease(lease);
-        }
         await lease.client.archiveSession(sessionId);
         this.assertClientLease(lease);
         this.clearSessionQueue(request.sessionId);
@@ -550,15 +539,14 @@ export class DesktopControlService {
     if (request.type === "session.config.get") {
       const lease = this.captureClientLease();
       const sessionId = request.sessionId as SessionId;
-      const [model, permission, delegation, goal, mcp] = await Promise.all([
+      const [model, permission, delegation, mcp] = await Promise.all([
         lease.client.getModelConfig({ sessionId, signal: lease.signal }),
         lease.client.getPermissionConfig({ signal: lease.signal }),
         lease.client.getDelegationConfig({ sessionId, signal: lease.signal }),
-        lease.client.getGoal({ sessionId, signal: lease.signal }),
         lease.client.mcpStatus({ sessionId, signal: lease.signal }),
       ]);
       this.assertClientLease(lease);
-      return { model, permission, delegation, goal: goal ?? null, mcp } satisfies DesktopSessionConfig;
+      return { model, permission, delegation, mcp } satisfies DesktopSessionConfig;
     }
     if (request.type === "session.model.set") {
       const lease = this.captureClientLease();
@@ -629,54 +617,6 @@ export class DesktopControlService {
         });
         this.assertClientLease(lease);
         return config;
-      });
-    }
-    if (request.type === "session.goal.get") {
-      const lease = this.captureClientLease();
-      const goal = await lease.client.getGoal({ sessionId: request.sessionId as SessionId, signal: lease.signal });
-      this.assertClientLease(lease);
-      return { goal: goal ?? null };
-    }
-    if (request.type === "session.goal.set") {
-      const lease = this.captureClientLease();
-      return this.withSessionActor(request.sessionId, async () => {
-        const goal = await lease.client.setGoal({
-          sessionId: request.sessionId as SessionId,
-          objective: request.objective,
-          ...(request.tokenBudget !== undefined ? { tokenBudget: request.tokenBudget } : {}),
-          ...(request.replace !== undefined ? { replace: request.replace } : {}),
-          signal: lease.signal,
-        });
-        this.assertClientLease(lease);
-        return goal;
-      });
-    }
-    if (request.type === "session.goal.update") {
-      const lease = this.captureClientLease();
-      return this.withSessionActor(request.sessionId, async () => {
-        if (request.status === "active" && await this.isBusy(request.sessionId, lease)) {
-          throw new Error("Wait for the current run to stop before resuming this Goal");
-        }
-        const goal = await lease.client.updateGoal({
-          sessionId: request.sessionId as SessionId,
-          ...(request.status !== undefined ? { status: request.status } : {}),
-          ...(request.objective !== undefined ? { objective: request.objective } : {}),
-          ...(request.tokenBudget !== undefined ? { tokenBudget: request.tokenBudget } : {}),
-          signal: lease.signal,
-        });
-        this.assertClientLease(lease);
-        return goal;
-      });
-    }
-    if (request.type === "session.goal.clear") {
-      const lease = this.captureClientLease();
-      return this.withSessionActor(request.sessionId, async () => {
-        const result = await lease.client.clearGoal({
-          sessionId: request.sessionId as SessionId,
-          signal: lease.signal,
-        });
-        this.assertClientLease(lease);
-        return result;
       });
     }
     if (request.type === "mcp.status") {
@@ -755,12 +695,6 @@ export class DesktopControlService {
   private async createConfiguredSession(
     request: Extract<DesktopRequest, { type: "sessions.create" }>,
   ): Promise<DesktopCreateSessionResult> {
-    if (request.goal && (
-      request.prompt === undefined
-      || request.prompt.trim() !== request.goal.objective.trim()
-    )) {
-      throw new TypeError("Goal objective must match the task prompt");
-    }
     const normalizedTitle = request.title === undefined
       ? undefined
       : normalizeSessionTitle(request.title);
@@ -837,23 +771,6 @@ export class DesktopControlService {
       }
     } catch (error) {
       return partial(error);
-    }
-
-    if (request.goal) {
-      stage = "goal";
-      try {
-        const goal = await lease.client.setGoal({
-          sessionId,
-          objective: request.goal.objective,
-          ...(request.goal.tokenBudget !== undefined ? { tokenBudget: request.goal.tokenBudget } : {}),
-          signal: lease.signal,
-        });
-        this.assertClientLease(lease);
-        this.markOptimisticBusy(String(sessionId), lease);
-        return { sessionId: String(sessionId), status: "started", startState: "started", started: true, goal };
-      } catch (error) {
-        return partial(error, true);
-      }
     }
 
     if (request.prompt !== undefined) {

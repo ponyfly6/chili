@@ -18,7 +18,6 @@ export const desktopCommands = [
   { id: "mcp", label: "管理工具连接", group: "settings", page: "tools" },
   { id: "skills", label: "查看可用技能", group: "settings", page: "tools" },
   { id: "memory", label: "偏好与目录说明", group: "settings", page: "memory" },
-  { id: "goal", label: "设置持续工作目标", group: "goal" },
   { id: "advanced", label: "配置高级任务", group: "advanced" },
 ] as const;
 export type DesktopCommand = (typeof desktopCommands)[number];

@@ -9,7 +9,6 @@ import {
 interface ConfigFixture {
   model: { sessionId: string };
   delegation: { sessionId: string };
-  goal: { sessionId: string } | null;
   marker: string;
 }
 
@@ -17,13 +16,11 @@ test("clears config on session switch and accepts only a response for the curren
   const sessionA: ConfigFixture = {
     model: { sessionId: "session-a" },
     delegation: { sessionId: "session-a" },
-    goal: { sessionId: "session-a" },
     marker: "A",
   };
   const sessionB: ConfigFixture = {
     model: { sessionId: "session-b" },
     delegation: { sessionId: "session-b" },
-    goal: null,
     marker: "B",
   };
   expect(sessionConfigAfterSelectionChange("session-a", "session-a", sessionA)).toBe(sessionA);
@@ -39,7 +36,6 @@ test("rejects a mixed-session aggregate even when its model session matches", ()
   const matching: ConfigFixture = {
     model: { sessionId: selected },
     delegation: { sessionId: selected },
-    goal: { sessionId: selected },
     marker: "matching",
   };
   expect(sessionConfigResponseForSelection(selected, matching)).toBe(matching);
@@ -50,10 +46,6 @@ test("rejects a mixed-session aggregate even when its model session matches", ()
   expect(sessionConfigResponseForSelection(selected, {
     ...matching,
     delegation: { sessionId: "session-a" },
-  })).toBeUndefined();
-  expect(sessionConfigResponseForSelection(selected, {
-    ...matching,
-    goal: { sessionId: "session-a" },
   })).toBeUndefined();
 });
 

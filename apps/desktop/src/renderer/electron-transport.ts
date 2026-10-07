@@ -54,14 +54,6 @@ export function createElectronTransport(api: ChiliDesktopApi, projectId?: string
     permissionConfig: () => invoke({ type: "permissions.get" }),
     setPermission: (profile) => invoke({ type: "permissions.set", profile }),
     setDelegation: (sessionId, policy) => invoke({ type: "session.delegation.set", sessionId, policy }),
-    setGoal: (sessionId, objective, tokenBudget) => invoke({
-      type: "session.goal.set",
-      sessionId,
-      objective,
-      ...(tokenBudget !== undefined ? { tokenBudget } : {}),
-    }),
-    updateGoal: (sessionId, input) => invoke({ type: "session.goal.update", sessionId, ...input }),
-    clearGoal: (sessionId) => invoke({ type: "session.goal.clear", sessionId }),
     reloadMcp: (sessionId) => invoke({ type: "mcp.reload", ...(sessionId ? { sessionId } : {}) }),
     send: async (sessionId, text, mode) => {
       const key = JSON.stringify([projectId, sessionId, mode]);

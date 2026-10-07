@@ -49,7 +49,6 @@ import {
   createDelegationStatusTool,
   createEditTool,
   createGitApplyPatchTool,
-  createGoalTools,
   createGlobTool,
   createGrepTool,
   createMcpResourceReadTool,
@@ -63,7 +62,6 @@ import {
   type ChiliToolDefinition,
   type BashRunRequest,
   type DelegationToolController,
-  type GoalToolController,
   type ToolAccessPolicyResolver,
   type ToolAccessPolicy,
 } from "@chili/tools";
@@ -341,16 +339,13 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       if (session.status !== "active") {
         throw new Error(`Session is not active: ${request.sessionId} (${session.status})`);
       }
-      if (session.readOnly) {
-        throw new Error(`Session is read-only: ${request.sessionId}`);
-      }
       const rootSession = sessions.find((candidate) => candidate.id === rootSessionId);
       if (!rootSession) throw new Error(`Approval root session not found: ${rootSessionId}`);
       if (rootSession.status !== "active") {
         throw new Error(`Approval root session is not active: ${rootSessionId} (${rootSession.status})`);
       }
-      if (rootSession.readOnly || rootSession.agent) {
-        throw new Error(`Approval root session must be a writable root: ${rootSessionId}`);
+      if (rootSession.agent) {
+        throw new Error(`Approval root session must be a root: ${rootSessionId}`);
       }
       const sessionCwd = await canonicalSkillWorkspace(session.cwd);
       const sessionConfig = await loadHostConfig(sessionCwd, { chiliHome });
@@ -543,9 +538,6 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       store: eventStore,
       getDelegationConfig: (sessionId) => service.getDelegationConfig(sessionId),
     });
-    for (const tool of createGoalTools(createGoalToolController(service))) {
-      registry.register(tool);
-    }
     const delegationController = createDelegationToolController(service);
     registry.register(createDelegationStatusTool(delegationController));
     registry.register(createDelegationSetTool(delegationController));
@@ -743,9 +735,6 @@ function registerMcpResourceTools(registry: InMemoryToolRegistry, runtime: HostM
 function createSessionToolPolicyResolver(store: ObservableEventStore): ToolAccessPolicyResolver {
   return { async resolve(context) {
     const session = await store.session(context.sessionId);
-    if (session?.readOnly) {
-      throw new Error(`Session is read-only: ${context.sessionId}`);
-    }
     return session?.agent?.policy;
   } };
 }
@@ -822,28 +811,6 @@ function combineToolAccessPolicyResolvers(
 
 function uniqueStrings(values: readonly string[]): string[] {
   return [...new Set(values)];
-}
-
-function createGoalToolController(service: RuntimeService): GoalToolController {
-  return {
-    async getGoal(context) {
-      return service.getGoal({ sessionId: context.sessionId });
-    },
-    async createGoal(input, context) {
-      return service.setGoal({
-        sessionId: context.sessionId,
-        objective: input.objective,
-        ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
-        replace: false,
-      });
-    },
-    async updateGoal(input, context) {
-      return service.updateGoal({
-        sessionId: context.sessionId,
-        status: input.status,
-      });
-    },
-  };
 }
 
 function createDelegationToolController(service: RuntimeService): DelegationToolController {

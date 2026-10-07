@@ -23,7 +23,6 @@ export type TuiCommandResult =
   | { type: "resume_session"; target: string }
   | { type: "open_rename_prompt" }
   | { type: "rename_session"; title: string }
-  | { type: "goal_action"; action: "show" | "set" | "pause" | "resume" | "clear"; objective?: string; tokenBudget?: number }
   | { type: "submit_command"; commandId: string; args: string }
   | { type: "insert_prompt"; text: string }
   | { type: "local_message"; level: "info" | "error"; text: string }

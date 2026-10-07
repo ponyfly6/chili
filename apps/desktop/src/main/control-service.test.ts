@@ -232,7 +232,7 @@ describe("desktop prompt controls", () => {
 
 });
 
-describe("desktop task and Goal controls", () => {
+describe("desktop task controls", () => {
   test("preserves archived task session scope when aggregating readable configuration", async () => {
     const mcpScopes: Array<string | undefined> = [];
     const client = {
@@ -250,7 +250,6 @@ describe("desktop task and Goal controls", () => {
         policy: "proactive",
         source: "session",
       }),
-      getGoal: async () => goalRecord("session_archived", "paused"),
       mcpStatus: async (input: { sessionId?: string } = {}) => {
         mcpScopes.push(input.sessionId);
         return {
@@ -269,7 +268,6 @@ describe("desktop task and Goal controls", () => {
       model: { sessionId: "session_archived", reasoningLevel: "high" },
       permission: { profile: "default" },
       delegation: { sessionId: "session_archived", policy: "proactive" },
-      goal: { sessionId: "session_archived", status: "paused" },
       mcp: { summary: { running: 1 } },
     });
     expect(mcpScopes).toEqual(["session_archived"]);
@@ -328,7 +326,7 @@ describe("desktop task and Goal controls", () => {
 
     const result = await serviceFor(client).invoke({
       type: "sessions.create",
-      title: "  Overnight   Goal\nconsole  ",
+      title: "  Overnight   Release\nconsole  ",
     });
 
     expect(result).toMatchObject({
@@ -337,21 +335,21 @@ describe("desktop task and Goal controls", () => {
       startState: "not_started",
     });
     expect(order).toEqual(["create", "rename"]);
-    expect(renamedTitles).toEqual(["Overnight Goal console"]);
+    expect(renamedTitles).toEqual(["Overnight Release console"]);
   });
 
-  test("configures a Goal task in safe order and starts only through setGoal", async () => {
+  test("configures a task in safe order before submitting its prompt", async () => {
     const order: string[] = [];
     let permission: "default" | "full-access" = "default";
     let promptSubmissions = 0;
     const client = {
       createSession: async () => {
         order.push("create");
-        return { sessionId: "session_goal" };
+        return { sessionId: "session_created" };
       },
       renameSession: async () => {
         order.push("rename");
-        return sessionSummary("session_goal");
+        return sessionSummary("session_created");
       },
       setModel: async () => {
         order.push("model");
@@ -378,29 +376,25 @@ describe("desktop task and Goal controls", () => {
         order.push(`permission:set:${profile}`);
         return permissionConfig(permission);
       },
-      setGoal: async () => {
-        order.push("goal");
-        return goalRecord("session_goal", "active");
-      },
       submitPromptAsync: async () => {
         promptSubmissions += 1;
-        return { status: "accepted", sessionId: "session_goal" };
+        order.push("prompt");
+        return { status: "accepted", sessionId: "session_created" };
       },
     } as unknown as RuntimeClient;
 
     const result = await serviceFor(client).invoke({
       type: "sessions.create",
-      title: "Overnight Goal",
+      title: "Overnight Release",
       prompt: "finish the release",
       modelSelection: { provider: "openai", model: "gpt-5" },
       reasoningLevel: "high",
       serviceTier: "fast",
       permissionProfile: "full-access",
       delegationPolicy: "proactive",
-      goal: { objective: "finish the release", tokenBudget: 20_000 },
     });
 
-    expect(result).toMatchObject({ sessionId: "session_goal", status: "started", started: true });
+    expect(result).toMatchObject({ sessionId: "session_created", status: "started", started: true });
     expect(order).toEqual([
       "create",
       "rename",
@@ -410,9 +404,9 @@ describe("desktop task and Goal controls", () => {
       "delegation",
       "permission:get:default",
       "permission:set:full-access",
-      "goal",
+      "prompt",
     ]);
-    expect(promptSubmissions).toBe(0);
+    expect(promptSubmissions).toBe(1);
   });
 
   test("serializes global permission rollback before a later desktop permission write", async () => {
@@ -508,18 +502,10 @@ describe("desktop task and Goal controls", () => {
     expect(String(permission)).toBe("full-access");
   });
 
-  test("pauses an idle active Goal before making its task read-only", async () => {
+  test("archives an idle task", async () => {
     const order: string[] = [];
     const client = {
       sessionEvents: async () => [],
-      getGoal: async () => {
-        order.push("goal:active");
-        return goalRecord("session_archive", "active");
-      },
-      updateGoal: async ({ status }: { status?: string }) => {
-        order.push(`goal:${status}`);
-        return goalRecord("session_archive", "paused");
-      },
       archiveSession: async () => {
         order.push("archive");
       },
@@ -527,12 +513,10 @@ describe("desktop task and Goal controls", () => {
 
     expect(await serviceFor(client).invoke({ type: "session.archive", sessionId: "session_archive" }))
       .toEqual({ archived: true });
-    expect(order).toEqual(["goal:active", "goal:paused", "archive"]);
+    expect(order).toEqual(["archive"]);
   });
 
-  test("keeps the busy-run archive guard ahead of Goal mutation", async () => {
-    let goalReads = 0;
-    let goalUpdates = 0;
+  test("rejects archiving while a run is busy", async () => {
     let archives = 0;
     const client = {
       sessionEvents: async () => [{
@@ -542,14 +526,6 @@ describe("desktop task and Goal controls", () => {
         sessionId: "session_archive",
         payload: { sessionId: "session_archive", status: "running" },
       }],
-      getGoal: async () => {
-        goalReads += 1;
-        return goalRecord("session_archive", "active");
-      },
-      updateGoal: async () => {
-        goalUpdates += 1;
-        return goalRecord("session_archive", "paused");
-      },
       archiveSession: async () => {
         archives += 1;
       },
@@ -557,41 +533,17 @@ describe("desktop task and Goal controls", () => {
 
     await expect(serviceFor(client).invoke({ type: "session.archive", sessionId: "session_archive" }))
       .rejects.toThrow("Stop the current run before archiving");
-    expect({ goalReads, goalUpdates, archives }).toEqual({ goalReads: 0, goalUpdates: 0, archives: 0 });
+    expect(archives).toBe(0);
   });
 
-  test("archives paused, completed, and budget-limited Goals without rewriting them", async () => {
-    for (const status of ["paused", "complete", "budgetLimited"] as const) {
-      let goalUpdates = 0;
-      let archives = 0;
-      const client = {
-        sessionEvents: async () => [],
-        getGoal: async () => goalRecord(`session_${status}`, status),
-        updateGoal: async () => {
-          goalUpdates += 1;
-          return goalRecord(`session_${status}`, status);
-        },
-        archiveSession: async () => {
-          archives += 1;
-        },
-      } as unknown as RuntimeClient;
-
-      expect(await serviceFor(client).invoke({ type: "session.archive", sessionId: `session_${status}` }))
-        .toEqual({ archived: true });
-      expect({ status, goalUpdates, archives }).toEqual({ status, goalUpdates: 0, archives: 1 });
-    }
-  });
-
-  test("resumes a paused Goal, rejects archived and budget-limited Goals", async () => {
-    const updates: Array<{ status?: string; tokenBudget?: number }> = [];
-    let goalStatus: "paused" | "budgetLimited" = "paused";
+  test("resumes the input queue and rejects archived tasks", async () => {
+    const resumedSessions: string[] = [];
     let lifecycle: "active" | "archived" = "active";
     const client = {
       listSessions: async () => [sessionSummary("session_resume", lifecycle)],
-      getGoal: async () => goalRecord("session_resume", goalStatus),
-      updateGoal: async (input: { status?: string; tokenBudget?: number }) => {
-        updates.push(input);
-        return goalRecord("session_resume", "active");
+      resumeInputs: async ({ sessionId }: { sessionId: string }) => {
+        resumedSessions.push(sessionId);
+        return emptyInputQueue(sessionId);
       },
       ...snapshotClientMethods(),
     } as unknown as RuntimeClient;
@@ -599,69 +551,17 @@ describe("desktop task and Goal controls", () => {
 
     expect((await service.invoke({ type: "session.resume", sessionId: "session_resume" })).sessionId)
       .toBe("session_resume");
-    expect(updates).toHaveLength(1);
-    expect(updates[0]?.status).toBe("active");
-
-    goalStatus = "budgetLimited";
-    await expect(service.invoke({ type: "session.resume", sessionId: "session_resume" }))
-      .rejects.toThrow("Increase the Goal token budget");
-    expect(updates).toHaveLength(1);
+    expect(resumedSessions).toEqual(["session_resume"]);
 
     lifecycle = "archived";
     await expect(service.invoke({ type: "session.resume", sessionId: "session_resume" }))
       .rejects.toThrow("Archived tasks cannot be resumed");
-    expect(updates).toHaveLength(1);
+    expect(resumedSessions).toEqual(["session_resume"]);
   });
 
-  test("forwards a higher Goal budget with active status for explicit recovery", async () => {
-    let received: { status?: string; tokenBudget?: number } | undefined;
-    const client = {
-      sessionEvents: async () => [],
-      updateGoal: async (input: { status?: string; tokenBudget?: number }) => {
-        received = input;
-        return { ...goalRecord("session_budget", "active"), tokenBudget: input.tokenBudget };
-      },
-    } as unknown as RuntimeClient;
-
-    const result = await serviceFor(client).invoke({
-      type: "session.goal.update",
-      sessionId: "session_budget",
-      status: "active",
-      tokenBudget: 40_000,
-    });
-    expect(received).toMatchObject({ status: "active", tokenBudget: 40_000 });
-    expect(result).toMatchObject({ status: "active", tokenBudget: 40_000 });
-  });
-
-  test("does not claim an active Goal resume while a prior run is still draining", async () => {
-    let updates = 0;
-    const client = {
-      sessionEvents: async () => [{
-        id: "event_cancelling",
-        type: "session.status_changed",
-        time: 1,
-        sessionId: "session_budget",
-        payload: { sessionId: "session_budget", status: "cancelling" },
-      }],
-      updateGoal: async () => {
-        updates += 1;
-        return goalRecord("session_budget", "active");
-      },
-    } as unknown as RuntimeClient;
-
-    await expect(serviceFor(client).invoke({
-      type: "session.goal.update",
-      sessionId: "session_budget",
-      status: "active",
-      tokenBudget: 40_000,
-    })).rejects.toThrow("Wait for the current run to stop");
-    expect(updates).toBe(0);
-  });
-
-  test("Steer delegates Goal arbitration entirely to RuntimeService", async () => {
+  test("Steer delegates input arbitration entirely to RuntimeService", async () => {
     const seen: string[] = [];
     const client = {
-      getGoal: async () => { throw new Error("steer must not read Goal"); },
       interruptSession: async () => { throw new Error("steer must not issue a separate interrupt"); },
       submitPromptAsync: async (input: { mode: string }) => { seen.push(input.mode); return acceptedInput("s", "change", true); },
     } as unknown as RuntimeClient;
@@ -1282,7 +1182,7 @@ describe("desktop session projections", () => {
 function serviceFor(client: RuntimeClient, onError: (error: Error) => void = () => undefined): DesktopControlService {
   client.inputQueue ??= async ({ sessionId }) => emptyInputQueue(sessionId);
   client.getInput ??= async () => undefined;
-  client.resumeInputs ??= async ({ sessionId }) => { await client.updateGoal?.({ sessionId, status: "active" }); return emptyInputQueue(sessionId); };
+  client.resumeInputs ??= async ({ sessionId }) => emptyInputQueue(sessionId);
 
   const sidecar = {
     state: () => ({ sidecar: { phase: "healthy" as const, attempt: 0 }, queuedBySession: {} }),
@@ -1321,18 +1221,6 @@ function permissionConfig(profile: "default" | "auto-review" | "full-access") {
       current: id === profile,
     })),
   } as never;
-}
-
-function goalRecord(sessionId: string, status: "active" | "paused" | "budgetLimited" | "complete") {
-  return {
-    sessionId,
-    objective: "finish the release",
-    status,
-    tokensUsed: 0,
-    timeUsedSeconds: 0,
-    createdAt: 1,
-    updatedAt: 1,
-  };
 }
 
 function snapshotClientMethods() {

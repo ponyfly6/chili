@@ -8,8 +8,6 @@ import type {
   RuntimePermissionProfileId,
   RuntimeSessionStatus,
   ServiceTier,
-  SessionGoal,
-  SessionGoalStatus,
 } from "@chili/protocol";
 import type { RuntimeSessionSummary } from "@chili/sdk";
 
@@ -25,13 +23,11 @@ export interface NewTaskDraft {
   serviceTier: ServiceTierSelection;
   permissionProfile: RuntimePermissionProfileId;
   delegationPolicy: DelegationPolicy;
-  goalEnabled: boolean;
-  tokenBudget: string;
 }
 
 export interface NewTaskValidation {
   valid: boolean;
-  errors: Partial<Record<"prompt" | "tokenBudget" | "model" | "reasoningLevel" | "serviceTier", string>>;
+  errors: Partial<Record<"prompt" | "model" | "reasoningLevel" | "serviceTier", string>>;
 }
 
 export interface NewTaskSubmission {
@@ -42,10 +38,6 @@ export interface NewTaskSubmission {
   serviceTier?: ServiceTier;
   permissionProfile: RuntimePermissionProfileId;
   delegationPolicy: DelegationPolicy;
-  goal?: {
-    objective: string;
-    tokenBudget?: number;
-  };
 }
 
 export interface SessionModelSettingsDraft {
@@ -88,8 +80,6 @@ export function createNewTaskDraft(models: readonly RuntimeModelDescriptor[] = [
     serviceTier: preferredServiceTier(selected),
     permissionProfile: "default",
     delegationPolicy: "proactive",
-    goalEnabled: false,
-    tokenBudget: "",
   };
 }
 
@@ -160,10 +150,6 @@ export function validateNewTaskDraft(
       ? "Choose a reasoning level supported by this model."
       : "This model uses provider-default reasoning.";
   }
-  const budget = draft.tokenBudget.trim();
-  if (budget && (!/^\d+$/.test(budget) || Number(budget) <= 0 || !Number.isSafeInteger(Number(budget)))) {
-    errors.tokenBudget = "Token budget must be a positive whole number.";
-  }
   return { valid: Object.keys(errors).length === 0, errors };
 }
 
@@ -184,11 +170,6 @@ export function newTaskSubmission(
   const title = draft.title.trim();
   if (title) submission.title = title;
   if (selected) submission.modelSelection = { provider: selected.provider, model: selected.model };
-  if (draft.goalEnabled) {
-    const goal: NonNullable<NewTaskSubmission["goal"]> = { objective: draft.prompt.trim() };
-    if (draft.tokenBudget.trim()) goal.tokenBudget = Number(draft.tokenBudget.trim());
-    submission.goal = goal;
-  }
   return submission;
 }
 
@@ -204,21 +185,15 @@ export function filterSessions(
     .sort((left, right) => right.updatedAt - left.updatedAt || String(left.id).localeCompare(String(right.id)));
 }
 
-export function goalProgress(tokensUsed: number, tokenBudget?: number): number | undefined {
-  if (!tokenBudget || tokenBudget <= 0) return undefined;
-  return Math.max(0, Math.min(1, tokensUsed / tokenBudget));
-}
-
 export function canResumeTask(
   sessionStatus: RuntimeSessionStatus | "unknown" | undefined,
-  goalStatus: SessionGoalStatus | undefined,
   readOnly: boolean,
   dispatchPaused = false,
 ): boolean {
-  if (dispatchPaused) return !readOnly && goalStatus !== "budgetLimited" && sessionStatus !== "running" && sessionStatus !== "cancelling" && sessionStatus !== "waiting_for_approval";
-  return !readOnly
-    && (goalStatus === "active" || goalStatus === "paused")
-    && (sessionStatus === "cancelled" || sessionStatus === "failed");
+  return dispatchPaused && !readOnly
+    && sessionStatus !== "running"
+    && sessionStatus !== "cancelling"
+    && sessionStatus !== "waiting_for_approval";
 }
 
 export function isSessionReadOnly(
@@ -237,10 +212,6 @@ export function canReloadSessionMcp(
   actionsDisabled: boolean,
 ): boolean {
   return Boolean(sessionId) && !readOnly && !actionsDisabled;
-}
-
-export function goalResumeBudgetMinimum(goal: Pick<SessionGoal, "tokenBudget" | "tokensUsed">): number {
-  return Math.max(goal.tokensUsed + 1, (goal.tokenBudget ?? 0) + 1);
 }
 
 function preferredModel(models: readonly RuntimeModelDescriptor[]): RuntimeModelDescriptor | undefined {

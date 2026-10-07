@@ -1,5 +1,4 @@
 import { afterEach, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,7 +49,7 @@ async function fixture(options: {
   return {
     get store() { return store; },
     get service() { return service; },
-    root, turns, database,
+    root, turns,
     start: () => service.submitPromptAsync({ sessionId: childId, text: "Inspect the implementation",
       submissionId: "initial", mode: "queue", inputSource: "agent", requestIdentity: "initial" }),
     restart: async () => { await service.shutdown(); await store.flushInputMirrors(); store.close(); store = new SqliteEventStore(database); service = create(); },
@@ -196,30 +195,6 @@ test("queued permit cancellation settles the accepted input before any model exe
   expect(f.service.inputQueue(childId).paused).toBe(true);
 });
 
-test("standalone child Goal continuation acquires the same execution permit as submitted inputs", async () => {
-  const wrapped: SessionId[] = [];
-  const f = await fixture({
-    runInput: async (sessionId, signal, run) => {
-      wrapped.push(sessionId);
-      if (wrapped.length === 1) return run();
-      return new Promise((_resolve, reject) => {
-        const stop = () => reject(Object.assign(new Error("permit cancelled"), { name: "AbortError" }));
-        if (signal.aborted) stop(); else signal.addEventListener("abort", stop, { once: true });
-      });
-    },
-  });
-  f.start();
-  await f.service.waitForIdle();
-  await f.service.setGoal({ sessionId: childId, objective: "Continue inspecting" });
-  await until(() => wrapped.length === 2);
-  expect(wrapped).toEqual([childId, childId]);
-  expect(f.turns).toHaveLength(1);
-  await f.service.interrupt(childId);
-  await f.service.waitForIdle();
-  expect(f.turns).toHaveLength(1);
-  expect((await f.service.getGoal({ sessionId: childId }))?.status).toBe("paused");
-});
-
 test("trusted local control can join a busy Agent without granting authority to an unrelated tool context", async () => {
   const f = await fixture({ run: (input) => aborted(input) });
   f.start();
@@ -283,41 +258,14 @@ test("failed external spawn drains under the root claim without failing the root
   expect(await f.store.childSessions(rootId)).toHaveLength(1);
 });
 
-test("root recovery leaves child queues to their trusted runtime and never revives legacy children", async () => {
+test("root recovery leaves child queues to their trusted runtime", async () => {
   const f = await fixture();
   await f.root.recoverInputs();
   expect(f.service.getInput(childId, "initial")?.state).toBe("pending");
-  const legacyId = "legacy_child" as SessionId;
-  await f.store.append({ id: crypto.randomUUID(), type: "session.created", sessionId: legacyId,
-    time: Date.now() as TimestampMs, payload: { sessionId: legacyId, cwd: "/legacy" } });
-  f.store.mutateSessionInputs({ kind: "accept", sessionId: legacyId, submissionId: "legacy_input", inputId: "legacy_input",
-    mode: "queue", payload: JSON.stringify({ sessionId: legacyId, text: "old pending work" }), text: "old pending work", source: "local" });
-  // Seed an old database projection directly: current event writers cannot create old Agent identities.
-  const database = new Database(f.database);
-  try {
-    database.query("delete from schema_migrations where name = ?").run("retired_workflows_v1");
-    database.query("insert into events (id, type, time, session_id, payload_json) values (?, ?, ?, ?, ?)")
-      .run("legacy_run_event", "agent.spawned", 1, rootId, JSON.stringify({
-        runId: "legacy_run", path: "/root/legacy", taskName: "legacy", childSessionId: legacyId,
-      }));
-  } finally { database.close(); }
-  // The upgrade materializes the restriction; runtime reads never inspect old events.
-  new SqliteEventStore(f.database).close();
-  expect((await f.store.session(legacyId))?.readOnly).toBe(true);
-  const before = await f.store.events({ sessionId: legacyId });
-  for (const service of [f.root, f.service]) {
-    await expect(service.assertSessionReadAllowed(legacyId)).resolves.toBeUndefined();
-    await expect(service.assertSessionTurnAllowed(legacyId)).rejects.toThrow("read-only");
-    await expect(service.setGoal({ sessionId: legacyId, objective: "Cannot continue old work" })).rejects.toThrow();
-    expect(() => service.submitPromptAsync({ sessionId: legacyId, text: "Cannot activate history" })).toThrow();
-    await expect(service.resumeInputs(legacyId)).rejects.toThrow();
-    await expect(service.interrupt(legacyId)).rejects.toThrow();
-  }
-  await f.root.recoverInputs();
+  expect(f.service.inputQueue(childId).paused).toBe(false);
   await f.service.recoverInputs();
-  expect(f.service.isRunning(legacyId)).toBe(false);
-  expect(f.service.getInput(legacyId, "legacy_input")?.state).toBe("pending");
-  expect(await f.store.events({ sessionId: legacyId })).toEqual(before);
+  expect(f.service.inputQueue(childId).paused).toBe(true);
+  expect(f.service.getInput(childId, "initial")?.state).toBe("pending");
 });
 
 test("periodic recovery does not pause fresh accepted work before dispatch", async () => {

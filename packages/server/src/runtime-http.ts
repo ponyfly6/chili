@@ -5,7 +5,6 @@ import {
   normalizePersistedError,
   normalizeSessionTitle,
   parseRuntimeArray,
-  parseRuntimeBoolean,
   parseRuntimeIdentifier,
   parseRuntimeModelSelection,
   parseRuntimeRecord,
@@ -21,7 +20,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { RuntimeSessionNotFoundError } from "@chili/core";
-import type { ChiliEvent, EventEnvelope, ApprovalDecisionAction, DelegationPolicy, RuntimeInterruptResult, RuntimeDelegationConfig, RuntimeModelConfig, RuntimeModelDescriptor, RuntimeMcpAddServerRequest, RuntimeMcpControlService, RuntimeMcpScopeInput, RuntimeMcpAuthRequest, RuntimeMcpListResponse, RuntimeMcpServerDescriptor, RuntimeMcpStatusResponse, RuntimeMcpTransport, MessageImageContent, RuntimePermissionConfig, RuntimePermissionProfileId, RuntimeApprovalResolveResult, RuntimePromptAccepted, RuntimePromptResult, RuntimeSessionRef, RuntimeTurnResult, RuntimeSkillMention, ModelSelection, ReasoningLevel, ServiceTier, SessionId, SessionGoal, SessionGoalStatus, PendingUserInputRequest, UserInputAnswers, UserInputId } from "@chili/protocol";
+import type { ChiliEvent, EventEnvelope, ApprovalDecisionAction, DelegationPolicy, RuntimeInterruptResult, RuntimeDelegationConfig, RuntimeModelConfig, RuntimeModelDescriptor, RuntimeMcpAddServerRequest, RuntimeMcpControlService, RuntimeMcpScopeInput, RuntimeMcpAuthRequest, RuntimeMcpListResponse, RuntimeMcpServerDescriptor, RuntimeMcpStatusResponse, RuntimeMcpTransport, MessageImageContent, RuntimePermissionConfig, RuntimePermissionProfileId, RuntimeApprovalResolveResult, RuntimePromptAccepted, RuntimePromptResult, RuntimeSessionRef, RuntimeTurnResult, RuntimeSkillMention, ModelSelection, ReasoningLevel, ServiceTier, SessionId, PendingUserInputRequest, UserInputAnswers, UserInputId } from "@chili/protocol";
 import type { AgentControlService, RuntimeBackgroundErrorHandler, SubmitPromptInput, SubmitPromptResult } from "@chili/core";
 import { SessionInputConflictError } from "@chili/store";
 import { eventStream, type EventStreamOptions } from "./event-stream.js";
@@ -63,10 +62,6 @@ export interface RuntimeHttpService {
   setServiceTier?(input: { sessionId: SessionId; serviceTier: ServiceTier }): Promise<RuntimeModelConfig>;
   getDelegationConfig?(sessionId: SessionId): Promise<RuntimeDelegationConfig>;
   setDelegationPolicy?(input: { sessionId: SessionId; policy: DelegationPolicy }): Promise<RuntimeDelegationConfig>;
-  getGoal?(input: { sessionId: SessionId }): Promise<SessionGoal | undefined>;
-  setGoal?(input: { sessionId: SessionId; objective: string; tokenBudget?: number; replace?: boolean; resumeDispatch?: boolean }): Promise<SessionGoal>;
-  updateGoal?(input: { sessionId: SessionId; status?: SessionGoalStatus; objective?: string; tokenBudget?: number; resumeDispatch?: boolean }): Promise<SessionGoal>;
-  clearGoal?(input: { sessionId: SessionId }): Promise<{ cleared: boolean; previousGoal?: SessionGoal }>;
   assertSessionReadAllowed(sessionId: SessionId): Promise<void>;
   assertSessionTurnAllowed(sessionId: SessionId): Promise<void>;
   submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult>;
@@ -288,7 +283,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "agents" || route.name === "agentSpawn" || route.name === "agentSend" || route.name === "agentWait" || route.name === "agentStop" || route.name === "agentResume") {
         await options.service.assertSessionReadAllowed(route.sessionId);
         const caller = await requireSession(options.store, route.sessionId);
-        if (caller.status !== "active" || caller.agent || caller.readOnly) {
+        if (caller.status !== "active" || caller.agent) {
           return jsonError(403, "Agent control requires an active root session");
         }
         if (!options.agents) return jsonError(501, "No agent control service is configured");
@@ -484,36 +479,6 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           sessionId: route.sessionId,
           policy: body.policy,
         }));
-      }
-
-      if (route.name === "goal") {
-        const goals = requireGoalControl(options);
-        if (request.method === "GET") {
-          rejectUnknownQueryParameters(url, []);
-          await requireSession(options.store, route.sessionId);
-          const goal = await goals.getGoal({ sessionId: route.sessionId });
-          return goal ? json(goal) : new Response(null, { status: 204 });
-        }
-        if (request.method === "POST") {
-          const body = await readJson<GoalBody>(request, ["objective", "tokenBudget", "replace"]);
-          const input = goalSetInput(route.sessionId, body);
-          await options.service.assertSessionTurnAllowed(route.sessionId);
-          await requireSession(options.store, route.sessionId);
-          return json(await goals.setGoal({ ...input, ...(options.service.inputQueue?.(route.sessionId).paused ? { resumeDispatch: true } : {}) }), 201);
-        }
-        if (request.method === "PATCH") {
-          const body = await readJson<GoalBody>(request, ["status", "objective", "tokenBudget"]);
-          const input = goalUpdateInput(route.sessionId, body);
-          await options.service.assertSessionTurnAllowed(route.sessionId);
-          await requireSession(options.store, route.sessionId);
-          return json(await goals.updateGoal({ ...input, ...(input.status === "active" && options.service.inputQueue?.(route.sessionId).paused ? { resumeDispatch: true } : {}) }));
-        }
-        if (request.method === "DELETE") {
-          rejectUnknownQueryParameters(url, []);
-          await options.service.assertSessionTurnAllowed(route.sessionId);
-          await requireSession(options.store, route.sessionId);
-          return json(await goals.clearGoal({ sessionId: route.sessionId }));
-        }
       }
 
       if (route.name === "inputQueue" || route.name === "resumeInputs" || route.name === "cancelInput" || route.name === "cancelInputSource") {
@@ -902,7 +867,6 @@ type Route =
   | { name: "setServiceTier"; sessionId: SessionId }
   | { name: "delegationConfig"; sessionId: SessionId }
   | { name: "setDelegationPolicy"; sessionId: SessionId }
-  | { name: "goal"; sessionId: SessionId }
   | { name: "prompt"; sessionId: SessionId }
   | { name: "promptAsync"; sessionId: SessionId }
   | { name: "command"; sessionId: SessionId }
@@ -966,13 +930,6 @@ interface ServiceTierBody {
 
 interface DelegationBody {
   policy?: unknown;
-}
-
-interface GoalBody {
-  objective?: unknown;
-  status?: unknown;
-  tokenBudget?: unknown;
-  replace?: unknown;
 }
 
 interface PermissionsBody {
@@ -1127,7 +1084,6 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "POST" && (action === "service-tier" || action === "service_tier" || action === "fast")) return { name: "setServiceTier", sessionId };
   if (method === "GET" && action === "delegation") return { name: "delegationConfig", sessionId };
   if (method === "POST" && action === "delegation") return { name: "setDelegationPolicy", sessionId };
-  if ((method === "GET" || method === "POST" || method === "PATCH" || method === "DELETE") && action === "goal") return { name: "goal", sessionId };
   if (method === "POST" && action === "prompt") return { name: "prompt", sessionId };
   if (method === "POST" && action === "prompt_async") return { name: "promptAsync", sessionId };
   if (method === "GET" && action === "input_queue") return { name: "inputQueue", sessionId };
@@ -1181,71 +1137,6 @@ function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody, parsedIm
     input.serviceTier = body.serviceTier;
   }
   return input;
-}
-
-function goalSetInput(sessionId: SessionId, body: GoalBody): {
-  sessionId: SessionId;
-  objective: string;
-  tokenBudget?: number;
-  replace?: boolean;
-} {
-  if (typeof body.objective !== "string" || body.objective.trim().length === 0) {
-    throw badRequest("objective is required");
-  }
-  const input: {
-    sessionId: SessionId;
-    objective: string;
-    tokenBudget?: number;
-    replace?: boolean;
-  } = {
-    sessionId,
-    objective: body.objective.trim(),
-  };
-  const tokenBudget = optionalPositiveInteger(body.tokenBudget, "tokenBudget");
-  if (tokenBudget !== undefined) input.tokenBudget = tokenBudget;
-  if (body.replace !== undefined) input.replace = parseRuntimeBoolean(body.replace, "body.replace");
-  return input;
-}
-
-function goalUpdateInput(sessionId: SessionId, body: GoalBody): {
-  sessionId: SessionId;
-  status?: SessionGoalStatus;
-  objective?: string;
-  tokenBudget?: number;
-} {
-  const input: {
-    sessionId: SessionId;
-    status?: SessionGoalStatus;
-    objective?: string;
-    tokenBudget?: number;
-  } = {
-    sessionId,
-  };
-  const status = optionalGoalStatus(body.status);
-  if (status) input.status = status;
-  if (body.objective !== undefined) {
-    if (typeof body.objective !== "string" || body.objective.trim().length === 0) {
-      throw badRequest("objective must be a non-empty string when provided");
-    }
-    input.objective = body.objective.trim();
-  }
-  const tokenBudget = optionalPositiveInteger(body.tokenBudget, "tokenBudget");
-  if (tokenBudget !== undefined) input.tokenBudget = tokenBudget;
-  if (!input.status && input.objective === undefined && input.tokenBudget === undefined) {
-    throw badRequest("status, objective, or tokenBudget is required");
-  }
-  return input;
-}
-
-function optionalGoalStatus(value: unknown): SessionGoalStatus | undefined {
-  if (value === undefined) return undefined;
-  if (value === "active" || value === "paused" || value === "budgetLimited" || value === "complete") return value;
-  throw badRequest("status must be active, paused, budgetLimited, or complete");
-}
-
-function optionalPositiveInteger(value: unknown, field: string): number | undefined {
-  if (value === undefined) return undefined;
-  return positiveInteger(value, field);
 }
 
 function positiveInteger(value: unknown, field: string): number {
@@ -2186,12 +2077,6 @@ function toHttpError(error: unknown): HttpError {
   if (rawError instanceof RuntimeSessionNotFoundError || err.name === "RuntimeSessionNotFoundError") {
     return { status: 404, message: err.message };
   }
-  if (err.name === "GoalAlreadyExistsError") {
-    return { status: 409, message: err.message };
-  }
-  if (err.name === "GoalNotFoundError") {
-    return { status: 404, message: err.message };
-  }
   if (rawError instanceof PromptCommandNotFoundError) {
     return { status: 404, message: err.message };
   }
@@ -2283,19 +2168,6 @@ function requireDelegationControl(options: RuntimeHttpHandlerOptions): Required<
   return {
     getDelegationConfig: service.getDelegationConfig.bind(service),
     setDelegationPolicy: service.setDelegationPolicy.bind(service),
-  };
-}
-
-function requireGoalControl(options: RuntimeHttpHandlerOptions): Required<Pick<RuntimeHttpService, "getGoal" | "setGoal" | "updateGoal" | "clearGoal">> {
-  const service = options.service;
-  if (!service.getGoal || !service.setGoal || !service.updateGoal || !service.clearGoal) {
-    throw { status: 501, message: "No goal control service is configured" } satisfies HttpError;
-  }
-  return {
-    getGoal: service.getGoal.bind(service),
-    setGoal: service.setGoal.bind(service),
-    updateGoal: service.updateGoal.bind(service),
-    clearGoal: service.clearGoal.bind(service),
   };
 }
 

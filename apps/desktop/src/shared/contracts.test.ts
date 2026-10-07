@@ -116,7 +116,7 @@ describe("desktop IPC contracts", () => {
     })).toEqual({ type: "session.send", sessionId: "session_1", text: "continue", mode: "steer" });
   });
 
-  test("validates the complete New Task and Goal control surface", () => {
+  test("validates the complete New Task control surface", () => {
     expect(parseDesktopRequest({
       type: "sessions.create",
       title: "Overnight",
@@ -126,31 +126,14 @@ describe("desktop IPC contracts", () => {
       serviceTier: "fast",
       permissionProfile: "auto-review",
       delegationPolicy: "proactive",
-      goal: { objective: "finish the release", tokenBudget: 20_000 },
     })).toMatchObject({
       type: "sessions.create",
-      goal: { objective: "finish the release", tokenBudget: 20_000 },
     });
-    expect(() => parseDesktopRequest({
-      type: "sessions.create",
-      prompt: "one objective",
-      goal: { objective: "different objective" },
-    })).toThrow("Goal objective must match");
     expect(() => parseDesktopRequest({
       type: "sessions.create",
       prompt: "work",
       permissionProfile: "unrestricted",
     })).toThrow("unsupported value");
-    expect(parseDesktopRequest({
-      type: "session.goal.update",
-      sessionId: "session_1",
-      status: "active",
-      tokenBudget: 40_000,
-    })).toMatchObject({ status: "active", tokenBudget: 40_000 });
-    expect(() => parseDesktopRequest({
-      type: "session.goal.update",
-      sessionId: "session_1",
-    })).toThrow("must change");
   });
 
   test("exports one shared canonical session title limit", () => {
@@ -184,13 +167,13 @@ describe("desktop IPC contracts", () => {
   test("normalizes session title whitespace at the Desktop request boundary", () => {
     expect(parseDesktopRequest({
       type: "sessions.create",
-      title: "  Overnight   Goal\nconsole  ",
-    })).toMatchObject({ title: "Overnight Goal console" });
+      title: "  Overnight   Release\nconsole  ",
+    })).toMatchObject({ title: "Overnight Release console" });
     expect(parseDesktopRequest({
       type: "session.rename",
       sessionId: "session_1",
-      title: "  Overnight   Goal\nconsole  ",
-    })).toMatchObject({ title: "Overnight Goal console" });
+      title: "  Overnight   Release\nconsole  ",
+    })).toMatchObject({ title: "Overnight Release console" });
     expect(() => parseDesktopRequest({
       type: "sessions.create",
       title: " \n\t ",
@@ -216,7 +199,6 @@ describe("desktop IPC contracts", () => {
         ],
       },
       delegation: { sessionId: "session_1", policy: "proactive", source: "session" },
-      goal: null,
       mcp: {
         servers: [{ name: "github", status: "running", enabled: true, toolCount: 4 }],
         summary: { total: 1, running: 1, disabled: 0, authRequired: 0, errored: 0 },
@@ -224,7 +206,6 @@ describe("desktop IPC contracts", () => {
     })).toMatchObject({
       model: { sessionId: "session_1", reasoningLevel: "high" },
       delegation: { policy: "proactive" },
-      goal: null,
       mcp: { summary: { running: 1 } },
     });
   });
@@ -518,7 +499,6 @@ describe("desktop IPC contracts", () => {
       ["tool bytes", runtimeEnvelope("tool.output_delta", { callId: "call_1", stream: "stdout", delta: "x", bytes: "1" }, "bad_bytes")],
       ["approval patterns", runtimeEnvelope("approval.requested", { approvalId: "approval_1", permission: "read", patterns: {} }, "bad_approval")],
       ["input questions", runtimeEnvelope("user_input.requested", { inputId: "input_1", callId: "call_1", questions: "question" }, "bad_input")],
-      ["goal objective", runtimeEnvelope("goal.updated", { goal: { sessionId: "session_1", objective: {}, status: "active", tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 } }, "bad_goal")],
       ["mcp status", runtimeEnvelope("mcp.progress", { serverName: "server", operation: "connect", status: "unknown" }, "bad_mcp")],
     ];
 

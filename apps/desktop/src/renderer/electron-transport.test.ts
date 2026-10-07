@@ -131,14 +131,11 @@ test("maps daily-driver task controls to explicit validated IPC requests", async
     serviceTier: "fast",
     permissionProfile: "auto-review",
     delegationPolicy: "proactive",
-    goal: { objective: "Finish the console", tokenBudget: 75_000 },
   });
-  await transport.resumeSession("session_goal");
-  await transport.renameSession("session_goal", "Renamed");
-  await transport.archiveSession("session_goal");
-  await transport.setGoal("session_goal", "Keep going", 50_000);
-  await transport.updateGoal("session_goal", { tokenBudget: 80_000, status: "active" });
-  await transport.reloadMcp("session_goal");
+  await transport.resumeSession("session_work");
+  await transport.renameSession("session_work", "Renamed");
+  await transport.archiveSession("session_work");
+  await transport.reloadMcp("session_work");
 
   expect(calls).toEqual([
     { type: "sessions.list", query: "overnight", status: "archived" },
@@ -151,14 +148,11 @@ test("maps daily-driver task controls to explicit validated IPC requests", async
       serviceTier: "fast",
       permissionProfile: "auto-review",
       delegationPolicy: "proactive",
-      goal: { objective: "Finish the console", tokenBudget: 75_000 },
     },
-    { type: "session.resume", sessionId: "session_goal" },
-    { type: "session.rename", sessionId: "session_goal", title: "Renamed" },
-    { type: "session.archive", sessionId: "session_goal" },
-    { type: "session.goal.set", sessionId: "session_goal", objective: "Keep going", tokenBudget: 50_000 },
-    { type: "session.goal.update", sessionId: "session_goal", tokenBudget: 80_000, status: "active" },
-    { type: "mcp.reload", sessionId: "session_goal" },
+    { type: "session.resume", sessionId: "session_work" },
+    { type: "session.rename", sessionId: "session_work", title: "Renamed" },
+    { type: "session.archive", sessionId: "session_work" },
+    { type: "mcp.reload", sessionId: "session_work" },
   ]);
 });
 

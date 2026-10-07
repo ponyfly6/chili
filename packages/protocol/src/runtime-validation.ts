@@ -6,10 +6,6 @@ import {
   type PendingUserInputRequest,
 } from "./event.js";
 import {
-  SESSION_GOAL_STATUSES,
-  type SessionGoal,
-} from "./goal.js";
-import {
   DELEGATION_POLICIES,
   DELEGATION_POLICY_SOURCES,
   REASONING_LEVELS,
@@ -309,41 +305,6 @@ export function parseRuntimePermissionConfig(value: unknown, path = "response"):
       return parsed;
     }, `${path}.profiles`),
   };
-}
-
-export function parseRuntimeSessionGoal(value: unknown, path = "response"): SessionGoal {
-  const record = parseRuntimeRecord(value, path);
-  const goal: SessionGoal = {
-    sessionId: parseRuntimeIdentifier(record.sessionId, `${path}.sessionId`) as SessionGoal["sessionId"],
-    objective: parseRuntimeString(record.objective, `${path}.objective`),
-    status: parseRuntimeEnum(record.status, SESSION_GOAL_STATUSES, `${path}.status`),
-    tokensUsed: parseRuntimeNonNegativeInteger(record.tokensUsed, `${path}.tokensUsed`),
-    timeUsedSeconds: parseRuntimeFiniteNumber(record.timeUsedSeconds, `${path}.timeUsedSeconds`),
-    createdAt: parseRuntimeNonNegativeInteger(record.createdAt, `${path}.createdAt`) as SessionGoal["createdAt"],
-    updatedAt: parseRuntimeNonNegativeInteger(record.updatedAt, `${path}.updatedAt`) as SessionGoal["updatedAt"],
-  };
-  if (goal.timeUsedSeconds < 0) throw new RuntimeValidationError(`${path}.timeUsedSeconds`, "must be non-negative");
-  if (record.tokenBudget !== undefined) goal.tokenBudget = parseRuntimePositiveInteger(record.tokenBudget, `${path}.tokenBudget`);
-  if (record.completedAt !== undefined) {
-    goal.completedAt = parseRuntimeNonNegativeInteger(
-      record.completedAt,
-      `${path}.completedAt`,
-    ) as NonNullable<SessionGoal["completedAt"]>;
-  }
-  if (record.lastReason !== undefined) {
-    goal.lastReason = parseRuntimeEnum(record.lastReason, [
-      "set",
-      "replace",
-      "pause",
-      "resume",
-      "clear",
-      "complete",
-      "budget_limited",
-      "usage",
-      "external",
-    ] as const, `${path}.lastReason`);
-  }
-  return goal;
 }
 
 export function parseRuntimePromptAccepted(value: unknown, path = "response"): RuntimePromptAccepted {
@@ -647,8 +608,6 @@ const RUNTIME_EVENT_TYPES = [
   "user_input.requested",
   "user_input.resolved",
   "user_input.cancelled",
-  "goal.updated",
-  "goal.cleared",
   "snapshot.created",
   "snapshot.reverted",
   "mcp.server_status_changed",
@@ -673,8 +632,6 @@ const SESSION_SCOPED_EVENT_TYPES = new Set<ChiliEvent["type"]>([
   "user_input.requested",
   "user_input.resolved",
   "user_input.cancelled",
-  "goal.updated",
-  "goal.cleared",
 ]);
 
 /**
@@ -1026,20 +983,6 @@ function validateRuntimeEventPayload(
       parseRuntimeIdentifier(payload.inputId, `${path}.inputId`);
       optionalEventString(payload.reason, `${path}.reason`);
       return;
-    case "goal.updated": {
-      const goal = parseRuntimeSessionGoal(payload.goal, `${path}.goal`);
-      if (envelopeSessionId !== undefined && goal.sessionId !== envelopeSessionId) {
-        throw new RuntimeValidationError(`${path}.goal.sessionId`, "must match event.sessionId");
-      }
-      optionalGoalReason(payload.reason, `${path}.reason`);
-      if (payload.usageDelta !== undefined) validateGoalUsageDelta(payload.usageDelta, `${path}.usageDelta`);
-      return;
-    }
-    case "goal.cleared":
-      matchingEventSessionId(payload.sessionId, envelopeSessionId, `${path}.sessionId`);
-      if (payload.previousGoal !== undefined) parseRuntimeSessionGoal(payload.previousGoal, `${path}.previousGoal`);
-      optionalGoalReason(payload.reason, `${path}.reason`);
-      return;
     case "snapshot.created":
       parseRuntimeIdentifier(payload.snapshotId, `${path}.snapshotId`);
       optionalEventIdentifier(payload.callId, `${path}.callId`);
@@ -1384,43 +1327,10 @@ function parseRuntimeError(value: unknown, path: string): { name: string; messag
   };
 }
 
-function validateGoalUsageDelta(value: unknown, path: string): void {
-  const delta = parseRuntimeRecord(value, path);
-  optionalEventIdentifier(delta.turnId, `${path}.turnId`);
-  parseRuntimeNonNegativeInteger(delta.tokens, `${path}.tokens`);
-  const timeSeconds = parseRuntimeFiniteNumber(delta.timeSeconds, `${path}.timeSeconds`);
-  if (timeSeconds < 0) throw new RuntimeValidationError(`${path}.timeSeconds`, "must be non-negative");
-  for (const key of [
-    "inputTokens",
-    "outputTokens",
-    "cacheReadInputTokens",
-    "cacheCreationInputTokens",
-    "totalTokens",
-  ] as const) {
-    optionalEventNonNegativeInteger(delta[key], `${path}.${key}`);
-  }
-}
-
 function matchingEventSessionId(value: unknown, expected: string | undefined, path: string): void {
   const sessionId = parseRuntimeIdentifier(value, path);
   if (expected !== undefined && sessionId !== expected) {
     throw new RuntimeValidationError(path, "must match event.sessionId");
-  }
-}
-
-function optionalGoalReason(value: unknown, path: string): void {
-  if (value !== undefined) {
-    parseRuntimeEnum(value, [
-      "set",
-      "replace",
-      "pause",
-      "resume",
-      "clear",
-      "complete",
-      "budget_limited",
-      "usage",
-      "external",
-    ] as const, path);
   }
 }
 

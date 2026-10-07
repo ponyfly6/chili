@@ -81,7 +81,7 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
     const eventPayload = (row: EventRow): unknown => {
       if (row.native_too_large) throw new RuntimeSnapshotLimitError();
       if (row.payload_json !== null) return JSON.parse(row.payload_json);
-      // Legacy diagnostic strings can exceed the SSE limit. Select only bounded display fields,
+      // Diagnostic strings can exceed the SSE limit. Select only bounded display fields,
       // never load their entire JSON blob into JavaScript just to truncate it afterwards.
       markTruncated();
       const fields: Record<string, string[]> = {
@@ -110,7 +110,7 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
       const checkpoint = { length: seeds.length, bytes: usedBytes, ordinal };
       try {
         const sessionId = String(row.session_id);
-        const seq = Number(row.created_event_seq ?? 0);
+        const seq = Number(row.created_event_seq);
         if (row.turn_id) {
           for (const type of ["turn.started", "turn.completed", "turn.model_metadata"]) {
             const event = latest(sessionId, type, "and json_extract(payload_json, '$.turnId') = ?", [String(row.turn_id)]);
@@ -132,7 +132,7 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
           if (partRow.data_json !== null) part = JSON.parse(String(partRow.data_json)) as Record<string, unknown>;
           else {
             markTruncated();
-            // Preserve identity/type anchors even when a legacy image, tool result or text is huge.
+            // Preserve identity/type anchors even when an image, tool result or text is huge.
             const fields = db.query<Row, [string]>(`select ${["text", "displayText", "output", "error", "callId", "providerCallId", "toolName", "status", "phase", "mimeType", "filename", "sourcePath", "agentPath", "summary", "artifactId", "boundaryMessageId", "reason"].map((field) =>
               `substr(json_extract(data_json, '$.${field}'), 1, ${FIELD_CHARS}) as ${field}`).join(", ")}
               from message_parts where id = ?`).get(String(partRow.id))!;
@@ -231,14 +231,14 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
       const completed = startedPayload ? latest(sessionId, "turn.completed", "and json_extract(payload_json, '$.turnId') = ?", [startedPayload.turnId]) : null;
       const activeTurnId = startedPayload && !completed ? startedPayload.turnId : undefined;
       const requiredMessages = db.query<Row, string[]>(`select * from messages where session_id = ?
-        and (${activeTurnId ? "turn_id = ? or" : ""} id = (select id from messages where session_id = ? order by coalesce(created_event_seq, 0) desc, created_at desc, id desc limit 1))
-        order by coalesce(created_event_seq, 0), created_at, id limit ${MAX_REQUIRED_ROWS + 1}`)
+        and (${activeTurnId ? "turn_id = ? or" : ""} id = (select id from messages where session_id = ? order by created_event_seq desc, created_at desc, id desc limit 1))
+        order by created_event_seq, created_at, id limit ${MAX_REQUIRED_ROWS + 1}`)
         .all(sessionId, ...(activeTurnId ? [activeTurnId] : []), sessionId);
       if (requiredMessages.length > MAX_REQUIRED_ROWS) throw new RuntimeSnapshotLimitError();
       for (const message of requiredMessages) readMessage(message, true);
       readTools(sessionId, activeTurnId ?? startedPayload?.turnId);
       const recent = db.query<Row, [string]>(`select * from messages where session_id = ?
-        order by coalesce(created_event_seq, 0) desc, created_at desc, id desc limit ${HISTORY_MESSAGES + 1}`).all(sessionId);
+        order by created_event_seq desc, created_at desc, id desc limit ${HISTORY_MESSAGES + 1}`).all(sessionId);
       if (recent.length > HISTORY_MESSAGES) markTruncated();
       history.push({ sessionId, ids: recent.slice(0, HISTORY_MESSAGES).reverse() });
       for (const type of ["session.model_changed", "session.reasoning_changed", "session.service_tier_changed", "session.delegation_changed"]) {
@@ -268,16 +268,6 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
           ...(approval.metadata_json ? { metadata: boundedJson(approval.metadata_json) } : {}),
         }, sessionId, Number(approval.created_at), (tip?.seq ?? 0) + 0.3);
       }
-      const goal = db.query<Row, [string]>(`select session_id, substr(objective,1,${FIELD_CHARS}) as objective, length(objective) as objective_length,
-        status, token_budget, tokens_used, time_used_seconds, created_at, updated_at, completed_at,
-        substr(last_reason, 1, 512) as last_reason
-        from session_goals where session_id = ?`).get(sessionId);
-      if (goal) add("goal.updated", { goal: { sessionId, objective: text(goal.objective, goal.objective_length), status: goal.status,
-        tokensUsed: goal.tokens_used, timeUsedSeconds: goal.time_used_seconds, createdAt: goal.created_at, updatedAt: goal.updated_at,
-        ...(goal.token_budget !== null ? { tokenBudget: goal.token_budget } : {}),
-        ...(goal.completed_at !== null ? { completedAt: goal.completed_at } : {}),
-        ...(goal.last_reason !== null ? { lastReason: goal.last_reason } : {}),
-      } }, sessionId, Number(goal.updated_at), (tip?.seq ?? 0) + 0.4);
       // Archive/cancellation may update the queue projection without a separate queue event.
       // Read the current projection, excluding private payload/identity columns entirely.
       const dispatch = db.query<Row, [string]>("select paused, revision from session_dispatch where session_id = ?").get(sessionId);

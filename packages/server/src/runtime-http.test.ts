@@ -50,8 +50,6 @@ import type {
   RuntimeSessionRef,
   ServiceTier,
   SessionId,
-  SessionGoal,
-  SessionGoalStatus,
   TimestampMs,
   ToolCallId,
   TurnId,
@@ -993,7 +991,7 @@ test("applies the central credential taxonomy idempotently to Error and HttpErro
   expect(await unicode.json()).toEqual({ error: { message: "会话暂不可用" } });
 });
 
-test("normalizes hostile service and goal errors at the HTTP boundary", async () => {
+test("normalizes hostile service errors at the HTTP boundary", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
   const service = new FakeRuntimeService(store);
@@ -1005,10 +1003,10 @@ test("normalizes hostile service and goal errors at the HTTP boundary", async ()
     error.name = name;
     return error;
   };
-  service.getGoal = async () => { throw hostileError("GoalNotFoundError"); };
+  service.getModelConfig = async () => { throw hostileError("RuntimeSessionNotFoundError"); };
   const handler = createRuntimeHttpHandler({ service, store });
   const requests = [
-    handler(new Request(`http://chili.test/sessions/${sessionId}/goal`)),
+    handler(new Request(`http://chili.test/sessions/${sessionId}/model`)),
   ];
   for (const response of await Promise.all(requests)) {
     const body = await response.text();
@@ -1136,7 +1134,7 @@ test("validates and normalizes explicit session ids before creating a session", 
   expect((await store.sessions()).map((session) => String(session.id))).toEqual(["session_http_trimmed"]);
 });
 
-test("rejects unknown event and goal query parameters", async () => {
+test("rejects unknown event query parameters", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
   const service = new FakeRuntimeService(store);
@@ -1155,14 +1153,6 @@ test("rejects unknown event and goal query parameters", async () => {
   expect(emptyScopeResponse.status).toBe(400);
   expect(await emptyScopeResponse.json()).toEqual({
     error: { message: "sessionId must not be empty" },
-  });
-
-  const goalResponse = await handler(new Request(
-    `http://chili.test/sessions/${session.sessionId}/goal?legacyScope=obsolete`,
-  ));
-  expect(goalResponse.status).toBe(400);
-  expect(await goalResponse.json()).toEqual({
-    error: { message: "Query parameter \"legacyScope\" is not supported" },
   });
 });
 
@@ -2557,19 +2547,6 @@ test("rejects direct HTTP prompts, commands, controls, and lifecycle mutations f
       body: JSON.stringify({ commandId: "prompt.project.joke", cwd: "   " }),
       headers: { "content-type": "application/json" },
     }),
-    new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
-      method: "POST",
-      body: JSON.stringify({ objective: "bypass through goal" }),
-      headers: { "content-type": "application/json" },
-    }),
-    new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
-      method: "PATCH",
-      body: JSON.stringify({ status: "paused" }),
-      headers: { "content-type": "application/json" },
-    }),
-    new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
-      method: "DELETE",
-    }),
     new Request(`http://chili.test/sessions/${session.sessionId}/commands`),
     new Request(`http://chili.test/sessions/${session.sessionId}/commands/reload`, {
       method: "POST",
@@ -2594,14 +2571,6 @@ test("rejects direct HTTP prompts, commands, controls, and lifecycle mutations f
       body: JSON.stringify({ policy: "off" }),
       headers: { "content-type": "application/json" },
     }),
-    new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
-      method: "PATCH",
-      body: JSON.stringify({ status: "paused" }),
-      headers: { "content-type": "application/json" },
-    }),
-    new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
-      method: "DELETE",
-    }),
     new Request(`http://chili.test/sessions/${session.sessionId}/commands`),
     new Request(`http://chili.test/sessions/${session.sessionId}/commands/reload`, {
       method: "POST",
@@ -2624,45 +2593,7 @@ test("rejects direct HTTP prompts, commands, controls, and lifecycle mutations f
     });
   }
   expect(service.lastPrompt).toBeUndefined();
-  expect(service.goal).toBeUndefined();
   expect(commands.lastRun).toBeUndefined();
-});
-
-test("read-only historical sessions remain readable but reject execution and root Agent control", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const sessionId = "session_http_history" as SessionId;
-  await service.createSession({ sessionId });
-  baseStore.sessionRows.set(sessionId, { ...baseStore.sessionRows.get(sessionId)!, readOnly: true });
-  const handler = createRuntimeHttpHandler({ service: Object.assign(service, {
-    inputQueue: () => ({ sessionId, paused: true, revision: 0, pendingCount: 0, interruptedCount: 0, items: [] }),
-  }), store, commands: new FakePromptCommandControl() });
-  const client = new HttpRuntimeClient({ baseUrl: "http://chili.test", fetch: ((input, init) => handler(new Request(input, init))) as typeof fetch });
-  expect((await client.listSessions())[0]).toMatchObject({ id: sessionId, readOnly: true });
-  expect(await client.messages(sessionId)).toEqual([]);
-  expect((await handler(new Request(`http://chili.test/sessions/${sessionId}/events`))).status).toBe(200);
-  expect((await handler(new Request(`http://chili.test/sessions/${sessionId}/agents`))).status).toBe(403);
-  for (const [action, body] of [
-    ["prompt", { text: "not executable" }],
-    ["prompt_async", { text: "not executable" }],
-    ["command_async", { commandId: "prompt.project.joke" }],
-    ["resume_inputs", {}],
-    ["interrupt", {}],
-    ["goal", { objective: "not executable" }],
-    ["model", { modelSelection: { provider: "fake", model: "fake" } }],
-    ["delegation", { policy: "proactive" }],
-    ["rename", { title: "not mutable" }],
-    ["archive", {}],
-    ["agents", { name: "child", prompt: "not executable" }],
-  ] as const) {
-    const response = await handler(new Request(`http://chili.test/sessions/${sessionId}/${action}`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-    }));
-    expect(response.status).toBe(403);
-  }
-  expect(service.lastPrompt).toBeUndefined();
-  expect(service.goal).toBeUndefined();
 });
 
 test("rejects prompt and mutation routes after a session is archived", async () => {
@@ -2735,11 +2666,6 @@ test("rejects a known pending child over HTTP before its session row exists", as
       body: JSON.stringify({commandId: "prompt.project.joke", cwd: null }),
       headers: { "content-type": "application/json" },
     }),
-    new Request(`http://chili.test/sessions/${sessionId}/goal`, {
-      method: "POST",
-      body: JSON.stringify({objective: "race through a goal continuation" }),
-      headers: { "content-type": "application/json" },
-    }),
   ];
 
   expect(await store.sessions()).toEqual([]);
@@ -2751,7 +2677,6 @@ test("rejects a known pending child over HTTP before its session row exists", as
     });
   }
   expect(service.lastPrompt).toBeUndefined();
-  expect(service.goal).toBeUndefined();
   expect(commands.lastRun).toBeUndefined();
 });
 
@@ -3221,42 +3146,17 @@ test("serves model control routes and prompt model overrides", async () => {
   });
 });
 
-test("serves persistent goal control routes", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
+test("removed Goal endpoints return 404 for every method", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
   const service = new FakeRuntimeService(store);
   const handler = createRuntimeHttpHandler({ service, store });
-  const session = await service.createSession();
+  const { sessionId } = await service.createSession();
 
-  const setResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
-    method: "POST",
-    body: JSON.stringify({
-      objective: "Ship the goal route",
-      tokenBudget: 50_000,
-      replace: true,
-    }),
-    headers: { "content-type": "application/json" },
-  }));
-  expect(setResponse.status).toBe(201);
-  expect(await setResponse.json()).toMatchObject({ objective: "Ship the goal route", status: "active" });
-
-  const pauseResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
-    method: "PATCH",
-    body: JSON.stringify({ status: "paused" }),
-    headers: { "content-type": "application/json" },
-  }));
-  expect(pauseResponse.status).toBe(200);
-  expect(await pauseResponse.json()).toMatchObject({ status: "paused" });
-
-  const getResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal`));
-  expect(getResponse.status).toBe(200);
-  expect(await getResponse.json()).toMatchObject({ objective: "Ship the goal route", status: "paused" });
-
-  const clearResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
-    method: "DELETE",
-  }));
-  expect(clearResponse.status).toBe(200);
-  expect(await clearResponse.json()).toMatchObject({ cleared: true });
+  for (const method of ["GET", "POST", "PATCH", "DELETE"]) {
+    const response = await handler(new Request(`http://chili.test/sessions/${sessionId}/goal`, { method }));
+    expect(response.status).toBe(404);
+  }
+  expect(service.lastPrompt).toBeUndefined();
 });
 
 test("does not accept async prompts or commands for missing or busy sessions", async () => {
@@ -3536,7 +3436,6 @@ class FakeRuntimeService implements RuntimeHttpService {
   delegationPolicy: DelegationPolicy = "explicit";
   delegationSource: DelegationPolicySource = "default";
   lastPrompt: SubmitPromptInput | undefined;
-  goal: SessionGoal | undefined;
   readonly blockedSessionAccess = new Set<SessionId>();
   readonly busySessionOperations = new Set<SessionId>();
   readonly sessionOperationIds: SessionId[] = [];
@@ -3564,7 +3463,6 @@ class FakeRuntimeService implements RuntimeHttpService {
   async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
     await this.assertSessionReadAllowed(sessionId);
     const session = (await this.store.sessions()).find((candidate) => candidate.id === sessionId);
-    if (session?.readOnly) throw new RuntimeSessionAccessError(sessionId, "Historical Session is read-only");
     if (session && session.status !== "active") {
       throw new RuntimeSessionInactiveError(sessionId, session.status);
     }
@@ -3646,42 +3544,6 @@ class FakeRuntimeService implements RuntimeHttpService {
     return this.getDelegationConfig(input.sessionId);
   }
 
-  async getGoal(input: { sessionId: SessionId }): Promise<SessionGoal | undefined> {
-    return this.goal?.sessionId === input.sessionId ? this.goal : undefined;
-  }
-
-  async setGoal(input: { sessionId: SessionId; objective: string; tokenBudget?: number }): Promise<SessionGoal> {
-    this.goal = {
-      sessionId: input.sessionId,
-      objective: input.objective,
-      status: "active",
-      ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
-      tokensUsed: 0,
-      timeUsedSeconds: 0,
-      createdAt: 3 as TimestampMs,
-      updatedAt: 3 as TimestampMs,
-    };
-    return this.goal;
-  }
-
-  async updateGoal(input: { sessionId: SessionId; status?: SessionGoalStatus }): Promise<SessionGoal> {
-    if (!this.goal || this.goal.sessionId !== input.sessionId) throw new Error("No goal");
-    this.goal = {
-      ...this.goal,
-      sessionId: input.sessionId,
-      ...(input.status ? { status: input.status } : {}),
-      updatedAt: 4 as TimestampMs,
-    };
-    return this.goal;
-  }
-
-  async clearGoal(input: { sessionId: SessionId }): Promise<{ cleared: boolean; previousGoal?: SessionGoal }> {
-    if (!this.goal || this.goal.sessionId !== input.sessionId) return { cleared: false };
-    const previousGoal = this.goal;
-    this.goal = undefined;
-    return { cleared: true, previousGoal };
-  }
-
   async submitPrompt(input: SubmitPromptInput): Promise<Awaited<ReturnType<RuntimeHttpService["submitPrompt"]>>> {
     this.lastPrompt = input;
     return { status: "completed", turns: [], finishReason: "stop" };
@@ -3691,9 +3553,7 @@ class FakeRuntimeService implements RuntimeHttpService {
     this.lastPrompt = input;
   }
 
-  async interrupt(sessionId: SessionId): Promise<boolean> {
-    const session = (await this.store.sessions()).find((candidate) => candidate.id === sessionId);
-    if (session?.readOnly) throw new RuntimeSessionAccessError(sessionId, "Historical Session is read-only");
+  async interrupt(_sessionId: SessionId): Promise<boolean> {
     return true;
   }
 
@@ -4162,7 +4022,7 @@ test("Agent HTTP control rejects child and archived callers before invoking the 
   const row = base.sessionRows.get(sessionId)!;
   const handler = createRuntimeHttpHandler({ service, store, agents });
   const child = { parentSessionId: "session_parent" as SessionId, name: "worker", path: "/root/worker" as AgentPath, policy: {} };
-  for (const invalid of [{ ...row, agent: child }, { ...row, readOnly: true as const }, { ...row, status: "archived" as const }]) {
+  for (const invalid of [{ ...row, agent: child }, { ...row, status: "archived" as const }]) {
     base.sessionRows.set(sessionId, invalid);
     for (const [method, suffix] of [["GET", ""], ["POST", ""], ["POST", "/another/send"], ["POST", "/another/wait"], ["POST", "/another/stop"], ["POST", "/another/resume"]] as const) {
       const response = await handler(new Request(`http://chili.test/sessions/${sessionId}/agents${suffix}`, { method }));

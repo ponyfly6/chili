@@ -17,7 +17,7 @@ export interface SessionSettingsValues extends SessionModelSettingsDraft {
 
 export function DesktopSettings({ page, onPage, project, session, config, models, disabled, busy, error,
   theme, onTheme, themeSaveFailed, themeSaving, preferences, onPreferences, preferenceSaveFailed,
-  onSave, onReloadMcp, onPrompt, onClose, onNewSession, goalControls,
+  onSave, onReloadMcp, onPrompt, onClose, onNewSession,
 }: {
   page: SettingsPage; onPage: (page: SettingsPage) => void; project: string; session: string | undefined;
   config: DesktopSessionConfig | undefined; models: readonly RuntimeModelDescriptor[]; disabled: boolean; error: string | undefined;
@@ -26,7 +26,6 @@ export function DesktopSettings({ page, onPage, project, session, config, models
   preferences: ReadingPreferences; onPreferences: (value: ReadingPreferences) => void; preferenceSaveFailed: boolean;
   onSave: (values: SessionSettingsValues, section: "models" | "permissions") => void; onReloadMcp: () => void;
   onPrompt: (text: string) => void; onClose: () => void; onNewSession: () => void;
-  goalControls: ReactNode;
 }) {
   const selected = settingsPages.find((item) => item.id === page)!;
   return <>
@@ -68,7 +67,6 @@ export function DesktopSettings({ page, onPage, project, session, config, models
             <p className="settings-note">这里读取 Chili 已有的模型配置。账号登录与密钥管理仍通过本机 Chili 配置完成。</p>
           </SettingsSection> : null}
         </> : null}
-        {page === "permissions" ? goalControls : null}
         {page === "tools" ? <>
           <SettingsSection title="工具连接 · MCP" scope="当前会话">
             <div className="settings-row"><span>连接状态<small>{config ? `${config.mcp.summary.running} / ${config.mcp.summary.total} 个连接正在运行` : "选择会话后查看连接状态"}</small></span><button className="secondary" disabled={disabled || !config} onClick={onReloadMcp}>重新读取</button></div>

@@ -86,8 +86,8 @@ export class SnapshotRecoveryService {
     if (session.status !== "active") {
       throw new Error(`Session is not active: ${sessionId} (${session.status})`);
     }
-    if (session.readOnly || session.agent) {
-      throw new Error(`Snapshot recovery requires a writable root Session: ${sessionId}`);
+    if (session.agent) {
+      throw new Error(`Snapshot recovery requires a root Session: ${sessionId}`);
     }
     return session;
   }

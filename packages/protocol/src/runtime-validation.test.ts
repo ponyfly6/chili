@@ -3,7 +3,7 @@ import {
   parseChiliEvent,
   parseRuntimeModelDescriptor,
   parseRuntimeNonNegativeInteger,
-  parseRuntimeSessionGoal,
+  parseRuntimePositiveInteger,
   parseRuntimeStringRecord,
   rejectRuntimeUnknownFields,
   RuntimeValidationError,
@@ -13,16 +13,9 @@ test("runtime numeric contracts reject unsafe integers", () => {
   expect(() => parseRuntimeNonNegativeInteger(Number.MAX_SAFE_INTEGER + 1, "tokens")).toThrow(
     "tokens must be a non-negative integer",
   );
-  expect(() => parseRuntimeSessionGoal({
-    sessionId: "session_1",
-    objective: "overnight\nwork",
-    status: "active",
-    tokenBudget: Number.MAX_SAFE_INTEGER + 1,
-    tokensUsed: 0,
-    timeUsedSeconds: 0.5,
-    createdAt: 1,
-    updatedAt: 1,
-  })).toThrow("response.tokenBudget must be a positive integer");
+  expect(() => parseRuntimePositiveInteger(Number.MAX_SAFE_INTEGER + 1, "limit")).toThrow(
+    "limit must be a positive integer",
+  );
 });
 
 test("model endpoints accept credential-free HTTP paths but reject URL credentials", () => {
@@ -90,7 +83,6 @@ test("all event families reject a known type with a wrong-shaped payload", () =>
     ["tool.call_started", undefined],
     ["approval.requested", undefined],
     ["user_input.requested", "session_1"],
-    ["goal.updated", "session_1"],
     ["snapshot.created", undefined],
     ["mcp.progress", undefined],
   ] as const) {

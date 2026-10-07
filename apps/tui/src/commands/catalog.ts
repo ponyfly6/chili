@@ -91,12 +91,6 @@ export function createTuiCommandRegistry(runtimeCatalog?: RuntimeCommandCatalog)
       ]),
       run: (_context, input) => delegationResult(input.raw),
     },
-    goal: { run: () => ({ type: "goal_action", action: "show" }) },
-    "goal.show": { run: () => ({ type: "goal_action", action: "show" }) },
-    "goal.set": { run: (_context, input) => goalSetResult(input.raw) },
-    "goal.pause": { run: () => ({ type: "goal_action", action: "pause" }) },
-    "goal.resume": { run: () => ({ type: "goal_action", action: "resume" }) },
-    "goal.clear": { run: () => confirm("Clear the current goal?", { type: "goal_action", action: "clear" }) },
     agents: { run: () => ({ type: "open_view", view: "agents" }) },
     "agents.list": { run: () => ({ type: "open_view", view: "agents" }) },
     "agents.stop": { run: (_context, input) => agentActionResult("stop", input.raw) },
@@ -210,33 +204,6 @@ function suggestion(value: string, label: string, description: string, group: st
     enabled: true,
     intent: "execute",
   };
-}
-
-function goalSetResult(raw: string): TuiCommandResult {
-  const tokens = raw.trim().split(/\s+/).filter(Boolean);
-  let tokenBudget: number | undefined;
-  const objective: string[] = [];
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index] ?? "";
-    if (token === "--budget" || token === "-b") {
-      tokenBudget = parseTokenBudget(tokens[index + 1] ?? "");
-      index += 1;
-    } else if (token.startsWith("--budget=")) {
-      tokenBudget = parseTokenBudget(token.slice(9));
-    } else {
-      objective.push(token);
-    }
-  }
-  if (objective.length === 0) return localError("Goal objective is required.");
-  return { type: "goal_action", action: "set", objective: objective.join(" "), ...(tokenBudget ? { tokenBudget } : {}) };
-}
-
-function parseTokenBudget(value: string): number | undefined {
-  const match = /^(\d+(?:\.\d+)?)(k|m)?$/i.exec(value);
-  if (!match) return undefined;
-  const multiplier = match[2]?.toLowerCase() === "m" ? 1_000_000 : match[2]?.toLowerCase() === "k" ? 1_000 : 1;
-  const budget = Math.round(Number(match[1]) * multiplier);
-  return budget > 0 ? budget : undefined;
 }
 
 function skillResult(action: "enable" | "disable", raw: string): TuiCommandResult {

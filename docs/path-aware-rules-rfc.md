@@ -15,8 +15,8 @@ The current implementation is unconditional even though it already parses path-r
 5. [`loadChiliMemoryContext`](../packages/core/src/memory/fragments.ts) loads user memory, project memory, and every discovered instruction/rule source in order. [`loadDocument`](../packages/core/src/memory/documents.ts) parses a rule again, removes valid frontmatter from its body, trims it, and clips each non-empty document independently at `DEFAULT_MAX_DOCUMENT_CHARS` (currently 32,000 characters in [`memory/constants.ts`](../packages/core/src/memory/constants.ts)). Missing and empty documents do not enter `documents`.
 6. [`chiliMemoryPromptFragments`](../packages/core/src/memory/fragments.ts) emits memory mechanics as `developer/system`, then emits every loaded document as a fragment. A project rule is currently always `layer: "contextual_user"`, `trust: "project"`, `source: "project"`, and `lifecycle: "session"`. `memoryDocumentDebugMetadata` labels every rule `ruleType: "unconditional"`, even when its parsed `alwaysApply` is `false`.
 7. [`buildCliPromptFragments`](../apps/cli/src/harness.ts) combines the base prompt, memory/project fragments, the skills catalog, and activated skill bodies. The root and child `RuntimeService` providers rebuild these fragments whenever `resolvePromptAssembly` runs. The separate `AgentRunnerSubagentRunner` provider receives no turn context and assembles its prompt once before its tool-use loop.
-8. [`RuntimeService.resolvePromptAssembly`](../packages/core/src/runtime-service.ts) calls the fragment provider, adds goal and conversation fragments, then uses [`PromptAssembler`](../packages/core/src/prompt/assembler.ts). The assembler sorts by layer, numeric fragment priority, and insertion order. It does not enforce a character budget; [`buildPromptDebugManifest`](../packages/core/src/prompt/debug.ts) only reports rendered fragments and their total characters.
-9. Normal submission in `RuntimeService.runReservedPrompt` passes a `RuntimePromptTurnContext` containing only `text` and optional `skillMentions` on every model turn in the tool-use loop. `runGoalContinuation` calls prompt assembly without a turn context. `RuntimePromptTurnContext`, `SubmitPromptInput`, and `InspectPromptInput` have no active/touched-path field today.
+8. [`RuntimeService.resolvePromptAssembly`](../packages/core/src/runtime-service.ts) calls the fragment provider, adds conversation fragments, then uses [`PromptAssembler`](../packages/core/src/prompt/assembler.ts). The assembler sorts by layer, numeric fragment priority, and insertion order. It does not enforce a character budget; [`buildPromptDebugManifest`](../packages/core/src/prompt/debug.ts) only reports rendered fragments and their total characters.
+9. Normal submission in `RuntimeService.runReservedPrompt` passes a `RuntimePromptTurnContext` containing only `text` and optional `skillMentions` on every model turn in the tool-use loop. `RuntimePromptTurnContext`, `SubmitPromptInput`, and `InspectPromptInput` have no active/touched-path field today.
 10. [`SingleAgentRuntime.runTurn`](../packages/core/src/single-agent-runtime.ts) includes system, developer, contextual-user fragments, and tool schemas in the fixed-input token estimate. When the selected model exposes request limits, [`ContextWindowBuilder`](../packages/core/src/context/window.ts) fails with `fixed_input_exceeds_window` rather than truncating fixed input. The CLI's `maxInputChars: 500_000` guard applies to conversation history, not as an aggregate fragment-character limit. If model limits are unavailable, there is no equivalent aggregate guard for fixed prompt fragments.
 11. [`RuntimeService.inspectPrompt`](../packages/core/src/runtime-service.ts) drives [`prompt-debug.ts`](../apps/cli/src/prompt-debug.ts). It can show metadata and, with `--content`, rendered content, but it can only report fragments that were injected. There is currently no catalog of discovered-but-not-injected rules.
 
@@ -139,15 +139,13 @@ v1 path state belongs to one prompt run. It is not long-term memory and is not r
 | --- | --- |
 | Current user prompt, first model turn | Valid `cwd` directory plus that submission's explicit `contextPaths` |
 | Consecutive model turns caused by tool use | The same frozen `cwd` and explicit `contextPaths` as the first turn; tool calls add nothing in v1 |
-| Goal continuation executed synchronously as part of the same `submitPrompt` run | The same frozen `cwd` and explicit `contextPaths`, even though skill-mention text need not be replayed |
-| Standalone persistent-goal continuation started later | Its new run's `cwd`; no prior `contextPaths` unless the caller explicitly supplies new ones |
 | Resume/reopen of a session or task | The resumed run's `cwd` and newly supplied `contextPaths`; previous run paths are not restored from events or messages |
 | Child `RuntimeService` task | Child `cwd` plus context paths explicitly supplied on the child submission; parent paths are not inherited |
 | `AgentRunnerSubagentRunner` local subagent | Subagent `cwd` plus paths explicitly present in its structured run input; absent support means cwd-only, never parent inheritance or task-text extraction |
 
 At submission, normalization produces an immutable ordered candidate set for the run. Every prompt assembly in that run reevaluates discovered rules against that set so results are stable across tool-use turns. Active project-rule fragments use `lifecycle: "turn"` in v1 because their presence is run-context-dependent; project instructions and memories retain their existing lifecycles.
 
-No `contextPaths` or derived activation set is written to memory, goal state, session events, compaction summaries, or the transcript in v1. A host may retain its own editor state and explicitly resubmit it, but Chili does not silently persist it.
+No `contextPaths` or derived activation set is written to memory, session events, compaction summaries, or the transcript in v1. A host may retain its own editor state and explicitly resubmit it, but Chili does not silently persist it.
 
 ## 7. Injection and Security Boundaries
 
@@ -288,8 +286,6 @@ Unless stated otherwise, `projectRoot=/repo`, the rule is at `/repo/.chili/rules
 | Active aggregate overflow | Five rendered active rules total more than 128,000 chars | No project-rule subset injected; blocking `project_rules_budget_exceeded`; normal model call count is zero |
 | Pattern/rule limits | 129 patterns in one scoped rule, 1,025 files, or 4,097 total patterns | Explicit invalid/blocking diagnostics as specified; never truncation |
 | Tool-use continuation | Explicit context file matches; first model calls a tool | The same rule is injected on the next model turn; tool arguments add no new v1 paths |
-| Same-run goal continuation | Explicit context file matches and active goal continues | The same rule remains injected |
-| Later goal/resume | Previous run had context files; new run supplies none | Only new `cwd` candidate is visible; previous paths are absent |
 | Child runtime | Parent has matching path; child gets none | Child does not inherit it. Supplying the same structured child path activates the child rule |
 | Local subagent | Task text names a matching file but structured subagent input has none | No text extraction; cwd-only activation |
 | Debug body boundary | Non-matching rule with unique secret marker and `--content` | Metadata/reason is visible; marker is absent from all content and prompt chars |
@@ -317,9 +313,9 @@ The implementation should be split into four independently revertible commits.
 ### Commit C: runtime and child/subagent context propagation
 
 - Allowed files: `packages/protocol/src/runtime.ts`, `packages/protocol/src/index.ts`, `packages/core/src/runtime-service.ts`, `packages/core/src/subagent.ts`, `packages/core/src/runner.ts`, `packages/core/src/agent-runner.test.ts`, `packages/core/src/subagent.test.ts`, `packages/server/src/runtime-http.ts`, `packages/server/src/runtime-http.test.ts`, `packages/sdk/src/client.ts`, `packages/sdk/src/client.test.ts`, `apps/cli/src/harness.ts`, and `apps/cli/src/harness.test.ts`.
-- Tests: first turn, consecutive tool turns, same-run goal continuation, later goal continuation, resume, child runtime, local subagent non-inheritance, direct/HTTP/SDK `contextPaths` round trips, malformed wire-item rejection, and zero model calls on blocking budget error.
+- Tests: first turn, consecutive tool turns, resume, child runtime, local subagent non-inheritance, direct/HTTP/SDK `contextPaths` round trips, malformed wire-item rejection, and zero model calls on blocking budget error.
 - Rollback point: remove the optional `contextPaths` plumbing while leaving the pure matcher and diagnostics unused.
-- Non-goals: deriving paths from tools, persisting paths in events/goals, permissions/approval/sandbox changes.
+- Non-goals: deriving paths from tools, persisting paths in events, permissions/approval/sandbox changes.
 
 ### Commit D: prompt-debug surface and maintainer documentation
 
@@ -340,7 +336,7 @@ This documentation-only change and the v1 implementation do not include:
 - a general YAML parser;
 - model-driven rule catalog/`activate_rule` activation;
 - tool-call `activePaths` accumulation or persistence (reserved for v2);
-- persistence of `contextPaths` across runs, resume, goals, parent/child boundaries, or compaction;
+- persistence of `contextPaths` across runs, resume, parent/child boundaries, or compaction;
 - memory CRUD changes;
 - additional rule discovery branches derived from `contextPaths`;
 - dependency additions, runtime prototypes, or unrelated TODO cleanup in this RFC change.

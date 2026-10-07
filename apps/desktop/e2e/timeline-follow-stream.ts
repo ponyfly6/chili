@@ -70,7 +70,6 @@ export async function assertTimelineFollowStream(page: Page, fixture: TimelineFo
   await model.selectOption(deepseek.value);
   await dialog.getByLabel("Permission profile", { exact: true }).selectOption("full-access");
   await dialog.getByLabel("Delegation", { exact: true }).selectOption("proactive");
-  await dialog.getByLabel("Run as an overnight Goal", { exact: true }).uncheck();
   await dialog.getByRole("button", { name: "Create & run", exact: true }).click();
   await dialog.waitFor({ state: "hidden" });
   await page.getByRole("heading", { name: TITLE, exact: true }).waitFor();

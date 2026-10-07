@@ -67,7 +67,7 @@ test("replay metadata sizes a tail and resume without reading oversized or malfo
     const insert = db.query("insert into events (id, type, time, session_id, payload_json) values (?, ?, ?, ?, ?)");
     db.transaction(() => {
       for (let i = 0; i < 5_010; i++) insert.run(`metadata_${i}`, "session.renamed", 5_010 - i, sessionId, "{invalid");
-      insert.run("hidden_legacy", "agent.legacy", 1, sessionId, "{invalid");
+      insert.run("other_session_event", "session.renamed", 1, "other_session", "{invalid");
     })();
     expect(await store.eventReplayBoundary({ sessionId, tail: true, limit: 5_000 })).toEqual({ afterEventId: "metadata_9", count: 5_000 });
     expect(await store.eventReplayBoundary({ sessionId, afterEventId: "metadata_9", limit: 5_001 })).toEqual({ afterEventId: "metadata_9", count: 5_000 });
@@ -78,16 +78,16 @@ test("replay metadata sizes a tail and resume without reading oversized or malfo
   } finally { store.close(); }
 });
 
-test("extreme legacy request bodies report resync before SQLite JSON parsing", async () => {
+test("extreme request bodies report resync before SQLite JSON parsing", async () => {
   const store = new SqliteEventStore(":memory:");
   try {
     // Deliberately invalid JSON: a compaction attempt would throw malformed
     // JSON instead of yielding the actionable durable cursor below.
     dbOf(store).query("insert into events (id, type, time, session_id, payload_json) values (?, ?, ?, ?, ?)").run(
-      "legacy_extreme", "model.request_prepared", 1, sessionId, "{" + "x".repeat(17 * 1024 * 1024),
+      "request_extreme", "model.request_prepared", 1, sessionId, "{" + "x".repeat(17 * 1024 * 1024),
     );
     await expect(store.events({ compactRequests: true, maxBytes: 256 * 1024 })).rejects.toMatchObject({
-      name: "EventPageTooLargeError", eventId: "legacy_extreme",
+      name: "EventPageTooLargeError", eventId: "request_extreme",
     });
   } finally { store.close(); }
 });

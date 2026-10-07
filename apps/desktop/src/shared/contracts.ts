@@ -14,7 +14,6 @@ import {
   parseRuntimeModelConfig as parseProtocolModelConfig,
   parseRuntimeModelDescriptor as parseProtocolModelDescriptor,
   parseRuntimePermissionConfig as parseProtocolPermissionConfig,
-  parseRuntimeSessionGoal as parseProtocolSessionGoal,
   type ChiliEvent,
   type DelegationPolicy,
   type ModelSelection,
@@ -27,8 +26,6 @@ import {
   type RuntimePermissionConfig,
   type RuntimePermissionProfileId,
   type ServiceTier,
-  type SessionGoal,
-  type SessionGoalStatus,
 } from "@chili/protocol";
 import type {
   RuntimePendingApprovalRequest,
@@ -58,8 +55,7 @@ export type DesktopCreateSessionStage =
   | "service_tier"
   | "delegation"
   | "permission"
-  | "prompt"
-  | "goal";
+  | "prompt";
 export type DesktopResyncReason =
   | "renderer_ready"
   | "source_cursor"
@@ -131,11 +127,6 @@ export interface UserInputRequest {
   createdAt: number;
 }
 
-export interface DesktopCreateGoalOptions {
-  objective: string;
-  tokenBudget?: number;
-}
-
 /**
  * All values needed to create and launch a top-level desktop task. Permission
  * profiles are runtime-global; the renderer must label them accordingly.
@@ -148,7 +139,6 @@ export interface DesktopCreateSessionOptions {
   serviceTier?: ServiceTier;
   permissionProfile?: RuntimePermissionProfileId;
   delegationPolicy?: DelegationPolicy;
-  goal?: DesktopCreateGoalOptions;
 }
 
 export interface DesktopCreateSessionFailure {
@@ -166,7 +156,6 @@ export interface DesktopCreateSessionResult {
   startState: "not_started" | "started" | "unknown";
   /** Compatibility convenience: true only when startState is started. */
   started: boolean;
-  goal?: SessionGoal;
   /** A created session is deliberately retained so the user can recover it. */
   failure?: DesktopCreateSessionFailure;
 }
@@ -175,7 +164,6 @@ export interface DesktopSessionConfig {
   model: RuntimeModelConfig;
   permission: RuntimePermissionConfig;
   delegation: RuntimeDelegationConfig;
-  goal: SessionGoal | null;
   mcp: RuntimeMcpStatusResponse;
 }
 
@@ -202,22 +190,6 @@ type DesktopOperation =
   | { type: "permissions.set"; profile: RuntimePermissionProfileId }
   | { type: "session.delegation.get"; sessionId: string }
   | { type: "session.delegation.set"; sessionId: string; policy: DelegationPolicy }
-  | { type: "session.goal.get"; sessionId: string }
-  | {
-      type: "session.goal.set";
-      sessionId: string;
-      objective: string;
-      tokenBudget?: number;
-      replace?: boolean;
-    }
-  | {
-      type: "session.goal.update";
-      sessionId: string;
-      status?: SessionGoalStatus;
-      objective?: string;
-      tokenBudget?: number;
-    }
-  | { type: "session.goal.clear"; sessionId: string }
   | { type: "mcp.status"; sessionId?: string }
   | { type: "mcp.reload"; sessionId?: string }
   | { type: "session.send"; sessionId: string; text: string; mode: SendMode; submissionId?: string }
@@ -261,10 +233,6 @@ export interface DesktopResponseMap {
   "permissions.set": RuntimePermissionConfig;
   "session.delegation.get": RuntimeDelegationConfig;
   "session.delegation.set": RuntimeDelegationConfig;
-  "session.goal.get": { goal: SessionGoal | null };
-  "session.goal.set": SessionGoal;
-  "session.goal.update": SessionGoal;
-  "session.goal.clear": { cleared: boolean; previousGoal?: SessionGoal };
   "mcp.status": RuntimeMcpStatusResponse;
   "mcp.reload": RuntimeMcpReloadResponse;
   "session.send": { status: "accepted" | "queued"; position?: number };
@@ -351,8 +319,6 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
     || type === "session.stop"
     || type === "session.config.get"
     || type === "session.delegation.get"
-    || type === "session.goal.get"
-    || type === "session.goal.clear"
   ) {
     return { type, sessionId: requireIdentifier(record.sessionId, "sessionId") };
   }
@@ -396,29 +362,6 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
       sessionId: requireIdentifier(record.sessionId, "sessionId"),
       policy: requireDelegationPolicy(record.policy, "policy"),
     };
-  }
-  if (type === "session.goal.set") {
-    const request: Extract<DesktopRequest, { type: "session.goal.set" }> = {
-      type,
-      sessionId: requireIdentifier(record.sessionId, "sessionId"),
-      objective: requireString(record.objective, "objective", 200_000),
-    };
-    if (record.tokenBudget !== undefined) request.tokenBudget = requireTokenBudget(record.tokenBudget, "tokenBudget");
-    if (record.replace !== undefined) request.replace = requireBoolean(record.replace, "replace");
-    return request;
-  }
-  if (type === "session.goal.update") {
-    const request: Extract<DesktopRequest, { type: "session.goal.update" }> = {
-      type,
-      sessionId: requireIdentifier(record.sessionId, "sessionId"),
-    };
-    if (record.status !== undefined) request.status = requireGoalStatus(record.status, "status");
-    if (record.objective !== undefined) request.objective = requireString(record.objective, "objective", 200_000);
-    if (record.tokenBudget !== undefined) request.tokenBudget = requireTokenBudget(record.tokenBudget, "tokenBudget");
-    if (request.status === undefined && request.objective === undefined && request.tokenBudget === undefined) {
-      throw new TypeError("Goal update must change status, objective, or tokenBudget");
-    }
-    return request;
   }
   if (type === "mcp.status" || type === "mcp.reload") {
     const request: Extract<DesktopRequest, { type: typeof type }> = { type };
@@ -520,20 +463,6 @@ function parseCreateSessionRequest(
   if (record.delegationPolicy !== undefined) {
     request.delegationPolicy = requireDelegationPolicy(record.delegationPolicy, "delegationPolicy");
   }
-  if (record.goal !== undefined) {
-    const goal = requireRecord(record.goal, "goal");
-    assertOnlyKeys(goal, ["objective", "tokenBudget"]);
-    request.goal = { objective: requireString(goal.objective, "goal.objective", 200_000) };
-    if (goal.tokenBudget !== undefined) {
-      request.goal.tokenBudget = requireTokenBudget(goal.tokenBudget, "goal.tokenBudget");
-    }
-    if (request.prompt === undefined) {
-      throw new TypeError("A Goal task requires the task objective in prompt");
-    }
-    if (request.prompt.trim() !== request.goal.objective.trim()) {
-      throw new TypeError("Goal objective must match the task prompt");
-    }
-  }
   return request;
 }
 
@@ -564,16 +493,6 @@ function requireDelegationPolicy(value: unknown, field: string): DelegationPolic
 
 function requirePermissionProfile(value: unknown, field: string): RuntimePermissionProfileId {
   return requireEnum(value, ["default", "auto-review", "full-access"], field) as RuntimePermissionProfileId;
-}
-
-function requireGoalStatus(value: unknown, field: string): SessionGoalStatus {
-  return requireEnum(value, ["active", "paused", "budgetLimited", "complete"], field) as SessionGoalStatus;
-}
-
-function requireTokenBudget(value: unknown, field: string): number {
-  const budget = requirePositiveInteger(value, field);
-  if (budget > 1_000_000_000_000) throw new TypeError(`${field} exceeds the supported limit`);
-  return budget;
 }
 
 export function parseDesktopEvent(value: unknown): DesktopEvent {
@@ -681,20 +600,6 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
     response = parseRuntimePermissionConfig(value, "permission config");
   } else if (request.type === "session.delegation.get" || request.type === "session.delegation.set") {
     response = parseRuntimeDelegationConfig(value, "delegation config");
-  } else if (request.type === "session.goal.get") {
-    const record = requireRecord(value, "goal response");
-    assertOnlyKeys(record, ["goal"]);
-    response = { goal: record.goal === null ? null : parseSessionGoal(record.goal, "goal") };
-  } else if (request.type === "session.goal.set" || request.type === "session.goal.update") {
-    response = parseSessionGoal(value, "goal");
-  } else if (request.type === "session.goal.clear") {
-    const record = requireRecord(value, "clear goal response");
-    assertOnlyKeys(record, ["cleared", "previousGoal"]);
-    const result: DesktopResponseMap["session.goal.clear"] = {
-      cleared: requireBoolean(record.cleared, "cleared"),
-    };
-    if (record.previousGoal !== undefined) result.previousGoal = parseSessionGoal(record.previousGoal, "previousGoal");
-    response = result;
   } else if (request.type === "mcp.status") {
     response = parseRuntimeMcpStatus(value, "MCP status");
   } else if (request.type === "mcp.reload") {
@@ -768,7 +673,6 @@ function assertDesktopResponseScope(request: DesktopRequest, response: unknown):
     const config = response as DesktopSessionConfig;
     requireMatchingSessionId(request.sessionId, String(config.model.sessionId), "model.sessionId");
     requireMatchingSessionId(request.sessionId, String(config.delegation.sessionId), "delegation.sessionId");
-    if (config.goal) requireMatchingSessionId(request.sessionId, String(config.goal.sessionId), "goal.sessionId");
     return;
   }
   if (
@@ -786,19 +690,6 @@ function assertDesktopResponseScope(request: DesktopRequest, response: unknown):
       "delegation.sessionId",
     );
     return;
-  }
-  if (request.type === "session.goal.get") {
-    const goal = (response as DesktopResponseMap["session.goal.get"]).goal;
-    if (goal) requireMatchingSessionId(request.sessionId, String(goal.sessionId), "goal.sessionId");
-    return;
-  }
-  if (request.type === "session.goal.set" || request.type === "session.goal.update") {
-    requireMatchingSessionId(request.sessionId, String((response as SessionGoal).sessionId), "goal.sessionId");
-    return;
-  }
-  if (request.type === "session.goal.clear") {
-    const previous = (response as DesktopResponseMap["session.goal.clear"]).previousGoal;
-    if (previous) requireMatchingSessionId(request.sessionId, String(previous.sessionId), "previousGoal.sessionId");
   }
 }
 
@@ -960,20 +851,6 @@ function parseRuntimeEvent(value: unknown): ChiliEvent {
     const answers = requireRecord(payload.answers, "event.payload.answers");
     for (const questionId of Object.keys(answers)) requireSafeMapKey(questionId, "event.payload answer key");
   }
-  if (type === "goal.updated") {
-    const goal = requireRecord(payload.goal, "event.payload.goal");
-    requireKnownIdentifiers(goal, "event.payload.goal", ["sessionId"]);
-    if (payload.usageDelta !== undefined) {
-      requireKnownIdentifiers(requireRecord(payload.usageDelta, "event.payload.usageDelta"), "event.payload.usageDelta", ["turnId"]);
-    }
-  }
-  if (type === "goal.cleared" && payload.previousGoal !== undefined) {
-    requireKnownIdentifiers(
-      requireRecord(payload.previousGoal, "event.payload.previousGoal"),
-      "event.payload.previousGoal",
-      ["sessionId"],
-    );
-  }
   return value as ChiliEvent;
 }
 
@@ -998,7 +875,7 @@ function parseSessionSummary(value: unknown): RuntimeSessionSummary {
 
 function parseCreateSessionResult(value: unknown): DesktopCreateSessionResult {
   const record = requireRecord(value, "create session response");
-  assertOnlyKeys(record, ["sessionId", "status", "startState", "started", "goal", "failure"]);
+  assertOnlyKeys(record, ["sessionId", "status", "startState", "started", "failure"]);
   const status = requireEnum(record.status, ["created", "started", "partial"], "status") as DesktopCreateSessionResult["status"];
   const startState = requireEnum(
     record.startState,
@@ -1022,17 +899,13 @@ function parseCreateSessionResult(value: unknown): DesktopCreateSessionResult {
     startState,
     started,
   };
-  if (record.goal !== undefined) {
-    result.goal = parseSessionGoal(record.goal, "goal");
-    if (String(result.goal.sessionId) !== result.sessionId) throw new TypeError("Created Goal belongs to another session");
-  }
   if (record.failure !== undefined) {
     const failure = requireRecord(record.failure, "failure");
     assertOnlyKeys(failure, ["stage", "message", "permissionRestored", "launchMayHaveCommitted"]);
     result.failure = {
       stage: requireEnum(
         failure.stage,
-        ["rename", "model", "reasoning", "service_tier", "delegation", "permission", "prompt", "goal"],
+        ["rename", "model", "reasoning", "service_tier", "delegation", "permission", "prompt"],
         "failure.stage",
       ) as DesktopCreateSessionStage,
       message: requireString(failure.message, "failure.message", 8_000),
@@ -1060,12 +933,11 @@ function parseCreateSessionResult(value: unknown): DesktopCreateSessionResult {
 
 function parseDesktopSessionConfig(value: unknown): DesktopSessionConfig {
   const record = requireRecord(value, "session config");
-  assertOnlyKeys(record, ["model", "permission", "delegation", "goal", "mcp"]);
+  assertOnlyKeys(record, ["model", "permission", "delegation", "mcp"]);
   return {
     model: parseRuntimeModelConfig(record.model, "session config.model"),
     permission: parseRuntimePermissionConfig(record.permission, "session config.permission"),
     delegation: parseRuntimeDelegationConfig(record.delegation, "session config.delegation"),
-    goal: record.goal === null ? null : parseSessionGoal(record.goal, "session config.goal"),
     mcp: parseRuntimeMcpStatus(record.mcp, "session config.mcp"),
   };
 }
@@ -1099,12 +971,6 @@ function parseRuntimePermissionConfig(value: unknown, field: string): RuntimePer
 
 function parseRuntimeDelegationConfig(value: unknown, field: string): RuntimeDelegationConfig {
   const parsed = parseProtocolDelegationConfig(value, field);
-  requireIdentifier(parsed.sessionId, `${field}.sessionId`);
-  return parsed;
-}
-
-function parseSessionGoal(value: unknown, field: string): SessionGoal {
-  const parsed = parseProtocolSessionGoal(value, field);
   requireIdentifier(parsed.sessionId, `${field}.sessionId`);
   return parsed;
 }
@@ -1195,7 +1061,6 @@ function requestKeys(type: string): readonly string[] {
       "serviceTier",
       "permissionProfile",
       "delegationPolicy",
-      "goal",
     ];
   }
   if (type === "models.list") return ["type", "provider"];
@@ -1206,8 +1071,6 @@ function requestKeys(type: string): readonly string[] {
     || type === "session.archive"
     || type === "session.config.get"
     || type === "session.delegation.get"
-    || type === "session.goal.get"
-    || type === "session.goal.clear"
   ) return ["type", "sessionId"];
   if (type === "session.rename") return ["type", "sessionId", "title"];
   if (type === "session.model.set") return ["type", "sessionId", "modelSelection"];
@@ -1215,8 +1078,6 @@ function requestKeys(type: string): readonly string[] {
   if (type === "session.service-tier.set") return ["type", "sessionId", "serviceTier"];
   if (type === "permissions.set") return ["type", "profile"];
   if (type === "session.delegation.set") return ["type", "sessionId", "policy"];
-  if (type === "session.goal.set") return ["type", "sessionId", "objective", "tokenBudget", "replace"];
-  if (type === "session.goal.update") return ["type", "sessionId", "status", "objective", "tokenBudget"];
   if (type === "mcp.status" || type === "mcp.reload") return ["type", "sessionId"];
   if (type === "session.send") return ["type", "sessionId", "text", "mode", "submissionId"];
   if (type === "agent.send") return ["type", "sessionId", "agentId", "text", "mode"];
@@ -1469,19 +1330,6 @@ function assertRuntimePayloadSchema(type: string, payload: Record<string, unknow
     return;
   }
 
-  if (type === "goal.updated") {
-    assertSessionGoal(requireRecord(payload.goal, "event.payload.goal"), "event.payload.goal");
-    if (payload.reason !== undefined) requireGoalUpdateReason(payload.reason, "event.payload.reason");
-    if (payload.usageDelta !== undefined) assertGoalUsage(requireRecord(payload.usageDelta, "event.payload.usageDelta"));
-    return;
-  }
-  if (type === "goal.cleared") {
-    requirePayloadString(payload.sessionId, "event.payload.sessionId");
-    if (payload.previousGoal !== undefined) assertSessionGoal(requireRecord(payload.previousGoal, "event.payload.previousGoal"), "event.payload.previousGoal");
-    if (payload.reason !== undefined) requireGoalUpdateReason(payload.reason, "event.payload.reason");
-    return;
-  }
-
   if (type === "snapshot.created") {
     requirePayloadString(payload.snapshotId, "event.payload.snapshotId");
     optionalPayloadString(payload.callId, "event.payload.callId");
@@ -1688,31 +1536,6 @@ function assertUserInputAnswers(value: unknown, field: string): void {
   }
 }
 
-function assertSessionGoal(value: Record<string, unknown>, field: string): void {
-  requirePayloadString(value.sessionId, `${field}.sessionId`);
-  requirePayloadString(value.objective, `${field}.objective`, true);
-  requireEnum(value.status, ["active", "paused", "budgetLimited", "complete"], `${field}.status`);
-  optionalNonNegativeNumber(value.tokenBudget, `${field}.tokenBudget`);
-  requireNonNegativeNumber(value.tokensUsed, `${field}.tokensUsed`);
-  requireNonNegativeNumber(value.timeUsedSeconds, `${field}.timeUsedSeconds`);
-  requireNonNegativeNumber(value.createdAt, `${field}.createdAt`);
-  requireNonNegativeNumber(value.updatedAt, `${field}.updatedAt`);
-  optionalNonNegativeNumber(value.completedAt, `${field}.completedAt`);
-  if (value.lastReason !== undefined) requireGoalUpdateReason(value.lastReason, `${field}.lastReason`);
-}
-
-function assertGoalUsage(value: Record<string, unknown>): void {
-  optionalPayloadString(value.turnId, "event.payload.usageDelta.turnId");
-  for (const key of ["tokens", "timeSeconds"] as const) requireNonNegativeNumber(value[key], `event.payload.usageDelta.${key}`);
-  for (const key of ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens", "totalTokens"] as const) {
-    optionalNonNegativeNumber(value[key], `event.payload.usageDelta.${key}`);
-  }
-}
-
-function requireGoalUpdateReason(value: unknown, field: string): void {
-  requireEnum(value, ["set", "replace", "pause", "resume", "clear", "complete", "budget_limited", "usage", "external"], field);
-}
-
 function requireToolCallStatus(value: unknown, field: string): void {
   requireEnum(value, ["pending", "validating", "waiting_for_approval", "running", "completed", "failed", "cancelled"], field);
 }
@@ -1796,7 +1619,6 @@ const RUNTIME_EVENT_ID_FIELDS: Readonly<Record<string, readonly string[]>> = {
   "user_input.requested": ["inputId", "callId"],
   "user_input.resolved": ["inputId"],
   "user_input.cancelled": ["inputId"],
-  "goal.cleared": ["sessionId"],
   "snapshot.created": ["snapshotId", "callId"],
   "snapshot.reverted": ["snapshotId"],
   "mcp.progress": ["operationId"],

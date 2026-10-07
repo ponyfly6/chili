@@ -16,7 +16,6 @@ import type {
   RuntimeSessionStatus,
   SessionAgentMetadata,
   SessionId,
-  SessionGoal,
   ToolCallId,
   ToolCallStatus,
   ToolOutputStream,
@@ -38,7 +37,6 @@ export interface ChiliRuntimeView {
   approvals: Record<string, RuntimeApprovalView>;
   modelMetadataTurnIds: TurnId[];
   modelMetadataByTurn: Record<string, RuntimeModelMetadataView>;
-  goalsBySession: Record<string, RuntimeSessionGoalView>;
   partIndex: Record<string, RuntimePartIndexEntry>;
   /** Stable durable/projection order for transcript rows across clock rollback. */
   transcriptOrder: Record<string, number>;
@@ -135,8 +133,6 @@ export interface RuntimeModelMetadataView extends ModelMetadataPayload {
   sessionId?: SessionId;
 }
 
-export interface RuntimeSessionGoalView extends SessionGoal {}
-
 export interface RuntimeApprovalView {
   id: ApprovalId;
   permission: string;
@@ -174,7 +170,6 @@ export interface ChatSessionView {
   items: ChatTranscriptItem[];
   pendingApprovals: ChatApprovalRow[];
   activeTools: ChatToolCallRow[];
-  goal?: SessionGoal;
   generatedAt: string;
   latestModelMetadata?: ModelMetadataPayload;
   usageSummary?: ModelUsage;
@@ -287,7 +282,6 @@ export function createRuntimeView(): ChiliRuntimeView {
     approvals: nullPrototypeRecord(),
     modelMetadataTurnIds: [],
     modelMetadataByTurn: nullPrototypeRecord(),
-    goalsBySession: nullPrototypeRecord(),
     partIndex: nullPrototypeRecord(),
     transcriptOrder: nullPrototypeRecord(),
     nextTranscriptOrder: 0,
@@ -615,23 +609,6 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       if (approval.sessionId) touchSession(view, approval.sessionId, event.time);
       break;
     }
-    case "goal.updated": {
-      const sourceGoal = event.payload?.goal;
-      const sessionId = matchingEnvelopeSessionId(event.sessionId, sourceGoal?.sessionId);
-      if (!sessionId || !sourceGoal) break;
-      const goal = cloneSessionGoal(sourceGoal);
-      goal.sessionId = sessionId;
-      view.goalsBySession[sessionId] = goal;
-      touchSession(view, sessionId, event.time);
-      break;
-    }
-    case "goal.cleared": {
-      const sessionId = matchingEnvelopeSessionId(event.sessionId, event.payload?.sessionId);
-      if (!sessionId) break;
-      delete view.goalsBySession[sessionId];
-      touchSession(view, sessionId, event.time);
-      break;
-    }
   }
 
   return view;
@@ -645,7 +622,6 @@ function normalizeRuntimeViewIndexes(view: ChiliRuntimeView): void {
   view.toolCalls = nullPrototypeIndex(view.toolCalls);
   view.approvals = nullPrototypeIndex(view.approvals);
   view.modelMetadataByTurn = nullPrototypeIndex(view.modelMetadataByTurn);
-  view.goalsBySession = nullPrototypeIndex(view.goalsBySession);
   view.partIndex = nullPrototypeIndex(view.partIndex);
   view.transcriptOrder = nullPrototypeIndex(view.transcriptOrder ?? {});
   if (!Number.isSafeInteger(view.nextTranscriptOrder) || view.nextTranscriptOrder < 0) {
@@ -739,7 +715,6 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
     : [];
   const latestModelMetadata = modelMetadata.at(-1);
   const usageSummary = modelUsageSummary(modelMetadata);
-  const goal = sessionId ? view.goalsBySession[sessionId] : undefined;
   const items = [...messages, ...tools, ...approvals]
     .sort((left, right) => (
       chatTranscriptOrder(view, left) - chatTranscriptOrder(view, right)
@@ -763,7 +738,6 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
   assignOptional(output, "cwd", session?.cwd || undefined);
   assignOptional(output, "statusReason", session?.statusReason);
   assignOptional(output, "statusEventId", session?.statusEventId);
-  assignOptional(output, "goal", goal ? cloneSessionGoal(goal) : undefined);
   assignOptional(output, "latestModelMetadata", latestModelMetadata ? chatModelMetadata(latestModelMetadata) : undefined);
   assignOptional(output, "usageSummary", usageSummary);
   assignOptional(output, "retry", session?.retry ? { ...session.retry } : undefined);
@@ -916,22 +890,6 @@ function cloneModelUsage(usage: ModelUsage): ModelUsage {
   assignOptional(output, "cacheCreationInputTokens", usage.cacheCreationInputTokens);
   assignOptional(output, "totalTokens", usage.totalTokens);
   assignOptional(output, "raw", usage.raw);
-  return output;
-}
-
-function cloneSessionGoal(goal: SessionGoal): SessionGoal {
-  const output: SessionGoal = {
-    sessionId: goal.sessionId,
-    objective: goal.objective,
-    status: goal.status,
-    tokensUsed: goal.tokensUsed,
-    timeUsedSeconds: goal.timeUsedSeconds,
-    createdAt: goal.createdAt,
-    updatedAt: goal.updatedAt,
-  };
-  assignOptional(output, "tokenBudget", goal.tokenBudget);
-  assignOptional(output, "completedAt", goal.completedAt);
-  assignOptional(output, "lastReason", goal.lastReason);
   return output;
 }
 
