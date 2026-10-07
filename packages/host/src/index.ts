@@ -8,6 +8,7 @@ export {
 } from "./host.js";
 export {
   createHostExecutionGate,
+  createExecutionReviewModule,
   DEFAULT_REVIEW_INSTRUCTIONS,
   REVIEWER_SYSTEM_INSTRUCTIONS,
   ToolReviewError,
@@ -15,6 +16,13 @@ export {
   type HostExecutionGateOptions,
   type ReviewSettings,
 } from "./approval.js";
+export {
+  HostHookError,
+  type HostModule,
+  type HostHookPoint,
+  type HostHookDiagnostic,
+  type HostPromptContext,
+} from "./hooks.js";
 export {
   createHostModel,
   resolveHostRuntimeModelSelection,

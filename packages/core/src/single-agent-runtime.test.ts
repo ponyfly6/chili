@@ -61,7 +61,8 @@ for (const toolFormat of ["legacy", "streamed"] as const) {
   test(`rejects EOF after a complete ${toolFormat} tool input and preserves usage`, async () => {
     let requests = 0;
     const fixture = harness({
-      async *stream(): AsyncIterable<ModelStreamEvent> {
+      async *stream(input): AsyncIterable<ModelStreamEvent> {
+        expect(input.purpose).toBe("task");
         requests++;
         yield { type: "metadata", usage };
         if (toolFormat === "legacy") {

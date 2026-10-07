@@ -1,5 +1,7 @@
 import type { ModelRouter, PromptFragment } from "@chili/core";
 import type { MessageId, ModelSelection, PartId, RuntimePermissionConfig, RuntimePermissionProfileId, TimestampMs } from "@chili/protocol";
+
+import type { HostModule } from "./hooks.js";
 import type { ToolExecutionGate, ToolReviewRequest, ToolReviewResult } from "@chili/tools";
 
 export const DEFAULT_REVIEW_INSTRUCTIONS = `Give the agent broad autonomy to complete the user's task. Allow ordinary investigation, necessary code changes, dependency installation, tests, and other reasonable steps within the user's intent without requiring approval of each implementation detail.
@@ -68,6 +70,19 @@ export function reviewPromptFragment(settings: Omit<ReviewSettings, "revision">)
   };
 }
 
+export const EXECUTION_REVIEW_MODULE_ID = "chili.execution-review";
+
+/** Automatic review is an ordinary registered capability with mandatory host assembly. */
+export function createExecutionReviewModule(options: HostExecutionGateOptions): HostModule {
+  const reviewer = createHostExecutionGate(options);
+  return {
+    id: EXECUTION_REVIEW_MODULE_ID,
+    timeoutMs: 60_000,
+    prompt: { collect: () => [reviewPromptFragment(options.settings())] },
+    tools: { review: (request, signal) => reviewer.review(request, signal) },
+  };
+}
+
 export function createHostExecutionGate(options: HostExecutionGateOptions): ToolExecutionGate {
   return {
     async review(request, signal): Promise<ToolReviewResult> {
@@ -129,6 +144,7 @@ export function createHostExecutionGate(options: HostExecutionGateOptions): Tool
           let response = "";
           let finished = false;
           for await (const event of options.model.stream({
+            purpose: "review",
             sessionId: request.sessionId,
             turnId: request.turnId,
             messages: [{ id: messageId, sessionId: request.sessionId, role: "user", createdAt: Date.now() as TimestampMs,

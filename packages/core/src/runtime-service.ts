@@ -77,6 +77,7 @@ import { resolveDelegationConfig } from "./delegation.js";
 import { buildFailureCheckpoint } from "./failure-checkpoint.js";
 import type { AgentRunner, PromptExecutionScope, RunTurnInput, RunTurnResult } from "./runner.js";
 import type { CompactContextResult } from "./single-agent-runtime.js";
+import { observeAgentLifecycle, type AgentLifecycleHooks, type AgentRunContext } from "./agent-lifecycle.js";
 
 
 const FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM =
@@ -128,6 +129,7 @@ export interface RuntimeServiceOptions {
   sessionAccess?: "root" | "child";
   /** Wrap one accepted input, including its model/tool continuations. */
   runInput?: (sessionId: SessionId, signal: AbortSignal, run: () => Promise<SubmitPromptResult>) => Promise<SubmitPromptResult>;
+  agentLifecycle?: AgentLifecycleHooks;
   onModelChanged?: (input: RuntimeModelChangedInput) => Promise<void> | void;
   /** Stop host resources owned by this session without changing its conversation. */
   stopSessionResources?: (sessionId: SessionId, reason: string) => Promise<boolean>;
@@ -144,6 +146,8 @@ export type RuntimePromptFragmentsProvider = (input: {
   sessionId: SessionId;
   cwd: string;
   turn?: RuntimePromptTurnContext;
+  /** Cancels prompt collection with the active turn; previews have no turn signal. */
+  signal?: AbortSignal;
 }) => Promise<PromptFragment[]> | PromptFragment[];
 
 export interface RuntimePromptTurnContext {
@@ -245,6 +249,8 @@ interface RuntimeRunState {
   executionRef: string;
   input?: StoredSessionInput;
   inputResult?: SubmitPromptResult;
+  agentRun?: AgentRunContext;
+  agentRunError?: unknown;
   steering?: boolean;
   controlInterrupted?: boolean;
 }
@@ -1137,14 +1143,17 @@ export class RuntimeService {
     controller: AbortController,
     run = () => this.runReservedPrompt(input, controller),
   ): Promise<SubmitPromptResult> {
+    let result: SubmitPromptResult;
     try {
-      return await (this.options.runInput ? this.options.runInput(input.sessionId, controller.signal, run) : run());
+      result = await (this.options.runInput ? this.options.runInput(input.sessionId, controller.signal, run) : run());
     } catch (error) {
       if (controller.signal.aborted && isAbortError(toError(error))) {
-        return this.cancelledPrompt(input, [], "Prompt aborted before execution");
-      }
-      throw error;
+        result = await this.cancelledPrompt(input, [], "Prompt aborted before execution");
+      } else throw error;
     }
+    const state = this.running.get(input.sessionId);
+    if (state?.controller === controller) state.inputResult = result;
+    return result;
   }
 
   private async runReservedPrompt(input: SubmitPromptInput, controller: AbortController): Promise<SubmitPromptResult> {
@@ -1164,6 +1173,19 @@ export class RuntimeService {
       const normalizedInput: SubmitPromptInput = { ...input, cwd };
       if (controller.signal.aborted) {
         return await this.cancelledPrompt(normalizedInput, turns, "Prompt aborted");
+      }
+      const run = this.running.get(input.sessionId);
+      if (run?.controller === controller && !run.agentRun) {
+        run.agentRun = Object.freeze({
+          runId: run.executionRef,
+          executionRef: run.executionRef,
+          ...(run.input ? { inputId: run.input.inputId } : {}),
+          sessionId: input.sessionId,
+          agentRole: this.options.sessionAccess ?? "root",
+          cwd,
+          startedAt: this.now(),
+        });
+        observeAgentLifecycle(this.options.agentLifecycle?.started, run.agentRun);
       }
       const promptModelState = await this.resolvePromptModelState(normalizedInput);
       if (controller.signal.aborted) {
@@ -1210,6 +1232,7 @@ export class RuntimeService {
         const prompt = await this.resolvePromptAssembly({
           sessionId: promptInput.sessionId,
           cwd,
+          signal: controller.signal,
           ...(promptModelState.reasoningLevel ? { reasoningLevel: promptModelState.reasoningLevel } : {}),
           turn: turnContext(promptInput),
           extraFragments: [
@@ -1256,6 +1279,7 @@ export class RuntimeService {
       const prompt = await this.resolvePromptAssembly({
         sessionId: promptInput.sessionId,
         cwd,
+        signal: controller.signal,
         ...(promptModelState.reasoningLevel ? { reasoningLevel: promptModelState.reasoningLevel } : {}),
         turn: turnContext(promptInput),
         extraFragments: [
@@ -1495,6 +1519,7 @@ export class RuntimeService {
   private async resolvePromptAssembly(input: {
     sessionId: SessionId;
     cwd: string;
+    signal?: AbortSignal;
     reasoningLevel?: ReasoningLevel;
     turn?: RuntimePromptTurnContext;
     previewTurnInConversation?: boolean;
@@ -1505,6 +1530,7 @@ export class RuntimeService {
       sessionId: input.sessionId,
       cwd: input.cwd,
       ...(input.turn ? { turn: input.turn } : {}),
+      ...(input.signal ? { signal: input.signal } : {}),
     });
     const conversation = await this.resolveConversationPromptFragment(input);
     const activeInput = this.running.get(input.sessionId)?.input;
@@ -2055,8 +2081,22 @@ export class RuntimeService {
           claimId: run.durableClaimId,
         });
       }
+    } catch (error) {
+      if (run) run.agentRunError = error;
+      throw error;
     } finally {
       if (this.running.get(sessionId) === run) this.running.delete(sessionId);
+      if (run?.agentRun) {
+        const result = run.inputResult;
+        const error = run.agentRunError ?? (result && "error" in result ? result.error : undefined);
+        const status = run.agentRunError !== undefined
+          ? isAbortError(toError(run.agentRunError)) ? "cancelled" : "failed"
+          : result?.status ?? (run.controller.signal.aborted ? "cancelled" : "failed");
+        observeAgentLifecycle(this.options.agentLifecycle?.ended, {
+          ...run.agentRun, endedAt: this.now(), status, turnCount: result?.turns.length ?? 0,
+          ...(error !== undefined ? { error: normalizePersistedError(error).message } : {}),
+        });
+      }
       run?.settle();
       if (this.inputStore() && this.lifecycle === "open") {
         queueMicrotask(() => {
@@ -2096,11 +2136,23 @@ export class RuntimeService {
             return outcome.value;
           },
         );
+      } catch (error) {
+        const run = this.running.get(sessionId);
+        if (run?.operationContext === context) run.agentRunError = error;
+        throw error;
       } finally {
         try {
           const run = this.running.get(sessionId);
           if (run?.operationContext === context) {
-            await run.resourceStop;
+            let resourceFailure: { error: unknown } | undefined;
+            try {
+              await run.resourceStop;
+            } catch (error) {
+              // Resource cleanup can fail after the model has already stopped.
+              // Preserve that failure while still settling this run's input.
+              resourceFailure = { error };
+              run.agentRunError = error;
+            }
             if (run.purpose === "operation" && run.controlInterrupted && !context.lost) {
               await this.publishStatus({ sessionId, status: "cancelled", reason: "operation_interrupted" },
                 context.capability.runClaim ? { runClaim: context.capability.runClaim } : undefined);
@@ -2108,19 +2160,26 @@ export class RuntimeService {
             if (run.input?.claimId && !context.lost) {
               const result = run.inputResult;
               const outcome = this.lifecycle !== "open" ? "interrupted"
+                : resourceFailure ? "failed"
                 : result?.status === "completed" ? "completed"
                 : result?.status === "cancelled" ? "cancelled" : "failed";
-              const finalTurn = result?.status === "completed" ? result.turns.at(-1) : undefined;
+              const finalTurn = outcome === "completed" && result?.status === "completed" ? result.turns.at(-1) : undefined;
               const finalMessage = finalTurn?.status === "completed" && !isToolUseFinishReason(finalTurn.finishReason)
                 ? await this.assistantMessage(sessionId, finalTurn.assistantMessageId) : undefined;
               this.mutateSessionInputs({ kind: "settle", sessionId,
                 inputId: run.input.inputId, claimId: run.input.claimId, outcome,
                 ...(finalMessage?.role === "assistant" ? { resultMessageId: finalMessage.id } : {}),
-                ...(result && "error" in result && result.error ? { error: result.error.message } : {}),
+                ...(resourceFailure ? { error: normalizePersistedError(resourceFailure.error).message }
+                  : result && "error" in result && result.error ? { error: result.error.message } : {}),
               });
               if (outcome === "interrupted") this.mutateSessionInputs({ kind: "pause", sessionId });
             }
+            if (resourceFailure) throw resourceFailure.error;
           }
+        } catch (error) {
+          const run = this.running.get(sessionId);
+          if (run?.operationContext === context) run.agentRunError = error;
+          throw error;
         } finally {
           this.releaseRunController(sessionId, context);
         }

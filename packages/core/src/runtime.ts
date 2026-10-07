@@ -63,9 +63,13 @@ export interface ModelRequestLimits {
 
 export type ModelRequestIdentity = PreparedModelIdentity;
 
+export type ModelRequestPurpose = "task" | "review" | "compaction" | "validation";
+
 export interface ModelStreamInput {
   sessionId: SessionId;
   turnId: TurnId;
+  /** Host observability only; does not change the provider request. */
+  purpose?: ModelRequestPurpose;
   messages: Message[];
   tools: ToolDefinition[];
   system: string[];
