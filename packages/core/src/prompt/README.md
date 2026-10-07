@@ -28,7 +28,7 @@ Extending an already-rendered assembly preserves these original source facts.
 The context builder applies the request budget after assembly. The prepared
 request records the actual sent text and its inclusion/omission status together
 with source identity, scope, revision, and hashes. Raw `sourceContent` is not
-copied into the debug manifest or permanent request record. Files and the Memory
-repository remain authoritative for source bodies; this is not a historical
+copied into the debug manifest or permanent request record. Files, including
+ordinary Markdown Memory, remain authoritative for source bodies; this is not a historical
 file-snapshot store. Inspecting an actual request uses its saved prepared record
 rather than reloading today's source and presenting it as yesterday's prompt.

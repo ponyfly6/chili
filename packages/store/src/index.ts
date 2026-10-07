@@ -9,4 +9,3 @@ export * from "./types.js";
 export * from "./runtime-snapshot.js";
 export * from "./session-inputs.js";
 export * from "./host-owner.js";
-export * from "./memory-repository.js";

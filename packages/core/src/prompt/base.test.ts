@@ -16,7 +16,15 @@ test("default Chili base prompt covers core prompt behavior without growing too 
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("Inspect, edit, and test");
   expect(DEFAULT_CHILI_BASE_PROMPT).not.toContain("task_batch");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("what changed, what you ran");
-  expect(DEFAULT_CHILI_BASE_PROMPT.length).toBeLessThan(1_900);
+  expect(DEFAULT_CHILI_BASE_PROMPT).toContain("not loaded automatically");
+  expect(DEFAULT_CHILI_BASE_PROMPT).toContain("AGENTS.md, CHILI.md, .chili/rules");
+  expect(DEFAULT_CHILI_BASE_PROMPT).toContain("user's latest correction");
+  expect(DEFAULT_CHILI_BASE_PROMPT).toContain("only when the user explicitly asks");
+  expect(DEFAULT_CHILI_BASE_PROMPT).toContain("ordinary Markdown files");
+  expect(DEFAULT_CHILI_BASE_PROMPT).toContain("These paths do not grant access");
+  expect(DEFAULT_CHILI_BASE_PROMPT).not.toContain("discover memory");
+  expect(DEFAULT_CHILI_BASE_PROMPT).not.toContain("IDs and revisions");
+  expect(DEFAULT_CHILI_BASE_PROMPT.length).toBeLessThan(3_300);
 });
 
 test("chiliBasePromptFragment wraps the core base prompt", () => {

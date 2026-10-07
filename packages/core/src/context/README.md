@@ -80,17 +80,18 @@ requirement over repeated compression.
 The complete request path is `buildHostPromptFragments` (or the child equivalent)
 → `PromptAssembler` → `ContextWindowBuilder` → `SingleAgentRuntime`'s prepared
 request → `ModelRouter.stream`. Host and child runtimes use the same path and
-selected profile/project binding. `RuntimeService` reloads materials at each
-model step, including after tools and for the final response; lifecycle labels
-are not a cache. This was existing behavior and is now exercised end to end.
+selected profile/project binding. `RuntimeService` rebuilds supplied prompt
+material at each model step; lifecycle labels are not a cache. The standard Host
+supplies Memory directory paths, while the Agent reads Memory and project files
+through ordinary tools when needed. Rebuilding the prompt does not reread them.
 
 | Material | Authority and scope | Selection and update |
 | --- | --- | --- |
 | Platform/runtime rules | Trusted base/developer roles | Current Host snapshot, not project/Memory authority |
 | Explicit user request/correction | Current session user message | Retained in effective history; takes precedence over stale Memory/summary |
-| AGENTS/CHILI/path rules | Project material in contextual user role | Profile/project/cwd/known targets; re-read on each model step |
+| AGENTS/CHILI/path rules | Project material observed through tools | Agent discovers and reads applicable files |
 | Skills/MCP descriptions | Tool/reference material in contextual user role | Current selected profile/registry and explicit mentions; no system promotion |
-| Memory preferences/facts | Profile user scope or canonical project scope | Existing lexical retrieval, stable ID/revision, explicit write/update/delete |
+| Memory preferences/facts | Markdown under profile personal/current project directories | Agent searches, reads and edits files; no special Memory tool or automatic selection |
 | History/tool observations | Session-owned conversation | Complete compaction contract, paired tools, existing marked preview limits |
 | Tool definitions/images | Actual advertised catalog/multimodal inputs | Included in the full request estimate and existing item limits |
 
@@ -100,25 +101,26 @@ collisions fail. Distinct MCP names have distinct identities. Numeric priority
 orders material selection; it does not give lower-trust material higher authority
 or solve arbitrary semantic conflicts.
 
-Context chooses the actual request. Current project rules precede optional
-Memory in the shared character allowance. With known model limits, optional
-Memory entries leave as whole items (lowest selection priority first) before they
-force eviction of otherwise usable history. Required rules and the current
-request are never relabeled as optional merely because their text matches a
-Memory entry. If the remaining required request cannot fit, the runtime fails
-explicitly. The prepared budget includes history, all selected prompt roles,
-tool definitions, image estimates, output reserve and framing margin.
+Context chooses the actual request. Explicitly supplied optional background
+fragments retain their selection boundaries; required instructions and the
+current request are never relabeled as optional merely because their text
+matches a background item. The standard Host's Memory reads are normal tool
+history, with the same explicit display limits and compaction coverage contract.
+If required input cannot fit, the runtime fails explicitly. The prepared budget
+includes history, all selected prompt roles, tool definitions, image estimates,
+output reserve and framing margin.
 
-Memory retains explicit durable facts and preferences using its existing
-repository, scope keys, revisions and deletion semantics. This change adds no
-automatic extractor, embedding service, graph, or permanent transcript store.
+Memory retains explicit durable facts and preferences as ordinary Markdown files.
+Editing or deleting a file immediately affects the next normal read. There is no
+Memory database, index, automatic extractor, embedding service or graph.
 Current task state and incomplete tool execution remain session facts. Main and
 child Agents share a profile's user preferences and the bound project's facts;
-other profiles/projects and session file-target histories stay isolated. Sharing
-Memory does not mean sharing private conversation history or authorization.
+directory discovery uses the execution's profile and project. Sharing Memory
+does not mean sharing private conversation history or authorization; filesystem
+access continues to use normal tool and worker policies.
 
 Loaded source bodies remain separate from display previews in memory. Only the
-existing authoritative files/Memory repository own those bodies. Inspection
+authoritative files own those bodies. Inspection
 records original source hash/length, rendered hash, actual sent hash, applicable
 scope/revision, and omission/truncation reason. Source matching consumes content
 occurrences, so empty fragments, duplicate text, and budget omission cannot shift
