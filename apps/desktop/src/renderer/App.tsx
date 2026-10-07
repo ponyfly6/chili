@@ -5,7 +5,14 @@ import { DesktopSettings, type SessionSettingsValues } from "./DesktopSettings.j
 import { conversationTitle, matchingDesktopCommands,
   type DesktopCommand, type SettingsPage } from "./conversation-design.js";
 import { ProjectSidebar } from "./ProjectSidebar.js";
-import { SessionList } from "./SessionList.js";
+import { SessionActivityBadge, SessionList } from "./SessionList.js";
+import { SidebarActivityMemory } from "./sidebar-activity-memory.js";
+import { UserInputCard } from "./UserInputCard.js";
+import { createUserInputDraft, type UserInputDraft } from "./user-input-drafts.js";
+import { ConversationActivityBar, ConversationQueue } from "./ConversationActivity.js";
+import { conversationActivity } from "./conversation-activity.js";
+import { ResultsPanel } from "./ResultsPanel.js";
+import { discoverDesktopResults } from "./result-model.js";
 import { TimelineViewport } from "./TimelineViewport.js";
 import { AgentDetailsPanel } from "./AgentDetailsPanel.js";
 import { sessionDescendantAgents } from "./agent-details-model.js";
@@ -34,7 +41,6 @@ import type {
   DesktopSessionConfig,
   DesktopState,
   RuntimeSnapshot,
-  UserInputRequest,
 } from "../shared/contracts.js";
 import type { ControlTransport } from "./transport.js";
 import {
@@ -64,7 +70,6 @@ import {
   workspaceSelectionChangesScope,
 } from "./interaction-model.js";
 import { IndependentRefreshScheduler } from "./refresh-scheduler.js";
-import { buildUserInputAnswers } from "./user-input-model.js";
 import {
   appendRuntimeEvent,
   desktopTimelineItems,
@@ -99,6 +104,7 @@ import {
 type DesktopProjection = CoordinatedProjection<DesktopState, RuntimeSessionSummary, RuntimeSnapshot>;
 const MAX_OUTER_RESYNC_RETRIES = 4;
 const OUTER_RESYNC_RETRY_DELAY_MS = 500;
+type ConversationMode = "chat" | "result" | "split";
 
 export function App({ transport: hostTransport }: { transport: ControlTransport }) {
   const buildInfo = getDesktopBuildInfo();
@@ -118,9 +124,15 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     sessions: [],
   });
   const [composer, setComposer] = useState("");
+  const [inputDrafts, setInputDrafts] = useState<Record<string, UserInputDraft>>({});
+  const [conversationModes, setConversationModes] = useState<Record<string, ConversationMode>>({});
+  const [resultTargets, setResultTargets] = useState<Record<string, string>>({});
+  const seenResults = useRef(new Map<string, string>());
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const transport = useMemo(() => projection.state.projectId && hostTransport.forProject
     ? hostTransport.forProject(projection.state.projectId) : hostTransport, [hostTransport, projection.state.projectId]);
   const projectViews = useRef(new ProjectViewMemory());
+  const sidebarActivity = useRef(new SidebarActivityMemory());
   const requestedProjectSession = useRef<{ projectId: string; sessionId: string } | undefined>(undefined);
   const [error, setError] = useState<string>();
   const [working, setWorking] = useState(false);
@@ -239,8 +251,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         { workspace: workspaceRef.current, sessionId: selectedRef.current },
         { workspace: published.state.workspace, sessionId: published.selectedId },
       )) {
-        const saved = projectViews.current.read(published.state.workspace);
-        setComposer(saved && saved.sessionId === published.selectedId ? saved.draft : "");
+        setComposer(projectViews.current.readDraft(published.state.workspace, published.selectedId) ?? "");
       }
       const projectChanged = workspaceRef.current !== published.state.workspace;
       workspaceRef.current = published.state.workspace;
@@ -252,6 +263,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         published.selectedId,
         current,
       ));
+      if (published.snapshot) sidebarActivity.current.seed(published.state.projectId ?? published.state.workspace, published.snapshot);
       projectionRef.current = published;
       setProjection(published);
       setLoadingSession(false);
@@ -288,6 +300,27 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   );
   const canResumeSession = canResumeTask(presentation?.chat.status, selectedReadOnly, snapshot?.inputQueue?.paused);
   const emptyConversation = !loadingSession && timelineItems.length === 0;
+  const conversationScope = JSON.stringify([desktop.projectId, desktop.workspace, selectedId]);
+  const resultTarget = resultTargets[conversationScope];
+  const activity = conversationActivity({ status: presentation?.chat.status, paused: snapshot?.inputQueue?.paused ?? false,
+    pendingQuestions: presentation?.pendingInputs.length ?? 0, readOnly: selectedReadOnly });
+  const results = useMemo(() => desktop.workspace && presentation
+    ? discoverDesktopResults(presentation.chat.items, desktop.workspace) : [], [desktop.workspace, presentation]);
+  const hasResults = results.length > 0 && Boolean(transport.readResult);
+  const savedMode = conversationModes[conversationScope] ?? "chat";
+  const conversationMode = !hasResults ? "chat" : savedMode === "split" && viewportWidth < 1000 ? "result" : savedMode;
+  const chooseConversationMode = (mode: ConversationMode) => setConversationModes((current) => ({ ...current, [conversationScope]: mode }));
+  const resultsRevision = results.map((result) => `${result.id}:${result.messageId}`).join("|");
+  useEffect(() => {
+    if (!hasResults || presentation?.chat.status !== "idle" || snapshot?.inputQueue?.paused
+      || loadingSession || resyncing || !healthy || presentation.pendingInputs.length || !resultsRevision) return;
+    if (seenResults.current.get(conversationScope) === resultsRevision) return;
+    seenResults.current.set(conversationScope, resultsRevision);
+    if (preferences.autoOpenResults) setConversationModes((current) => ({
+      ...current, [conversationScope]: current[conversationScope] === "split" ? "split" : "result",
+    }));
+  }, [conversationScope, hasResults, loadingSession, preferences.autoOpenResults, presentation?.chat.status, presentation?.pendingInputs.length, resultsRevision,
+    snapshot?.inputQueue?.paused, resyncing, healthy]);
   const commands = commandsOpen && !selectedReadOnly ? matchingDesktopCommands(composer.startsWith("/") ? composer : "/") : [];
   useEffect(() => {
     setCommandsOpen(false);
@@ -307,6 +340,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     let previousWidth = window.innerWidth;
     const handleResize = (): void => {
       const width = window.innerWidth;
+      setViewportWidth(width);
       if (previousWidth > 640 && width <= 640) closeSidebar();
       previousWidth = width;
     };
@@ -395,8 +429,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       { workspace: workspaceRef.current, sessionId: selectedRef.current },
       { workspace: workspaceRef.current, sessionId },
     )) {
-      const saved = projectViews.current.read(workspaceRef.current);
-      setComposer(saved?.sessionId === sessionId ? saved.draft : "");
+      setComposer(projectViews.current.readDraft(workspaceRef.current, sessionId) ?? "");
     }
     setSelectedId(sessionId);
     if (!options.background) {
@@ -406,7 +439,10 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     setError(undefined);
     try {
       const next = await coordinator.refreshSessionSnapshot(sessionId);
-      if (selectedRef.current === sessionId) setSnapshot(next);
+      if (selectedRef.current === sessionId) {
+        sidebarActivity.current.seed(projectionRef.current.state.projectId ?? workspaceRef.current, next);
+        setSnapshot(next);
+      }
     } catch (cause) {
       if (!(cause instanceof SupersededProjectionRequestError) && !(cause instanceof RecoveryInProgressError)) {
         setError(messageFor(cause));
@@ -438,7 +474,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           ? current
           : next.find((session) => session.status === "active")?.id ?? next[0]?.id;
       if (!target) {
-        setComposer("");
+        setComposer(projectViews.current.readDraft(workspaceRef.current, undefined) ?? "");
         setSelectedId(undefined);
         setSnapshot(undefined);
       } else if (target !== current || preferredId) {
@@ -560,6 +596,9 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       resumeBarrier: startResync,
     });
     const unsubscribe = hostTransport.subscribe((envelope) => {
+      if (envelope.event.type === "runtime.event") {
+        sidebarActivity.current.ingest(envelope.event.projectId ?? projectionRef.current.state.projectId ?? workspaceRef.current, envelope.event.event);
+      }
       if (!eventMatchesProject(envelope.event, projectionRef.current.state.projectId)) return;
       coordinator.recordFrame({ sequence: envelope.sequence, frame: envelope.event });
       const event = envelope.event;
@@ -586,7 +625,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         }
         if (workspaceChanged) {
           projectionRefreshes.cancel();
-          setComposer("");
+          setComposer(projectViews.current.readDraft(event.state.workspace, undefined) ?? "");
           setNewTaskOpen(false);
           setSettingsOpen(false);
           setRenameTarget(undefined);
@@ -705,7 +744,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     workspaceRef.current = state.workspace;
     sidecarPhaseRef.current = state.sidecar.phase;
     if (workspaceChanged) {
-      setComposer("");
+      setComposer(projectViews.current.readDraft(state.workspace, undefined) ?? "");
       const previousSelectedId = selectedRef.current;
       selectedRef.current = undefined;
       setSessionConfig((current) => sessionConfigAfterSelectionChange(
@@ -882,6 +921,24 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     });
   };
 
+  const changeMcpConnection = async (server: string, connect: boolean) => {
+    if (!selectedId || selectedReadOnly) return;
+    const operation = connect ? transport.connectMcp : transport.disconnectMcp;
+    if (!operation) return;
+    await runAction(async () => {
+      let result;
+      try { result = await operation(server, selectedId); }
+      catch {
+        await reloadSessionConfig(selectedId).catch(() => undefined);
+        throw new Error(connect ? "连接失败，请检查本机配置后重试。" : "暂时无法断开连接，请重试。");
+      }
+      await reloadSessionConfig(selectedId);
+      if (connect && result.status !== "running") {
+        throw new Error(result.status === "auth_required" ? "需要先在本机配置中完成授权，再重试连接。" : "连接未成功，可以检查配置后重试。");
+      }
+    });
+  };
+
   const chooseCommand = (command: DesktopCommand) => {
     if (selectedReadOnly) return;
     setCommandsOpen(false);
@@ -897,10 +954,11 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   };
 
   const submit = async (mode: "queue" | "steer") => {
-    const text = composer.trim();
-    if (!text || !composerEditable || actionInFlightRef.current) return;
-    const localCommand = matchingDesktopCommands(text).find((command) => `/${command.id}` === text.toLowerCase());
+    const draft = composer.trim();
+    if (!draft || !composerEditable || actionInFlightRef.current) return;
+    const localCommand = matchingDesktopCommands(draft).find((command) => `/${command.id}` === draft.toLowerCase());
     if (localCommand) { chooseCommand(localCommand); return; }
+    const text = resultTarget ? `请修改文件「${resultTarget}」：\n${draft}` : draft;
     setCommandsOpen(false);
     await runAction(async () => {
       if (!selectedId) {
@@ -916,6 +974,12 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         }
         await transport.send(selectedId, text, mode);
         projectViews.current.remember(desktop.workspace, selectedId, "");
+        setResultTargets((current) => {
+          if (current[conversationScope] !== resultTarget) return current;
+          const next = { ...current };
+          delete next[conversationScope];
+          return next;
+        });
         if (projectionRef.current.state.workspace === desktop.workspace && selectedRef.current === selectedId) setComposer("");
       }
       requestAnimationFrame(() => composerRef.current?.focus());
@@ -1066,10 +1130,12 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                       <span className="session-title">{session.title || session.preview || "新会话"}</span>
                       <span className="session-meta">
                         {formatRelativeTime(session.updatedAt)}
-                        {(desktop.queuedBySession[session.id] ?? 0) > 0 ? ` · ${desktop.queuedBySession[session.id]} queued` : ""}
+                        {(desktop.queuedBySession[session.id] ?? 0) > 0 ? ` · 待处理 ${desktop.queuedBySession[session.id]}` : ""}
                       </span>
                     </span>
-                    {selectedId === session.id ? <span className="session-active-mark" aria-hidden="true" /> : null}
+                    <SessionActivityBadge {...sidebarActivity.current.read(desktop.projectId ?? desktop.workspace, session.id)}
+                      queuedCount={desktop.queuedBySession[session.id] ?? 0}
+                      archived={session.status === "archived"} />
                   </button>
                   {canExposeTaskActions(session) ? (
                     <>
@@ -1139,8 +1205,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           <div className="conversation-heading">
             <div className="conversation-title"><h1>{selectedId ? selectedTitle : "新会话"}</h1></div>
             <div className="conversation-heading-actions">
-              {canResumeSession ? <button className="secondary compact-action" disabled={runtimeActionsDisabled} onClick={() => void resumeSession()}><Icon name="resume" />继续处理</button> : null}
-              {sessionBusy && !selectedReadOnly ? <span className="session-status status-running"><span />正在处理</span> : null}
+              {activity.kind !== "idle" && !selectedReadOnly ? <span className={`conversation-state state-${activity.kind}`}><span />{activity.label}</span> : null}
               {selectedId && !selectedReadOnly ? <button className="icon-button" aria-label="Task runtime settings" title="会话设置" disabled={runtimeActionsDisabled || !sessionConfig} onClick={() => openSettings("models")}><Icon name="more" /></button> : null}
             </div>
           </div>
@@ -1151,7 +1216,14 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             </div>
           ) : null}
 
-          <div className="conversation-body">
+          {hasResults ? <nav className="conversation-viewbar" aria-label="查看方式">
+            <div><button type="button" aria-pressed={conversationMode === "result"} onClick={() => chooseConversationMode("result")}>成果 <span>{results.length}</span></button>
+              <button type="button" aria-pressed={conversationMode === "chat"} onClick={() => chooseConversationMode("chat")}>对话</button></div>
+            {viewportWidth >= 1000 ? <button type="button" className="split-view-button" aria-pressed={conversationMode === "split"} onClick={() => chooseConversationMode("split")}><Icon name="sidebar" />并排查看</button> : null}
+          </nav> : null}
+          <div className={`conversation-stage mode-${conversationMode}`}>
+          <div className="conversation-dialogue">
+          <div className="conversation-body" hidden={conversationMode === "result"}>
           <div className="chat-surface">
           <TimelineViewport scopeKey={JSON.stringify([desktop.projectId, desktop.workspace, selectedId])}>
             {snapshot?.truncated ? <p className="transcript-warning" role="status">{snapshot.warning ?? "This large session was trimmed for desktop safety."}</p> : null}
@@ -1167,8 +1239,8 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           </div>
 
           {selectedId && descendantAgents.length > 0 ? (
-            <details className="conversation-agents">
-              <summary>Agents · {descendantAgents.length}</summary>
+            <details className="conversation-agents" hidden={conversationMode === "result"}>
+              <summary>分工协作 · {descendantAgents.length}</summary>
               <div>
                 <AgentDetailsPanel
                   projectId={desktop.projectId}
@@ -1191,22 +1263,29 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
 
           {presentation && presentation.pendingInputs.length > 0 ? (
             <div className="blocking-dock">
-              {presentation.pendingInputs.map((input) => (
+              {presentation.pendingInputs.map((input) => {
+                const draftKey = JSON.stringify([desktop.workspace, selectedId, input.id]);
+                return (
                 <UserInputCard
-                  key={input.id}
+                  key={draftKey}
                   request={input}
+                  draft={inputDrafts[draftKey] ?? createUserInputDraft()}
+                  onDraftChange={(draft) => setInputDrafts((current) => ({ ...current, [draftKey]: draft }))}
                   disabled={runtimeActionsDisabled}
                   submit={(answers) => runAction(async () => {
                     if (selectedReadOnly) return;
                     await transport.resolveUserInput(input.id, answers);
+                    setInputDrafts((current) => { const next = { ...current }; delete next[draftKey]; return next; });
                     await reloadSelected();
                   })}
                 />
-              ))}
+              ); })}
             </div>
           ) : null}
 
           <div className="composer-wrap">
+            <ConversationQueue queue={snapshot?.inputQueue} pendingCount={desktop.queuedBySession[selectedId ?? ""] ?? 0} />
+            {resultTarget ? <div className="composer-result-target"><span>正在修改：{resultTarget}</span><button type="button" aria-label="取消修改对象" onClick={() => setResultTargets((current) => { const next = { ...current }; delete next[conversationScope]; return next; })}><Icon name="close" /></button></div> : null}
             <div className="composer">
               {commandsOpen && commands.length > 0 ? <div id="composer-commands" className="composer-command-menu" role="listbox" aria-label="斜杠命令">
                 <p>按需使用</p>{commands.map((command, index) => <button id={`command-${command.id}`} key={command.id} type="button" role="option" aria-selected={index === commandIndex % commands.length}
@@ -1235,47 +1314,48 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                     else if (composerEditable) void submit("queue");
                   }
                 }}
-                placeholder={selectedReadOnly ? "已归档的会话仅供查看" : sessionBusy ? "补充想法，或告诉 Chili 调整方向…" : "说说你想做什么…"}
+                placeholder={selectedReadOnly ? "已归档的会话仅供查看" : resultTarget ? "想怎么修改这个文件？" : activity.queueInput ? "补充想法，或告诉 Chili 调整方向…" : emptyConversation ? "说说你想做什么…" : "继续说说你想改哪里…"}
                 aria-expanded={commandsOpen && commands.length > 0}
                 aria-controls={commandsOpen && commands.length > 0 ? "composer-commands" : undefined}
                 aria-activedescendant={commandsOpen && commands.length > 0 ? `command-${commands[commandIndex % commands.length]!.id}` : undefined}
                 disabled={!composerEditable}
                 rows={2}
               />
+              <ConversationActivityBar activity={activity} disabled={!selectedId || runtimeActionsDisabled} canResume={canResumeSession}
+                onStop={() => void stop()} onResume={() => void resumeSession()} />
               <div className="composer-actions">
                 <div className="composer-context">
                   <button className="slash-trigger" aria-label="更多命令" disabled={!composerEditable} onClick={() => { setCommandsOpen((open) => !open); setCommandIndex(0); composerRef.current?.focus(); }}>/ <span>更多</span></button>
-                  {snapshot?.inputQueue?.paused && !selectedReadOnly ? <span>已暂停 · 可继续处理</span> : null}
-                  {(desktop.queuedBySession[selectedId ?? ""] ?? 0) > 0 ? <span>{desktop.queuedBySession[selectedId ?? ""]} 条待处理</span> : null}
                 </div>
                 <div className="composer-buttons">
-                  {sessionBusy ? (
-                    <button
-                      className="composer-stop"
-                      title="Stop current turn"
-                      aria-label="Stop current turn"
-                      disabled={!selectedId || runtimeActionsDisabled}
-                      onClick={() => void stop()}
-                    >
-                      <Icon name="stop" />
-                    </button>
-                  ) : null}
-                  {sessionBusy ? (
+                  {sessionBusy && presentation?.chat.status !== "cancelling" && composer.trim() ? (
                     <button className="steer-button" disabled={!composer.trim() || !selectedId || runtimeActionsDisabled} onClick={() => void submit("steer")}>
                       <Icon name="steer" />调整方向
                     </button>
                   ) : null}
-                  <button className="send-button" title={sessionBusy ? "Queue message" : "Send message"} aria-label={sessionBusy ? "Queue message" : "Send message"} disabled={!composer.trim() || runtimeActionsDisabled} onClick={() => void submit("queue")}>
-                    <Icon name={sessionBusy ? "queue" : "send"} />
+                  {activity.queueInput ? <span className="composer-send-hint">稍后处理</span> : null}
+                  <button className="send-button" title={activity.queueInput ? "Queue message" : "Send message"} aria-label={activity.queueInput ? "Queue message" : "Send message"} disabled={!composer.trim() || runtimeActionsDisabled} onClick={() => void submit("queue")}>
+                    <Icon name="send" />
                   </button>
                 </div>
               </div>
             </div>
+            {!emptyConversation ? <p className="composer-key-hint">{activity.hint}</p> : null}
             {emptyConversation ? <div className="conversation-examples">{[
               ["做一个网站", "帮我做一个简洁自然的网站，先了解这个目录，再和我确认具体内容。"],
               ["整理文件", "查看这个目录，给我一个整理文件的建议，先不要移动或删除文件。"],
               ["修改已有作品", "看看这个目录里的作品，告诉我有哪些值得改进的地方。"],
             ].map(([label, prompt]) => <button key={label} disabled={!composerEditable} onClick={() => { setComposer(prompt!); composerRef.current?.focus(); }}>{label}<span aria-hidden="true">↗</span></button>)}</div> : null}
+          </div>
+          </div>
+          {hasResults && selectedId && desktop.workspace && presentation ? <div className="results-surface" hidden={conversationMode === "chat"}>
+            <ResultsPanel key={conversationScope} transport={transport} sessionId={selectedId} workspace={desktop.workspace}
+              items={presentation.chat.items} renderMarkdown={(text) => <MarkdownText text={text} />}
+              {...(!selectedReadOnly ? { onContinue: (path: string) => {
+                setResultTargets((current) => ({ ...current, [conversationScope]: path }));
+                requestAnimationFrame(() => composerRef.current?.focus());
+              } } : {})} />
+          </div> : null}
           </div>
         </section>
       </main>
@@ -1320,6 +1400,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           models={models} disabled={runtimeActionsDisabled} busy={working} error={error} theme={theme} onTheme={changeTheme}
           themeSaveFailed={themeSaveFailed} themeSaving={themeSaving || preferencesSaving} preferences={preferences} onPreferences={savePreferences} preferenceSaveFailed={preferenceSaveFailed}
           onSave={(values, section) => void saveSessionSettings(values, section)} onReloadMcp={() => void reloadMcp()}
+          {...(transport.connectMcp && transport.disconnectMcp ? { onMcpConnection: (server: string, connect: boolean) => void changeMcpConnection(server, connect) } : {})}
           onPrompt={(text) => { if (selectedReadOnly) return; setSettingsOpen(false); setComposer(text); requestAnimationFrame(() => composerRef.current?.focus()); }}
           onNewSession={() => { setSettingsOpen(false); openNewTask(); }} onClose={() => setSettingsOpen(false)} />
       </ModalFrame> : null}
@@ -1948,71 +2029,6 @@ function inlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
   }
   if (cursor < text.length) nodes.push(text.slice(cursor));
   return nodes;
-}
-
-function UserInputCard({
-  request,
-  disabled,
-  submit,
-}: {
-  request: UserInputRequest;
-  disabled: boolean;
-  submit: (answers: Record<string, string[]>) => Promise<void>;
-}) {
-  const [selected, setSelected] = useState<Record<string, string[]>>({});
-  const [custom, setCustom] = useState<Record<string, string>>({});
-  const answers = buildUserInputAnswers(request, selected, custom);
-  const complete = Object.values(answers).every((values) => values.length > 0);
-
-  return (
-    <section className="request-card input-card">
-      <p className="eyebrow">Input requested · {shortId(request.sessionId)}</p>
-      {request.questions.map((question) => (
-        <fieldset key={question.id}>
-          <legend><span>{question.header}</span>{question.question}</legend>
-          <div className="choice-list">
-            {question.options.map((option) => {
-              const active = selected[question.id]?.includes(option.label) ?? false;
-              return (
-                <button
-                  type="button"
-                  key={option.label}
-                  className={active ? "choice active" : "choice"}
-                  aria-pressed={active}
-                  onClick={() => {
-                    setSelected((current) => ({
-                      ...current,
-                      [question.id]: question.multiple
-                        ? active
-                          ? (current[question.id] ?? []).filter((label) => label !== option.label)
-                          : [...(current[question.id] ?? []), option.label]
-                        : [option.label],
-                    }));
-                    if (!question.multiple) setCustom((current) => ({ ...current, [question.id]: "" }));
-                  }}
-                >
-                  <strong>{option.label}</strong>{option.description ? <span>{option.description}</span> : null}
-                </button>
-              );
-            })}
-          </div>
-          <input
-            aria-label={`Custom answer for ${question.header}`}
-            value={custom[question.id] ?? ""}
-            onChange={(event) => {
-              const value = event.target.value;
-              setCustom((current) => ({ ...current, [question.id]: value }));
-              if (!question.multiple && value.trim()) {
-                setSelected((current) => ({ ...current, [question.id]: [] }));
-              }
-            }}
-            placeholder="Or type an answer…"
-          />
-        </fieldset>
-      ))}
-      <div className="request-actions"><button className="primary" disabled={disabled || !complete} onClick={() => void submit(answers)}>Submit answer</button></div>
-    </section>
-  );
 }
 
 type IconName = "activity" | "archive" | "chevron" | "close" | "folder" | "message" | "more"

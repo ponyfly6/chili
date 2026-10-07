@@ -1,5 +1,6 @@
 import type { ReadingPreferences } from "./reading-preferences.js";
 import type { DesktopTheme } from "./appearance.js";
+import { isResultPreviewUrl, MAX_RESULT_IMAGE_BYTES, MAX_RESULT_TEXT_BYTES, resultFileType, type DesktopResultRead } from "./result-preview.js";
 import {
   normalizeSessionTitle,
   parseChiliEvent,
@@ -11,6 +12,8 @@ import {
   parseRuntimeDelegationConfig as parseProtocolDelegationConfig,
   parseRuntimeMcpReloadResponse as parseProtocolMcpReloadResponse,
   parseRuntimeMcpStatusResponse as parseProtocolMcpStatusResponse,
+  parseRuntimeMcpServerDescriptor as parseProtocolMcpServerDescriptor,
+  type RuntimeMcpServerDescriptor,
   parseRuntimeModelConfig as parseProtocolModelConfig,
   parseRuntimeModelDescriptor as parseProtocolModelDescriptor,
   parseRuntimePermissionConfig as parseProtocolPermissionConfig,
@@ -169,6 +172,8 @@ export interface DesktopSessionConfig {
   mcp: RuntimeMcpStatusResponse;
 }
 
+export type DesktopMcpConnectionState = Pick<RuntimeMcpServerDescriptor, "name" | "status" | "enabled" | "transport" | "toolCount">;
+
 type DesktopOperation =
   | { type: "reading.get" }
   | ({ type: "reading.set" } & ReadingPreferences)
@@ -194,6 +199,7 @@ type DesktopOperation =
   | { type: "session.delegation.set"; sessionId: string; policy: DelegationPolicy }
   | { type: "mcp.status"; sessionId?: string }
   | { type: "mcp.reload"; sessionId?: string }
+  | { type: "mcp.connect" | "mcp.disconnect"; server: string; sessionId?: string }
   | { type: "session.send"; sessionId: string; text: string; mode: SendMode; submissionId?: string }
   | { type: "session.stop"; sessionId: string }
   | { type: "agent.send"; sessionId: string; agentId: string; text: string; mode?: SendMode }
@@ -201,6 +207,7 @@ type DesktopOperation =
   | { type: "agent.resume"; sessionId: string; agentId: string }
   | { type: "user-input.resolve"; inputId: string; answers: Record<string, string[]> }
   | { type: "events.resync.complete"; barrierId: string }
+  | { type: "result.read"; path: string }
   | { type: "diff.get"; scope: DiffScope; sessionId: string; turnId?: string };
 
 /** Every runtime operation can name its owning project independently of the visible project. */
@@ -231,6 +238,8 @@ export interface DesktopResponseMap {
   "session.delegation.set": RuntimeDelegationConfig;
   "mcp.status": RuntimeMcpStatusResponse;
   "mcp.reload": RuntimeMcpReloadResponse;
+  "mcp.connect": DesktopMcpConnectionState;
+  "mcp.disconnect": DesktopMcpConnectionState;
   "session.send": { status: "accepted" | "queued"; position?: number };
   "session.stop": { interrupted: boolean };
   "agent.send": { agentId: string; inputId: string };
@@ -238,6 +247,7 @@ export interface DesktopResponseMap {
   "agent.resume": { agentId: string; inputId?: string };
   "user-input.resolve": { resolved: boolean };
   "events.resync.complete": { status: "completed" | "retry" };
+  "result.read": DesktopResultRead;
   "diff.get": { scope: DiffScope; text: string; truncated: boolean };
 }
 
@@ -286,7 +296,12 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
 
   if (type === "workspace.activate") return { type, id: requireProjectId(record.id, "id") };
   if (type === "reading.get") return { type };
-  if (type === "reading.set") return { type, expandWork: requireBoolean(record.expandWork, "expandWork") };
+  if (type === "reading.set") return { type, expandWork: requireBoolean(record.expandWork, "expandWork"), autoOpenResults: requireBoolean(record.autoOpenResults, "autoOpenResults") };
+  if (type === "result.read") {
+    const path = requireString(record.path, "path", 4_096);
+    if (/[\u0000-\u001f\u007f]/u.test(path)) throw new TypeError("Invalid result path");
+    return { type, path };
+  }
   if (type === "appearance.get") return { type };
   if (type === "appearance.set") {
     return { type, theme: requireEnum(record.theme, ["system", "dark", "light"], "theme") as DesktopTheme };
@@ -371,6 +386,11 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
     const request: Extract<DesktopRequest, { type: typeof type }> = { type };
     if (record.sessionId !== undefined) request.sessionId = requireIdentifier(record.sessionId, "sessionId");
     return request;
+  }
+  if (type === "mcp.connect" || type === "mcp.disconnect") {
+    const server = requireString(record.server, "server", 200);
+    if (/[\u0000-\u001f\u007f]/u.test(server)) throw new TypeError("Invalid MCP server name");
+    return { type, server, ...(record.sessionId !== undefined ? { sessionId: requireIdentifier(record.sessionId, "sessionId") } : {}) };
   }
   if (type === "session.send") {
     const mode = record.mode;
@@ -555,8 +575,8 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
   let response: unknown;
   if (request.type === "reading.get" || request.type === "reading.set") {
     const record = requireRecord(value, "reading preferences");
-    assertOnlyKeys(record, ["expandWork"]);
-    response = { expandWork: requireBoolean(record.expandWork, "expandWork") };
+    assertOnlyKeys(record, ["expandWork", "autoOpenResults"]);
+    response = { expandWork: requireBoolean(record.expandWork, "expandWork"), autoOpenResults: requireBoolean(record.autoOpenResults, "autoOpenResults") };
   } else if (request.type === "appearance.get" || request.type === "appearance.set") {
     const record = requireRecord(value, "appearance response");
     assertOnlyKeys(record, ["theme"]);
@@ -595,6 +615,12 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
     response = parseRuntimeMcpStatus(value, "MCP status");
   } else if (request.type === "mcp.reload") {
     response = parseRuntimeMcpReload(value, "MCP reload");
+  } else if (request.type === "mcp.connect" || request.type === "mcp.disconnect") {
+    const record = requireRecord(value, "MCP connection");
+    assertOnlyKeys(record, ["name", "status", "enabled", "transport", "toolCount"]);
+    const server = parseProtocolMcpServerDescriptor(record, "MCP connection");
+    if (server.name !== request.server) throw new TypeError("MCP response belongs to a different server");
+    response = server;
   } else if (request.type === "session.send") {
     const record = requireRecord(value, "send response");
     if (record.status !== "accepted" && record.status !== "queued") throw new TypeError("Invalid send status");
@@ -616,6 +642,8 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
     const status = requireRecord(value, "resync completion response").status;
     if (status !== "completed" && status !== "retry") throw new TypeError("Invalid resync completion status");
     response = { status };
+  } else if (request.type === "result.read") {
+    response = parseResultRead(value);
   } else if (request.type === "diff.get") {
     const record = requireRecord(value, "diff response");
     if (record.scope !== "turn" && record.scope !== "workspace") throw new TypeError("Invalid diff scope");
@@ -629,6 +657,33 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
   }
   assertDesktopResponseScope(request, response);
   return response as DesktopResponse<Request>;
+}
+
+function parseResultRead(value: unknown): DesktopResultRead {
+  const record = requireRecord(value, "result response");
+  if (record.status === "unavailable") {
+    assertOnlyKeys(record, ["status", "reason"]);
+    return { status: "unavailable", reason: requireEnum(record.reason,
+      ["outside_workspace", "missing", "unsupported", "too_large", "not_file", "invalid_text", "unavailable"], "reason") as Extract<DesktopResultRead, { status: "unavailable" }>["reason"] };
+  }
+  assertOnlyKeys(record, ["status", "path", "kind", "mimeType", "content", "bytes", "previewUrl"]);
+  if (record.status !== "ready") throw new TypeError("Invalid result status");
+  const path = requireString(record.path, "result path", 4_096);
+  const type = resultFileType(path);
+  if (!type || record.kind !== type.kind || record.mimeType !== type.mimeType) throw new TypeError("Invalid result type");
+  const bytes = requireNonNegativeInteger(record.bytes, "result bytes");
+  const limit = type.kind === "image" ? MAX_RESULT_IMAGE_BYTES : MAX_RESULT_TEXT_BYTES;
+  if (bytes > limit) throw new TypeError("Result exceeds byte limit");
+  const content = requireString(record.content, "result content", type.kind === "image" ? Math.ceil(limit / 3) * 4 : limit, true);
+  if (type.kind === "image" && !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(content)) {
+    throw new TypeError("Invalid image content");
+  }
+  let previewUrl: string | undefined;
+  if (record.previewUrl !== undefined) {
+    previewUrl = requireString(record.previewUrl, "previewUrl", 13_000);
+    if (type.kind !== "html" || !isResultPreviewUrl(previewUrl)) throw new TypeError("Invalid result preview URL");
+  }
+  return { status: "ready", path, ...type, bytes, content, ...(previewUrl ? { previewUrl } : {}) };
 }
 
 export function parseDesktopInvokeResponse<Request extends DesktopRequest>(
@@ -813,7 +868,7 @@ function parseRuntimeEvent(value: unknown): ChiliEvent {
   const payload = requireRecord(event.payload, "event.payload");
   if (event.sessionId !== undefined) requireIdentifier(event.sessionId, "event.sessionId");
   assertJsonValue(payload, "event.payload", 0);
-  if (type === "session.created" || type === "session.input_queue_changed") {
+  if (type === "session.created" || type === "session.input_queue_changed" || type === "session.tools_loaded") {
     const parsed = parseChiliEvent(value);
     assertRuntimePayloadIdentifiers(type, payload);
     if (parsed.type === "session.created" && parsed.payload.agent) {
@@ -1045,7 +1100,8 @@ function parseUserInputQuestion(value: unknown): UserInputQuestion {
 function requestKeys(type: string): readonly string[] {
   if (type === "workspace.activate") return ["type", "id"];
   if (type === "reading.get") return ["type"];
-  if (type === "reading.set") return ["type", "expandWork"];
+  if (type === "reading.set") return ["type", "expandWork", "autoOpenResults"];
+  if (type === "result.read") return ["type", "path"];
   if (type === "appearance.get") return ["type"];
   if (type === "appearance.set") return ["type", "theme"];
   if (type === "app.state" || type === "workspace.select" || type === "permissions.get") return ["type"];
@@ -1078,6 +1134,7 @@ function requestKeys(type: string): readonly string[] {
   if (type === "permissions.set") return ["type", "profile", "reviewInstructions", "reviewerModel"];
   if (type === "session.delegation.set") return ["type", "sessionId", "policy"];
   if (type === "mcp.status" || type === "mcp.reload") return ["type", "sessionId"];
+  if (type === "mcp.connect" || type === "mcp.disconnect") return ["type", "server", "sessionId"];
   if (type === "session.send") return ["type", "sessionId", "text", "mode", "submissionId"];
   if (type === "agent.send") return ["type", "sessionId", "agentId", "text", "mode"];
   if (type === "agent.stop" || type === "agent.resume") return ["type", "sessionId", "agentId"];
@@ -1590,6 +1647,7 @@ const RUNTIME_EVENT_ID_FIELDS: Readonly<Record<string, readonly string[]>> = {
   "session.created": ["sessionId"],
   "session.identity_bound": ["sessionId"],
   "session.input_queue_changed": ["sessionId"],
+  "session.tools_loaded": ["sessionId", "turnId", "callId"],
   "session.renamed": ["sessionId"],
   "session.status_changed": ["sessionId", "turnId"],
   "session.model_changed": ["sessionId"],

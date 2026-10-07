@@ -1,0 +1,4 @@
+.settings-row > .mcp-connection-actions { display: flex; flex-direction: row; align-items: center; flex-shrink: 0; gap: 10px; }
+.mcp-connection-actions .connection-label { white-space: nowrap; }
+.mcp-connection-actions button { min-width: 56px; }
+@media (max-width: 620px) { .settings-row > .mcp-connection-actions { gap: 6px; } }

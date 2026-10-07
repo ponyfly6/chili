@@ -9,6 +9,7 @@ export const PRODUCTION_CSP = [
   "img-src 'self' data:",
   "font-src 'self'",
   "connect-src 'none'",
+  "frame-src chili-result:",
   "object-src 'none'",
   "base-uri 'none'",
   "form-action 'none'",
@@ -25,6 +26,18 @@ export type RendererAssetDecision =
   | { status: 200; target: string }
   | { status: 400 | 404 };
 
+export function isAllowedResultFrameNavigation(input: {
+  registeredDocument: boolean;
+  parentIsMainFrame: boolean;
+  initiatorIsMainFrame: boolean;
+  hasInitiator: boolean;
+  currentUrl: string | undefined;
+}): boolean {
+  const initialFrame = !input.currentUrl || input.currentUrl === "about:blank";
+  return input.registeredDocument && input.parentIsMainFrame
+    && (input.initiatorIsMainFrame || (initialFrame && !input.hasInitiator));
+}
+
 export function isTrustedRendererUrl(input: string, policy: RendererTrustPolicy): boolean {
   const parsed = parseUrl(input);
   if (!parsed || parsed.username || parsed.password) return false;
@@ -40,6 +53,14 @@ export function isTrustedRendererUrl(input: string, policy: RendererTrustPolicy)
   if (!expected || (expected.protocol !== "http:" && expected.protocol !== "https:")) return false;
   if (expected.username || expected.password || parsed.username || parsed.password) return false;
   return parsed.origin === expected.origin;
+}
+
+export function isAllowedExternalWindowOpen(input: string, referrer: string, policy: RendererTrustPolicy): boolean {
+  // Trusted Markdown links deliberately omit their referrer. Result documents
+  // cannot request popups: both their response CSP and iframe sandbox deny them.
+  if (referrer !== "" && !isTrustedRendererUrl(referrer, policy)) return false;
+  const url = parseUrl(input);
+  return url !== undefined && ["https:", "http:", "mailto:"].includes(url.protocol);
 }
 
 export function decideRendererAsset(

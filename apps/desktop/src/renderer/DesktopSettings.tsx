@@ -3,6 +3,7 @@ import type { DelegationPolicy, RuntimeModelDescriptor, RuntimePermissionProfile
 import type { DesktopSessionConfig } from "../shared/contracts.js";
 import type { DesktopTheme } from "./theme.js";
 import { RemoteControlPanel } from "./RemoteControlPanel.js";
+import { McpConnectionList } from "./McpConnectionList.js";
 import { settingsPages, type ReadingPreferences, type SettingsPage } from "./conversation-design.js";
 import {
   availableReasoningLevels, availableServiceTiers, canSelectProviderDefault, createSessionModelSettingsDraft,
@@ -19,7 +20,7 @@ export interface SessionSettingsValues extends SessionModelSettingsDraft {
 
 export function DesktopSettings({ page, onPage, project, session, config, models, disabled, busy, error,
   theme, onTheme, themeSaveFailed, themeSaving, preferences, onPreferences, preferenceSaveFailed,
-  onSave, onReloadMcp, onPrompt, onClose, onNewSession,
+  onSave, onReloadMcp, onMcpConnection, onPrompt, onClose, onNewSession,
 }: {
   page: SettingsPage; onPage: (page: SettingsPage) => void; project: string; session: string | undefined;
   config: DesktopSessionConfig | undefined; models: readonly RuntimeModelDescriptor[]; disabled: boolean; error: string | undefined;
@@ -27,6 +28,7 @@ export function DesktopSettings({ page, onPage, project, session, config, models
   theme: DesktopTheme; onTheme: (theme: DesktopTheme) => void; themeSaveFailed: boolean; themeSaving: boolean;
   preferences: ReadingPreferences; onPreferences: (value: ReadingPreferences) => void; preferenceSaveFailed: boolean;
   onSave: (values: SessionSettingsValues, section: "models" | "permissions") => void; onReloadMcp: () => void;
+  onMcpConnection?: (server: string, connect: boolean) => void;
   onPrompt: (text: string) => void; onClose: () => void; onNewSession: () => void;
 }) {
   const selected = settingsPages.find((item) => item.id === page)!;
@@ -49,7 +51,8 @@ export function DesktopSettings({ page, onPage, project, session, config, models
             </select></label>
             {themeSaveFailed ? <p role="alert" className="field-error">外观已应用，但保存失败。<button className="text-button" onClick={() => onTheme(theme)}>重试</button></p> : null}
           </SettingsSection>
-          <SettingsSection title="对话" scope="整个客户端">
+          <SettingsSection title="查看结果" scope="整个客户端">
+            <label className="settings-row"><span>完成后直接查看成果<small>有可预览的文件时打开成果，也可以随时回到对话。</small></span><input type="checkbox" checked={preferences.autoOpenResults} onChange={(event) => onPreferences({ ...preferences, autoOpenResults: event.target.checked })} /></label>
             <label className="settings-row"><span>默认展开工作过程<small>查看 Chili 做了哪些步骤。</small></span><input type="checkbox" checked={preferences.expandWork} onChange={(event) => onPreferences({ ...preferences, expandWork: event.target.checked })} /></label>
             {preferenceSaveFailed ? <p role="alert" className="field-error">此次偏好未能保存，重启后将恢复上次保存的设置。</p> : null}
           </SettingsSection>
@@ -70,11 +73,11 @@ export function DesktopSettings({ page, onPage, project, session, config, models
           </SettingsSection> : null}
         </> : null}
         {page === "tools" ? <>
-          <SettingsSection title="工具连接 · MCP" scope="当前会话">
-            <div className="settings-row"><span>连接状态<small>{config ? `${config.mcp.summary.running} / ${config.mcp.summary.total} 个连接正在运行` : "选择会话后查看连接状态"}</small></span><button className="secondary" disabled={disabled || !config} onClick={onReloadMcp}>重新读取</button></div>
-            {config?.mcp.servers.map((server) => <div className="settings-row" key={server.name}><span>{server.name}<small>{server.error}</small></span><span className="connection-label">{server.status}</span></div>)}
+          <SettingsSection title="工具连接 · MCP" scope="当前目录与会话">
+            <div className="settings-row"><span>连接状态<small>{config ? `${config.mcp.summary.running} / ${config.mcp.summary.total} 个连接正在运行` : "选择会话后查看连接状态"}</small></span><button className="secondary" disabled={disabled || !config} onClick={onReloadMcp}>重新读取配置</button></div>
+            {config ? <McpConnectionList servers={config.mcp.servers} disabled={disabled} {...(onMcpConnection ? { onConnection: onMcpConnection } : {})} /> : null}
             {config?.mcp.servers.length === 0 ? <p className="settings-note">当前没有配置工具连接。</p> : null}
-            <p className="settings-note">连接来自已有的个人和目录配置。修改后重新读取即可生效。</p>
+            <p className="settings-note">连接来自已有的个人和目录配置，供此目录内的会话使用。重新读取配置会断开已有连接，随后可逐个连接需要的工具。</p>
           </SettingsSection>
           <SettingsSection title="技能" scope="个人与当前目录">
             <p className="settings-note">Chili 会按当前目录发现可用技能。可以在会话中查看技能，并说明你希望使用的方法。</p>
@@ -88,7 +91,8 @@ export function DesktopSettings({ page, onPage, project, session, config, models
             <button className="secondary" disabled={disabled} onClick={() => onPrompt("请帮我更新这个目录的 AGENTS.md，记住以下工作偏好：\n")}>添加目录偏好</button>
           </SettingsSection>
           <SettingsSection title="个人记忆" scope="所有目录">
-            <p className="settings-note">当前版本没有独立的个人记忆库。目录里的约定会随项目保留；会话记录也可以随时继续。</p>
+            <p className="settings-note">Chili 可以保存个人与目录记忆。当前可在会话中查看和管理，桌面列表仍在完善。</p>
+            <button className="secondary" disabled={disabled} onClick={() => onPrompt("从当前会话提供的记忆目录中读取相关 Markdown 文件，查看个人与当前项目的记忆，简要说明内容和适用范围。先不要修改。")}>在会话中查看记忆</button>
           </SettingsSection>
         </> : null}
         {page === "phone" ? <RemoteControlPanel embedded /> : null}
@@ -142,7 +146,7 @@ function SessionPreferencesForm({ section, config, models, disabled, onSave }: {
           {config.permission.profiles.map((profile) => <option key={profile.id} value={profile.id} disabled={Boolean(profile.disabledReason)}>{profile.id === "full-access" ? "完全访问" : "帮我审批"}</option>)}
         </select></label>
         <p className="settings-note">{values.permissionProfile === "full-access" ? "直接执行工具，不进行自动审查。" : "每次执行工具前，由独立模型根据当前任务和审查说明决定是否执行。"}</p>
-        <p className="settings-note">保存后立即用于此目录的所有会话。其他已打开的目录重新打开后应用。</p>
+        <p className="settings-note">保存为个人默认，并立即用于此目录的所有会话。其他已打开的目录在重启 Chili 后应用。</p>
         {values.permissionProfile === "auto-review" ? <>
           <label className="settings-row"><span>审查模型<small>独立判断即将执行的操作。</small></span><select aria-label="审查模型" value={values.reviewerModelKey} disabled={disabled} onChange={(event) => setValues({ ...values, reviewerModelKey: event.target.value })}>
             <option value="">使用默认模型</option>

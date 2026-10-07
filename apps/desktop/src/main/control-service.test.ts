@@ -1128,6 +1128,15 @@ describe("desktop session projections", () => {
   test("includes the root-visible hierarchy without using child identities as HTTP callers", async () => {
     const queried: string[] = [];
     const client = {
+      inputQueue: async ({ sessionId }: { sessionId: string }) => {
+        expect(sessionId).toBe("root");
+        return emptyInputQueue(sessionId);
+      },
+      eventSnapshot: async ({ sessionId }: { sessionId?: string }) => {
+        queried.push(`active:${sessionId ?? "workspace"}`);
+        if (sessionId) throw new RuntimeHttpError(403, `Session identity is not admitted by this runtime: ${sessionId}`);
+        return { events: [] };
+      },
       sessionEvents: async ({ sessionId }: { sessionId: string }) => {
         queried.push(`events:${sessionId}`);
         return [{ id: `event_${sessionId}`, type: "turn.started", time: queried.length, sessionId, payload: { turnId: `turn_${sessionId}` } }];
@@ -1148,11 +1157,89 @@ describe("desktop session projections", () => {
     } as unknown as RuntimeClient;
 
     const snapshot = await serviceFor(client).invoke({ type: "session.snapshot", sessionId: "root" });
+    expect(queried.filter((item) => item.startsWith("active:"))).toEqual(["active:workspace"]);
     expect(queried.filter((item) => item.startsWith("agents:"))).toEqual(["agents:root"]);
     expect(new Set(snapshot.events.map((event) => String(event.sessionId)))).toEqual(new Set(["root", "child", "grandchild"]));
     expect(new Set(snapshot.pendingInputs.map((input) => String(input.sessionId)))).toEqual(new Set(["root", "child", "grandchild"]));
     expect(new Set(snapshot.agents.map((agent) => agent.agentId))).toEqual(new Set(["child", "grandchild"]));
     expect(snapshot.agents.find((agent) => agent.agentId === "grandchild")).toMatchObject({ parentAgentId: "child", path: "/root/child/grandchild" });
+  });
+
+  test("combines the root active prefix with persisted child messages, status, and queue", async () => {
+    const activeReads: string[] = [];
+    const childQueue = emptyInputQueue("child", true, 4);
+    const client = {
+      ...snapshotClientMethods(),
+      inputQueue: async ({ sessionId }: { sessionId: string }) => {
+        expect(sessionId).toBe("root");
+        return emptyInputQueue(sessionId);
+      },
+      eventSnapshot: async ({ sessionId: requestedSessionId }: { sessionId?: string }) => {
+        activeReads.push(requestedSessionId ?? "workspace");
+        if (requestedSessionId) throw new RuntimeHttpError(403, `Session identity is not admitted by this runtime: ${requestedSessionId}`);
+        const sessionId = "root";
+        return { events: [
+          { id: "root_message", type: "message.created", sessionId, time: 1, payload: { messageId: "root_reply", role: "assistant" } },
+          { id: "root_prefix", type: "message.part_stream_snapshot", sessionId, time: 2, payload: {
+            messageId: "root_reply", part: { id: "root_part", messageId: "root_reply", sessionId, type: "text", text: "Still working" },
+          } },
+        ] };
+      },
+      sessionEventWindow: async ({ sessionId }: { sessionId: string }) => {
+        const events = sessionId === "root" ? [] : [
+          { id: "child_message", type: "message.created", sessionId, time: 3, payload: { messageId: "child_reply", role: "assistant" } },
+          { id: "child_part", type: "message.part_committed", sessionId, time: 4, payload: {
+            messageId: "child_reply", part: { id: "child_text", messageId: "child_reply", sessionId, type: "text", text: "Child result", completion: "completed" },
+          } },
+          { id: "child_status", type: "session.status_changed", sessionId, time: 5, payload: { sessionId, status: "idle" } },
+          { id: "child_queue", type: "session.input_queue_changed", sessionId, time: 6, payload: childQueue },
+        ];
+        return { events, pendingApprovals: [], truncated: false, bytes: Buffer.byteLength(JSON.stringify(events)), pinnedEventIds: [] };
+      },
+      listAgents: async ({ sessionId }: { sessionId: string }) => {
+        expect(sessionId).toBe("root");
+        return [agentRecord("child", "/root/child", "root", "child")];
+      },
+    } as unknown as RuntimeClient;
+
+    const request = { type: "session.snapshot", sessionId: "root" } as const;
+    const snapshot = parseDesktopResponse(request, await serviceFor(client).invoke(request));
+    const runtime = reduceRuntimeEvents(snapshot.events);
+    expect(activeReads).toEqual(["workspace"]);
+    expect(runtime.messages.root_reply?.parts).toMatchObject([{ text: "Still working" }]);
+    expect(runtime.messages.child_reply?.parts).toMatchObject([{ text: "Child result", completion: "completed" }]);
+    expect(runtime.sessions.child).toMatchObject({ status: "idle", inputQueue: childQueue });
+    expect(snapshot.inputQueue).toEqual(emptyInputQueue("root"));
+    expect(snapshot.truncated).toBeUndefined();
+  });
+
+  test("requires root admission and propagates active snapshot or child durable history failures", async () => {
+    const rootError = new RuntimeHttpError(403, "Root identity rejected");
+    const rootClient = {
+      ...snapshotClientMethods(),
+      inputQueue: async () => { throw rootError; },
+      eventSnapshot: async () => { throw new Error("Must verify root admission before reading workspace state"); },
+    } as unknown as RuntimeClient;
+    await expect(serviceFor(rootClient).invoke({ type: "session.snapshot", sessionId: "root" })).rejects.toBe(rootError);
+
+    const activeError = new RuntimeHttpError(503, "Runtime state recovery exceeds its bounded snapshot capacity.");
+    const activeClient = {
+      ...snapshotClientMethods(),
+      eventSnapshot: async () => { throw activeError; },
+    } as unknown as RuntimeClient;
+    await expect(serviceFor(activeClient).invoke({ type: "session.snapshot", sessionId: "root" })).rejects.toBe(activeError);
+
+    const childError = new RuntimeHttpError(500, "Child history unavailable");
+    const childClient = {
+      ...snapshotClientMethods(),
+      eventSnapshot: async () => ({ events: [] }),
+      listAgents: async () => [agentRecord("child", "/root/child", "root", "child")],
+      sessionEventWindow: async ({ sessionId }: { sessionId: string }) => {
+        if (sessionId === "child") throw childError;
+        return { events: [], pendingApprovals: [], truncated: false, bytes: 2, pinnedEventIds: [] };
+      },
+    } as unknown as RuntimeClient;
+    await expect(serviceFor(childClient).invoke({ type: "session.snapshot", sessionId: "root" })).rejects.toBe(childError);
   });
 
   test("bounds descendant snapshot concurrency and output size", async () => {

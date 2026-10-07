@@ -58,7 +58,8 @@ export async function assertConversationDesign(page: Page, artifacts: string): P
     await settings.getByRole("button", { name, exact: true }).click();
     await settings.getByRole("heading", { name, exact: true }).waitFor();
   }
-  assert.equal(await settings.getByRole("checkbox", { name: /完成后直接查看成果/ }).count(), 0);
+  assert.equal(await settings.getByRole("checkbox", { name: /完成后直接查看成果/ }).isChecked(), true,
+    "Completed results should open automatically by default");
   await settings.getByRole("checkbox", { name: /默认展开工作过程/ }).check();
   await settings.getByRole("button", { name: "模型与账号", exact: true }).click();
   await settings.getByLabel("Task model", { exact: true }).waitFor();
@@ -105,9 +106,19 @@ async function assertProjectSessionList(page: Page, artifacts: string): Promise<
   await more.click();
   assert.equal(await rows.count(), 12);
   assert.equal(await more.count(), 0, "The expansion button disappears after the last page");
-  await composer.fill("");
+  const recentDraft = "只属于第十一个会话的草稿";
+  const olderDraft = "只属于较早会话的草稿";
+  await composer.fill(recentDraft);
   await rows.filter({ has: page.getByText("hello conversation redesign", { exact: true }) }).click();
   await page.getByRole("heading", { name: "hello conversation redesign", exact: true }).waitFor();
+  await composer.fill(olderDraft);
+  await rows.filter({ has: page.getByText("Sidebar conversation 11", { exact: true }) }).click();
+  await page.getByRole("heading", { name: "Sidebar conversation 11", exact: true }).waitFor();
+  assert.equal(await composer.inputValue(), recentDraft, "Same-directory conversation switching restores each draft");
+  await rows.filter({ has: page.getByText("hello conversation redesign", { exact: true }) }).click();
+  await page.getByRole("heading", { name: "hello conversation redesign", exact: true }).waitFor();
+  assert.equal(await composer.inputValue(), olderDraft, "Returning to an older conversation preserves its independent draft");
+  await composer.fill("");
   await project.getByRole("button", { name: "收起更多会话", exact: true }).click();
   assert.equal(await rows.count(), 5);
   assert.equal(await rows.filter({ has: page.getByText("hello conversation redesign", { exact: true }) }).count(), 1,

@@ -10,7 +10,7 @@ import { appendRuntimeEvent, presentSession } from "../renderer/view-model.js";
 
 test("opening an already-streaming root restores root and child prefixes before subsequent deltas", async () => {
   const fixture = await streamingFixture();
-  const { base, store, service } = fixture;
+  const { base, store, service, snapshotScopes, readScopes } = fixture;
   try {
     const historicalText = "earlier complete answer ".repeat(1_000);
     await store.appendMany([
@@ -20,6 +20,14 @@ test("opening an already-streaming root restores root and child prefixes before 
       }, 5),
       streamDelta("root_prefix", "root", "hello", 0),
       streamDelta("child_prefix", "child", "思考😀", 0),
+      event("other_root", "session.created", "other", { sessionId: "other", cwd: "/repo" }, 1),
+      event("other_child", "session.created", "other_child", {
+        sessionId: "other_child", cwd: "/repo", agent: { parentSessionId: "other", name: "other_child", path: "/root/other_child", policy: {} },
+      }, 2),
+      event("other_message", "message.created", "other", { messageId: "message_other", role: "assistant" }, 3),
+      event("other_child_message", "message.created", "other_child", { messageId: "message_other_child", role: "assistant" }, 3),
+      streamDelta("other_prefix", "other", "Unrelated root output", 0),
+      streamDelta("other_child_prefix", "other_child", "Unrelated child output", 0),
     ]);
     expect((await base.events()).some((row) => row.type === "message.part_stream_delta")).toBe(false);
     const request = { type: "session.snapshot", sessionId: "root" } as const;
@@ -30,6 +38,10 @@ test("opening an already-streaming root restores root and child prefixes before 
     // Bounded recovery history must not replace a complete historical file read.
     expect(view.messages.message_old?.parts[0]).toMatchObject({ text: historicalText });
     expect(snapshot.events.filter((row) => row.type === "message.part_stream_snapshot")).toHaveLength(2);
+    expect(snapshotScopes).toEqual([null]);
+    expect(readScopes.every((sessionId) => sessionId === "root")).toBe(true);
+    expect(snapshot.events.every((row) => row.sessionId === "root" || row.sessionId === "child")).toBe(true);
+    expect(Object.keys(view.messages).sort()).toEqual(["message_child", "message_old", "message_root"]);
 
     const unsubscribe = store.subscribe((row) => { snapshot = appendRuntimeEvent(snapshot, row); });
     try {
@@ -44,6 +56,8 @@ test("opening an already-streaming root restores root and child prefixes before 
     const refreshed = parseDesktopResponse(request, await service.invoke(request));
     expect(presentSession(refreshed).runtime.messages.message_root?.parts[0]).toMatchObject({ text: "hello world" });
     expect(presentSession(refreshed).runtime.messages.message_child?.parts[0]).toMatchObject({ text: "思考😀完成" });
+    expect(snapshotScopes).toEqual([null, null]);
+    expect(refreshed.events.every((row) => row.sessionId === "root" || row.sessionId === "child")).toBe(true);
   } finally { base.close(); }
 });
 
@@ -81,10 +95,15 @@ async function streamingFixture() {
     event("message_root", "message.created", "root", { messageId: "message_root", role: "assistant" }, 3),
     event("message_child", "message.created", "child", { messageId: "message_child", role: "assistant" }, 3),
   ]);
+  const snapshotScopes: Array<string | null> = [];
+  const readScopes: string[] = [];
   const handler = createRuntimeHttpHandler({
     store,
     service: {
-      assertSessionReadAllowed: async () => undefined,
+      assertSessionReadAllowed: async (sessionId: SessionId) => {
+        readScopes.push(sessionId);
+        if (sessionId !== "root") throw new Error(`Session identity is not admitted by this runtime: ${sessionId}`);
+      },
       inputQueue: (sessionId: SessionId) => emptyInputQueue(sessionId),
     } as unknown as RuntimeHttpService,
     agents: { forSession: () => ({ listAgents: async () => [
@@ -94,7 +113,12 @@ async function streamingFixture() {
   });
   const client = new HttpRuntimeClient({
     baseUrl: "http://chili.test",
-    fetch: ((input, init) => handler(new Request(input, init))) as typeof fetch,
+    fetch: ((input, init) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname === "/events/snapshot") snapshotScopes.push(url.searchParams.get("sessionId"));
+      return handler(request);
+    }) as typeof fetch,
   });
   const service = new DesktopControlService({
     sidecar: {
@@ -110,7 +134,7 @@ async function streamingFixture() {
     emitQueue: () => undefined,
     onError: () => undefined,
   });
-  return { base, store, client, service };
+  return { base, store, client, service, snapshotScopes, readScopes };
 }
 
 function streamDelta(id: string, sessionId: string, delta: string, offset: number): ChiliEvent {

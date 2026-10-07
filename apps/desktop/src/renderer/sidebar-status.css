@@ -1,0 +1,68 @@
+/* Keep activity beside the title even when the compact layout hides session metadata. */
+.sidebar .session-entry .session-row {
+  grid-template-columns: 4px minmax(0, 1fr) auto;
+}
+
+.sidebar .session-row > .session-activity {
+  display: inline-block;
+  flex: none;
+  max-width: 76px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar .session-activity[data-tone="working"],
+.sidebar .session-activity[data-tone="attention"] {
+  color: var(--accent);
+}
+
+.sidebar .session-row:has(.session-activity[data-tone="working"]) .session-glyph,
+.sidebar .session-row:has(.session-activity[data-tone="attention"]) .session-glyph {
+  background: var(--accent);
+  opacity: 1;
+}
+
+.sidebar .project-heading-row .project-heading {
+  min-height: 32px;
+}
+
+.sidebar .project-heading .project-badge {
+  min-width: 0;
+  padding: 0;
+  background: none;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.sidebar .project-heading .project-badge.attention { color: var(--accent); }
+.sidebar .project-heading .project-badge.running { color: var(--muted); }
+
+.sidebar .project-task-preview .project-task-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 35px;
+  padding: 8px 9px;
+}
+
+.sidebar .project-task-dot {
+  flex: none;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--muted);
+  opacity: .45;
+}
+
+.sidebar .project-task-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

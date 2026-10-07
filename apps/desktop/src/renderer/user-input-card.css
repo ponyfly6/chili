@@ -1,0 +1,149 @@
+.user-input-card.input-card {
+  padding: 17px 19px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--panel-raised);
+}
+
+.user-input-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 17px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.user-input-card.input-card fieldset {
+  min-width: 0;
+  margin: 0 0 18px;
+  padding: 0;
+  border: 0;
+}
+
+.user-input-card.input-card legend {
+  width: 100%;
+  margin-bottom: 11px;
+  padding: 0;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+  font-weight: 550;
+  overflow-wrap: anywhere;
+}
+
+.user-input-card.input-card legend span {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.user-input-options {
+  display: grid;
+  gap: 7px;
+}
+
+.user-input-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  width: 100%;
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  text-align: left;
+}
+
+.user-input-option:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  background: var(--panel-hover);
+}
+
+.user-input-option.is-selected,
+.user-input-option.is-selected:hover:not(:disabled) {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+.user-input-option > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.user-input-option strong {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+.user-input-option small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.user-input-option > svg {
+  flex: none;
+  color: var(--muted);
+}
+
+.user-input-option.is-selected > svg {
+  color: var(--accent);
+}
+
+.user-input-custom {
+  display: block;
+  margin-top: 12px;
+}
+
+.user-input-custom > span {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.user-input-card.input-card .user-input-custom input {
+  width: 100%;
+  margin: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--canvas);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.user-input-card .user-input-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 0;
+}
+
+.user-input-actions > span {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.user-input-actions > button {
+  flex: none;
+  font-size: 12px;
+}
+
+@media (max-width: 600px) {
+  .user-input-card.input-card { padding: 15px; }
+  .user-input-card .user-input-actions { flex-wrap: wrap; }
+}

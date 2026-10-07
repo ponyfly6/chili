@@ -34,7 +34,7 @@ bun run desktop:package:dir
 bun run smoke:desktop
 ```
 
-`test:e2e:desktop` 仅支持 macOS；它会先构建真实 Electron 应用和 sidecar，再点击完成 New Task、审批、输入、Steer、Stop、恢复、rename/search/archive、多项目后台运行、队列与草稿隔离、重启后项目恢复，并检查原生 1440/820/390 宽度。已经构建时可用 `CHILI_DESKTOP_E2E_SKIP_BUILD=1 bun run test:e2e:desktop` 跳过重复构建。
+`test:e2e:desktop` 仅支持 macOS；它会先构建真实 Electron 应用和 sidecar，再点击完成 New Task、自动审查、输入、Steer、Stop、恢复、rename/search/archive、多项目后台运行、队列与草稿隔离、重启后项目恢复，并检查原生 1440/820/390 宽度。已经构建时可用 `CHILI_DESKTOP_E2E_SKIP_BUILD=1 bun run test:e2e:desktop` 跳过重复构建。
 
 `smoke:desktop` 在每轮 `mkdtemp` 目录中独立构建 sidecar、桌面与手机页面，以及当前主机架构的 macOS `.app`，不读写共享 `apps/desktop/release`、`out` 或 `resources` 构建产物。它核验签名、完整 Electron 42 fuse wire、最小 ASAR 与其 header integrity，再实际启动应用内的 `Contents/Resources/chili-sidecar`。它会用同一个隔离 user-data 连续启动两次，通过 preload 创建 session、发送 fake-model 消息并等待 SSE assistant/idle 事件，并走原生 `app.quit()` 路径；两个正常启动都拒绝 forced stage、stderr、源码路径或秘密 canary 泄漏。blocked-Git fixture 通过仓库本地 `include.path` FIFO 阻塞 Git，并验证退出会中止 diff、清理登记的 Git process group。另有独立 fixture 会对 Electron 父进程发送 `SIGKILL`，验证 hard-crash containment。每个场景结束后都会检查 sidecar、登记的 Git/tool process group、继承子进程和 Electron helper 全部消失。
 
@@ -69,12 +69,12 @@ Preview 使用本地 ad-hoc 签名，不是已公证的正式发布包。打包�
 - 每个目录可通过名称前的箭头独立收起，当前目录也可点击名称折叠。展开时默认显示最近 5 条会话，“展开更多会话”每次增加 5 条，“收起更多会话”恢复精简列表；正在查看的较早会话也会保留在这 5 条中。搜索涵盖整个目录，切换目录或新建会话会展开对应列表。
 - 搜索 active/archived task，创建、重新载入或继续未归档 task，并对 active task 执行 rename/archive；具有 Agent 身份的子会话在 Agent 层级中展示，也不支持 unarchive。
 - **设置** 按通用、模型与账号、权限与协作、工具与技能、偏好与记忆、手机连接分类；模型、思考深度与响应速度按模型能力展示，权限标明影响此目录的所有会话，协作方式属于当前会话。工具设置读取 MCP 状态并支持重新加载；不支持显式 tier 的模型使用 provider default，Desktop 不会提交伪造 tier。
-- 在对话中实时查看消息、执行步骤、工具结果和审批。
+- 在对话中实时查看消息、执行步骤、工具结果和自动审查状态。
 - 发送消息；忙碌时 Queue，或 Steer（中断当前 turn 后优先发送）。
 - Stop 当前 session。
-- 汇总 root 与 descendant session 的 pending approvals，并允许 deny、allow once、allow session、always allow。
+- 权限提供自动审查与完全访问；自动审查由独立模型判断工具调用是否执行。
 - 展示并提交 `request_user_input` 请求。
-- 窗口失焦或后台项目发生审批、输入请求和 turn 完成时发原生通知，点击后切到对应项目并聚焦窗口。
+- 窗口失焦或后台项目发生输入请求和 turn 完成时发原生通知，点击后切到对应项目并聚焦窗口。
 
 ## 新会话与高级任务
 
@@ -82,17 +82,19 @@ Preview 使用本地 ad-hoc 签名，不是已公证的正式发布包。打包�
 
 输入 `/` 或点击 **更多** 打开可搜索的命令菜单，支持方向键、Enter、Escape。`/settings`、`/model`、`/permissions`、`/mcp`、`/skills`、`/memory` 打开对应设置；`/review` 和 `/help` 填入待发送的需求。`⌘ ,` 随时打开设置。
 
-所有回复直接显示在对话中，可以持续追问并查看历史消息。工作过程默认折叠；通用设置中的“默认展开工作过程”由主进程原子保存到客户端的 `reading-settings.json`。网页内嵌预览、点选页面元素修改及附件上传尚未接入，不显示模拟操作入口。
+回复保留在对话中，可以持续追问并查看历史消息。会话引用本地成果后可切换 **成果 / 对话 / 并排**；窄窗口收为单栏。工作过程默认折叠；通用设置中的“默认展开工作过程”和“完成后自动打开成果”由主进程原子保存到客户端的 `reading-settings.json`。点选页面元素修改及附件上传尚未接入。
+
+成果来自助手回复中的本地 Markdown 链接、图片路径和已成功写入/编辑的文件引用。预览按当前目录读取文件，支持 UTF-8 文本、Markdown、代码、HTML 和 PNG/JPEG/GIF/WebP；文本上限 512 KB，图片上限 4 MB。无法读取或已删除的引用会说明原因；刷新读取最新文件，“继续修改”把当前文件带回输入区。HTML 使用独立协议与无权限 sandbox 展示静态页面，保留内嵌样式及当前目录中的 CSS/栅格图片；脚本、外部资源、字体、表单提交、弹窗和页面导航均停用。可随时切换源码。此处不提供虚构版本历史、元素点选或运行中网页应用。
 
 每次用户请求的多轮模型调用和工具执行合并为一条工作过程。执行中显示当前动作、操作数和耗时；展开后按连续的读取与搜索、文件修改、命令执行等操作分组，再查看思考记录、调用参数和输出。MiniMax 等未提供消息阶段的模型，其关联工具调用的中间文字归入过程，最终回答继续直接显示。手动展开的过程在完成后保持打开；历史失败保留在详情中，取消不计作失败，顶层仅在请求执行失败时突出提示。
 
-模型账号继续使用已有本机配置；设置显示真实模型可用性，不在网页收集密钥。技能和目录说明通过明确标注的“在会话中查看”入口填入需求，不模拟连接或记忆管理。当前无独立的个人记忆库，目录偏好由已有 `AGENTS.md` 机制承载。
+模型账号继续使用已有本机配置；设置显示真实模型可用性，不在网页收集密钥。技能和目录说明通过明确标注的“在会话中查看”入口填入需求，不模拟连接或记忆管理。Runtime 已支持个人与目录记忆，桌面可通过会话查看和管理；`AGENTS.md` 继续用于目录说明与工作约定。
 
 `/advanced` 按需打开高级任务对话框，一次配置标题、需求、model、模型能力允许的 reasoning/service tier、permission 和 delegation，配置完成后提交一次普通 prompt。没有公开 service tiers 的模型显示 provider default，并省略显式 tier。
 
 创建结果区分 `not_started`、`started` 和 `unknown`。启动前失败会保留可恢复的 session，并在安全时回滚 permission；最终启动请求若可能已经提交但确认丢失，则返回 `unknown`，不擅自 archive session 或改变一个可能正在运行的 task。
 
-Permission profile 是当前项目 runtime/sidecar 的**全局内存状态**，不是 session 配置：修改后会影响该项目中所有 task，不影响其他项目，Desktop 会串行化 New Task 与 permission 写入。它不写入 Desktop 持久化状态，runtime 重启后回到其配置默认值。
+Permission profile 属于个人默认设置，保存到当前 Chili profile 的 `review-settings.json`，同时立即应用于当前目录 runtime 的所有会话。其他已经运行的目录保留当前设置，重启后读取新的个人默认。Desktop 会串行化 New Task 与 permission 写入。
 
 ## Stop、Steer、恢复与 archive
 
@@ -105,7 +107,7 @@ MCP 面板读取当前 session scope 的 server 状态与汇总，并提供 relo
 
 ## 多项目与对话验收
 
-`bun run test:e2e:desktop` 使用真实 Electron、编译后的 sidecar 与本地 fake model，覆盖主题持久化、多项目切换、持久输入恢复、审批/提问、任务操作，以及委派任务的对话结果、权限和模型设置、目录折叠和会话分页。
+`bun run test:e2e:desktop` 使用真实 Electron、编译后的 sidecar 与本地 fake model，覆盖主题持久化、多项目切换、持久输入恢复、自动审查/提问、任务操作，以及委派任务的对话结果、权限和模型设置、目录折叠和会话分页。
 
 `bun run smoke:desktop-projects` 是独立的 macOS 多项目进程门禁：三个项目同时运行，反复切换、分别 Stop，并验证正常退出和强制终止 Electron 后的 sidecar、工具及 Git 进程回收。测试只管理本次启动并确认身份的进程，保留无关进程；成功或失败均留下性能与进程证据。CI 已构建当前源码时可设置 `CHILI_DESKTOP_PROJECTS_SKIP_BUILD=1`。
 
