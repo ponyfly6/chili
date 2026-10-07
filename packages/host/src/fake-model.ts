@@ -73,6 +73,17 @@ export class FakeModelRouter implements ModelRouter {
       return;
     }
 
+    if (text.startsWith("desktop delivery fixture: ")) {
+      const fixture = JSON.parse(text.slice("desktop delivery fixture: ".length)) as {
+        filePath: string;
+        title: string;
+        description?: string;
+      };
+      yield { type: "tool_call", name: "present_file", input: fixture };
+      yield { type: "finish", reason: "tool_use" };
+      return;
+    }
+
     if (text.includes("list agents through tool")) {
       yield { type: "tool_call", name: "agent_list", input: {} };
       yield { type: "finish", reason: "tool_use" };

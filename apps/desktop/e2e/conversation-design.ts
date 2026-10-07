@@ -9,13 +9,33 @@ export async function openDesktopSettings(page: Page) {
   return dialog;
 }
 
+export async function startEmptyConversation(page: Page): Promise<void> {
+  const showSidebar = page.getByRole("button", { name: "Show sidebar", exact: true });
+  if (await showSidebar.isVisible()) await showSidebar.click();
+  await page.getByRole("button", { name: "New task", exact: true }).click();
+  await page.getByRole("heading", { name: "你想做点什么？", exact: true }).waitFor();
+  await page.waitForFunction(() => {
+    const composer = document.querySelector<HTMLTextAreaElement>('[aria-label="Message composer"]');
+    return Boolean(composer && !composer.disabled);
+  });
+}
+
+/** Wait after observing this turn's response, not immediately after submission. */
+export async function waitForConversationIdle(page: Page): Promise<void> {
+  await page.waitForFunction(() => {
+    const composer = document.querySelector<HTMLTextAreaElement>('[aria-label="Message composer"]');
+    const settings = document.querySelector<HTMLButtonElement>('[aria-label="Task runtime settings"]');
+    return Boolean(composer && !composer.disabled && composer.value === "" && settings && !settings.disabled
+      && !document.querySelector(".conversation-activity") && !document.querySelector(".work-summary.active"));
+  });
+}
+
 export async function openAdvancedTaskDialog(page: Page) {
   const composer = page.getByLabel("Message composer", { exact: true });
   if (await composer.isDisabled()) {
     const showSidebar = page.getByRole("button", { name: "Show sidebar", exact: true });
     if (await showSidebar.isVisible()) await showSidebar.click();
-    await page.getByRole("button", { name: "New task", exact: true }).click();
-    await page.waitForFunction(() => !document.querySelector<HTMLTextAreaElement>('[aria-label="Message composer"]')?.disabled);
+    await startEmptyConversation(page);
   }
   await composer.fill("/advanced");
   await composer.press("Enter");
@@ -58,8 +78,8 @@ export async function assertConversationDesign(page: Page, artifacts: string): P
     await settings.getByRole("button", { name, exact: true }).click();
     await settings.getByRole("heading", { name, exact: true }).waitFor();
   }
-  assert.equal(await settings.getByRole("checkbox", { name: /完成后直接查看成果/ }).isChecked(), true,
-    "Completed results should open automatically by default");
+  assert.equal(await settings.getByRole("checkbox", { name: /完成后直接查看成果/ }).count(), 0,
+    "Deliveries are opened intentionally from the conversation rather than automatically replacing it");
   await settings.getByRole("checkbox", { name: /默认展开工作过程/ }).check();
   await settings.getByRole("button", { name: "模型与账号", exact: true }).click();
   await settings.getByLabel("Task model", { exact: true }).waitFor();
@@ -84,7 +104,7 @@ async function assertProjectSessionList(page: Page, artifacts: string): Promise<
   const project = page.locator(".project-active");
   const rows = project.locator(".session-row");
   for (let index = 1; index <= 11; index++) {
-    if (index > 1) await page.getByRole("button", { name: "New task", exact: true }).click();
+    if (index > 1) await startEmptyConversation(page);
     const title = `Sidebar conversation ${index}`;
     await composer.fill(title);
     await composer.press("Enter");
@@ -136,8 +156,7 @@ async function assertProjectSessionList(page: Page, artifacts: string): Promise<
   await page.getByRole("button", { name: "搜索会话", exact: true }).click();
   assert.equal(await rows.count(), 5);
   await project.getByRole("button", { name: "收起 workspace 的会话", exact: true }).click();
-  await page.getByRole("button", { name: "New task", exact: true }).click();
-  await page.getByRole("heading", { name: "你想做点什么？", exact: true }).waitFor();
+  await startEmptyConversation(page);
   await project.getByRole("button", { name: "收起 workspace 的会话", exact: true }).waitFor();
   assert.equal(await rows.count(), 5, "A new conversation is revealed even if the directory was collapsed");
 }

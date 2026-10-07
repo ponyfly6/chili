@@ -186,6 +186,7 @@ try {
     logStep("launch 3/4: persist an in-flight streamed input for explicit recovery");
     currentLaunch = await launchDesktop("stream-controls", "deepseek");
     const interruptedInputId = await createSlowProviderTaskThroughUi(currentLaunch.page);
+    await assertProgressDismissalDuringWork(currentLaunch.page);
     await assertMultipleProjects(currentLaunch);
     await closeDesktop(currentLaunch);
     currentLaunch = undefined;
@@ -718,6 +719,18 @@ async function createSlowProviderTaskThroughUi(page: Page): Promise<string> {
   await waitForTaskTitle(page, SLOW_TITLE);
   await waitForProviderRequest(SLOW_STEER_PROMPT, 1);
   return (await latestSlowInput()).input_id;
+}
+
+async function assertProgressDismissalDuringWork(page: Page): Promise<void> {
+  const request = provider.requests.findLast((candidate) => candidate.text.includes(SLOW_STEER_PROMPT));
+  assert.ok(request && !request.aborted, "The progress check starts with a real running provider request");
+  const panel = page.getByRole("complementary", { name: "会话侧栏", exact: true });
+  await page.getByRole("button", { name: "进展", exact: true }).click();
+  await panel.waitFor();
+  await page.getByRole("button", { name: "关闭侧栏", exact: true }).click();
+  await panel.waitFor({ state: "hidden" });
+  await page.locator(".conversation-activity").getByRole("button", { name: "Stop current turn", exact: true }).waitFor();
+  assert.equal(request.aborted, false, "Closing progress must not abort the active provider request");
 }
 
 async function recoverSlowInputThroughUi(page: Page, inputId: string): Promise<void> {

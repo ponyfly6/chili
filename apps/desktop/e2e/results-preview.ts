@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ElectronApplication, Frame, Locator, Page } from "playwright-core";
-import { openDesktopSettings } from "./conversation-design.js";
+import { startEmptyConversation, waitForConversationIdle } from "./conversation-design.js";
 
 const EXTERNAL_IMAGE = "https://chili-result-preview.invalid/canary.png";
 const RESULT_PATH = "result-fixture/index.html";
 const RESULT_LABEL = "花间首页";
 
-/** Exercise real assistant messages, desktop IPC, and the sandboxed result scheme. */
+/** Exercise real delivery tool calls, desktop IPC, and the sandboxed result scheme. */
 export async function assertDesktopResults(page: Page, workspace: string, artifacts: string, app: ElectronApplication): Promise<void> {
   const fixtureDirectory = join(workspace, "result-fixture");
   await mkdir(fixtureDirectory, { recursive: true });
@@ -30,14 +30,29 @@ export async function assertDesktopResults(page: Page, workspace: string, artifa
   });
   try {
     const composer = page.getByLabel("Message composer", { exact: true });
-    await page.getByRole("button", { name: "New task", exact: true }).click();
-    await composer.fill(`展示 [${RESULT_LABEL}](${RESULT_PATH})`);
+    await startEmptyConversation(page);
+    const referencePrompt = `仅引用 [${RESULT_LABEL}](${RESULT_PATH})`;
+    await composer.fill(referencePrompt);
     await composer.press("Enter");
-    const results = page.getByRole("region", { name: "会话结果", exact: true });
+    await page.locator(".timeline .message-assistant").getByText(`Echo: ${referencePrompt}`, { exact: true }).waitFor();
+    await waitForConversationIdle(page);
+    // The session list title arrives in a separate refresh from the reply.
+    // Do not capture its temporary "新会话" label as a session identifier.
+    await page.locator(".conversation-heading").getByRole("heading", { name: /^仅引用 \[花间首页\]/u }).waitFor();
+    assert.equal(await page.locator(".delivery-card").count(), 0, "A local reference is not a delivered file");
+    assert.equal(await page.getByRole("button", { name: "交付文件", exact: true }).count(), 0);
+    const deliverySessionTitle = await page.locator(".conversation-heading h1").innerText();
+
+    await submitDelivery(page, RESULT_LABEL);
+    const results = page.getByRole("region", { name: "交付文件", exact: true });
+    assert.equal(await results.isVisible(), false, "An explicit delivery keeps its preview closed until requested");
+    assert.equal(await page.getByRole("navigation", { name: "查看方式", exact: true }).count(), 0,
+      "The conversation has no result/chat replacement modes");
+    await page.locator(".conversation-body").waitFor({ state: "visible" });
+    await page.getByRole("button", { name: "交付文件", exact: true }).click();
     await results.waitFor();
-    const viewbar = page.getByRole("navigation", { name: "查看方式", exact: true });
-    assert.equal(await viewbar.getByRole("button", { name: /^成果(?:\s|$)/u }).getAttribute("aria-pressed"), "true",
-      "The finished local result opens automatically");
+    await page.locator(".conversation-body").waitFor({ state: "visible" });
+    await page.getByRole("complementary", { name: "会话侧栏", exact: true }).waitFor();
     const iframe = results.locator("iframe");
     const frame = await resultFrame(iframe);
     await assertStaticResult(frame, "花间 · 日常的花");
@@ -70,7 +85,7 @@ export async function assertDesktopResults(page: Page, workspace: string, artifa
     await page.screenshot({ path: join(artifacts, "conversation-result-preview.png") });
 
     await results.getByRole("button", { name: "源码", exact: true }).click();
-    const source = results.getByLabel("结果文件内容", { exact: true });
+    const source = results.getByLabel("交付文件内容", { exact: true });
     await source.waitFor();
     assert.match(await source.innerText(), /data-inline-script-ran|inlineScriptRan/u);
     assert.equal(await iframe.count(), 0, "Source mode displays text rather than rendering another document");
@@ -79,20 +94,41 @@ export async function assertDesktopResults(page: Page, workspace: string, artifa
 
     await writeFile(join(fixtureDirectory, "index.html"), resultHtml("花间 · 每天一束花"));
     const beforeRefresh = await iframe.getAttribute("src");
-    await results.getByRole("button", { name: "刷新结果", exact: true }).click();
+    await results.getByRole("button", { name: "刷新交付文件", exact: true }).click();
     await page.waitForFunction((previous) => {
       const frame = document.querySelector<HTMLIFrameElement>(".results-html-frame");
       return Boolean(frame?.src && frame.src !== previous);
     }, beforeRefresh);
     await assertStaticResult(await resultFrame(iframe), "花间 · 每天一束花");
-    await viewbar.getByRole("button", { name: "并排查看", exact: true }).click();
-    await results.waitFor();
     await page.locator(".conversation-body").waitFor({ state: "visible" });
     await page.screenshot({ path: join(artifacts, "conversation-result-split.png") });
+
+    await page.getByRole("button", { name: "关闭侧栏", exact: true }).click();
+    await results.waitFor({ state: "hidden" });
+    const revisedLabel = `${RESULT_LABEL} · 已更新`;
+    await submitDelivery(page, revisedLabel);
+    assert.equal(await page.locator(".delivery-card").count(), 1, "Repeated delivery updates the same file card");
+    assert.equal(await results.isVisible(), false, "A later delivery does not reopen the closed panel");
+    await page.getByRole("button", { name: `打开交付文件：${revisedLabel}`, exact: true }).click();
+    await results.waitFor();
+    await results.getByRole("heading", { name: revisedLabel, exact: true }).waitFor();
 
     await results.getByRole("button", { name: "继续修改", exact: true }).click();
     await page.locator(".composer-result-target").getByText(`正在修改：${RESULT_PATH}`, { exact: true }).waitFor();
     await page.waitForFunction(() => document.querySelector('[aria-label="Message composer"]') === document.activeElement);
+
+    await startEmptyConversation(page);
+    assert.equal(await results.isVisible(), false, "A new conversation does not inherit another conversation's preview");
+    assert.equal(await page.locator(".composer-result-target").count(), 0, "A new conversation does not inherit the file editing target");
+    assert.equal(await page.locator(".delivery-card").count(), 0);
+    await composer.fill("独立的交付隔离检查");
+    await composer.press("Enter");
+    await page.getByText("Echo: 独立的交付隔离检查", { exact: true }).waitFor();
+    await waitForConversationIdle(page);
+    await page.locator(".conversation-heading").getByRole("heading", { name: "独立的交付隔离检查", exact: true }).waitFor();
+    await page.locator(".session-row").filter({ has: page.getByText(deliverySessionTitle, { exact: true }) }).click();
+    await page.getByRole("heading", { name: deliverySessionTitle, exact: true }).waitFor();
+    await page.locator(".composer-result-target").getByText(`正在修改：${RESULT_PATH}`, { exact: true }).waitFor();
     await composer.fill("把标题再简短一点");
     await composer.press("Enter");
     const expectedPrompt = `请修改文件「${RESULT_PATH}」：\n把标题再简短一点`;
@@ -102,27 +138,11 @@ export async function assertDesktopResults(page: Page, workspace: string, artifa
     await editReply.waitFor();
     assert.equal(await editRequest.innerText(), expectedPrompt, "The edit message includes the selected file path");
     assert.equal(await editReply.innerText(), `Echo: ${expectedPrompt}`);
-    await page.getByRole("button", { name: "Send message", exact: true }).waitFor();
-    await viewbar.getByRole("button", { name: "对话", exact: true }).click();
+    await waitForConversationIdle(page);
     assert.equal(await page.locator(".composer-result-target").count(), 0, "The target clears after the edit request is accepted");
-
-    const settings = await openDesktopSettings(page);
-    await settings.getByRole("button", { name: "通用", exact: true }).click();
-    const autoOpen = settings.getByRole("checkbox", { name: /完成后直接查看成果/ });
-    await autoOpen.uncheck();
-    await settings.getByRole("button", { name: "关闭设置", exact: true }).click();
-    await settings.waitFor({ state: "hidden" });
-    await composer.fill(`再次展示 [${RESULT_LABEL}](${RESULT_PATH})`);
-    await composer.press("Enter");
-    await page.locator(".timeline .message-assistant").getByText(`Echo: 再次展示 [${RESULT_LABEL}](${RESULT_PATH})`, { exact: true }).waitFor();
-    assert.equal(await viewbar.getByRole("button", { name: "对话", exact: true }).getAttribute("aria-pressed"), "true",
-      "Turning off automatic result viewing preserves the conversation on a new result");
-    await openDesktopSettings(page);
-    await settings.getByRole("button", { name: "通用", exact: true }).click();
-    await autoOpen.check();
-    await settings.getByRole("button", { name: "关闭设置", exact: true }).click();
-    await settings.waitFor({ state: "hidden" });
-    await page.getByRole("button", { name: "New task", exact: true }).click();
+    if (await results.isVisible()) await page.getByRole("button", { name: "关闭侧栏", exact: true }).click();
+    await assertNarrowDeliveryPanel(page, app, artifacts, revisedLabel);
+    await startEmptyConversation(page);
   } finally {
     await page.unroute(EXTERNAL_IMAGE);
     await app.evaluate(({ shell }) => {
@@ -131,6 +151,64 @@ export async function assertDesktopResults(page: Page, workspace: string, artifa
       delete audit.resultPreviewOriginalOpenExternal;
       delete audit.resultPreviewExternalOpens;
     });
+  }
+}
+
+async function submitDelivery(page: Page, title: string): Promise<void> {
+  const composer = page.getByLabel("Message composer", { exact: true });
+  const responsesBefore = await page.locator(".timeline .message-assistant").count();
+  await composer.fill(`desktop delivery fixture: ${JSON.stringify({ filePath: RESULT_PATH, title })}`);
+  await composer.press("Enter");
+  await page.getByRole("button", { name: `打开交付文件：${title}`, exact: true }).waitFor();
+  await page.waitForFunction((previousCount) => document.querySelectorAll(".timeline .message-assistant").length > previousCount, responsesBefore);
+  await page.locator(".timeline .message-assistant").last().getByText("I read the file and the tool loop works.", { exact: true }).waitFor();
+  await waitForConversationIdle(page);
+}
+
+async function assertNarrowDeliveryPanel(page: Page, app: ElectronApplication, artifacts: string, title: string): Promise<void> {
+  const original = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.getContentSize());
+  try {
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setContentSize(390, 820, false));
+    await page.waitForFunction(() => window.innerWidth === 390);
+    await page.getByRole("button", { name: `打开交付文件：${title}`, exact: true }).click();
+    const panel = page.getByRole("dialog", { name: "交付文件", exact: true });
+    await panel.waitFor();
+    await page.getByRole("button", { name: "关闭侧栏", exact: true }).waitFor();
+    const bounds = await panel.boundingBox();
+    assert.ok(bounds && bounds.x >= -1 && bounds.x + bounds.width <= 391, "The preview fits a narrow desktop window");
+    await assertStaticResult(await resultFrame(panel.locator("iframe")), "花间 · 每天一束花");
+    const footer = await panel.locator(".results-panel-footer").boundingBox();
+    assert.ok(footer && footer.y >= 0 && footer.y + footer.height <= 821,
+      `The file actions remain inside the narrow viewport before scrolling: ${JSON.stringify(footer)}`);
+    const continueButton = await panel.getByRole("button", { name: "继续修改", exact: true }).boundingBox();
+    assert.ok(continueButton && continueButton.x >= 0 && continueButton.x + continueButton.width <= 391
+      && continueButton.y >= 0 && continueButton.y + continueButton.height <= 821,
+      `Continue editing is reachable without scrolling the drawer: ${JSON.stringify(continueButton)}`);
+    await page.screenshot({ path: join(artifacts, "conversation-delivery-narrow.png") });
+    await page.keyboard.press("Escape");
+    await panel.waitFor({ state: "hidden" });
+    await page.getByRole("button", { name: "交付文件", exact: true }).click();
+    await panel.waitFor();
+    const frame = await resultFrame(panel.locator("iframe"));
+    await frame.getByRole("heading", { name: "花间 · 每天一束花", exact: true }).click();
+    await page.waitForFunction(() => document.activeElement?.tagName === "IFRAME");
+    // CDP keyboard injection bypasses Electron's before-input-event for an
+    // iframe. Exercise the same native input route as a user's Escape key.
+    await app.evaluate(({ BrowserWindow }) => {
+      const contents = BrowserWindow.getAllWindows()[0]!.webContents;
+      contents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+      contents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
+    });
+    await panel.waitFor({ state: "hidden" });
+    await page.getByRole("button", { name: "交付文件", exact: true }).click();
+    await panel.waitFor();
+    await panel.getByRole("button", { name: "继续修改", exact: true }).click();
+    await panel.waitFor({ state: "hidden" });
+    await page.waitForFunction(() => document.querySelector('[aria-label="Message composer"]') === document.activeElement);
+    await page.locator(".composer-result-target").getByText(`正在修改：${RESULT_PATH}`, { exact: true }).waitFor();
+  } finally {
+    await app.evaluate(({ BrowserWindow }, size) => BrowserWindow.getAllWindows()[0]!.setContentSize(size[0]!, size[1]!, false), original);
+    await page.waitForFunction((width) => window.innerWidth === width, original[0]);
   }
 }
 

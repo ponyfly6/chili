@@ -42,5 +42,17 @@ export async function assertDelegatedConversation(page: Page, workspace: string,
   }
   assert.ok(agentPath, "The real delegated read task must complete before inspecting its result");
   assert.equal(await page.locator(".inspector").count(), 0);
+  assert.equal(await page.locator(".conversation-agents").count(), 0,
+    "Delegation does not insert a management panel between the reply and composer");
+  const panel = page.getByRole("complementary", { name: "会话侧栏", exact: true });
+  assert.equal(await panel.isVisible(), false, "Delegation does not open the side panel automatically");
+  await page.getByRole("button", { name: "进展", exact: true }).click();
+  await panel.waitFor();
+  const details = await panel.innerText();
+  assert.doesNotMatch(details, /Agent ID|Parent agent ID|Nested agents|Queue|Steer|\/root\/|Agent message:|collaborator-provided/u,
+    "Progress describes work without exposing runtime identifiers or delegation controls");
+  await page.locator(".conversation-body").waitFor({ state: "visible" });
   await page.screenshot({ path: join(artifacts, "delegated-conversation.png") });
+  await page.getByRole("button", { name: "关闭侧栏", exact: true }).click();
+  await panel.waitFor({ state: "hidden" });
 }
