@@ -254,6 +254,7 @@ export class ContextCompactionService {
     const modelInput: ModelStreamInput = {
       sessionId: input.sessionId,
       turnId: input.turnId,
+      purpose: source.stage === "verification" ? "validation" : "compaction",
       messages: [syntheticPromptMessage(input.sessionId, input.turnId, prompt, this.now())],
       tools: [],
       system: [COMPACTION_SYSTEM_PROMPT],

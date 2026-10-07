@@ -22,6 +22,8 @@ test("every original message, including a 100k middle constraint, reaches both s
   expect(recorded.requests).toHaveLength(6);
   const drafts = recorded.requests.filter((request) => !isVerification(request));
   const reviews = recorded.requests.filter(isVerification);
+  expect(drafts.every((request) => request.purpose === "compaction")).toBe(true);
+  expect(reviews.every((request) => request.purpose === "validation")).toBe(true);
   for (const stage of [drafts, reviews]) {
     expect(stage).toHaveLength(3);
     for (const message of messages.slice(0, 3)) {

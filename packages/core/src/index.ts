@@ -1,4 +1,5 @@
 export * from "./agent-control.js";
+export * from "./agent-lifecycle.js";
 export * from "./anthropic-compatible-model.js";
 export * from "./context/index.js";
 export * from "./memory/index.js";
@@ -10,6 +11,7 @@ export * from "./recovery.js";
 export * from "./retry.js";
 export * from "./runner.js";
 export * from "./runtime.js";
+export * from "./model-lifecycle.js";
 export * from "./runtime-service.js";
 export * from "./single-agent-runtime.js";
 export * from "./subagent-run-limiter.js";

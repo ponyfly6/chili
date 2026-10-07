@@ -384,6 +384,7 @@ export class SingleAgentRuntime implements AgentRunner {
       let modelInput: ModelStreamInput = {
         sessionId: input.sessionId,
         turnId,
+        purpose: "task",
         messages: context.messages,
         tools: context.surface.tools,
         system: context.surface.system,

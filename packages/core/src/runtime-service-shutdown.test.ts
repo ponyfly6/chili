@@ -287,6 +287,44 @@ test("RuntimeService shutdown during prompt assembly does not start the first tu
   expect(statuses(store)).toEqual(["running", "cancelled"]);
 });
 
+for (const finalAssembly of [false, true]) {
+  test(`RuntimeService propagates cancellation to ${finalAssembly ? "final" : "initial"} prompt collection`, async () => {
+    const sessionId = `session_prompt_signal_${finalAssembly}` as SessionId;
+    const runner = new ToolUseThenFinalRunner();
+    const store = new ClaimTrackingEventStore();
+    store.addSession(sessionId);
+    const assemblyStarted = deferred<void>();
+    let assemblyCalls = 0;
+    let collectionSignal: AbortSignal | undefined;
+    const service = new RuntimeService({
+      runtime: runner,
+      store,
+      cwd: "/repo",
+      maxTurns: 1,
+      createId: createSequentialId(),
+      now: () => 1 as TimestampMs,
+      promptFragments: async ({ signal }) => {
+        assemblyCalls++;
+        if (finalAssembly && assemblyCalls === 1) return [];
+        if (!signal) throw new Error("Prompt collection requires its active turn signal");
+        collectionSignal = signal;
+        return new Promise((_, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          assemblyStarted.resolve();
+        });
+      },
+    });
+    const prompt = service.submitPrompt({ sessionId, text: "stop prompt collection" });
+    await assemblyStarted.promise;
+    const shutdown = service.shutdown("test_shutdown");
+    expect(await prompt).toMatchObject({ status: "cancelled" });
+    await shutdown;
+    expect(collectionSignal?.aborted).toBe(true);
+    expect(runner.turnInputs).toHaveLength(finalAssembly ? 1 : 0);
+    expect(store.claims.has(sessionId)).toBe(false);
+  });
+}
+
 test("RuntimeService shutdown during final prompt assembly does not start the final turn", async () => {
   const sessionId = "session_shutdown_final_assembly" as SessionId;
   const runner = new ToolUseThenFinalRunner();
