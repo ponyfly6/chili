@@ -448,7 +448,8 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     }
     setError(undefined);
     try {
-      const next = await coordinator.refreshSessionSnapshot(sessionId);
+      const next = await coordinator.refreshSessionSnapshot(sessionId,
+        options.background ? undefined : () => projectTransport().openSession(sessionId));
       if (selectedRef.current === sessionId) {
         sidebarActivity.current.seed(projectionRef.current.state.projectId ?? workspaceRef.current, next);
         setSnapshot(next);
@@ -462,7 +463,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         setLoadingSession(false);
       }
     }
-  }, [coordinator, setSelectedId, setSnapshot]);
+  }, [coordinator, setSelectedId, setSnapshot, projectTransport]);
 
   const refreshSessions = useCallback(async (preferredId?: string) => {
     if (sidecarPhaseRef.current !== "healthy") return;

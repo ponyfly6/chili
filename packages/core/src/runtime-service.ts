@@ -49,6 +49,8 @@ import {
   type StoredSessionInput,
   type SessionInputMutation,
   SessionInputConflictError,
+  HostSessionOwnerConflictError,
+  type StaleTurnRecoveryStore,
 } from "@chili/store";
 import { executionPolicyFor, type ToolAccessPolicy } from "@chili/tools";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -582,6 +584,32 @@ export class RuntimeService {
     await this.assertSessionAccessAllowed(sessionId, false);
   }
 
+  /** Open an existing conversation for this Host without starting a turn. */
+  async acquireSession(sessionId: SessionId): Promise<void> {
+    return this.withMutationAdmission(async () => {
+      await this.assertSessionAccessAllowed(sessionId, true);
+      const acquired = this.options.store.acquireSessionOwnership?.(sessionId);
+      this.assertControlOwner(sessionId);
+      if (acquired) {
+        const recovery = this.options.store as Partial<StaleTurnRecoveryStore>;
+        await recovery.reconcileStaleTurns?.({
+          staleBefore: Date.now(),
+          createId: (prefix) => this.id(prefix),
+          status: "failed",
+          reason: "session_reopened",
+        });
+      }
+      if (!this.running.has(sessionId) && this.inputStore()?.sessionInputQueue(sessionId).items.some(
+        (item) => item.state === "claimed" || (acquired && item.state === "pending"),
+      )) {
+        this.mutateSessionInputs({ kind: "recover", sessionId });
+      }
+      // A read-only preview may have cached settings before another Host closed.
+      this.sessionModelState.delete(sessionId);
+      delete this.globalModelState;
+    });
+  }
+
   async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
     this.assertControlOwner(sessionId);
     await this.assertSessionAccessAllowed(sessionId, true);
@@ -1023,6 +1051,9 @@ export class RuntimeService {
   async resumeInputs(sessionId: SessionId): Promise<RuntimeInputQueue> {
     return this.withMutationAdmission(async () => {
       this.assertControlOwner(sessionId);
+      if (!this.running.has(sessionId) && this.inputQueue(sessionId).items.some((item) => item.state === "claimed")) {
+        this.mutateSessionInputs({ kind: "recover", sessionId });
+      }
       const before = this.inputQueue(sessionId);
       await this.assertSessionTurnAllowed(sessionId);
       if (this.running.has(sessionId) || before.items.some((item) => item.state === "claimed")) throw new RuntimeBusyError(sessionId);
@@ -1041,16 +1072,23 @@ export class RuntimeService {
     for (const session of await this.options.store.sessions()) {
       if (session.status !== "active" || this.running.has(session.id)) continue;
       if (Boolean(session.agent) !== (this.options.sessionAccess === "child")) continue;
+      if (this.options.store.canRecoverSession?.(session.id) === false) continue;
       if (store.sessionInputQueue(session.id).items.some((item) => item.state === "claimed"
         || (options.includePending !== false && item.state === "pending"))) {
-        this.assertControlOwner(session.id);
-        this.mutateSessionInputs({ kind: "recover", sessionId: session.id });
+        try {
+          this.assertControlOwner(session.id);
+          this.mutateSessionInputs({ kind: "recover", sessionId: session.id });
+        } catch (error) {
+          // Another Host can open the session after the read-only filter above.
+          if (!(error instanceof HostSessionOwnerConflictError)) throw error;
+        }
       }
     }
   }
 
   private assertControlOwner(sessionId: SessionId): void {
     const store = this.options.store as typeof this.options.store & Partial<RuntimeAtomicSessionStore>;
+    store.assertSessionOwnership?.(sessionId);
     const claim = store.sessionRunClaim?.(sessionId);
     if (claim && claim.leaseExpiresAt > Date.now()
       && this.running.get(sessionId)?.durableClaimId !== claim.claimId) {
@@ -1692,7 +1730,9 @@ export class RuntimeService {
 
   private async resolveSessionModelState(sessionId: SessionId): Promise<RuntimeSessionModelState> {
     const cached = this.sessionModelState.get(sessionId);
-    if (cached) return cloneSessionModelState(cached);
+    // Shared stores can change while this Host only previews a session, before
+    // explicit open or the first write. Read their settings from durable events.
+    if (cached && !this.options.store.acquireSessionOwnership) return cloneSessionModelState(cached);
 
     const state = await this.resolveGlobalModelState();
     const modelEvents = await this.options.store.events({
@@ -1734,7 +1774,7 @@ export class RuntimeService {
   }
 
   private async resolveGlobalModelState(): Promise<RuntimeSessionModelState> {
-    if (this.globalModelState) return cloneSessionModelState(this.globalModelState);
+    if (this.globalModelState && !this.options.store.acquireSessionOwnership) return cloneSessionModelState(this.globalModelState);
 
     const state = defaultSessionModelState(this.options);
     const modelEvents = await this.options.store.events({
@@ -2675,6 +2715,8 @@ function isRuntimeSessionBoundaryError(error: Error): boolean {
   return error instanceof RuntimeServiceClosedError
     || error instanceof RuntimeForeignOwnerError
     || error.name === "RuntimeForeignOwnerError"
+    || error instanceof HostSessionOwnerConflictError
+    || error.name === "HostSessionOwnerConflictError"
     || error instanceof RuntimeSessionInactiveError
     || error instanceof RuntimeSessionAccessError
     || error instanceof RuntimeSessionNotFoundError

@@ -23,7 +23,7 @@ import type {
   EventStore,
   SessionRow,
 } from "@chili/store";
-import { ObservableEventStore, SqliteEventStore, UnknownEventCursorError } from "@chili/store";
+import { ObservableEventStore, SqliteEventStore, UnknownEventCursorError, HostSessionOwnerConflictError } from "@chili/store";
 import { HttpRuntimeClient, type RuntimeSessionEventWindow } from "@chili/sdk";
 import type {
   AgentPath,
@@ -427,6 +427,30 @@ test("rejects every browser-originated mutation, including routes without bodies
   expect(response.status).toBe(403);
   expect(await response.json()).toEqual({ error: { message: "Browser-originated runtime mutations are disabled" } });
   expect((await store.sessions()).find((candidate) => candidate.id === session.sessionId)?.status).toBe("active");
+});
+
+test("explicit open acquires the existing session and reports ownership conflicts without changing history", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const service = new FakeRuntimeService(store);
+  const { sessionId } = await service.createSession();
+  const opened: SessionId[] = [];
+  const acquire = spyOn(service, "acquireSession").mockImplementation(async (id) => { opened.push(id); });
+  const handler = createRuntimeHttpHandler({ service, store });
+  const before = await store.events({ sessionId });
+  const request = () => new Request(`http://chili.test/sessions/${sessionId}/open`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+  });
+  expect((await handler(new Request("http://chili.test/sessions"))).status).toBe(200);
+  expect((await handler(new Request(`http://chili.test/sessions/${sessionId}/messages`))).status).toBe(200);
+  expect(opened).toEqual([]);
+  const response = await handler(request());
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ sessionId });
+  expect(opened).toEqual([sessionId]);
+  acquire.mockImplementation(async () => { throw new HostSessionOwnerConflictError(sessionId, sessionId, 12345); });
+  expect((await handler(request())).status).toBe(409);
+  expect(await store.events({ sessionId })).toEqual(before);
+  acquire.mockRestore();
 });
 
 test("keeps runtime HTTP routes unauthenticated when no auth token is configured", async () => {
@@ -3313,6 +3337,14 @@ class FakeRuntimeService implements RuntimeHttpService {
   readonly sessionOperationIds: SessionId[] = [];
 
   constructor(protected readonly store: EventStore & EventPublisher) {}
+
+  async acquireSession(sessionId: SessionId): Promise<void> {
+    await this.assertSessionTurnAllowed(sessionId);
+    if (!(await this.store.sessions()).some((session) => session.id === sessionId)) {
+      throw new RuntimeSessionNotFoundError(sessionId);
+    }
+    this.store.acquireSessionOwnership?.(sessionId);
+  }
 
   async withSessionOperation<T>(
     sessionId: SessionId,

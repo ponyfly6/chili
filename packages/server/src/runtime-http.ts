@@ -56,6 +56,7 @@ export interface RuntimeHttpService {
     fn: (operation: RuntimeHttpSessionOperation) => Promise<T> | T,
   ): Promise<T>;
   createSession(input?: { sessionId?: SessionId; cwd?: string }): Promise<RuntimeSessionRef>;
+  acquireSession?(sessionId: SessionId): Promise<void>;
   listModels?(input?: { provider?: string }): Promise<RuntimeModelDescriptor[]>;
   getModelConfig?(sessionId: SessionId): Promise<RuntimeModelConfig>;
   setModel?(input: { sessionId: SessionId; modelSelection: ModelSelection }): Promise<RuntimeModelConfig>;
@@ -188,7 +189,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "commands") {
         if (!route.sessionId) return json(await requireCommandControl(options).list());
-        await options.service.assertSessionTurnAllowed(route.sessionId);
+        await options.service.assertSessionReadAllowed(route.sessionId);
         const session = await requireSession(options.store, route.sessionId);
         const cwd = await authoritativeRequestCwd(session.cwd, undefined);
         return json(await requireCommandControl(options).list({ cwd }));
@@ -199,6 +200,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         await options.service.assertSessionTurnAllowed(route.sessionId);
         const session = await requireSession(options.store, route.sessionId);
         const cwd = await authoritativeRequestCwd(session.cwd, undefined);
+        await options.service.acquireSession?.(route.sessionId);
         return json(await requireCommandControl(options).reload({ cwd }));
       }
 
@@ -326,6 +328,13 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         if (body.sessionId !== undefined) input.sessionId = requestSessionId(body.sessionId);
         if (body.cwd !== undefined) input.cwd = await requestWorkspaceCwd(body.cwd);
         return json(await options.service.createSession(input), 201);
+      }
+
+      if (route.name === "openSession") {
+        if (!options.service.acquireSession) return jsonError(501, "Session ownership is unavailable");
+        await readJson<Record<string, unknown>>(request, []);
+        await options.service.acquireSession(route.sessionId);
+        return json({ sessionId: route.sessionId });
       }
 
       if (route.name === "eventSnapshot") {
@@ -829,6 +838,7 @@ type Route =
   | { name: "mcpAuth"; server: string }
   | { name: "mcpLogout"; server: string }
   | { name: "createSession" }
+  | { name: "openSession"; sessionId: SessionId }
   | { name: "messages"; sessionId: SessionId }
   | { name: "sessionEvents"; sessionId: SessionId }
   | { name: "eventSnapshot" }
@@ -1000,6 +1010,11 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "GET" && path === "/mcp/status") return { name: "mcpStatus" };
   if (method === "POST" && path === "/mcp/reload") return { name: "mcpReload" };
   if (method === "POST" && path === "/sessions") return { name: "createSession" };
+
+  const openSessionRoute = /^\/sessions\/([^/]+)\/open$/.exec(path);
+  if (method === "POST" && openSessionRoute) {
+    return { name: "openSession", sessionId: requestSessionId(decodeURIComponent(openSessionRoute[1] ?? "")) };
+  }
 
   const mcpRoute = /^\/mcp\/([^/]+)(?:\/([^/]+))?$/.exec(path);
   if (mcpRoute) {
@@ -1986,7 +2001,7 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "AbortError") {
     return { status: 499, message: err.message };
   }
-  if (err.name === "RuntimeBusyError" || err.name === "RuntimeForeignOwnerError" || err.name === "SessionInputConflictError") {
+  if (err.name === "RuntimeBusyError" || err.name === "RuntimeForeignOwnerError" || err.name === "SessionInputConflictError" || err.name === "HostSessionOwnerConflictError") {
     return { status: 409, message: err.message };
   }
   if (err.name === "RuntimeSessionAccessError" || err.name === "SessionAccessError") {

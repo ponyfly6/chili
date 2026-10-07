@@ -211,7 +211,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
   const owner = new HostOwnerClaim(join(stateDir, "chili.sqlite"));
   let unsubscribeGuardians: (() => void) | undefined;
   try {
-    sqliteStore = new SqliteEventStore(join(stateDir, "chili.sqlite"));
+    sqliteStore = new SqliteEventStore(join(stateDir, "chili.sqlite"), { hostOwnerToken: owner.token });
     unsubscribeGuardians = observeProcessGuardianLifecycle((event) => {
       if (event.ownerId !== owner.token) return;
       if (event.type === "started") owner.registerGuardian(event.pid);

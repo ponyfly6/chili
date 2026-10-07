@@ -113,6 +113,10 @@ export const SQLITE_SCHEMA = [
     heartbeat_at integer not null,
     lease_expires_at integer not null
   )`,
+  `create table if not exists session_host_owners (
+    root_session_id text primary key,
+    owner_token text not null
+  )`,
   `create table if not exists session_dispatch (
     session_id text primary key references sessions(id),
     paused integer not null default 0,

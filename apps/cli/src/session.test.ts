@@ -13,7 +13,9 @@ test("CLI resume accepts only an existing active root session without creating e
   const archivedSessionId = "session_resume_archived" as SessionId;
   const childSessionId = "session_resume_child" as SessionId;
   let createCalls = 0;
+  const opened: SessionId[] = [];
   const service = {
+    async acquireSession(sessionId: SessionId) { opened.push(sessionId); },
     async createSession() {
       createCalls += 1;
       return { sessionId: "session_created" as SessionId };
@@ -67,6 +69,7 @@ test("CLI resume accepts only an existing active root session without creating e
     resume: activeSessionId,
   })).resolves.toEqual({ sessionId: activeSessionId, isNew: false });
   expect(createCalls).toBe(0);
+  expect(opened).toEqual([activeSessionId]);
 });
 
 test("CLI resumes the persisted project session after restart and execution settings change", async () => {

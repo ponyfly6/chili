@@ -21,6 +21,7 @@ export async function resolveSession(input: {
     }
     if (!session) throw new Error(`Session not found: ${sessionId}`);
     if (session.status !== "active") throw new Error(`Session is not active: ${sessionId}`);
+    await input.service.acquireSession(sessionId);
     return { sessionId, isNew: false };
   }
 

@@ -8,7 +8,9 @@ test("direct CLI revert resolves an active root session before invoking recovery
   const archivedSessionId = "session_revert_archived" as SessionId;
   const childSessionId = "session_revert_child" as SessionId;
   const snapshotId = "snapshot_cli_revert" as SnapshotId;
+  const opened: SessionId[] = [];
   const service = {
+    async acquireSession(sessionId: SessionId) { opened.push(sessionId); },
     async createSession() {
       throw new Error("direct revert must not create a session");
     },
@@ -62,8 +64,10 @@ test("direct CLI revert resolves an active root session before invoking recovery
   await expect(revertSessionSnapshot({ ...baseInput, resume: childSessionId }))
     .rejects.toThrow("belongs to an agent");
   expect(recoveryCalls).toEqual([]);
+  expect(opened).toEqual([]);
 
   await expect(revertSessionSnapshot({ ...baseInput, resume: activeSessionId }))
     .resolves.toMatchObject({ snapshotId });
   expect(recoveryCalls).toEqual([{ sessionId: activeSessionId, snapshotId }]);
+  expect(opened).toEqual([activeSessionId]);
 });

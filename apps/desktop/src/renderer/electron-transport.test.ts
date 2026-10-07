@@ -190,6 +190,7 @@ test("maps daily-driver task controls to explicit validated IPC requests", async
     permissionProfile: "auto-review",
     delegationPolicy: "proactive",
   });
+  await transport.openSession("session_work");
   await transport.resumeSession("session_work");
   await transport.renameSession("session_work", "Renamed");
   await transport.archiveSession("session_work");
@@ -207,6 +208,7 @@ test("maps daily-driver task controls to explicit validated IPC requests", async
       permissionProfile: "auto-review",
       delegationPolicy: "proactive",
     },
+    { type: "session.open", sessionId: "session_work" },
     { type: "session.resume", sessionId: "session_work" },
     { type: "session.rename", sessionId: "session_work", title: "Renamed" },
     { type: "session.archive", sessionId: "session_work" },

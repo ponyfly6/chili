@@ -256,7 +256,7 @@ test("CLI harness close observes rejected MCP and synchronous SQLite cleanup fai
   }
 });
 
-test("CLI harness retries stale-turn reconciliation after a crashed run claim lease expires", async () => {
+test("CLI harness reconciles an owned stale session after its legacy run claim lease expires", async () => {
   const root = await mkdtempName();
   const repo = join(root, "repo");
   const stateDir = join(repo, ".chili");
@@ -320,6 +320,10 @@ test("CLI harness retries stale-turn reconciliation after a crashed run claim le
     expect((await harness.events.events({ sessionId, type: "session.status_changed", limit: 20 })).at(-1)?.payload).toMatchObject({
       status: "running",
     });
+
+    // Background maintenance must not claim unopened history. Select this
+    // legacy session without eagerly repairing it to exercise the timer.
+    harness.store.acquireSessionOwnership(sessionId);
 
     await waitFor(async () => {
       const statuses = await harness?.events.events({ sessionId, type: "session.status_changed", limit: 20 });

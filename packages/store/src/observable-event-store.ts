@@ -38,12 +38,18 @@ export class ObservableEventStore
   private readonly activeParts = new Map<string, Extract<ChiliEvent, { type: "message.part_stream_snapshot" }>>();
   readonly eventReplayBoundary?: NonNullable<EventStore["eventReplayBoundary"]>;
   readonly runtimeSnapshot?: NonNullable<EventStore["runtimeSnapshot"]>;
+  readonly acquireSessionOwnership?: NonNullable<EventStore["acquireSessionOwnership"]>;
+  readonly assertSessionOwnership?: NonNullable<EventStore["assertSessionOwnership"]>;
+  readonly canRecoverSession?: NonNullable<EventStore["canRecoverSession"]>;
   readonly sessionInputForMessage?: NonNullable<EventStore["sessionInputForMessage"]>;
 
   constructor(
     private readonly inner: EventStore,
     private readonly options: ObservableEventStoreOptions = {},
   ) {
+    if (inner.acquireSessionOwnership) this.acquireSessionOwnership = (sessionId) => inner.acquireSessionOwnership!(sessionId);
+    if (inner.assertSessionOwnership) this.assertSessionOwnership = (sessionId) => inner.assertSessionOwnership!(sessionId);
+    if (inner.canRecoverSession) this.canRecoverSession = (sessionId) => inner.canRecoverSession!(sessionId);
     // Preserve capability absence across wrapper chains so callers can fail
     // explicitly instead of fabricating an incomplete recovery snapshot.
     if (inner.eventReplayBoundary) this.eventReplayBoundary = (query) => inner.eventReplayBoundary!(query);

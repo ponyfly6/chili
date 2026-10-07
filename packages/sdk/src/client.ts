@@ -84,6 +84,7 @@ export type { RuntimeAgentRecord, RuntimeAgentSubmission, RuntimeAgentWaitResult
 
 export interface RuntimeClient {
   createSession(input?: CreateSessionRequest): Promise<RuntimeSessionRef>;
+  openSession(sessionId: SessionId, signal?: AbortSignal): Promise<void>;
   listModels(input?: ListModelsRequest): Promise<RuntimeModelDescriptor[]>;
   getModelConfig(input: GetModelConfigRequest): Promise<RuntimeModelConfig>;
   setModel(input: SetModelRequest): Promise<RuntimeModelConfig>;
@@ -478,6 +479,10 @@ export class HttpRuntimeClient implements RuntimeClient {
   createSession(input: CreateSessionRequest = {}): Promise<RuntimeSessionRef> {
     const { signal, ...body } = input;
     return this.post("sessions", body, signal, parseRuntimeSessionRef);
+  }
+
+  async openSession(sessionId: SessionId, signal?: AbortSignal): Promise<void> {
+    await this.post(`sessions/${encodeURIComponent(sessionId)}/open`, {}, signal, parseRuntimeSessionRef);
   }
 
   listModels(input: ListModelsRequest = {}): Promise<RuntimeModelDescriptor[]> {

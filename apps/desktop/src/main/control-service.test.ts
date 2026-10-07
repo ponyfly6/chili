@@ -564,8 +564,10 @@ describe("desktop task controls", () => {
 
   test("resumes the input queue and rejects archived tasks", async () => {
     const resumedSessions: string[] = [];
+    const openedSessions: string[] = [];
     let lifecycle: "active" | "archived" = "active";
     const client = {
+      openSession: async (sessionId: string) => { openedSessions.push(sessionId); },
       listSessions: async () => [sessionSummary("session_resume", lifecycle)],
       resumeInputs: async ({ sessionId }: { sessionId: string }) => {
         resumedSessions.push(sessionId);
@@ -578,11 +580,44 @@ describe("desktop task controls", () => {
     expect((await service.invoke({ type: "session.resume", sessionId: "session_resume" })).sessionId)
       .toBe("session_resume");
     expect(resumedSessions).toEqual(["session_resume"]);
+    expect(openedSessions).toEqual(["session_resume"]);
 
     lifecycle = "archived";
     await expect(service.invoke({ type: "session.resume", sessionId: "session_resume" }))
       .rejects.toThrow("Archived tasks cannot be resumed");
     expect(resumedSessions).toEqual(["session_resume"]);
+    expect(openedSessions).toEqual(["session_resume"]);
+  });
+
+  test("opening active tasks acquires ownership while snapshots and archived tasks remain readable", async () => {
+    const opened: string[] = [];
+    let lifecycle: "active" | "archived" = "active";
+    const client = {
+      ...snapshotClientMethods(),
+      listSessions: async () => [sessionSummary("saved", lifecycle)],
+      openSession: async (sessionId: string) => { opened.push(sessionId); },
+    } as unknown as RuntimeClient;
+    const service = serviceFor(client);
+    await service.invoke({ type: "session.snapshot", sessionId: "saved" });
+    expect(opened).toEqual([]);
+    await service.invoke({ type: "session.open", sessionId: "saved" });
+    expect(opened).toEqual(["saved"]);
+    lifecycle = "archived";
+    await service.invoke({ type: "session.open", sessionId: "saved" });
+    expect(opened).toEqual(["saved"]);
+  });
+
+  test("a foreign session owner prevents resume before queued inputs are touched", async () => {
+    let resumes = 0;
+    const client = {
+      ...snapshotClientMethods(),
+      listSessions: async () => [sessionSummary("owned")],
+      openSession: async () => { throw new Error("This session is open in another Host"); },
+      resumeInputs: async () => { resumes++; return emptyInputQueue("owned"); },
+    } as unknown as RuntimeClient;
+    await expect(serviceFor(client).invoke({ type: "session.resume", sessionId: "owned" }))
+      .rejects.toThrow("another Host");
+    expect(resumes).toBe(0);
   });
 
   test("Steer delegates input arbitration entirely to RuntimeService", async () => {
@@ -1293,6 +1328,7 @@ describe("desktop session projections", () => {
 });
 
 function serviceFor(client: RuntimeClient, onError: (error: Error) => void = () => undefined): DesktopControlService {
+  client.openSession ??= async () => undefined;
   client.inputQueue ??= async ({ sessionId }) => emptyInputQueue(sessionId);
   client.getInput ??= async () => undefined;
   client.resumeInputs ??= async ({ sessionId }) => emptyInputQueue(sessionId);

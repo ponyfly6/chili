@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { hostOwnerBlockingPid } from "./host-owner.js";
 import { StoredContentCodec } from "./content-store.js";
 import { SessionInputConflictError, SessionInputRepository, type SessionInputMutation, type SessionInputMutationOptions, type SessionInputMutationResult } from "./session-inputs.js";
 import type {
@@ -169,7 +170,15 @@ export class SessionStateConflictError extends Error {
   }
 }
 
+export class HostSessionOwnerConflictError extends Error {
+  override readonly name = "HostSessionOwnerConflictError";
+  constructor(readonly sessionId: SessionId, readonly rootSessionId: SessionId, readonly ownerPid: number) {
+    super(`Session ${rootSessionId} is owned by another Host (PID ${ownerPid}); close that Host before resuming it.`);
+  }
+}
+
 export interface SqliteEventStoreOptions {
+  hostOwnerToken?: string;
   mirror?: EventMirror;
   onMirrorError?: (error: unknown, event: RuntimeEvent) => void;
   busyTimeoutMs?: number;
@@ -232,6 +241,7 @@ export class SqliteEventStore
             throw new SessionAccessError(sessionId);
           }
           if (!session || session.status !== "active") throw new SessionStateConflictError(sessionId, session?.status);
+          this.acquireSessionOwnershipInTransaction(sessionId);
         },
         retry: (operation) => this.runWithWriteRetry(operation),
       });
@@ -243,6 +253,78 @@ export class SqliteEventStore
       }
       throw error;
     }
+  }
+
+  acquireSessionOwnership(sessionId: SessionId): boolean {
+    if (!this.options.hostOwnerToken) return false;
+    return this.runWithWriteRetry(() => this.db.transaction(() => this.acquireSessionOwnershipInTransaction(sessionId)).immediate());
+  }
+
+  assertSessionOwnership(sessionId: SessionId): void {
+    if (!this.options.hostOwnerToken) return;
+    this.assertRegisteredHost();
+    // Leave missing-session classification to the caller's access admission.
+    if (!this.db.query<{ found: number }, [string]>("select 1 as found from sessions where id = ?").get(sessionId)) return;
+    const root = this.rootSessionId(sessionId);
+    const owner = this.db.query<{ owner_token: string }, [string]>("select owner_token from session_host_owners where root_session_id = ?").get(root);
+    if (owner && owner.owner_token !== this.options.hostOwnerToken) {
+      const pid = hostOwnerBlockingPid(this.db, owner.owner_token);
+      if (pid !== undefined) throw new HostSessionOwnerConflictError(sessionId, root, pid);
+    }
+  }
+
+  canRecoverSession(sessionId: SessionId): boolean {
+    const token = this.options.hostOwnerToken;
+    if (!token) return true;
+    this.assertRegisteredHost();
+    if (!this.db.query<{ found: number }, [string]>("select 1 as found from sessions where id = ?").get(sessionId)) return false;
+    const root = this.rootSessionId(sessionId);
+    return this.db.query<{ owner_token: string }, [string]>("select owner_token from session_host_owners where root_session_id = ?").get(root)?.owner_token === token;
+  }
+
+  private assertRegisteredHost(): void {
+    const token = this.options.hostOwnerToken;
+    if (token && !this.db.query<{ found: number }, [string]>("select 1 as found from host_owner where token = ?").get(token)) {
+      throw new Error("Host registration has been released");
+    }
+  }
+
+  private rootSessionId(sessionId: SessionId, allowMissing = false): SessionId {
+    const seen = new Set<SessionId>();
+    let current = sessionId;
+    for (;;) {
+      if (seen.has(current)) throw new Error("Cyclic session ancestry");
+      seen.add(current);
+      const session = this.db.query<{ parent_session_id: string | null }, [string]>("select parent_session_id from sessions where id = ?").get(current);
+      if (!session) {
+        if (allowMissing && current === sessionId) return current;
+        throw new SessionStateConflictError(current);
+      }
+      if (!session.parent_session_id) return current;
+      current = session.parent_session_id as SessionId;
+    }
+  }
+
+  private acquireSessionOwnershipInTransaction(sessionId: SessionId, allowMissing = false, parentSessionId?: SessionId): boolean {
+    const token = this.options.hostOwnerToken;
+    if (!token) return false;
+    this.assertRegisteredHost();
+    const root = this.rootSessionId(parentSessionId ?? sessionId, allowMissing);
+    const owner = this.db.query<{ owner_token: string }, [string]>("select owner_token from session_host_owners where root_session_id = ?").get(root);
+    if (owner?.owner_token === token) return false;
+    if (owner) {
+      const pid = hostOwnerBlockingPid(this.db, owner.owner_token);
+      if (pid !== undefined) throw new HostSessionOwnerConflictError(sessionId, root, pid);
+      // The old process and every registered guardian have ended. Its leases
+      // cannot represent live work, even if their wall-clock expiry is later.
+      for (const table of ["session_run_claims", "session_creation_claims"] as const) {
+        this.db.query(`with recursive tree(id) as (
+          select ? union all select s.id from sessions s join tree on s.parent_session_id = tree.id
+        ) delete from ${table} where session_id in (select id from tree)`).run(root);
+      }
+    }
+    this.db.query("insert into session_host_owners(root_session_id, owner_token) values (?, ?) on conflict(root_session_id) do update set owner_token = excluded.owner_token").run(root, token);
+    return true;
   }
 
   close(): void {
@@ -279,6 +361,7 @@ export class SqliteEventStore
     const transact = this.db.transaction(() => {
       // This is the only cross-Session creation operation. Check the parent's
       // live ownership here without weakening ordinary event write fences.
+      this.acquireSessionOwnershipInTransaction(input.parentSessionId);
       this.assertRunClaimFence(input.runClaim, []);
       const parent = this.readSession(input.parentSessionId);
       if (!parent || parent.status !== "active") throw new SessionStateConflictError(input.parentSessionId, parent?.status);
@@ -419,18 +502,20 @@ export class SqliteEventStore
       if (this.ownedCreationClaims.has(input.sessionId)) {
         return { status: "already_exists" as const };
       }
-      this.db.query(
-        `delete from session_creation_claims where session_id = ? and lease_expires_at <= ?`,
-      ).run(input.sessionId, input.time);
       const existing = this.db
         .query<{ found: number }, [string]>(`select 1 as found from sessions where id = ? limit 1`)
         .get(input.sessionId);
+      if (existing) return { status: "already_exists" as const };
+      this.acquireSessionOwnershipInTransaction(input.sessionId, true);
+      this.db.query(
+        `delete from session_creation_claims where session_id = ? and lease_expires_at <= ?`,
+      ).run(input.sessionId, input.time);
       const existingClaim = this.db
         .query<{ found: number }, [string]>(
           `select 1 as found from session_creation_claims where session_id = ? limit 1`,
         )
         .get(input.sessionId);
-      if (existing || existingClaim) return { status: "already_exists" as const };
+      if (existingClaim) return { status: "already_exists" as const };
       this.db.query(
         `insert into session_creation_claims
            (session_id, claim_id, cwd, claimed_at, heartbeat_at, lease_expires_at)
@@ -457,7 +542,9 @@ export class SqliteEventStore
     leaseDurationMs: number;
   }): boolean {
     if (this.ownedCreationClaims.get(input.sessionId) !== input.claimId) return false;
-    const renewed = this.runWithWriteRetry(() => this.db.query(
+    const renewed = this.runWithWriteRetry(() => this.db.transaction(() => {
+      this.acquireSessionOwnershipInTransaction(input.sessionId, true);
+      return this.db.query(
       `update session_creation_claims
           set heartbeat_at = ?, lease_expires_at = ?
         where session_id = ? and claim_id = ? and lease_expires_at > ?`,
@@ -467,7 +554,8 @@ export class SqliteEventStore
       input.sessionId,
       input.claimId,
       input.time,
-    ));
+    );
+    }).immediate());
     return renewed.changes === 1;
   }
 
@@ -506,6 +594,7 @@ export class SqliteEventStore
         return { status: "inactive" as const, sessionStatus: session.status };
       }
       if (!!session.parent_session_id !== (input.sessionAccess === "child")) return { status: "forbidden" as const };
+      this.acquireSessionOwnershipInTransaction(input.sessionId);
       // See claimSessionCreation: replacing an owned claim on this connection
       // would erase the identity needed to reject the old operation's appends.
       if (this.ownedRunClaims.has(input.sessionId)) return { status: "busy" as const };
@@ -552,7 +641,9 @@ export class SqliteEventStore
     leaseDurationMs: number;
   }): boolean {
     if (this.ownedRunClaims.get(input.sessionId) !== input.claimId) return false;
-    const renewed = this.runWithWriteRetry(() => this.db.query(
+    const renewed = this.runWithWriteRetry(() => this.db.transaction(() => {
+      this.acquireSessionOwnershipInTransaction(input.sessionId, false);
+      return this.db.query(
       `update session_run_claims
           set heartbeat_at = ?, lease_expires_at = ?
         where session_id = ? and claim_id = ? and lease_expires_at > ?`,
@@ -562,7 +653,8 @@ export class SqliteEventStore
       input.sessionId,
       input.claimId,
       input.time,
-    ));
+    );
+    }).immediate());
     return renewed.changes === 1;
   }
 
@@ -853,7 +945,7 @@ export class SqliteEventStore
     const run = this.db.transaction((items: readonly RuntimeEvent[]) => {
       return this.writeTransactionEvents(items, runClaim, creationClaim, fenceEvents);
     });
-    return this.runWithWriteRetry(() => run(events));
+    return this.runWithWriteRetry(() => run.immediate(events));
   }
 
   private writeTransactionEvents(
@@ -865,6 +957,10 @@ export class SqliteEventStore
     this.assertRunClaimFence(runClaim, fenceEvents);
     this.assertCreationClaimFence(creationClaim, fenceEvents);
     for (const event of fenceEvents) {
+      if (event.sessionId) {
+        this.acquireSessionOwnershipInTransaction(event.sessionId, event.type === "session.created",
+          event.type === "session.created" ? event.payload.agent?.parentSessionId : undefined);
+      }
       validateScopedEventSessionIdentity(event);
       this.assertOwnedCreationClaim(event.sessionId);
       this.assertOwnedRunClaim(event.sessionId);
@@ -1047,6 +1143,7 @@ export class SqliteEventStore
       const events: RuntimeEvent[] = [];
       for (const row of rows) {
         const sessionId = row.session_id as SessionId;
+        if (!this.canRecoverSession(sessionId)) continue;
         if (
           this.ownedCreationClaims.has(sessionId)
           || this.ownedRunClaims.has(sessionId)
@@ -1149,6 +1246,7 @@ export class SqliteEventStore
       const finishedCalls = new Set<string>();
       for (const approval of approvals) {
         const sessionId = approval.session_id as SessionId | null;
+        if (sessionId && !this.canRecoverSession(sessionId)) continue;
         if (sessionId && (this.ownedCreationClaims.has(sessionId) || this.ownedRunClaims.has(sessionId))) continue;
         const base = { time: now, ...(sessionId ? { sessionId } : {}) };
         events.push({
