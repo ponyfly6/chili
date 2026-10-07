@@ -9,7 +9,7 @@ project identity so related workspaces use the same project Memory scope. A Host
 may own sessions in different projects: prompt, skills and Memory identities are
 resolved for each session cwd, rather than inheriting the Host startup project.
 The Memory tool uses a trusted `optionsForCwd` resolver during validation and
-freezes that binding in its PreparedCall. Approval and execution use that same
+freezes that binding in its PreparedCall. Execution review and execution use that same
 profile/project resource; model-supplied binding fields are discarded.
 
 These inputs have separate responsibilities:
@@ -55,16 +55,15 @@ an alternative editable database. Legacy rules and project instructions remain
 live files and are not migrated.
 
 The model tool supports `add`, `list`, `get`, `search`, `put`, `remove`/`delete`,
-and `export`. Memory resources use dedicated `memory.read` / `memory.write`
-permissions scoped to `profile:<canonical-profile-path>/user` or
-`profile:<canonical-profile-path>/project:<project-id>`. Filesystem grants for an
-old Markdown pathname do not silently become authority over a profile database.
-Host checks current `memory.read` rules before automatic prompt selection and
-supplies `memoryScopes`; denied/approval-required scopes are not migrated or read
-and produce `memory_read_not_authorized` omission records. Tool program results
-use `structuredData`, separate from their truncatable model text. The tool declares
-its trusted resource policy as `internal`: profile Memory permissions govern it,
-independently of workspace file-write scopes. It forwards only the executor-owned
+and `export`. Memory resource descriptors label read and write operations as
+`memory.read` / `memory.write` and identify `profile:<canonical-profile-path>/user`
+or `profile:<canonical-profile-path>/project:<project-id>`. Every explicit Memory
+tool call passes through the Host execution gate, including its prepared input
+and profile/project identity. Host supplies both scopes for automatic prompt
+selection; profile and project identity continue to isolate their data.
+Tool program results use `structuredData`, separate from their truncatable model
+text. The tool declares its trusted resource policy as `internal`, independently
+of workspace file-write scopes. It forwards only the executor-owned
 `assertCurrentAuthorization` hook, and rechecks after asynchronous path discovery,
 legacy-source reads, and immediately before SQLite transactions/queries. A revoke
 while migration is waiting prevents both import and the requested mutation.

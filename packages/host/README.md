@@ -3,7 +3,7 @@
 `@chili/host` is the shared application composition for the local coding agent.
 CLI and Desktop construct it; TUI connects to its HTTP/SSE adapter through
 `@chili/sdk`. Host owns the runtime, tool and MCP registration, configuration,
-permission policy, session store, recovery timers, and resource shutdown.
+execution review, session store, recovery timers, and resource shutdown.
 
 ## Create and close
 
@@ -33,14 +33,34 @@ offline fixtures; `@chili/host/testing` exposes their router for test code.
 
 Host has no terminal UI and writes no execution output to stdout. An optional
 `onEvent` observer receives committed events from initialization through shutdown;
-observer exceptions do not change the committed result. CLI supplies its printer
-and readline approval UI. Desktop supplies deferred approval and user-input queues.
+observer exceptions do not change the committed result. CLI and Desktop supply
+user-input interfaces for clarification, independently from execution review.
 
-Approval policy remains inside Host. An `askApproval` callback only returns a
-decision; Host validates its scope and persists allowed grants. `approvalQueue`
-takes precedence when supplied. Without either interface, operations requiring
-approval are denied. `permissionProfile: "full-access"` still honors configured
-denies; `"auto-review"` is unavailable and rejected.
+Host supports exactly two execution modes. `full-access` executes tools directly.
+`auto-review` (the default) asks an independent model to allow or deny each exact
+prepared call. The host triggers review automatically; the task model has no
+approval tool. A denial returns its explanation to the task model. Review errors,
+invalid responses, oversized inputs and timeouts fail the tool without execution
+or a fallback human approval queue. Reviewers receive no tools in this version.
+
+The reviewer receives the complete frozen action, selected conversation evidence
+with explicit provenance, the fixed reviewer role/output contract, and editable
+user review instructions. Authenticated human inputs and question answers are
+separated from agent messages, command expansion, tool output and repository text.
+Human intent is timestamped, and newer instructions, settings changes and
+cancellation invalidate pending permits before effects. Every invocation is
+reviewed independently; there are no session grants or remembered tool approvals.
+
+`permissions.set(profile, { reviewInstructions, reviewerModel })` asynchronously
+saves `review-settings.json` in the user profile. `reviewerModel: null` returns to
+the current task model. Instructions default to broad task autonomy with checks
+for major unintended destructive actions and private-data exposure; restore the
+returned `defaultReviewInstructions` to reset them. Settings affect the current
+Host after a successful save; other running Hosts retain their loaded settings
+until restarted or changed. Project configuration cannot replace review settings.
+Legacy `[permissions]` tables are ignored. `reviewerModelRouter` and
+`reviewTimeoutMs` support isolated fake-model tests. The built-in fake model also
+provides deterministic review decisions without network calls.
 
 `close()` returns one shared promise. It closes admission, interrupts/drains root
 and child execution, stops managed processes and maintenance, settles interaction
@@ -51,7 +71,7 @@ resources already created.
 
 ```text
 CLI adapter / Desktop sidecar ──> Host ──> core, tools, store, providers,
-                                       mcp, policy, skills, commands
+                                       mcp, skills, commands
 HTTP/SSE server <── injected service objects from the entry point
 TUI / Desktop client ──> SDK ──> protocol
 ```
@@ -73,7 +93,7 @@ event persistence, and JSONL mirroring remain compatible.
 Host resolves canonical profile, authentication path, project and workspace
 identities. Git worktrees share the common repository project ID while retaining
 separate workspace IDs. Session-specific cwd selection continues to work: skills,
-Memory, rules and child execution follow that session's project rather than the
+Memory and child execution follow that session's project rather than the
 initial Host directory. The identity is persisted when a session is created;
 legacy sessions bind on their first owned execution. Resume and execution reject
 a changed profile/project/workspace binding before model or tool effects.
@@ -102,25 +122,16 @@ lease. Child model turns share the configured concurrency limit.
 ## Tools, context and durable compatibility
 
 The runtime advertises a versioned tool catalog, then prepares each call once for
-schema validation, permission analysis, scheduling and execution. Catalog changes
-invalidate stale calls. The effect boundary rechecks current policy and resource
-identity, including after approval and file-lock waits. Structured program data
-is stored separately from model previews and compact UI transport.
+schema validation, execution review, scheduling and execution. Catalog changes
+invalidate stale calls. The effect boundary rechecks the execution permit and
+resource identity, including after snapshots and file-lock waits. Structured
+program data is stored separately from model previews and compact UI transport.
 
-Each authorization boundary captures one copied policy observation. Permission
-decisions, revision hashes and file-resource checks share that observation; the
-next boundary captures fresh rules. An approval returns its accepted policy
-version with the decision, so a stale reply cannot acquire a newer version during
-handoff to the executor. Worker admission and backend scopes likewise use one
-copied worker policy per check. This does not pin permissions for an entire turn:
-revocation during approval, backup or file-lock waits still blocks later effects.
-See the [permission refactor record](../../docs/agent-foundation-implementation-2026-10-03.md#2026-10-06权限执行链收拢).
-
-Explicit file denies also constrain Bash through the actual process backend.
-They force macOS Seatbelt even under full-access; escalation and opaque runners
-cannot bypass them. Unsupported platforms and deny patterns fail closed. Scoped
-commands keep their complete invocation, write and network restrictions through
-the final process-start authorization check. See [process isolation](../../docs/managed-processes.md).
+Both modes execute approved ordinary shell calls through the normal host backend.
+Explicit delegated worker scopes remain enforced by the tool executor and process
+sandbox. A worker cannot widen its assigned filesystem, command or network scope
+by selecting Full Access. Unsupported scoped process isolation fails closed.
+See [process isolation](../../docs/managed-processes.md).
 
 File tools share session/workspace/version observations and cooperative mutation
 locks. Snapshot v3 restoration checks ownership and all target versions before
