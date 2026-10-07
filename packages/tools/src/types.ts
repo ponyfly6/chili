@@ -225,6 +225,13 @@ export interface ToolLifecycleHooks {
   ended?(outcome: ToolLifecycleOutcome): void;
 }
 
+/** A host/runtime refusal or cancellation before entering tool execution. */
+export interface ToolNonExecutionOutcome {
+  status: "failed" | "blocked" | "cancelled";
+  error: unknown;
+  phase?: ToolLifecyclePhase;
+}
+
 export interface ToolExecutorOptions {
   registry: ToolRegistry;
   events: ToolEventSink;

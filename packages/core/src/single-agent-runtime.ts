@@ -30,7 +30,7 @@ import {
   timestampNow,
 } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
-import type { ChiliToolDefinition, ExecuteToolInput, PreparedToolCall, ToolAccessPolicy, ToolAccessPolicyResolver, ToolRegistry } from "@chili/tools";
+import type { ChiliToolDefinition, ExecuteToolInput, PreparedToolCall, ToolAccessPolicy, ToolAccessPolicyResolver, ToolLifecyclePhase, ToolRegistry } from "@chili/tools";
 import { ToolDispatchScope, ToolExecutor, ToolValidationError, UnknownToolError, filterToolsByPolicy } from "@chili/tools";
 import {
   ContextCompactionService,
@@ -812,11 +812,11 @@ export class SingleAgentRuntime implements AgentRunner {
         await this.commitPendingContent(input, assistantMessageId, state, aborted ? "cancelled" : "failed");
         markAssistantMutation(err, assistantMutated);
         if (aborted) {
-          await this.finishUnfinishedStreamingToolCalls(input, state, "cancelled", persistedError);
+          await this.finishUnfinishedStreamingToolCalls(input, turnId, state, "cancelled", persistedError);
           await this.finishPendingToolCalls(input, turnId, assistantMessageId, state.toolCalls.splice(0), "cancelled", persistedError);
           throw attachModelUsage(err, previousAttemptUsage);
         }
-        await this.finishUnfinishedStreamingToolCalls(input, state, "failed", persistedError);
+        await this.finishUnfinishedStreamingToolCalls(input, turnId, state, "failed", persistedError);
         await this.finishPendingToolCalls(input, turnId, assistantMessageId, state.toolCalls.splice(0), "failed", persistedError);
         if (!assistantMutated && attempt < retryPolicy.maxAttempts && retryPolicy.retryable(err)) {
           const delayMs = retryDelay(retryPolicy, attempt, err);
@@ -1145,33 +1145,8 @@ export class SingleAgentRuntime implements AgentRunner {
         toolName: persistedToolName,
         count: guardResult.count,
       });
-      await this.append(input, "tool.call_started", {
-        turnId,
-        callId: toolCall.callId,
-        ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
-        toolName: persistedToolName,
-        input: persistedInput,
-      });
-      const persistedError = normalizePersistedError(error);
-      await this.append(input, "tool.call_finished", {
-        callId: toolCall.callId,
-        ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
-        status: "failed",
-        error: persistedError.message,
-        ...persistedErrorDetailsPayload(persistedError),
-        synthetic: true,
-      });
-      await this.appendPart(input, assistantMessageId, {
-        id: this.id<PartId>("part"),
-        messageId: assistantMessageId,
-        sessionId: input.sessionId,
-        type: "tool_result",
-        callId: toolCall.callId,
-        ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
-        output: "",
-        error: persistedError.message,
-        synthetic: true,
-      });
+      const part = await this.failToolCallWithoutExecution(input, turnId, assistantMessageId, toolCall, error, "blocked", "authorizing");
+      await this.appendPart(input, assistantMessageId, part);
       throw error;
     }
 
@@ -1190,25 +1165,20 @@ export class SingleAgentRuntime implements AgentRunner {
   }
 
   private async finishUnfinishedStreamingToolCalls(
-    input: EventContext,
+    input: RunTurnInput,
+    turnId: TurnId,
     state: AssistantStreamState,
     status: "failed" | "cancelled",
     error: unknown,
   ): Promise<void> {
-    const persistedError = normalizePersistedError(error);
     const unfinished = [...state.streamingToolCalls.values()];
     state.streamingToolCalls.clear();
     const seen = new Set<ToolCallId>();
     for (const toolCall of unfinished) {
       if (seen.has(toolCall.callId)) continue;
       seen.add(toolCall.callId);
-      await this.append(input, "tool.call_finished", {
-        callId: toolCall.callId,
-        ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
-        status,
-        error: persistedError.message,
-        ...persistedErrorDetailsPayload(persistedError),
-        synthetic: true,
+      await this.options.toolExecutor.recordNonExecution(this.executeInput(input, turnId, toolCall), {
+        status, error, phase: "starting",
       });
     }
   }
@@ -1256,19 +1226,22 @@ export class SingleAgentRuntime implements AgentRunner {
       if (input.signal?.aborted) throw abortError("Turn aborted");
       if (input.toolMode === "disabled") {
         await flush();
+        pendingToolCalls.delete(toolCall);
         const part = await this.failToolCallWithoutExecution(
           input,
           turnId,
           assistantMessageId,
           toolCall,
           "Tool use is disabled for this turn.",
+          "blocked",
+          "authorizing",
         );
-        pendingToolCalls.delete(toolCall);
         await this.appendPart(input, assistantMessageId, part);
         continue;
       }
       if (unloadedToolNames.has(toolCall.toolName) || envelopeHiddenToolNames.has(toolCall.toolName)) {
         await flush();
+        pendingToolCalls.delete(toolCall);
         const part = await this.failToolCallWithoutExecution(
           input,
           turnId,
@@ -1277,13 +1250,15 @@ export class SingleAgentRuntime implements AgentRunner {
           unloadedToolNames.has(toolCall.toolName)
             ? `Tool is not loaded for direct calls. Use tool_search with query "select:${toolCall.toolName}" first, then call it on the next turn. Code-mode-enabled tools remain callable from scripts without loading.`
             : "Tool was not advertised to the model because its definition exceeded the context envelope.",
+          "blocked",
+          "authorizing",
         );
-        pendingToolCalls.delete(toolCall);
         await this.appendPart(input, assistantMessageId, part);
         continue;
       }
       if (toolCall.inputParseError) {
         await flush();
+        pendingToolCalls.delete(toolCall);
         const part = await this.failToolCallWithoutExecution(
           input,
           turnId,
@@ -1291,7 +1266,6 @@ export class SingleAgentRuntime implements AgentRunner {
           toolCall,
           toolCall.inputParseError,
         );
-        pendingToolCalls.delete(toolCall);
         await this.appendPart(input, assistantMessageId, part);
         continue;
       }
@@ -1303,8 +1277,8 @@ export class SingleAgentRuntime implements AgentRunner {
       } catch (error) {
         if (!(error instanceof ToolValidationError) && !(error instanceof UnknownToolError)) throw error;
         await flush();
-        const part = await this.failToolCallWithoutExecution(input, turnId, assistantMessageId, toolCall, error);
         pendingToolCalls.delete(toolCall);
+        const part = await this.failToolCallWithoutExecution(input, turnId, assistantMessageId, toolCall, error);
         await this.appendPart(input, assistantMessageId, part);
         continue;
       }
@@ -1327,29 +1301,16 @@ export class SingleAgentRuntime implements AgentRunner {
   }
 
   private async failToolCallWithoutExecution(
-    input: EventContext,
+    input: RunTurnInput,
     turnId: TurnId,
     assistantMessageId: MessageId,
     toolCall: PendingToolCall,
     error: unknown,
-    status: "failed" | "cancelled" = "failed",
+    status: "failed" | "blocked" | "cancelled" = "failed",
+    phase: ToolLifecyclePhase = "validating",
   ): Promise<MessagePart> {
     const persistedError = normalizePersistedError(error);
-    await this.append(input, "tool.call_started", {
-      turnId,
-      callId: toolCall.callId,
-      ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
-      toolName: boundedToolName(toolCall.toolName),
-      input: boundedToolInput(toolCall.input),
-    });
-    await this.append(input, "tool.call_finished", {
-      callId: toolCall.callId,
-      ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
-      status,
-      error: persistedError.message,
-      ...persistedErrorDetailsPayload(persistedError),
-      synthetic: true,
-    });
+    await this.options.toolExecutor.recordNonExecution(this.executeInput(input, turnId, toolCall), { status, error, phase });
     return {
       id: this.id<PartId>("part"),
       messageId: assistantMessageId,
@@ -1364,7 +1325,7 @@ export class SingleAgentRuntime implements AgentRunner {
   }
 
   private async finishPendingToolCalls(
-    input: EventContext,
+    input: RunTurnInput,
     turnId: TurnId,
     assistantMessageId: MessageId,
     toolCalls: readonly PendingToolCall[],
@@ -1379,6 +1340,7 @@ export class SingleAgentRuntime implements AgentRunner {
         toolCall,
         error,
         status,
+        "starting",
       );
       await this.appendPart(input, assistantMessageId, part);
     }
@@ -1647,17 +1609,6 @@ function isSafeRuntimeErrorTag(value: string): boolean {
   if (Buffer.byteLength(value, "utf8") > 256 || !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/u.test(value)) return false;
   const probe = normalizePersistedError(Object.assign(new Error("classification tag"), { code: value }));
   return probe.code === value;
-}
-
-function persistedErrorDetailsPayload(
-  error: ReturnType<typeof normalizePersistedError>,
-): { errorDetails?: ReturnType<typeof normalizePersistedError>["persistedErrorDetails"] } {
-  const details = error.persistedErrorDetails;
-  return (details.name !== "Error" && details.name !== "AbortError")
-    || details.code !== undefined
-    || details.truncated === true
-    ? { errorDetails: details }
-    : {};
 }
 
 function terminalPersistedError(error: Error, aborted: boolean): ReturnType<typeof normalizePersistedError> {

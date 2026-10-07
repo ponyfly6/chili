@@ -43,6 +43,7 @@ import type {
   ToolLifecycleContext,
   ToolLifecycleOutcome,
   ToolLifecyclePhase,
+  ToolNonExecutionOutcome,
   ToolExecutorOptions,
   PersistedToolOutputRegistration,
   ToolRegistryContext,
@@ -118,6 +119,51 @@ export class ToolExecutor {
     return this.options.executionContext
       ? this.options.executionContext(() => this.executeOwned(scopedInput))
       : this.executeOwned(scopedInput);
+  }
+
+  /** Record an accepted call refused before execution; never prepare or review it. */
+  async recordNonExecution(input: ExecuteToolInput, outcome: ToolNonExecutionOutcome): Promise<void> {
+    const capturedInput = { ...input };
+    const capturedOutcome = { ...outcome };
+    return this.options.executionContext
+      ? this.options.executionContext(() => this.recordNonExecutionOwned(capturedInput, capturedOutcome))
+      : this.recordNonExecutionOwned(capturedInput, capturedOutcome);
+  }
+
+  private async recordNonExecutionOwned(input: ExecuteToolInput, outcome: ToolNonExecutionOutcome): Promise<void> {
+    const callId = input.callId === undefined ? this.id<ToolCallId>("toolcall") : normalizeToolCallId(input.callId);
+    const startedAt = this.now();
+    const attemptedInput = boundToolEventValue(input.input, "tool input");
+    const lifecycle: ToolLifecycleState = {
+      context: Object.freeze({
+        sessionId: input.sessionId, turnId: input.turnId, callId,
+        ...(input.providerCallId === undefined ? {} : { providerCallId: input.providerCallId }),
+        ...(input.parentCallId === undefined ? {} : { parentCallId: input.parentCallId }),
+        toolName: input.toolName, cwd: input.cwd, input: freezePreparedValue(attemptedInput),
+        invocationMode: input.parentCallId ? "code" : "direct", prepared: false,
+      }),
+      phase: outcome.phase ?? "validating", status: outcome.status,
+      handlerEntered: false, executionSucceeded: false, error: toError(outcome.error),
+    };
+    try {
+      // Refusal/cancellation must still be recorded when the caller's signal or
+      // dispatch scope has already stopped. No execution permit is acquired.
+      await this.publish("tool.call_started", input, {
+        turnId: input.turnId, callId,
+        ...(input.providerCallId === undefined ? {} : { providerCallId: input.providerCallId }),
+        ...(input.parentCallId === undefined ? {} : { parentCallId: input.parentCallId }),
+        toolName: boundToolEventName(input.toolName), input: attemptedInput,
+      });
+      if (outcome.status === "cancelled") await this.cancel(input, callId, lifecycle.error!);
+      else await this.fail(input, callId, lifecycle.error!);
+    } catch (error) {
+      lifecycle.status = "failed";
+      lifecycle.phase = "publishing_result";
+      lifecycle.error = toError(error);
+      throw error;
+    } finally {
+      this.notifyLifecycleEnded(lifecycle, startedAt);
+    }
   }
 
   private async executeOwned(input: ExecuteToolInput): Promise<ExecuteToolResult> {

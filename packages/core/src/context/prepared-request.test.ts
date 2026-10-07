@@ -23,17 +23,18 @@ async function fixture(model: ModelRouter, contextBudget = {}) {
   const store = new SqliteEventStore(databasePath);
   cleanups.push(async () => { store.close(); await rm(cwd, { recursive: true, force: true }); });
   const registry = new InMemoryToolRegistry();
+  const executions: SessionId[] = [];
   registry.register({
     name: "inspect", description: "Inspect the current session", risk: "read", inputSchema: { type: "object" },
     resources: () => false,
-    async execute(_input, context) { return { title: "session", output: context.sessionId }; },
+    async execute(_input, context) { executions.push(context.sessionId); return { title: "session", output: context.sessionId }; },
   });
   const runtime = new SingleAgentRuntime({
     store, model, toolRegistry: registry, contextBudget,
     retryPolicy: { maxAttempts: 2, initialDelayMs: 0 },
     toolExecutor: new ToolExecutor({ registry, events: { publish: (event) => store.append(event) }, gate: { review: async () => ({ decision: "allow" }) } }),
   });
-  return { cwd, databasePath, store, registry, runtime };
+  return { cwd, databasePath, store, registry, runtime, executions };
 }
 
 test("reused provider IDs across sessions and turns never share SQLite tool rows or context identities", async () => {
@@ -213,8 +214,13 @@ test("a provider cannot silently overwrite an unfinished streamed call by repeat
   const result = await f.runtime.runTurn({ sessionId, cwd: f.cwd });
   expect(result.status).toBe("failed");
   if (result.status === "failed") expect(result.error.message).toContain("reused a live tool call");
-  expect(await f.store.events({ sessionId, type: "tool.call_started" })).toHaveLength(0);
-  expect(await f.store.events({ sessionId, type: "tool.call_finished" })).toMatchObject([{ payload: { status: "failed", providerCallId: "call_0" } }]);
+  // A synthetic start records the refused attempt, not handler entry.
+  expect(f.executions).toEqual([]);
+  const starts = await f.store.events({ sessionId, type: "tool.call_started" });
+  expect(starts).toHaveLength(1);
+  expect(await f.store.events({ sessionId, type: "tool.call_finished" })).toMatchObject([{
+    payload: { callId: (starts[0]!.payload as { callId: string }).callId, status: "failed", providerCallId: "call_0", synthetic: true },
+  }]);
 });
 
 test("request sources record whole-material omissions and exact selected content versions", () => {

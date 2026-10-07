@@ -347,6 +347,74 @@ test("real MCP adapters retain review denial and report one canonical and presen
   });
 });
 
+test("non-executed calls record one synthetic terminal event and lifecycle outcome without invoking any execution stage", async () => {
+  for (const status of ["failed", "blocked", "cancelled"] as const) {
+    let validations = 0;
+    let reviews = 0;
+    let processors = 0;
+    const h = harness({
+      tool: { validate(input) { validations++; return { ok: true, value: input }; } },
+      gate: { async review() { reviews++; return { decision: "allow" }; } },
+      lifecycle: { async processResult(_context, result) { processors++; return result; } },
+    });
+    const error = Object.assign(new Error("Host precheck refused the call"), { name: "ToolValidationError", code: "PRECHECK_FAILED" });
+    await h.executor.recordNonExecution({
+      ...call({ attempted: "input" }),
+      providerCallId: "provider-precheck", parentCallId: "parent-precheck" as ToolCallId,
+      prepared: { toolName: "effect", validatedInput: { fabricated: true }, isConcurrencySafe: true },
+    }, { status, error, phase: "authorizing" });
+    expect(validations + reviews + processors).toBe(0);
+    expect(h.effects).toHaveLength(0);
+    expect(h.events.map((event) => event.type)).toEqual(["tool.call_started", "tool.call_finished"]);
+    expect(h.events[0]).toMatchObject({ payload: { callId: "call_lifecycle", providerCallId: "provider-precheck",
+      parentCallId: "parent-precheck", input: { attempted: "input" } } });
+    expect(h.events[1]).toMatchObject({ payload: {
+      callId: "call_lifecycle", providerCallId: "provider-precheck", status: status === "blocked" ? "failed" : status,
+      synthetic: true, error: "Host precheck refused the call", errorDetails: { name: "ToolValidationError", code: "PRECHECK_FAILED" },
+    } });
+    expect(h.outcomes).toHaveLength(1);
+    expect(h.outcomes[0]).toMatchObject({ status, phase: "authorizing", handlerEntered: false, executionSucceeded: false,
+      context: { prepared: false, input: { attempted: "input" }, providerCallId: "provider-precheck", parentCallId: "parent-precheck" } });
+    expect(h.outcomes[0]!.result).toBeUndefined();
+  }
+});
+
+test("non-execution recording survives cancellation and failed dispatch scope without acquiring a permit", async () => {
+  const h = harness({ lifecycle: { ended() { throw new Error("Observer must not break cancellation recording"); } } });
+  const scope = new ToolDispatchScope();
+  scope.fail(new Error("Turn already stopped"));
+  let acquisitions = 0;
+  scope.acquire = async () => { acquisitions++; throw new Error("Must not acquire a permit"); };
+  await h.executor.recordNonExecution({ ...call({}), dispatchScope: scope, signal: AbortSignal.abort("Stopped") },
+    { status: "cancelled", error: new DOMException("Turn cancelled", "AbortError") });
+  expect(acquisitions).toBe(0);
+  expect(h.events).toHaveLength(2);
+  expect(h.events[1]).toMatchObject({ payload: { status: "cancelled", synthetic: true } });
+  expect(h.outcomes).toHaveLength(1);
+  expect(h.outcomes[0]).toMatchObject({ status: "cancelled", phase: "validating", handlerEntered: false, executionSucceeded: false });
+});
+
+test("non-execution audit failures escape and notify one failed publishing outcome", async () => {
+  for (const failingEvent of ["tool.call_started", "tool.call_finished"] as const) {
+    const attempted: string[] = [];
+    const h = harness({
+      publish(event) {
+        attempted.push(event.type);
+        if (event.type === failingEvent) throw new Error(`Cannot persist ${failingEvent}`);
+      },
+      lifecycle: { ended() { throw new Error("Observer failure must not replace audit failure"); } },
+    });
+    await expect(h.executor.recordNonExecution(call({}), { status: "blocked", error: "Precheck denied" }))
+      .rejects.toThrow(`Cannot persist ${failingEvent}`);
+    expect(attempted).toEqual(failingEvent === "tool.call_started"
+      ? ["tool.call_started"] : ["tool.call_started", "tool.call_finished"]);
+    expect(h.outcomes).toHaveLength(1);
+    expect(h.outcomes[0]).toMatchObject({ status: "failed", phase: "publishing_result", handlerEntered: false,
+      executionSucceeded: false, error: { message: `Cannot persist ${failingEvent}` } });
+    expect(h.effects).toHaveLength(0);
+  }
+});
+
 function harness(options: {
   tool?: Partial<ChiliToolDefinition>;
   gate?: ToolExecutionGate;

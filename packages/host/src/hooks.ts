@@ -272,7 +272,7 @@ function captureModule(module: HostModule, builtin: boolean, ids: Set<string>): 
   const captured: Record<string, unknown> = { id: module.id, ...(module.timeoutMs === undefined ? {} : { timeoutMs: module.timeoutMs }) };
   let count = 0;
   for (const key of Object.keys(module)) {
-    if (key !== "id" && key !== "timeoutMs" && !(key in CAPABILITIES)) throw new TypeError(`Unsupported module capability "${key}".`);
+    if (key !== "id" && key !== "timeoutMs" && !Object.hasOwn(CAPABILITIES, key)) throw new TypeError(`Unsupported module capability "${key}".`);
   }
   for (const group of Object.keys(CAPABILITIES) as Array<keyof typeof CAPABILITIES>) {
     const original = module[group];
@@ -287,6 +287,8 @@ function captureModule(module: HostModule, builtin: boolean, ids: Set<string>): 
       copy[key] = handler.bind(original);
       count++;
     }
+    const required = group === "prompt" ? "collect" : group === "runtime" ? "event" : group === "modelSelection" ? "changed" : undefined;
+    if (required && typeof copy[required] !== "function") throw new TypeError(`Module hook "${group}.${required}" requires a handler.`);
     if (group === "runtime" && module.runtime?.eventTypes !== undefined) {
       if (!Array.isArray(module.runtime.eventTypes) || module.runtime.eventTypes.some((type) => typeof type !== "string")) throw new TypeError("eventTypes must be an array of event types.");
       copy.eventTypes = Object.freeze([...module.runtime.eventTypes]);

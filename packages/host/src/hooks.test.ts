@@ -28,6 +28,8 @@ test("registration captures multiple capabilities in fixed order, rejecting coll
   expect(() => new HostModuleRegistry({ modules: [{ id: "chili.external", runtime: { event() {} } }] })).toThrow("reserved");
   expect(() => new HostModuleRegistry({ modules: [{ id: "same", runtime: { event() {} } }, { id: "same", prompt: { collect: () => [] } }] })).toThrow("Duplicate");
   expect(() => new HostModuleRegistry({ modules: [{ id: "unknown", wrap() {} } as unknown as HostModule] })).toThrow("Unsupported");
+  expect(() => new HostModuleRegistry({ modules: [{ id: "unknown", constructor: {}, runtime: { event() {} } } as unknown as HostModule] })).toThrow("Unsupported");
+  expect(() => new HostModuleRegistry({ modules: [{ id: "invalid", prompt: {}, runtime: { event() {} } } as unknown as HostModule] })).toThrow("requires a handler");
   const calls: string[] = [];
   const source: HostModule = { id: "external", prompt: { collect: () => { calls.push("prompt"); return []; } }, runtime: { event() { calls.push("event"); } } };
   const registry = new HostModuleRegistry({ builtins: [{ id: "chili.base", prompt: { collect: () => { calls.push("builtin"); return []; } } }], modules: [source] });
