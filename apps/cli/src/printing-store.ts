@@ -11,7 +11,15 @@ import type {
 } from "@chili/store";
 
 export class PrintingEventStore implements EventStore, EventCommitAwareStore, StaleTurnRecoveryStore {
-  constructor(private readonly inner: EventStore, private readonly printer: CliPrinter) {}
+  readonly eventReplayBoundary?: NonNullable<EventStore["eventReplayBoundary"]>;
+  readonly runtimeSnapshot?: NonNullable<EventStore["runtimeSnapshot"]>;
+  readonly activeMessageParts?: NonNullable<EventStore["activeMessageParts"]>;
+
+  constructor(private readonly inner: EventStore, private readonly printer: CliPrinter) {
+    if (inner.eventReplayBoundary) this.eventReplayBoundary = (query) => inner.eventReplayBoundary!(query);
+    if (inner.runtimeSnapshot) this.runtimeSnapshot = (query) => inner.runtimeSnapshot!(query);
+    if (inner.activeMessageParts) this.activeMessageParts = (query) => inner.activeMessageParts!(query);
+  }
 
   async append(event: RuntimeEvent, options?: EventAppendOptions): Promise<void> {
     await this.appendCommitted(event, options);
@@ -65,8 +73,8 @@ export class PrintingEventStore implements EventStore, EventCommitAwareStore, St
     return this.inner.messages(sessionId);
   }
 
-  pendingApprovals(sessionId?: SessionId): Promise<ApprovalRow[]> {
-    return this.inner.pendingApprovals(sessionId);
+  pendingApprovals(sessionId?: SessionId, limit?: number): Promise<ApprovalRow[]> {
+    return this.inner.pendingApprovals(sessionId, limit);
   }
 }
 
@@ -75,6 +83,8 @@ export class CliPrinter {
   private readonly roles = new Map<string, MessageRole>();
   private readonly partRoles = new Map<string, MessageRole | undefined>();
   private readonly partTypes = new Map<string, MessagePart["type"]>();
+  private readonly printedTextLengths = new Map<string, number>();
+  private readonly committedParts = new Set<string>();
 
   event(event: ChiliEvent): void {
     if (event.type === "session.created" && event.payload.agent) {
@@ -86,11 +96,20 @@ export class CliPrinter {
       return;
     }
 
-    if (event.type === "message.part_added") {
+    if (event.type === "message.part_added" || event.type === "message.part_stream_snapshot" || event.type === "message.part_committed") {
       const role = this.roles.get(event.payload.messageId);
       this.partRoles.set(event.payload.part.id, role);
       this.partTypes.set(event.payload.part.id, event.payload.part.type);
       this.part(event.payload.part, role);
+      if (event.type === "message.part_committed") this.committedParts.add(event.payload.part.id);
+      return;
+    }
+
+    if (event.type === "message.part_stream_delta") {
+      const { messageId, partId, partType, delta, offset } = event.payload;
+      this.partRoles.set(partId, this.roles.get(messageId));
+      this.partTypes.set(partId, partType);
+      this.partDelta(partId, "text", delta, offset);
       return;
     }
 
@@ -145,8 +164,7 @@ export class CliPrinter {
     if (role !== "assistant") return;
 
     if (part.type === "text") {
-      process.stdout.write(part.text);
-      this.needsNewline = true;
+      this.partDelta(part.id, "text", part.text, 0);
       return;
     }
 
@@ -164,11 +182,20 @@ export class CliPrinter {
     }
   }
 
-  private partDelta(partId: string, field: string, delta: string): void {
+  private partDelta(partId: string, field: string, delta: string, offset?: number): void {
     if (field !== "text") return;
     if (this.partRoles.get(partId) !== "assistant") return;
     if (this.partTypes.get(partId) !== "text") return;
-    process.stdout.write(delta);
+    if (this.committedParts.has(partId)) return;
+    const printedLength = this.printedTextLengths.get(partId) ?? 0;
+    const start = offset ?? printedLength;
+    // A missing interval is repaired by the next complete snapshot or commit.
+    // Replayed and overlapping intervals must never print the same text twice.
+    if (start > printedLength) return;
+    const suffix = delta.slice(printedLength - start);
+    if (!suffix) return;
+    process.stdout.write(suffix);
+    this.printedTextLengths.set(partId, printedLength + suffix.length);
     this.needsNewline = true;
   }
 

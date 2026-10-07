@@ -5,7 +5,10 @@ export const SQLITE_SCHEMA = [
     type text not null,
     time integer not null,
     session_id text,
-    payload_json text not null
+    payload_json text not null,
+    payload_bytes integer,
+    compact_payload_bytes integer,
+    content_version integer not null default 0
   )`,
   `create unique index if not exists events_id_idx on events(id)`,
   `create index if not exists events_seq_idx on events(seq)`,
@@ -50,6 +53,7 @@ export const SQLITE_SCHEMA = [
     type text not null,
     ordinal integer not null,
     data_json text not null,
+    content_version integer not null default 0,
     delta_event_seq integer not null default 0,
     created_at integer not null
   )`,
@@ -65,6 +69,8 @@ export const SQLITE_SCHEMA = [
     tool_name text not null,
     status text not null,
     input_json text,
+    input_content_version integer not null default 0,
+    output_content_version integer not null default 0,
     output text,
     error text,
     synthetic integer not null default 0,
@@ -121,6 +127,7 @@ export const SQLITE_SCHEMA = [
     state text not null,
     revision integer not null default 1,
     payload text not null,
+    content_version integer not null default 0,
     identity text not null,
     text text not null,
     source text not null,

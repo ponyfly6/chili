@@ -250,6 +250,56 @@ test("SessionTranscriptJsonlMirror writes one JSONL line per completed message",
   }
 });
 
+test("SessionTranscriptJsonlMirror exports committed blocks in original order without stream duplicates", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-transcript-committed-"));
+  const sessionId = "session_committed" as SessionId;
+  const messageId = "message_committed" as MessageId;
+  const textId = "part_text" as PartId;
+  const mirror = new SessionTranscriptJsonlMirror(dir);
+
+  try {
+    await mirror.write({
+      id: "message_created", type: "message.created", time: 1 as TimestampMs, sessionId,
+      payload: { messageId, role: "assistant" },
+    });
+    await mirror.write({
+      id: "text_delta", type: "message.part_stream_delta", time: 2 as TimestampMs, sessionId,
+      payload: { messageId, partId: textId, partType: "text", delta: "partial reply", offset: 0, ordinal: 1 },
+    });
+    const textCommit: ChiliEvent = {
+      id: "text_commit", type: "message.part_committed", time: 3 as TimestampMs, sessionId,
+      payload: { messageId, part: {
+        id: textId, messageId, sessionId, type: "text", text: "partial reply", ordinal: 1, completion: "cancelled",
+      } },
+    };
+    await mirror.write(textCommit);
+    await mirror.write(textCommit);
+    await mirror.write({
+      id: "reasoning_commit", type: "message.part_committed", time: 4 as TimestampMs, sessionId,
+      payload: { messageId, part: {
+        id: "part_reasoning" as PartId, messageId, sessionId, type: "reasoning", text: "thinking", ordinal: 0, completion: "completed",
+      } },
+    });
+    await mirror.write({
+      id: "turn_completed", type: "turn.completed", time: 5 as TimestampMs, sessionId,
+      payload: { turnId: "turn_committed" as TurnId, status: "cancelled" },
+    });
+
+    const lines = (await readFile(join(dir, `${sessionId}.jsonl`), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      text: "thinking\npartial reply",
+      parts: [
+        { type: "reasoning", text: "thinking", completion: "completed" },
+        { type: "text", text: "partial reply", completion: "cancelled" },
+      ],
+    });
+    expect(lines[0].parts).toHaveLength(2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function sessionCreatedEvent(sessionId: SessionId): ChiliEvent {
   return {
     id: "event_session",

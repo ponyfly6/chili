@@ -43,7 +43,7 @@ test("preserves nested calls across reopen without model messages", async () => 
     const db = new Database(path, { readonly: true });
     try {
       expect(db.query("select id, provider_call_id, parent_call_id, status, output from tool_calls where parent_call_id = ?").all(parentCallId))
-        .toEqual([{ id: callId, provider_call_id: null, parent_call_id: parentCallId, status: "completed", output: "file contents" }]);
+        .toEqual([{ id: callId, provider_call_id: null, parent_call_id: parentCallId, status: "completed", output: expect.stringContaining('"__chiliStoredValue":1') }]);
       expect(db.query("select provider_call_id, parent_call_id from tool_calls where id = ?").get(parentCallId))
         .toEqual({ provider_call_id: "provider_script", parent_call_id: null });
     } finally {

@@ -5,6 +5,7 @@ import type {
   RuntimeAgentRecord,
   RuntimeClient,
   RuntimePendingApprovalRequest,
+  RuntimeSessionEventWindow,
   RuntimeSessionSummary,
 } from "@chili/sdk";
 import type {
@@ -873,6 +874,7 @@ export class DesktopControlService {
       maxEvents: SNAPSHOT_EVENT_LIMIT,
       maxBytes: SNAPSHOT_EVENT_BYTES,
       maxSources: MAX_DESCENDANT_SESSIONS,
+      preserveTransientEvents: true,
     });
 
     while (pendingSessionIds.length > 0) {
@@ -880,12 +882,18 @@ export class DesktopControlService {
       const snapshots = await Promise.all(batch.map(async (candidate): Promise<SessionControlSnapshot> => {
         const [eventWindow, sessionAgents, pendingInputs] = await Promise.all([
           limiter(async () => {
+            // Capture the active prefix before reading durable history. A block
+            // committed during that read then supersedes its captured prefix.
+            const activeSnapshot = typeof lease.client.eventSnapshot === "function"
+              ? await lease.client.eventSnapshot({ sessionId: candidate, signal: lease.signal })
+              : undefined;
             if (lease.client.sessionEventWindow) {
-              return lease.client.sessionEventWindow({
+              const history = await lease.client.sessionEventWindow({
                 sessionId: candidate,
                 limit: 5_000,
                 signal: lease.signal,
               });
+              return withActiveMessageParts(history, activeSnapshot?.events ?? []);
             }
             const sessionEvents = await lease.client.sessionEvents({
               sessionId: candidate,
@@ -900,14 +908,14 @@ export class DesktopControlService {
                     truncated: false,
                   }
                 : { approvals: [], truncated: false };
-            return {
+            return withActiveMessageParts({
               events: sessionEvents,
               pendingApprovals: approvalWindow.approvals,
               truncated: false,
               bytes: jsonByteLength(sessionEvents),
               pinnedEventIds: [],
               approvalsTruncated: approvalWindow.truncated,
-            };
+            }, activeSnapshot?.events ?? []);
           }),
           candidate === sessionId ? limiter(async () => {
             try {
@@ -1286,6 +1294,28 @@ interface SessionControlSnapshot {
   approvalsTruncated: boolean;
   agents: RuntimeAgentRecord[];
   inputs: Awaited<ReturnType<import("@chili/sdk").RuntimeClient["listUserInputs"]>>;
+}
+
+function withActiveMessageParts<T extends RuntimeSessionEventWindow>(history: T, snapshotEvents: readonly ChiliEvent[]): T {
+  const completed = new Set(history.events.flatMap((event) => event.type === "message.part_committed"
+    || (event.type === "message.part_added" && (event.payload.part.type === "text" || event.payload.part.type === "reasoning")
+      && event.payload.part.completion)
+    ? [String(event.payload.part.id)] : []));
+  const active = snapshotEvents.filter((event): event is Extract<ChiliEvent, { type: "message.part_stream_snapshot" }> => event.type === "message.part_stream_snapshot"
+    && !completed.has(String(event.payload.part.id)));
+  if (active.length === 0) return history;
+  const messageIds = new Set(history.events.flatMap((event) => event.type === "message.created"
+    ? [String(event.payload.messageId)] : []));
+  const activeMessageIds = new Set(active.map((event) => String(event.payload.messageId)));
+  const anchors = snapshotEvents.filter((event) => event.type === "message.created"
+    && activeMessageIds.has(String(event.payload.messageId)) && !messageIds.has(String(event.payload.messageId)));
+  const events = [...history.events, ...anchors, ...active];
+  return {
+    ...history,
+    events,
+    bytes: jsonByteLength(events),
+    pinnedEventIds: [...history.pinnedEventIds, ...active.map((event) => event.id)],
+  };
 }
 
 function descendantSessionIds(snapshot: SessionControlSnapshot): Set<string> {

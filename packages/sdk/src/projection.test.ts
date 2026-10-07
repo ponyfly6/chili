@@ -4,6 +4,7 @@ import type {
   ApprovalId,
   ChiliEvent,
   MessageId,
+  Message,
   PartId,
   RuntimeInputQueue,
   SessionId,
@@ -18,6 +19,8 @@ import {
   chatSessionView,
   createRuntimeView,
   markRuntimeOutputGap,
+  hydrateRuntimeMessages,
+  hasRuntimePartStreamGap,
   MAX_TOOL_OUTPUT_PREVIEW_BYTES,
   pendingApprovals,
   reduceRuntimeEvents,
@@ -2282,3 +2285,120 @@ function toolApprovalEvents(input: {
     },
   ];
 }
+
+
+test("streamed text uses offsets, full snapshots and commits without duplicate appends", () => {
+  const sessionId = "session_stream_parts" as SessionId;
+  const messageId = "message_stream_parts" as MessageId;
+  const partId = "part_stream_parts" as PartId;
+  const view = createRuntimeView();
+  const send = (event: ChiliEvent) => applyRuntimeEvent(view, event);
+  const delta = (offset: number, text: string): ChiliEvent => ({
+    id: `delta:${offset}:${text}`, type: "message.part_stream_delta", time: 2 as TimestampMs,
+    sessionId, payload: { messageId, partId, partType: "text", delta: text, offset, ordinal: 1 },
+  });
+  send({ id: "created", type: "message.created", time: 1 as TimestampMs, sessionId,
+    payload: { messageId, role: "assistant" } });
+  send(delta(0, "你好🌶️"));
+  send(delta(0, "你好🌶️"));
+  const initial = "你好🌶️";
+  send(delta(initial.length - 2, initial.slice(-2) + " reply"));
+  expect(view.messages[messageId]?.parts[0]).toMatchObject({ text: initial + " reply" });
+  expect(view.lastEventId).toBe("created");
+  send({ id: "active_snapshot", type: "message.part_stream_snapshot", time: 3 as TimestampMs, sessionId,
+    payload: { messageId, part: { id: partId, messageId, sessionId, type: "text", text: initial + " reply complete", ordinal: 1 } } });
+  send(delta(initial.length, " reply"));
+  send({ id: "commit", type: "message.part_committed", time: 4 as TimestampMs, sessionId,
+    payload: { messageId, part: { id: partId, messageId, sessionId, type: "text", text: initial + " reply complete", completion: "completed", ordinal: 1 } } });
+  send(delta((initial + " reply complete").length, " obsolete"));
+  send({ id: "stale_snapshot", type: "message.part_stream_snapshot", time: 3 as TimestampMs, sessionId,
+    payload: { messageId, part: { id: partId, messageId, sessionId, type: "text", text: "stale", ordinal: 1 } } });
+  expect(view.messages[messageId]?.parts[0]).toMatchObject({ text: initial + " reply complete", completion: "completed" });
+  expect(view.lastEventId).toBe("commit");
+});
+
+test("missing live offsets require recovery and snapshots clear the gap", () => {
+  const sessionId = "session_gap_parts" as SessionId;
+  const messageId = "message_gap_parts" as MessageId;
+  const partId = "part_gap_parts" as PartId;
+  const view = reduceRuntimeEvents([{
+    id: "gap", type: "message.part_stream_delta", time: 1 as TimestampMs, sessionId,
+    payload: { messageId, partId, partType: "reasoning", offset: 8, delta: " suffix" },
+  }]);
+  expect(hasRuntimePartStreamGap(view)).toBe(true);
+  expect(view.partStreamGaps[partId]).toEqual({ messageId, expectedOffset: 0, receivedOffset: 8 });
+  expect(view.messages[messageId]?.parts).toEqual([]);
+  applyRuntimeEvent(view, {
+    id: "snapshot", type: "message.part_stream_snapshot", time: 2 as TimestampMs, sessionId,
+    payload: { messageId, part: { id: partId, messageId, sessionId, type: "reasoning", text: "thinking suffix" } },
+  });
+  expect(hasRuntimePartStreamGap(view)).toBe(false);
+  expect(view.messages[messageId]?.parts[0]).toMatchObject({ text: "thinking suffix" });
+  expect(view.lastEventId).toBeUndefined();
+});
+
+test("committed parts retain first-appearance order and expose interrupted completion", () => {
+  const sessionId = "session_order_parts" as SessionId;
+  const messageId = "message_order_parts" as MessageId;
+  const textId = "part_order_text" as PartId;
+  const reasonId = "part_order_reason" as PartId;
+  const view = reduceRuntimeEvents([
+    { id: "text", type: "message.part_committed", time: 20 as TimestampMs, sessionId,
+      payload: { messageId, part: { id: textId, messageId, sessionId, type: "text", text: "partial", ordinal: 1, completion: "failed" } } },
+    { id: "reason", type: "message.part_committed", time: 21 as TimestampMs, sessionId,
+      payload: { messageId, part: { id: reasonId, messageId, sessionId, type: "reasoning", text: "thinking", ordinal: 0, completion: "cancelled" } } },
+    { id: "created_late", type: "message.created", time: 1 as TimestampMs, sessionId,
+      payload: { messageId, role: "assistant", turnId: "turn_order" as TurnId } },
+  ]);
+  expect(view.messages[messageId]?.parts.map((part) => part.id)).toEqual([reasonId, textId]);
+  expect(view.partIndex[textId]?.index).toBe(1);
+  expect(view.messages[messageId]?.createdAt).toBe(1);
+  const message = chatSessionView(view, { sessionId }).items.find((item) => item.kind === "message");
+  expect(message?.kind === "message" && message.parts).toEqual([
+    { id: reasonId, type: "reasoning", text: "thinking", completion: "cancelled" },
+    { id: textId, type: "text", text: "partial", completion: "failed" },
+  ]);
+});
+
+test("complete history supplements older messages without moving the stream cursor or replaying deltas", () => {
+  const sessionId = "session_full_history" as SessionId;
+  const oldId = "message_old_history" as MessageId;
+  const newId = "message_new_history" as MessageId;
+  const oldPart = "part_old_history" as PartId;
+  const newPart = "part_new_history" as PartId;
+  const view = reduceRuntimeEvents([
+    { id: "live_created", type: "message.created", time: 2 as TimestampMs, sessionId, payload: { messageId: newId, role: "assistant" } },
+    { id: "live_delta", type: "message.part_stream_delta", time: 3 as TimestampMs, sessionId,
+      payload: { messageId: newId, partId: newPart, partType: "text", offset: 0, delta: "live response" } },
+  ]);
+  const history: Message[] = [
+    { id: oldId, sessionId, role: "assistant", createdAt: 10 as TimestampMs,
+      parts: [{ id: oldPart, messageId: oldId, sessionId, type: "text", text: "old full response", completion: "completed" }] },
+    { id: newId, sessionId, role: "assistant", createdAt: 2 as TimestampMs,
+      parts: [{ id: newPart, messageId: newId, sessionId, type: "text", text: "live" }] },
+  ];
+  hydrateRuntimeMessages(view, history);
+  expect(view.lastEventId).toBe("live_created");
+  expect(view.messages[newId]?.parts[0]).toMatchObject({ text: "live response" });
+  expect(chatSessionView(view, { sessionId }).items.map((item) => item.id)).toEqual([oldId, newId]);
+  applyRuntimeEvent(view, { id: "late_legacy_delta", type: "message.part_delta", time: 4 as TimestampMs, sessionId,
+    payload: { messageId: oldId, partId: oldPart, field: "text", delta: " already materialized" } });
+  expect(view.messages[oldId]?.parts[0]).toMatchObject({ text: "old full response" });
+  history[0]!.parts[0]!.id = "mutated_source" as PartId;
+  expect(view.messages[oldId]?.parts[0]?.id).toBe(oldPart);
+});
+
+
+test("hydrating an active message leaves following stream offsets live", () => {
+  const sessionId = "session_hydrate_active" as SessionId;
+  const messageId = "message_hydrate_active" as MessageId;
+  const partId = "part_hydrate_active" as PartId;
+  const view = createRuntimeView();
+  hydrateRuntimeMessages(view, [{ id: messageId, sessionId, role: "assistant", createdAt: 1 as TimestampMs,
+    parts: [{ id: partId, messageId, sessionId, type: "text", text: "hello" }] }]);
+  expect(view.committedPartIds[partId]).toBeUndefined();
+  applyRuntimeEvent(view, { id: "active_suffix", type: "message.part_stream_delta", time: 2 as TimestampMs, sessionId,
+    payload: { messageId, partId, partType: "text", offset: 5, delta: " world" } });
+  expect(view.messages[messageId]?.parts[0]).toMatchObject({ text: "hello world" });
+  expect(view.lastEventId).toBeUndefined();
+});

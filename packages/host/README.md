@@ -66,7 +66,8 @@ restrictions before submission.
 The runtime remains `RuntimeService` plus `SingleAgentRuntime`; Host adds no
 parallel session state machine. Root and restricted child registries remain
 separate. Store location (`<workspace>/.chili/chili.sqlite`), session identities,
-event persistence, and JSONL mirroring remain compatible.
+event identities and old inline history remain compatible. New content is stored
+in adjacent immutable files; the default duplicate JSONL mirror is disabled.
 
 ## Execution identity and ownership
 
@@ -181,14 +182,16 @@ HTTP/SSE and `@chili/sdk` expose receipts, queue snapshots, cancellation, Resume
 and `session.input_queue_changed`. Desktop main caches these projections but owns
 no execution queue. Renderer retries retain the submission ID until acknowledgment;
 this draft retry map lasts for the current renderer process. Accepted content is
-in SQLite regardless of renderer lifetime. Queue snapshots include previews only;
+in the store regardless of renderer lifetime; SQLite retains the receipt and
+references the full input in the adjacent content directory. Queue snapshots include previews only;
 full input content and execution options remain in the store.
 
 Limits: 128 pending inputs per session, 4,096 globally, 64 MiB of pending payloads,
 and 16 MiB per payload, in addition to existing transport admission limits.
-The store opens the current schema directly; older database schemas
-are unsupported. JSONL mirroring is a best-effort secondary copy and is drained
-before Host closes SQLite.
+The content-storage change adds its storage-format and byte-accounting columns to the existing
+schema and continues reading inline history. It does not migrate unrelated older
+schemas. The default Host does not create a secondary transcript mirror. Backups
+must include `chili.sqlite` and `contents/chili.sqlite/` together.
 
 A second Host is rejected until the current owner and its resources have stopped.
 There is no control forwarding or attach protocol. Stores without durable input

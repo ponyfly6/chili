@@ -188,6 +188,52 @@ test("hidden thinking masks reasoning text", async () => {
   expect(frame).toContain("final answer");
 });
 
+test("saved partial answers and thinking display why they are incomplete", async () => {
+  for (const [completion, label] of [["cancelled", "Stopped · incomplete"], ["failed", "Failed · incomplete"]] as const) {
+    const items: ChatTranscriptItem[] = [{
+      id: `msg_partial_${completion}` as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        { type: "reasoning", id: `part_partial_reasoning_${completion}` as PartId, text: "Partial thought\n\nDetail retained.", completion },
+        { type: "text", id: `part_partial_answer_${completion}` as PartId, text: "Partial answer retained.", completion },
+      ],
+    }];
+
+    const compact = await renderMessageList(items, { status: "running" });
+    const details = await renderMessageList(items, { showToolDetails: true });
+    const hidden = await renderMessageList(items, { hideThinking: true, status: "running" });
+
+    expect(compact).toContain(`Thinking (${label}): Partial thought`);
+    expect(compact).toContain("Partial answer retained.");
+    expect(occurrences(compact, label)).toBe(2);
+    expect(details).toContain(`Thinking (${label}): Partial thought`);
+    expect(details).toContain("Detail retained.");
+    expect(hidden).toContain(`🫧 ${label}`);
+    expect(hidden).not.toContain("thinking...");
+    expect(hidden).not.toContain("Partial thought");
+    expect(hidden).toContain("Partial answer retained.");
+  }
+});
+
+test("completed content blocks keep their normal appearance", async () => {
+  const frame = await renderMessageList([{
+    id: "msg_completed_blocks" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      { type: "reasoning", id: "part_completed_thinking" as PartId, text: "Finished thought.", completion: "completed" },
+      { type: "text", id: "part_completed_answer" as PartId, text: "Finished answer.", completion: "completed" },
+    ],
+  }], { status: "running" });
+
+  expect(frame).toContain("Thinking: Finished thought.");
+  expect(frame).toContain("Assistant: Finished answer.");
+  expect(frame).not.toContain("incomplete");
+});
+
 test("Thinking subjects stay compact and render Markdown details without raw markers", async () => {
   const items: ChatTranscriptItem[] = [{
     id: "msg_reasoning_sections" as MessageId,

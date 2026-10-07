@@ -38,6 +38,8 @@ export interface BasePart {
   id: PartId;
   messageId: MessageId;
   sessionId: SessionId;
+  /** First appearance within the message, independent of block completion order. */
+  ordinal?: number;
 }
 
 export interface TextPart extends BasePart {
@@ -46,6 +48,7 @@ export interface TextPart extends BasePart {
   phase?: AssistantMessagePhase;
   displayText?: string;
   synthetic?: boolean;
+  completion?: "completed" | "cancelled" | "failed";
 }
 
 export interface MessageImageContent {
@@ -65,6 +68,7 @@ export interface ReasoningPart extends BasePart {
   text: string;
   redacted?: boolean;
   modelOutput?: PersistedModelOutput;
+  completion?: "completed" | "cancelled" | "failed";
 }
 
 /** Opaque provider output that must be replayed to continue a stateless response. */

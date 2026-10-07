@@ -82,6 +82,8 @@ test("the registered dispatcher bounds a 100-snapshot burst before mock sidecar 
       const path = url.pathname;
       const body = path.endsWith("/input_queue")
         ? { sessionId: "session_1", paused: false, revision: 0, pendingCount: 0, interruptedCount: 0, items: [] }
+        : path === "/events/snapshot"
+          ? { version: 1, events: [], coveredSessionIds: ["session_1"], truncated: false, temporaryOutput: "not-replayed" }
         : url.searchParams.get("window") === "replayable"
           ? { events: [], pendingApprovals: [], truncated: false, bytes: 2, pinnedEventIds: [] }
           : [];

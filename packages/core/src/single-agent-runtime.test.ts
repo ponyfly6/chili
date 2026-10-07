@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { tmpdir } from "node:os";
-import type { ModelUsage, SessionId } from "@chili/protocol";
+import type { MessagePart, ModelUsage, RuntimeEvent, SessionId } from "@chili/protocol";
+import { CodexApiResponsesModel, ProviderBackpressureCoordinator } from "@chili/providers";
 import { SqliteEventStore } from "@chili/store";
 import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
 import type { DoomLoopGuardOptions } from "./doom-loop-guard.js";
@@ -20,6 +21,12 @@ afterEach(async () => {
 
 function harness(model: ModelRouter, doomLoopGuard?: DoomLoopGuardOptions) {
   const store = new SqliteEventStore(":memory:");
+  const emitted: RuntimeEvent[] = [];
+  const append = store.append.bind(store);
+  store.append = async (event, options) => {
+    emitted.push(structuredClone(event));
+    await append(event, options);
+  };
   const registry = new InMemoryToolRegistry();
   const executed: SessionId[] = [];
   registry.register({
@@ -47,7 +54,7 @@ function harness(model: ModelRouter, doomLoopGuard?: DoomLoopGuardOptions) {
   });
   const service = new RuntimeService({ runtime, store, cwd: tmpdir(), maxTurns: 8 });
   resources.push({ service, store });
-  return { store, registry, runtime, service, executed };
+  return { store, registry, runtime, service, executed, emitted };
 }
 
 for (const toolFormat of ["legacy", "streamed"] as const) {
@@ -446,4 +453,245 @@ test("standalone model turns retain independent guards when no scope is supplied
     expect((await fixture.runtime.runTurn({ sessionId, cwd: tmpdir() })).status).toBe("completed");
   }
   expect(fixture.executed).toHaveLength(2);
+});
+
+
+test("keeps live fragments in memory and commits each completed content block in its original order", async () => {
+  const persistedDuringStream: MessagePart[][] = [];
+  const fixture = harness({
+    async *stream(input): AsyncIterable<ModelStreamEvent> {
+      yield { type: "reasoning_delta", index: 0, text: "先😀" };
+      yield { type: "reasoning_delta", index: 0, text: "检查" };
+      persistedDuringStream.push((await fixture.store.messages(input.sessionId)).flatMap((message) => message.parts));
+      yield { type: "reasoning_end", index: 0 };
+      persistedDuringStream.push((await fixture.store.messages(input.sessionId)).flatMap((message) => message.parts));
+      yield { type: "text_delta", index: 1, phase: "commentary", text: "First " };
+      yield { type: "text_delta", index: 2, phase: "final_answer", text: "Second" };
+      yield { type: "text_end", index: 2, phase: "final_answer" };
+      yield { type: "text_delta", index: 1, phase: "commentary", text: "block" };
+      yield { type: "text_end", index: 1, phase: "commentary" };
+      yield { type: "finish", reason: "stop" };
+    },
+  });
+  const sessionId = await fixture.runtime.createSession({ cwd: tmpdir() });
+  const result = await fixture.runtime.runTurn({ sessionId, cwd: tmpdir() });
+  expect(result.status).toBe("completed");
+  expect(persistedDuringStream).toHaveLength(2);
+  expect(persistedDuringStream[0]).toEqual([]);
+  expect(persistedDuringStream[1]).toMatchObject([
+    { type: "reasoning", text: "先😀检查", completion: "completed", ordinal: 0 },
+  ]);
+  const parts = (await fixture.store.messages(sessionId)).flatMap((message) => message.parts);
+  expect(parts).toMatchObject([
+    { type: "reasoning", text: "先😀检查", completion: "completed", ordinal: 0 },
+    { type: "text", text: "First block", phase: "commentary", completion: "completed", ordinal: 1 },
+    { type: "text", text: "Second", phase: "final_answer", completion: "completed", ordinal: 2 },
+  ]);
+  const live = fixture.emitted.filter((event) => event.type === "message.part_stream_delta");
+  expect(live.map((event) => event.payload.offset)).toEqual([0, 3, 0, 0, 6]);
+  const durable = await fixture.store.events({ sessionId });
+  expect(durable.some((event) => event.type === "message.part_stream_delta" || event.type === "message.part_delta")).toBe(false);
+  expect(durable.filter((event) => event.type === "message.part_committed")).toHaveLength(3);
+  expect(durable.filter((event) => event.type === "message.part_added")).toHaveLength(0);
+});
+
+test("flushes complete text and reasoning at response finish when block end signals are unavailable", async () => {
+  const fixture = harness({
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "reasoning_delta", text: "Preserve " };
+      yield { type: "reasoning_delta", text: "all thinking." };
+      yield { type: "text_delta", text: "Full " };
+      yield { type: "text_delta", text: "answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  });
+  const sessionId = await fixture.runtime.createSession({ cwd: tmpdir() });
+  expect((await fixture.runtime.runTurn({ sessionId, cwd: tmpdir() })).status).toBe("completed");
+  expect((await fixture.store.messages(sessionId)).flatMap((message) => message.parts)).toMatchObject([
+    { type: "reasoning", text: "Preserve all thinking.", completion: "completed" },
+    { type: "text", text: "Full answer.", completion: "completed" },
+  ]);
+});
+
+for (const termination of ["cancelled", "failed", "eof"] as const) {
+  test(`preserves completed blocks and saves unfinished content once on ${termination}`, async () => {
+    const controller = new AbortController();
+    let requests = 0;
+    const fixture = harness({
+      async *stream(): AsyncIterable<ModelStreamEvent> {
+        requests++;
+        yield { type: "reasoning_delta", index: 0, text: "Completed thinking." };
+        yield { type: "reasoning_end", index: 0 };
+        yield { type: "reasoning_delta", index: 1, text: "More " };
+        yield { type: "reasoning_delta", index: 1, text: "thinking" };
+        yield { type: "text_delta", text: "Partial " };
+        yield { type: "text_delta", text: "answer" };
+        if (termination === "cancelled") controller.abort();
+        else if (termination === "failed") yield { type: "error", error: new Error("network connection closed") };
+      },
+    });
+    const sessionId = await fixture.runtime.createSession({ cwd: tmpdir() });
+    const result = await fixture.runtime.runTurn({ sessionId, cwd: tmpdir(), signal: controller.signal });
+    const completion = termination === "cancelled" ? "cancelled" : "failed";
+    expect(result.status).toBe(completion);
+    if (result.status === "completed") throw new Error("expected a partial model response");
+    expect(await fixture.store.events({ sessionId, type: "turn.completed" })).toMatchObject([
+      { payload: { status: completion, reason: result.error.message } },
+    ]);
+    expect(requests).toBe(1);
+    const parts = (await fixture.store.messages(sessionId)).flatMap((message) => message.parts);
+    expect(parts).toMatchObject([
+      { type: "reasoning", text: "Completed thinking.", completion: "completed" },
+      { type: "reasoning", text: "More thinking", completion },
+      { type: "text", text: "Partial answer", completion },
+    ]);
+    expect(await fixture.store.events({ sessionId, type: "message.part_committed" })).toHaveLength(3);
+    expect(await fixture.store.events({ sessionId, type: "message.part_delta" })).toHaveLength(0);
+  });
+}
+
+test("keeps tool calls in first-observed order while earlier text is still uncommitted", async () => {
+  const modelOutput = { apiFamily: "openai-responses", outputIndex: 1, item: { type: "reasoning", encrypted_content: "opaque provider value", summary: [] } };
+  const fixture = harness({
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "text_delta", text: "Before tools." };
+      yield { type: "tool_call_start", toolCallId: "ordered", name: "inspect", index: 2 };
+      yield { type: "reasoning_item", output: modelOutput };
+      yield { type: "tool_call_end", toolCallId: "ordered", name: "inspect", input: {}, index: 2 };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  });
+  const sessionId = await fixture.runtime.createSession({ cwd: tmpdir() });
+  expect((await fixture.runtime.runTurn({ sessionId, cwd: tmpdir() })).status).toBe("completed");
+  const parts = (await fixture.store.messages(sessionId)).flatMap((message) => message.parts);
+  expect(parts.map((part) => part.type)).toEqual(["text", "tool_call", "reasoning", "tool_result"]);
+  expect(parts.map((part) => part.ordinal)).toEqual([0, 1, 2, 3]);
+  expect(parts[2]).toMatchObject({ modelOutput, completion: "completed" });
+});
+
+test("rejects late deltas without changing an already committed content block", async () => {
+  const fixture = harness({
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "text_delta", text: "Committed." };
+      yield { type: "text_end" };
+      yield { type: "text_delta", text: "Late duplicate." };
+      yield { type: "finish", reason: "stop" };
+    },
+  });
+  const sessionId = await fixture.runtime.createSession({ cwd: tmpdir() });
+  expect((await fixture.runtime.runTurn({ sessionId, cwd: tmpdir() })).status).toBe("failed");
+  expect((await fixture.store.messages(sessionId)).flatMap((message) => message.parts)).toMatchObject([
+    { type: "text", text: "Committed.", completion: "completed" },
+  ]);
+  expect(await fixture.store.events({ sessionId, type: "message.part_committed" })).toHaveLength(1);
+});
+
+
+test("keeps filtered output partial and does not execute queued tools", async () => {
+  const fixture = harness({
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "text_delta", text: "Unfinished response" };
+      yield { type: "tool_call", name: "inspect", input: {} };
+      yield { type: "finish", reason: "content_filter" };
+    },
+  });
+  const sessionId = await fixture.runtime.createSession({ cwd: tmpdir() });
+  const result = await fixture.runtime.runTurn({ sessionId, cwd: tmpdir() });
+  expect(result.status).toBe("failed");
+  expect(fixture.executed).toEqual([]);
+  expect((await fixture.store.messages(sessionId)).flatMap((message) => message.parts).filter((part) => part.type === "text"))
+    .toMatchObject([{ text: "Unfinished response", completion: "failed" }]);
+});
+
+
+for (const fragments of [1, 200]) {
+  test(`persists complete tool arguments once instead of ${fragments} growing partial inputs`, async () => {
+    const completeInput = { path: "x".repeat(200) };
+    let updatesBeforeEnd: unknown[] = [];
+    let executedBeforeFinish: SessionId[] = [];
+    const fixture = harness({
+      async *stream(input): AsyncIterable<ModelStreamEvent> {
+        yield { type: "tool_call_start", toolCallId: "arguments", name: "inspect", index: 0 };
+        for (let index = 1; index <= fragments; index++) {
+          yield {
+            type: "tool_call_delta", toolCallId: "arguments", name: "inspect", index: 0,
+            delta: "x".repeat(200 / fragments),
+            partialInput: { path: completeInput.path.slice(0, index * (200 / fragments)) },
+          };
+        }
+        updatesBeforeEnd = await fixture.store.events({ sessionId: input.sessionId, type: "tool.call_updated" });
+        yield { type: "tool_call_end", toolCallId: "arguments", name: "inspect", index: 0, input: completeInput };
+        executedBeforeFinish = [...fixture.executed];
+        yield { type: "finish", reason: "tool_use" };
+      },
+    });
+    const sessionId = await fixture.runtime.createSession({ cwd: tmpdir() });
+    expect((await fixture.runtime.runTurn({ sessionId, cwd: tmpdir() })).status).toBe("completed");
+    expect(updatesBeforeEnd).toMatchObject([{ payload: { toolName: "inspect", input: {} } }]);
+    const updates = fixture.emitted.filter((event) => event.type === "tool.call_updated" && event.payload.toolName !== undefined);
+    expect(updates).toHaveLength(2);
+    expect(updates[1]).toMatchObject({ payload: { toolName: "inspect", input: completeInput } });
+    const durableUpdates = await fixture.store.events({ sessionId, type: "tool.call_updated" });
+    expect(durableUpdates.filter((event) => (event.payload as { toolName?: string }).toolName !== undefined)).toHaveLength(2);
+    expect(executedBeforeFinish).toEqual([]);
+    expect(fixture.executed).toEqual([sessionId]);
+  });
+}
+
+
+test("persists incomplete Codex reasoning as failed after its SSE summary done event", async () => {
+  const body = [
+    { type: "response.reasoning_summary_text.delta", item_id: "reasoning_partial", output_index: 0, summary_index: 0, delta: "Truncated " },
+    { type: "response.reasoning_summary_part.done", item_id: "reasoning_partial", output_index: 0, summary_index: 0, status: "incomplete", part: { type: "summary_text", text: "Truncated reasoning" } },
+    { type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } } },
+  ].map((payload) => `data: ${JSON.stringify(payload)}\n\n`).join("");
+  const provider = new CodexApiResponsesModel({
+    model: "gpt-5.6-sol",
+    apiKey: "test-key",
+    baseUrl: "https://gateway.test/v1",
+    env: {},
+    backpressureCoordinator: new ProviderBackpressureCoordinator(),
+    fetch: (async () => new Response(body, { headers: { "content-type": "text/event-stream" } })) as unknown as typeof fetch,
+  });
+  const fixture = harness({
+    async *stream(input): AsyncIterable<ModelStreamEvent> {
+      yield* provider.stream({ messages: input.messages, ...(input.signal ? { signal: input.signal } : {}) });
+    },
+  });
+  const sessionId = await fixture.runtime.createSession({ cwd: tmpdir() });
+  const result = await fixture.runtime.runTurn({ sessionId, cwd: tmpdir() });
+  expect(result.status).toBe("failed");
+  const parts = (await fixture.store.messages(sessionId)).flatMap((message) => message.parts);
+  expect(parts).toMatchObject([{ type: "reasoning", text: "Truncated reasoning", completion: "failed" }]);
+  expect(await fixture.store.events({ sessionId, type: "message.part_committed" })).toHaveLength(1);
+  expect(fixture.executed).toEqual([]);
+});
+
+
+test("text fragmentation does not increase durable record count or change stored content", async () => {
+  const body = "x".repeat(200);
+  const snapshots: Array<{ events: string[]; parts: unknown[] }> = [];
+  for (const fragments of [1, 200]) {
+    const fixture = harness({
+      async *stream(): AsyncIterable<ModelStreamEvent> {
+        const size = body.length / fragments;
+        for (let index = 0; index < fragments; index++) {
+          yield { type: "text_delta", text: body.slice(index * size, (index + 1) * size) };
+        }
+        yield { type: "finish", reason: "stop" };
+      },
+    });
+    const sessionId = await fixture.runtime.createSession({ cwd: tmpdir() });
+    expect((await fixture.runtime.runTurn({ sessionId, cwd: tmpdir() })).status).toBe("completed");
+    snapshots.push({
+      events: (await fixture.store.events({ sessionId })).map((event) => event.type),
+      parts: (await fixture.store.messages(sessionId)).flatMap((message) => message.parts).map((part) => ({
+        type: part.type, ordinal: part.ordinal,
+        ...(part.type === "text" ? { text: part.text, completion: part.completion } : {}),
+      })),
+    });
+  }
+  expect(snapshots[1]).toEqual(snapshots[0]);
+  expect(snapshots[0]?.events.filter((type) => type === "message.part_committed")).toHaveLength(1);
+  expect(snapshots[0]?.parts).toEqual([{ type: "text", ordinal: 0, text: body, completion: "completed" }]);
 });

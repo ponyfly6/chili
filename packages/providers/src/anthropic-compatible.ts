@@ -248,6 +248,7 @@ export class AnthropicCompatibleModel implements ChiliModel {
     let usage: ModelUsage | undefined;
     let finishReason = "stop";
     const toolBlocks = new Map<number, ToolBlockState>();
+    const contentBlocks = new Map<number, "text" | "reasoning">();
 
     for await (const event of readSseEvents(body, signal)) {
       if (event.data === "[DONE]") break;
@@ -282,12 +283,18 @@ export class AnthropicCompatibleModel implements ChiliModel {
 
       if (payload.type === "content_block_start" && payload.index !== undefined && payload.content_block) {
         const block = payload.content_block;
-        if (block.type === "text") continue;
-        if (block.type === "thinking" && block.thinking) {
-          yield { type: "reasoning_delta", text: block.thinking, index: payload.index };
+        if (block.type === "text") {
+          contentBlocks.set(payload.index, "text");
+          if (block.text) yield { type: "text_delta", text: block.text, index: payload.index };
+          continue;
+        }
+        if (block.type === "thinking") {
+          contentBlocks.set(payload.index, "reasoning");
+          if (block.thinking) yield { type: "reasoning_delta", text: block.thinking, index: payload.index };
           continue;
         }
         if (block.type === "redacted_thinking") {
+          contentBlocks.set(payload.index, "reasoning");
           yield { type: "reasoning_delta", text: "[Reasoning redacted]", index: payload.index, redacted: true };
           continue;
         }
@@ -307,10 +314,12 @@ export class AnthropicCompatibleModel implements ChiliModel {
 
       if (payload.type === "content_block_delta" && payload.index !== undefined && payload.delta) {
         if (payload.delta.type === "text_delta" && payload.delta.text) {
+          contentBlocks.set(payload.index, "text");
           yield { type: "text_delta", text: payload.delta.text, index: payload.index };
           continue;
         }
         if (payload.delta.type === "thinking_delta" && payload.delta.thinking) {
+          contentBlocks.set(payload.index, "reasoning");
           yield { type: "reasoning_delta", text: payload.delta.thinking, index: payload.index };
           continue;
         }
@@ -326,6 +335,11 @@ export class AnthropicCompatibleModel implements ChiliModel {
       }
 
       if (payload.type === "content_block_stop" && payload.index !== undefined) {
+        const contentType = contentBlocks.get(payload.index);
+        if (contentType) {
+          contentBlocks.delete(payload.index);
+          yield { type: contentType === "text" ? "text_end" : "reasoning_end", index: payload.index };
+        }
         const tool = toolBlocks.get(payload.index);
         if (tool) {
           toolBlocks.delete(payload.index);
@@ -389,13 +403,21 @@ export class AnthropicCompatibleModel implements ChiliModel {
     const metadata = metadataEvent(this.provider, payload.model ?? this.model, payload.id, usage);
     if (metadata) yield metadata;
 
+    const complete = payload.stop_reason === undefined
+      || payload.stop_reason === "stop"
+      || payload.stop_reason === "end_turn"
+      || payload.stop_reason === "stop_sequence"
+      || payload.stop_reason === "tool_use";
     for (const [blockIndex, block] of (payload.content ?? []).entries()) {
       if (block.type === "text") {
-        yield { type: "text_delta", text: block.text };
+        yield { type: "text_delta", text: block.text, index: blockIndex };
+        if (complete) yield { type: "text_end", index: blockIndex };
       } else if (block.type === "thinking") {
-        yield { type: "reasoning_delta", text: block.thinking };
+        yield { type: "reasoning_delta", text: block.thinking, index: blockIndex };
+        if (complete) yield { type: "reasoning_end", index: blockIndex };
       } else if (block.type === "redacted_thinking") {
-        yield { type: "reasoning_delta", text: "[Reasoning redacted]", redacted: true };
+        yield { type: "reasoning_delta", text: "[Reasoning redacted]", redacted: true, index: blockIndex };
+        if (complete) yield { type: "reasoning_end", index: blockIndex };
       } else if (block.type === "tool_use") {
         const toolCallId = normalizeToolCallId(block.id, blockIndex);
         yield { type: "tool_call_start", toolCallId, name: block.name };

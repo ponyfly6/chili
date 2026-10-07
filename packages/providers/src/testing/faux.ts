@@ -12,7 +12,9 @@ export const FAUX_CHILI_MODEL_ID = "faux-model";
 
 export type FauxChiliScriptEventType =
   | "text_delta"
+  | "text_end"
   | "reasoning_delta"
+  | "reasoning_end"
   | "tool_call_start"
   | "tool_call_delta"
   | "tool_call_end"

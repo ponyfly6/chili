@@ -1,10 +1,18 @@
-import { basename } from "node:path";
+import { basename, relative } from "node:path";
 import type { SqliteEventStoreDiagnostics } from "@chili/store";
 
 export function formatStoreDoctorText(report: SqliteEventStoreDiagnostics): string {
+  const sqliteBytes = report.files.database.bytes + report.files.wal.bytes + report.files.shm.bytes;
+  const totalBytes = sqliteBytes + report.contentFiles.totalBytes + report.toolResultFiles.totalBytes;
   return [
     `Store doctor: ${report.path}`,
+    `storage total=${formatBytes(totalBytes)} sqlite=${formatBytes(sqliteBytes)} contents=${formatBytes(report.contentFiles.totalBytes)} tool_results=${formatBytes(report.toolResultFiles.totalBytes)}`,
     `files database=${formatBytes(report.files.database.bytes)} wal=${formatBytes(report.files.wal.bytes)} shm=${formatBytes(report.files.shm.bytes)}`,
+    `contents files=${report.contentFiles.files} total=${formatBytes(report.contentFiles.totalBytes)} path=${report.contentFiles.path}`,
+    ...tableLines("largest content files", ["file", "size"], report.contentFiles.largestFiles.map((row) => [
+      relative(report.contentFiles.path, row.path),
+      formatBytes(row.bytes),
+    ])),
     `tool_results files=${report.toolResultFiles.files} total=${formatBytes(report.toolResultFiles.totalBytes)} path=${report.toolResultFiles.path}`,
     ...tableLines("largest tool result files", ["file", "size"], report.toolResultFiles.largestFiles.map((row) => [
       basename(row.path),

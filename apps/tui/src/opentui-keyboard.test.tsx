@@ -4493,10 +4493,12 @@ async function mountShell(
   const runtime: ChatRuntimeState = {
     runtimeView: createRuntimeView(),
     revision: 0,
+    recoveryRevision: 0,
     connection: model.connection,
     message: "test stream",
     reconnect: () => undefined,
     hydrateEvents: () => undefined,
+    hydrateMessages: () => undefined,
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
@@ -4591,10 +4593,12 @@ function chatRuntime(
   return {
     runtimeView: createRuntimeView(),
     revision: 0,
+    recoveryRevision: 0,
     connection: model.connection,
     message: "test stream",
     reconnect: () => undefined,
     hydrateEvents: () => undefined,
+    hydrateMessages: () => undefined,
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
@@ -4859,6 +4863,7 @@ function fakeChatClient(
       const suffix = index === 1 ? "" : `_${index}`;
       return { sessionId: `session_created${suffix}` as SessionId };
     },
+    messages: async () => [],
     sessionEvents: async (input: Record<string, unknown>) => {
       records.sessionEvents.push(input);
       records.sessionLifecycle.push(`events:${String(input.sessionId)}`);

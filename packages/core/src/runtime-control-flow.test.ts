@@ -266,6 +266,7 @@ test("consumes rich model streams and executes tool calls after the stream finis
       id: expect.any(String),
       messageId: expect.any(String),
       sessionId: "session_rich_stream" as SessionId,
+      ordinal: 2,
       type: "tool_call",
       callId: expect.any(String), providerCallId: "tool_provider_1",
       toolName: "echo",
@@ -284,7 +285,6 @@ test("consumes rich model streams and executes tool calls after the stream finis
   expect(liveToolUpdates.map((event) => event.payload)).toEqual([
     { callId: expect.any(String), providerCallId: "tool_provider_1", status: "running", toolName: "echo", input: {} },
     { callId: expect.any(String), providerCallId: "tool_provider_1", status: "running", toolName: "echo", input: { value: "ok" } },
-    { callId: expect.any(String), providerCallId: "tool_provider_1", status: "running", toolName: "echo", input: { value: "ok" } },
   ]);
   const liveToolUpdateIndex = store.items.findIndex(
     (event) => event.type === "tool.call_updated" && event.payload.providerCallId === "tool_provider_1" && event.payload.toolName === "echo",
@@ -296,7 +296,7 @@ test("consumes rich model streams and executes tool calls after the stream finis
   expect(toolStartedIndex).toBeGreaterThan(toolCallPartIndex);
 });
 
-test("bounds partial and final tool inputs only at persistence and desktop boundaries", async () => {
+test("bounds complete tool inputs at persistence and desktop boundaries", async () => {
   const hugeInput = "\u0000".repeat(4 * 1024 * 1024);
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();
@@ -1389,8 +1389,8 @@ function createSequentialId(): (prefix: string) => string {
 function messageParts(store: MemoryEventStore): MessagePart[] {
   const parts = new Map<string, MessagePart>();
   for (const event of store.items) {
-    if (event.type === "message.part_added") {
-      parts.set(event.payload.part.id, event.payload.part);
+    if (event.type === "message.part_added" || event.type === "message.part_committed") {
+      parts.set(event.payload.part.id, { ...event.payload.part });
     }
     if (event.type === "message.part_delta") {
       const part = parts.get(event.payload.partId);
@@ -1399,7 +1399,7 @@ function messageParts(store: MemoryEventStore): MessagePart[] {
       }
     }
   }
-  return [...parts.values()];
+  return [...parts.values()].sort((left, right) => (left.ordinal ?? 0) - (right.ordinal ?? 0));
 }
 
 function textParts(store: MemoryEventStore): Extract<MessagePart, { type: "text" }>[] {

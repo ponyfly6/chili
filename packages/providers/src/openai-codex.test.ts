@@ -1004,8 +1004,9 @@ test("preserves assistant phase for every Codex message output item", async () =
   expect(events.filter((event) => event.type === "text_delta")).toEqual([
     { type: "text_delta", text: "Checking ", index: 0, phase: "commentary" },
     { type: "text_delta", text: "files.", index: 0, phase: "commentary" },
-    { type: "text_delta", text: "Done.", index: 2, phase: "final_answer" },
+    { type: "text_delta", text: "Done.", index: 1, phase: "final_answer" },
   ]);
+  expect(events.filter((event) => event.type === "text_end")).toEqual([]);
 });
 
 for (const scenario of [
@@ -1134,6 +1135,191 @@ test("preserves reasoning summary sections from Codex Responses streams", async 
   expect(reasoning.map((event) => event.index)).toEqual([0, 0, 1, 1]);
   expect(reasoning.filter((event) => event.index === 0).map((event) => event.text).join("")).toBe("**Inspecting core**");
   expect(reasoning.filter((event) => event.index === 1).map((event) => event.text).join("")).toBe("**Checking schema**");
+});
+
+test("ends each Codex text content block once and preserves its message phase", async () => {
+  const model = codexStreamModel([
+    data({ type: "response.output_item.added", output_index: 2, item: { type: "message", id: "msg_blocks", phase: "commentary" } }),
+    data({ type: "response.output_text.delta", output_index: 2, content_index: 0, delta: "First " }),
+    data({ type: "response.output_text.delta", output_index: 2, content_index: 0, delta: "block." }),
+    data({ type: "response.output_text.done", output_index: 2, content_index: 0, text: "First block." }),
+    data({ type: "response.output_text.delta", output_index: 2, content_index: 1, delta: "Second block." }),
+    data({ type: "response.output_text.done", output_index: 2, content_index: 1, text: "Second block." }),
+    data({ type: "response.output_item.done", output_index: 2, item: { type: "message", id: "msg_blocks", phase: "commentary" } }),
+    data({ type: "response.output_item.added", output_index: 3, item: { type: "message", id: "msg_final", phase: "final_answer" } }),
+    data({ type: "response.refusal.delta", output_index: 3, content_index: 0, delta: "Refusal." }),
+    data({ type: "response.refusal.done", output_index: 3, content_index: 0, refusal: "Refusal." }),
+    data({ type: "response.output_item.done", output_index: 3, item: { type: "message", id: "msg_final", phase: "final_answer" } }),
+    data({ type: "response.completed", response: { status: "completed" } }),
+  ]);
+
+  const events = await collect(model.stream({ messages: [] }));
+  expect(events.filter((streamEvent) => streamEvent.type === "text_delta" || streamEvent.type === "text_end")).toEqual([
+    { type: "text_delta", text: "First ", index: 0, phase: "commentary" },
+    { type: "text_delta", text: "block.", index: 0, phase: "commentary" },
+    { type: "text_end", index: 0, phase: "commentary" },
+    { type: "text_delta", text: "Second block.", index: 1, phase: "commentary" },
+    { type: "text_end", index: 1, phase: "commentary" },
+    { type: "text_delta", text: "Refusal.", index: 2, phase: "final_answer" },
+    { type: "text_end", index: 2, phase: "final_answer" },
+  ]);
+});
+
+test("Codex item completion closes remaining blocks without ending on index changes", async () => {
+  const model = codexStreamModel([
+    data({ type: "response.reasoning_summary_text.delta", item_id: "r", output_index: 0, summary_index: 0, delta: "First thought." }),
+    data({ type: "response.reasoning_summary_text.delta", item_id: "r", output_index: 0, summary_index: 1, delta: "Second thought." }),
+    data({ type: "response.reasoning_summary_text.done", output_index: 0, summary_index: 0 }),
+    data({ type: "response.reasoning_summary_part.done", item_id: "r", output_index: 0, summary_index: 0 }),
+    data({ type: "response.output_item.done", output_index: 0, item: { type: "reasoning", id: "r", summary: [] } }),
+    data({ type: "response.output_item.added", output_index: 1, item: { type: "message", id: "msg", phase: "final_answer" } }),
+    data({ type: "response.output_text.delta", output_index: 1, content_index: 0, delta: "First block." }),
+    data({ type: "response.output_text.delta", output_index: 1, content_index: 1, delta: "Second block." }),
+    data({ type: "response.output_item.done", output_index: 1, item: { type: "message", id: "msg", phase: "final_answer" } }),
+    data({ type: "response.completed", response: { status: "completed" } }),
+  ]);
+
+  const events = await collect(model.stream({ messages: [] }));
+  expect(events.filter((streamEvent) => streamEvent.type !== "metadata" && streamEvent.type !== "finish")).toEqual([
+    { type: "reasoning_delta", text: "First thought.", index: 0 },
+    { type: "reasoning_delta", text: "Second thought.", index: 1 },
+    { type: "reasoning_end", index: 0 },
+    { type: "reasoning_end", index: 1 },
+    { type: "text_delta", text: "First block.", index: 0, phase: "final_answer" },
+    { type: "text_delta", text: "Second block.", index: 1, phase: "final_answer" },
+    { type: "text_end", index: 0, phase: "final_answer" },
+    { type: "text_end", index: 1, phase: "final_answer" },
+  ]);
+});
+
+test("recovers Codex content delivered only in completion events without duplicating streamed prefixes", async () => {
+  const model = codexStreamModel([
+    data({ type: "response.reasoning_summary_text.done", output_index: 0, summary_index: 0, text: "A full thought." }),
+    data({ type: "response.reasoning_summary_part.done", output_index: 0, summary_index: 0, part: { text: "A full thought." } }),
+    data({ type: "response.reasoning_summary_part.done", output_index: 0, summary_index: 1, part: { text: "A second thought." } }),
+    data({ type: "response.reasoning_summary_text.delta", output_index: 0, summary_index: 2, delta: "A final " }),
+    data({ type: "response.output_item.done", output_index: 0, item: { type: "reasoning", summary: [
+      { text: "A full thought." }, { text: "A second thought." }, { text: "A final thought." }, { text: "Only in item." },
+    ] } }),
+    data({ type: "response.output_item.added", output_index: 1, item: { type: "message", phase: "commentary" } }),
+    data({ type: "response.output_text.done", output_index: 1, content_index: 0, text: "Full text." }),
+    data({ type: "response.output_text.delta", output_index: 1, content_index: 1, delta: "A streamed " }),
+    data({ type: "response.output_text.done", output_index: 1, content_index: 1, text: "A streamed prefix." }),
+    data({ type: "response.output_item.done", output_index: 1, item: { type: "message", phase: "commentary", content: [
+      { type: "output_text", text: "Full text." }, { type: "output_text", text: "A streamed prefix." },
+    ] } }),
+    data({ type: "response.output_item.done", output_index: 2, item: { type: "message", phase: "final_answer", content: [
+      { type: "output_text", text: "Only in item." }, { type: "refusal", refusal: "Full refusal." },
+    ] } }),
+    data({ type: "response.completed", response: { status: "completed" } }),
+  ]);
+
+  const events = await collect(model.stream({ messages: [] }));
+  const reasoning = events.filter((streamEvent) => streamEvent.type === "reasoning_delta");
+  expect(reasoning.map((streamEvent) => streamEvent.text).join("")).toBe("A full thought.A second thought.A final thought.Only in item.");
+  const text = events.filter((streamEvent) => streamEvent.type === "text_delta");
+  expect(text.map((streamEvent) => streamEvent.text).join("")).toBe("Full text.A streamed prefix.Only in item.Full refusal.");
+  expect(events.filter((streamEvent) => streamEvent.type === "reasoning_end").map((streamEvent) => streamEvent.index)).toEqual([0, 1, 2, 3]);
+  expect(events.filter((streamEvent) => streamEvent.type === "text_end").map((streamEvent) => streamEvent.index)).toEqual([0, 1, 2, 3]);
+});
+
+test("keeps explicitly incomplete Codex done content pending while preserving its final text", async () => {
+  const scenarios = [
+    {
+      kind: "reasoning",
+      done: { type: "response.reasoning_summary_part.done", status: "incomplete", part: { text: "Partial thought" } },
+    },
+    {
+      kind: "reasoning",
+      done: { type: "response.reasoning_summary_part.done", part: { status: "incomplete", text: "Partial thought" } },
+    },
+    {
+      kind: "reasoning",
+      done: { type: "response.reasoning_summary_text.done", status: "incomplete", text: "Partial thought" },
+    },
+    {
+      kind: "reasoning",
+      done: { type: "response.output_item.done", item: { type: "reasoning", status: "incomplete", summary: [{ text: "Partial thought" }] } },
+    },
+    {
+      kind: "reasoning",
+      done: { type: "response.output_item.done", item: { type: "reasoning", summary: [{ status: "incomplete", text: "Partial thought" }] } },
+    },
+    {
+      kind: "text",
+      done: { type: "response.output_text.done", status: "incomplete", text: "Partial thought" },
+    },
+    {
+      kind: "text",
+      done: { type: "response.refusal.done", status: "incomplete", refusal: "Partial thought" },
+    },
+    {
+      kind: "text",
+      done: { type: "response.output_item.done", item: { type: "message", phase: "final_answer", status: "incomplete", content: [{ type: "output_text", text: "Partial thought" }] } },
+    },
+    {
+      kind: "text",
+      done: { type: "response.output_item.done", item: { type: "message", phase: "final_answer", content: [{ type: "refusal", status: "incomplete", refusal: "Partial thought" }] } },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    for (const terminal of ["incomplete", "failed"] as const) {
+      for (const prefix of ["", "Partial "]) {
+        const reasoning = scenario.kind === "reasoning";
+        const item = reasoning
+          ? { type: "reasoning", summary: [{ text: "Partial thought" }] }
+          : { type: "message", phase: "final_answer", content: [{ type: "output_text", text: "Partial thought" }] };
+        const model = codexStreamModel([
+          data({ type: "response.output_item.added", output_index: 0, item }),
+          ...(prefix ? [data({ type: reasoning ? "response.reasoning_summary_text.delta" : "response.output_text.delta", output_index: 0, summary_index: 0, content_index: 0, delta: prefix })] : []),
+          data({ ...scenario.done, output_index: 0, summary_index: 0, content_index: 0 }),
+          // A subsequent item-level completion must not reclassify an explicitly incomplete part.
+          data({ type: "response.output_item.done", output_index: 0, item }),
+          data({ type: `response.${terminal}`, response: { status: terminal, ...(terminal === "failed" ? { error: { message: "Generation failed" } } : {}) } }),
+        ]);
+        const events: ModelStreamEvent[] = [];
+        const consume = (async () => {
+          for await (const streamEvent of model.stream({ messages: [] })) events.push(streamEvent);
+        })();
+        if (terminal === "failed") await expect(consume).rejects.toBeInstanceOf(ProviderError);
+        else {
+          await consume;
+          expect(events.at(-1)).toMatchObject({ type: "finish", reason: "length" });
+        }
+        expect(events.filter((streamEvent) => streamEvent.type === "reasoning_end" || streamEvent.type === "text_end")).toEqual([]);
+        expect(events.filter((streamEvent) => streamEvent.type === "reasoning_delta" || streamEvent.type === "text_delta").map((streamEvent) => streamEvent.text).join("")).toBe("Partial thought");
+      }
+    }
+  }
+});
+
+test("incomplete Codex item completion keeps already streamed blocks pending", async () => {
+  const model = codexStreamModel([
+    data({ type: "response.reasoning_summary_text.delta", output_index: 0, summary_index: 0, delta: "Partial thought" }),
+    data({ type: "response.output_item.done", output_index: 0, item: { type: "reasoning", status: "incomplete" } }),
+    data({ type: "response.output_item.added", output_index: 1, item: { type: "message", phase: "final_answer" } }),
+    data({ type: "response.output_text.delta", output_index: 1, delta: "Partial answer" }),
+    data({ type: "response.output_item.done", output_index: 1, item: { type: "message", phase: "final_answer", status: "incomplete" } }),
+    data({ type: "response.incomplete", response: { status: "incomplete" } }),
+  ]);
+  const events = await collect(model.stream({ messages: [] }));
+  expect(events.filter((streamEvent) => streamEvent.type === "reasoning_end" || streamEvent.type === "text_end")).toEqual([]);
+  expect(events.at(-1)).toMatchObject({ type: "finish", reason: "length" });
+});
+
+test("rejects completed Codex content that contradicts an already streamed prefix", async () => {
+  const model = codexStreamModel([
+    data({ type: "response.output_item.added", output_index: 0, item: { type: "message", phase: "final_answer" } }),
+    data({ type: "response.output_text.delta", output_index: 0, delta: "Original " }),
+    data({ type: "response.output_text.done", output_index: 0, text: "Different text." }),
+    data({ type: "response.completed", response: { status: "completed" } }),
+  ]);
+  const events: ModelStreamEvent[] = [];
+  await expect((async () => {
+    for await (const streamEvent of model.stream({ messages: [] })) events.push(streamEvent);
+  })()).rejects.toThrow("disagrees with its streamed prefix");
+  expect(events.filter((streamEvent) => streamEvent.type === "text_end")).toEqual([]);
 });
 
 test("replays the completed encrypted reasoning item on the next stateless request", async () => {

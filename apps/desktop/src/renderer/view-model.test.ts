@@ -805,6 +805,73 @@ test("bounds active tool output by UTF-8 bytes and preserves its newest tail", (
   expect(visibleToolLiveOutput("final result", [{ stream: "stdout", delta: "duplicate" }])).toBeUndefined();
 });
 
+test("compacts transient fragments into complete active blocks without losing text", () => {
+  const limits = { maxEvents: 32, maxBytes: 100_000 };
+  const created = event("message.created", "root", { messageId: "message_active", role: "assistant" }, 1);
+  let snapshot = appendRuntimeEvent(baseSnapshot([]), created, limits);
+  let text = "";
+  for (let index = 0; index < 500; index += 1) {
+    const delta = `${index}😀|`;
+    snapshot = appendRuntimeEvent(snapshot, event("message.part_stream_delta", "root", {
+      messageId: "message_active", partId: "part_active", partType: "reasoning", ordinal: 0,
+      offset: text.length, delta,
+    }, index + 2), limits);
+    text += delta;
+  }
+  expect(presentSession(snapshot).runtime.messages.message_active?.parts[0]).toMatchObject({ type: "reasoning", text });
+  expect(presentSession(baseSnapshot(snapshot.events)).runtime.messages.message_active?.parts[0]).toMatchObject({ text });
+  expect(snapshot.events.some((row) => row.type === "message.part_stream_snapshot")).toBe(true);
+  expect(snapshot.events.length).toBeLessThanOrEqual(limits.maxEvents);
+  expect(snapshot.warning).toBeUndefined();
+  expect(runtimeEventRetentionDiagnostics(snapshot).incrementalProjectionUpdates).toBeGreaterThan(470);
+
+  snapshot = appendRuntimeEvent(snapshot, event("message.part_committed", "root", {
+    messageId: "message_active", part: {
+      id: "part_active", messageId: "message_active", sessionId: "root", type: "reasoning", ordinal: 0,
+      text, completion: "cancelled",
+    },
+  }, 1_000), limits);
+  snapshot = appendRuntimeEvent(snapshot, event("message.part_stream_delta", "root", {
+    messageId: "message_active", partId: "part_active", partType: "reasoning", offset: 0, delta: "obsolete",
+  }, 1_001), limits);
+  expect(presentSession(snapshot).runtime.messages.message_active?.parts[0]).toMatchObject({ text, completion: "cancelled" });
+});
+
+test("stream snapshots and commits isolate snapshot branches and reject late shorter history", () => {
+  const created = event("message.created", "root", { messageId: "message_live", role: "assistant" }, 1);
+  const part = { id: "part_live", messageId: "message_live", sessionId: "root", type: "text", ordinal: 1, text: "A😀" };
+  const seed = event("message.part_stream_snapshot", "root", { messageId: "message_live", part }, 2);
+  let base = appendRuntimeEvent(baseSnapshot([created]), seed);
+  const left = appendRuntimeEvent(base, event("message.part_stream_delta", "root", {
+    messageId: "message_live", partId: "part_live", partType: "text", offset: 1, delta: "😀left",
+  }, 3));
+  const right = appendRuntimeEvent(base, event("message.part_committed", "root", {
+    messageId: "message_live", part: { ...part, text: "A😀right", completion: "failed" },
+  }, 4));
+  base = appendRuntimeEvent(base, event("message.part_added", "root", {
+    messageId: "message_live", part: { ...part, text: "A" },
+  }, 5));
+  expect(presentSession(base).runtime.messages.message_live?.parts[0]).toMatchObject({ text: "A😀" });
+  expect(presentSession(left).runtime.messages.message_live?.parts[0]).toMatchObject({ text: "A😀left" });
+  expect(presentSession(right).runtime.messages.message_live?.parts[0]).toMatchObject({ text: "A😀right", completion: "failed" });
+  expect(seed.payload).toMatchObject({ part: { text: "A😀" } });
+  expect(presentSession(base).runtime.committedPartIds.part_live).toBeUndefined();
+  expect(presentSession(left).runtime.committedPartIds.part_live).toBeUndefined();
+});
+
+test("committed blocks clear obsolete omitted-prefix markers", () => {
+  const created = event("message.created", "root", { messageId: "message_omitted", role: "assistant" }, 1);
+  const part = { id: "part_omitted", messageId: "message_omitted", sessionId: "root", type: "text", text: "seed" };
+  const snapshot = { ...baseSnapshot([created, event("message.part_added", "root", { messageId: "message_omitted", part }, 2)]),
+    omittedMessageParts: [{ messageId: "message_omitted", partId: "part_omitted", field: "text" as const }],
+  };
+  const completed = appendRuntimeEvent(snapshot, event("message.part_committed", "root", {
+    messageId: "message_omitted", part: { ...part, text: "complete", completion: "completed" },
+  }, 3));
+  expect(presentSession(completed).runtime.messages.message_omitted?.parts[0]).toMatchObject({ text: "complete" });
+  expect(completed.omittedMessageParts).toBeUndefined();
+});
+
 function baseSnapshot(
   events: ChiliEvent[],
   pendingInputs: UserInputRequest[] = [],

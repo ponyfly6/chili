@@ -17,7 +17,7 @@ import {
 } from "@chili/core";
 import type { ChiliEvent, ExecutionIdentity, ModelSelection, RuntimeEvent, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId } from "@chili/protocol";
 import { compactRuntimeEvent } from "@chili/protocol";
-import { HostOwnerClaim, ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
+import { HostOwnerClaim, ObservableEventStore, SqliteEventStore } from "@chili/store";
 import {
   DeferredApprovalQueue,
   DeferredUserInputQueue,
@@ -207,14 +207,10 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
   const baseCommands = createFilesystemPromptCommandControl({ cwd, chiliHome });
   let commands: PromptCommandControl = baseCommands;
   let sqliteStore: SqliteEventStore;
-  const sessionMirror = new SessionTranscriptJsonlMirror(join(chiliHome, "sessions"), {
-    groupByCwd: true,
-    resolveSessionCwd: async (sessionId) => (await sqliteStore.sessions()).find((session) => session.id === sessionId)?.cwd,
-  });
   const owner = new HostOwnerClaim(join(stateDir, "chili.sqlite"));
   let unsubscribeGuardians: (() => void) | undefined;
   try {
-    sqliteStore = new SqliteEventStore(join(stateDir, "chili.sqlite"), { mirror: sessionMirror });
+    sqliteStore = new SqliteEventStore(join(stateDir, "chili.sqlite"));
     unsubscribeGuardians = observeProcessGuardianLifecycle((event) => {
       if (event.ownerId !== owner.token) return;
       if (event.type === "started") owner.registerGuardian(event.pid);

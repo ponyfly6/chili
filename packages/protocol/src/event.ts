@@ -9,7 +9,7 @@ import type {
   UserInputId,
 } from "./ids.js";
 import type { SessionAgentMetadata } from "./session-agent.js";
-import type { Message, MessagePart } from "./message.js";
+import type { AssistantMessagePhase, Message, MessagePart, ReasoningPart, TextPart } from "./message.js";
 import type {
   McpDiagnosticPayload,
   McpProgressPayload,
@@ -50,7 +50,9 @@ export type RuntimeEvent =
 export type ChiliEvent = RuntimeEvent;
 
 export function isTransientEvent(event: Pick<EventEnvelope, "type">): boolean {
-  return event.type === "tool.output_delta";
+  return event.type === "tool.output_delta"
+    || event.type === "message.part_stream_delta"
+    || event.type === "message.part_stream_snapshot";
 }
 
 /** Program results are read through storage; UI history carries their model/display form. */
@@ -103,7 +105,7 @@ export type TurnEvent =
   | EventEnvelope<"model.request_identity", { turnId: TurnId; requestId: string; attempt: number; identity: PreparedModelIdentity }>
   | EventEnvelope<"turn.started", { turnId: TurnId }>
   | EventEnvelope<"turn.model_metadata", ModelMetadataPayload>
-  | EventEnvelope<"turn.completed", { turnId: TurnId; status: "completed" | "failed" | "cancelled" }>
+  | EventEnvelope<"turn.completed", { turnId: TurnId; status: "completed" | "failed" | "cancelled"; reason?: string }>
   | EventEnvelope<"turn.compaction_requested", { turnId: TurnId; reason: "manual" | "token_budget" | "recovery"; boundaryMessageId?: MessageId; estimatedChars?: number; budgetChars?: number }>
   | EventEnvelope<"turn.compaction_started", { turnId: TurnId; reason: "manual" | "token_budget" | "recovery"; boundaryMessageId?: MessageId; sourceMessageCount?: number; estimatedChars?: number; budgetChars?: number }>
   | EventEnvelope<"turn.compaction_completed", { turnId: TurnId; messageId: MessageId; boundaryMessageId: MessageId; summaryChars: number; sourceMessageCount: number; estimatedCharsBefore: number; estimatedCharsAfter: number }>
@@ -114,6 +116,19 @@ export type TurnEvent =
 export type MessageEvent =
   | EventEnvelope<"message.created", { messageId: MessageId; role: "system" | "user" | "assistant" | "tool"; turnId?: TurnId }>
   | EventEnvelope<"message.part_added", { messageId: MessageId; part: MessagePart }>
+  | EventEnvelope<"message.part_committed", { messageId: MessageId; part: TextPart | ReasoningPart }>
+  | EventEnvelope<"message.part_stream_snapshot", { messageId: MessageId; part: TextPart | ReasoningPart }>
+  | EventEnvelope<"message.part_stream_delta", {
+    messageId: MessageId;
+    partId: string;
+    partType: "text" | "reasoning";
+    delta: string;
+    /** Offset in JavaScript string code units, not UTF-8 bytes. */
+    offset: number;
+    ordinal?: number;
+    phase?: AssistantMessagePhase;
+    redacted?: boolean;
+  }>
   | EventEnvelope<"message.part_delta", { messageId: MessageId; partId: string; field: string; delta: string }>;
 
 export type ToolEvent =

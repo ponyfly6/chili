@@ -136,10 +136,12 @@ export class SessionTranscriptJsonlMirror implements EventMirror {
       return;
     }
 
-    if (event.type === "message.part_added") {
+    if (event.type === "message.part_added" || event.type === "message.part_committed") {
       const state = this.messages.get(event.payload.messageId);
       if (!state) return;
-      state.parts.push(event.payload.part);
+      const index = state.parts.findIndex((part) => part.id === event.payload.part.id);
+      if (index === -1) state.parts.push(event.payload.part);
+      else state.parts[index] = event.payload.part;
       state.updatedAt = event.time;
       return;
     }
@@ -171,6 +173,10 @@ export class SessionTranscriptJsonlMirror implements EventMirror {
   }
 
   private async writeMessage(message: TranscriptMessageState): Promise<void> {
+    const parts = message.parts
+      .map((part, index) => ({ part, index }))
+      .sort((a, b) => (a.part.ordinal ?? a.index) - (b.part.ordinal ?? b.index))
+      .map(({ part }) => part);
     await this.paths.writeTranscriptLine(message.sessionId, {
       timestamp: new Date(message.createdAt).toISOString(),
       type: "message",
@@ -178,8 +184,8 @@ export class SessionTranscriptJsonlMirror implements EventMirror {
       ...(message.turnId ? { turnId: message.turnId } : {}),
       messageId: message.messageId,
       role: message.role,
-      text: messageText(message.parts),
-      parts: message.parts,
+      text: messageText(parts),
+      parts,
       createdAt: message.createdAt,
       updatedAt: message.updatedAt,
     });

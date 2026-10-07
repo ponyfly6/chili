@@ -13,6 +13,7 @@ import type {
   ExecutionIdentity,
   RuntimeInputQueue,
   RuntimeStateSnapshot,
+  ChiliEvent,
 } from "@chili/protocol";
 import type { SessionInputAccept, StoredSessionInput } from "./session-inputs.js";
 
@@ -164,8 +165,14 @@ export interface EventStore {
    */
   events(query?: EventQuery): Promise<EventEnvelope[]>;
   eventReplayBoundary?(query?: EventReplayBoundaryQuery): Promise<EventReplayBoundary>;
-  /** Authoritative materialized state and its durable watermark in one read transaction. */
+  /** Durable state and watermark from one read transaction, plus current in-memory content when available. */
   runtimeSnapshot?(query?: { sessionId?: SessionId; maxBytes?: number }): Promise<RuntimeStateSnapshot>;
+  /**
+   * Synchronously capture complete, uncommitted text/reasoning from this process.
+   * Subscribe before calling this method so subsequent deltas cannot fall into
+   * an asynchronous gap. Returned snapshots never advance the durable cursor.
+   */
+  activeMessageParts?(query?: { sessionId?: SessionId; maxBytes?: number }): ChiliEvent[];
   sessions(): Promise<SessionRow[]>;
   messages(sessionId: SessionId): Promise<Message[]>;
   pendingApprovals(sessionId?: SessionId, limit?: number): Promise<ApprovalRow[]>;

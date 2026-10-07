@@ -5,7 +5,7 @@ import { shorten } from "../components/helpers.js";
 import type { TuiTheme } from "../theme/index.js";
 import { AssistantMarkdownCell, assistantTextCellLines } from "./AssistantCells.js";
 import { componentBackedCell, lineBackedCell, TranscriptCellView, type TranscriptCellModel } from "./cells.js";
-import { type OpenFileLinkHandler, type TranscriptLineModel, wrapLine } from "./lines.js";
+import { TranscriptLines, type OpenFileLinkHandler, type TranscriptLineModel, wrapLine } from "./lines.js";
 import { charDisplayWidth, markdownToTerminalLines } from "./markdown.js";
 import { localTranscriptItemTime } from "./local-transcript.js";
 import { buildChatDisplayItems, groupExplorationTools, type ChatDisplayItem } from "./presentation.js";
@@ -176,20 +176,30 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
       theme,
       cwd,
     });
+    const completion = incompleteContentLabel(item.completion);
+    const completionLines = completion ? wrapLine(completion, {
+      key: `${key}:completion`,
+      fg: theme.colors.text.muted,
+      width,
+      hangingIndent: "  ",
+    }) : [];
     return componentBackedCell({
       key,
       render: () => (
-        <AssistantMarkdownCell
-          cellKey={key}
-          text={item.text}
-          phase={item.phase}
-          streaming={item.streaming === true}
-          width={width}
-          theme={theme}
-          fallbackLines={lines}
-        />
+        <>
+          <AssistantMarkdownCell
+            cellKey={key}
+            text={item.text}
+            phase={item.phase}
+            streaming={item.streaming === true}
+            width={width}
+            theme={theme}
+            fallbackLines={lines}
+          />
+          {completionLines.length > 0 ? <TranscriptLines lines={completionLines} /> : null}
+        </>
       ),
-      fallbackLines: lines,
+      fallbackLines: [...lines, ...completionLines],
     });
   }
   if (item.kind === "reasoning") return lineBackedCell(`display:${item.kind}:${item.id}`, reasoningLines(item, width, theme, showToolDetails, hideThinking));
@@ -376,7 +386,8 @@ function reasoningLines(
   showToolDetails: boolean,
   hideThinking: boolean,
 ): TranscriptLineModel[] {
-  const hiddenText = item.active === true ? "🫧 thinking..." : "🫧";
+  const completion = incompleteContentLabel(item.completion);
+  const hiddenText = `${item.active === true ? "🫧 thinking..." : "🫧"}${completion ? ` ${completion}` : ""}`;
   const visibleThinking = item.active === true ? (item.text || "thinking...") : item.text;
   const key = `display:${item.kind}:${item.id}`;
   if (hideThinking) {
@@ -393,7 +404,7 @@ function reasoningLines(
     return markdownToTerminalLines(source, {
       key,
       width,
-      prefix: "Thinking: ",
+      prefix: completion ? `Thinking (${completion}): ` : "Thinking: ",
       hangingIndent: "  ",
     }).map((line) => ({
       key: line.key,
@@ -403,12 +414,18 @@ function reasoningLines(
   }
 
   const subject = reasoningSubject(source);
-  return wrapLine(`Thinking: ${shorten(subject, 180)}`, {
+  return wrapLine(`Thinking${completion ? ` (${completion})` : ""}: ${shorten(subject, 180)}`, {
     key,
     fg: theme.colors.text.muted,
     width,
     hangingIndent: "  ",
   });
+}
+
+function incompleteContentLabel(completion: Extract<ChatDisplayItem, { kind: "assistant_text" }>["completion"]): string | undefined {
+  if (completion === "cancelled") return "Stopped · incomplete";
+  if (completion === "failed") return "Failed · incomplete";
+  return undefined;
 }
 
 function reasoningSubject(source: string): string {

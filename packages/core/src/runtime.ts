@@ -89,7 +89,9 @@ export type ModelUsage = ProtocolModelUsage;
 export type ModelStreamEvent =
   | ModelMetadataEvent
   | ModelTextDeltaEvent
+  | ModelTextEndEvent
   | ModelReasoningDeltaEvent
+  | ModelReasoningEndEvent
   | ModelReasoningItemEvent
   | ModelToolCallStartEvent
   | ModelToolCallDeltaEvent
@@ -115,11 +117,24 @@ export interface ModelTextDeltaEvent {
   phase?: AssistantMessagePhase;
 }
 
+/** The provider explicitly completed this text block. Missing signals flush at response finish. */
+export interface ModelTextEndEvent {
+  type: "text_end";
+  index?: number;
+  phase?: AssistantMessagePhase;
+}
+
 export interface ModelReasoningDeltaEvent {
   type: "reasoning_delta";
   text: string;
   index?: number;
   redacted?: boolean;
+}
+
+/** The provider explicitly completed this reasoning block. */
+export interface ModelReasoningEndEvent {
+  type: "reasoning_end";
+  index?: number;
 }
 
 export interface ModelReasoningItemEvent {

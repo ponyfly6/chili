@@ -566,6 +566,84 @@ test("parses Anthropic SSE text and tool deltas", async () => {
   });
 });
 
+test("ends Anthropic text and thinking only at their explicit block stops", async () => {
+  const model = new AnthropicCompatibleModel({
+    provider: "anthropic-compatible",
+    model: "test-model",
+    apiKey: "test-key",
+    baseUrl: "https://model.test",
+    fetch: sseFetch([
+      event("content_block_start", { index: 0, content_block: { type: "thinking", thinking: "" } }),
+      event("content_block_delta", { index: 0, delta: { type: "thinking_delta", thinking: "Check " } }),
+      event("content_block_delta", { index: 0, delta: { type: "thinking_delta", thinking: "the files." } }),
+      event("content_block_start", { index: 1, content_block: { type: "text", text: "Working " } }),
+      event("content_block_delta", { index: 1, delta: { type: "text_delta", text: "on it." } }),
+      event("content_block_stop", { index: 0 }),
+      event("content_block_stop", { index: 0 }),
+      event("content_block_stop", { index: 1 }),
+      event("content_block_start", { index: 2, content_block: { type: "redacted_thinking", data: "opaque" } }),
+      event("content_block_stop", { index: 2 }),
+      event("message_stop", {}),
+    ]),
+  });
+
+  const events = await collect(model.stream({ messages: [] }));
+  expect(events.slice(0, -1)).toEqual([
+    { type: "reasoning_delta", text: "Check ", index: 0 },
+    { type: "reasoning_delta", text: "the files.", index: 0 },
+    { type: "text_delta", text: "Working ", index: 1 },
+    { type: "text_delta", text: "on it.", index: 1 },
+    { type: "reasoning_end", index: 0 },
+    { type: "text_end", index: 1 },
+    { type: "reasoning_delta", text: "[Reasoning redacted]", index: 2, redacted: true },
+    { type: "reasoning_end", index: 2 },
+  ]);
+});
+
+test("keeps separate completed Anthropic JSON content blocks", async () => {
+  const model = new AnthropicCompatibleModel({
+    model: "test-model",
+    apiKey: "test-key",
+    baseUrl: "https://model.test",
+    fetch: jsonFetch({
+      content: [
+        { type: "thinking", thinking: "First thought." },
+        { type: "thinking", thinking: "Second thought." },
+        { type: "text", text: "First answer." },
+        { type: "text", text: "Second answer." },
+      ],
+      stop_reason: "end_turn",
+    }),
+  });
+
+  const events = await collect(model.stream({ messages: [] }));
+  expect(events.filter((streamEvent) => streamEvent.type !== "metadata" && streamEvent.type !== "finish")).toEqual([
+    { type: "reasoning_delta", text: "First thought.", index: 0 },
+    { type: "reasoning_end", index: 0 },
+    { type: "reasoning_delta", text: "Second thought.", index: 1 },
+    { type: "reasoning_end", index: 1 },
+    { type: "text_delta", text: "First answer.", index: 2 },
+    { type: "text_end", index: 2 },
+    { type: "text_delta", text: "Second answer.", index: 3 },
+    { type: "text_end", index: 3 },
+  ]);
+});
+
+test("leaves truncated Anthropic JSON content unfinished", async () => {
+  const model = new AnthropicCompatibleModel({
+    model: "test-model",
+    apiKey: "test-key",
+    baseUrl: "https://model.test",
+    fetch: jsonFetch({
+      content: [{ type: "thinking", thinking: "Partial thought" }, { type: "text", text: "Partial answer" }],
+      stop_reason: "max_tokens",
+    }),
+  });
+  const events = await collect(model.stream({ messages: [] }));
+  expect(events.filter((streamEvent) => streamEvent.type === "text_end" || streamEvent.type === "reasoning_end")).toEqual([]);
+  expect(events.filter((streamEvent) => streamEvent.type === "text_delta" || streamEvent.type === "reasoning_delta")).toHaveLength(2);
+});
+
 test("normalizes hostile Anthropic stream tool call ids consistently", async () => {
   const model = new AnthropicCompatibleModel({
     provider: "minimax",
@@ -674,6 +752,7 @@ test("falls back to non-streaming JSON responses", async () => {
   expect(events.map((streamEvent) => streamEvent.type)).toEqual([
     "metadata",
     "text_delta",
+    "text_end",
     "tool_call_start",
     "tool_call_end",
     "finish",
@@ -683,15 +762,16 @@ test("falls back to non-streaming JSON responses", async () => {
     responseId: "msg_json",
     usage: { inputTokens: 5, outputTokens: 6, totalTokens: 11 },
   });
-  expect(events[1]).toEqual({ type: "text_delta", text: "done" });
-  expect(events[2]).toEqual({ type: "tool_call_start", toolCallId: "toolu_2", name: "edit" });
-  expect(events[3]).toEqual({
+  expect(events[1]).toEqual({ type: "text_delta", text: "done", index: 0 });
+  expect(events[2]).toEqual({ type: "text_end", index: 0 });
+  expect(events[3]).toEqual({ type: "tool_call_start", toolCallId: "toolu_2", name: "edit" });
+  expect(events[4]).toEqual({
     type: "tool_call_end",
     toolCallId: "toolu_2",
     name: "edit",
     input: { filePath: "README.md" },
   });
-  expect(events[4]).toMatchObject({ type: "finish", reason: "end_turn", responseId: "msg_json" });
+  expect(events[5]).toMatchObject({ type: "finish", reason: "end_turn", responseId: "msg_json" });
 });
 
 test("types MiniMax 2062 as non-retryable and short-circuits sibling requests", async () => {

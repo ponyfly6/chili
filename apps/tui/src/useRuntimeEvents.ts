@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   applyRuntimeEvent,
   createRuntimeView,
+  hasRuntimePartStreamGap,
+  hydrateRuntimeMessages,
   isEventCursorResyncRequiredError,
   isEventTransportResyncRequiredError,
   markRuntimeOutputGap,
@@ -10,7 +12,7 @@ import {
   type HttpRuntimeClient,
   type StreamEventsRequest,
 } from "@chili/sdk";
-import { isTransientEvent, type ChiliEvent, type SessionId } from "@chili/protocol";
+import { isTransientEvent, type ChiliEvent, type Message, type SessionId } from "@chili/protocol";
 
 export interface RuntimeTuiOptions {
   baseUrl: string;
@@ -39,10 +41,13 @@ export function runtimeStreamInput(
 export interface RuntimeEventsState {
   runtimeView: ChiliRuntimeView;
   revision: number;
+  /** Advances only when recovery replaced the projection with a snapshot. */
+  recoveryRevision: number;
   connection: RuntimeConnectionState;
   message: string;
   reconnect: () => void;
   hydrateEvents: (events: readonly ChiliEvent[]) => void;
+  hydrateMessages: (messages: readonly Message[]) => void;
 }
 
 export function useRuntimeEvents(input: { client: HttpRuntimeClient; options: RuntimeTuiOptions }): RuntimeEventsState {
@@ -61,6 +66,7 @@ export function useRuntimeEvents(input: { client: HttpRuntimeClient; options: Ru
   const snapshotCoveredSessionIdsRef = useRef(new Set<string>());
 
   const [revision, setRevision] = useState(0);
+  const [recoveryRevision, setRecoveryRevision] = useState(0);
   const [connection, setConnection] = useState<RuntimeConnectionState>(() => ({ status: "connecting" }));
   const [message, setMessage] = useState("connecting");
 
@@ -114,6 +120,7 @@ export function useRuntimeEvents(input: { client: HttpRuntimeClient; options: Ru
           streamFromStartRef.current = snapshot.afterEventId === undefined;
           snapshotRequiredRef.current = false;
           restoringSnapshot = false;
+          setRecoveryRevision((current) => current + 1);
           setRevision((current) => current + 1);
           setSafeConnection(connectionState("reconnecting", undefined, snapshot.afterEventId), snapshot.warning ?? "event snapshot restored");
         }
@@ -131,6 +138,14 @@ export function useRuntimeEvents(input: { client: HttpRuntimeClient; options: Ru
           setConnection(connectionState("streaming", undefined, streamCursorRef.current));
           setMessage(`last event: ${event.type}`);
           if (applied) setRevision((current) => current + 1);
+          if (hasRuntimePartStreamGap(runtimeViewRef.current)) {
+            snapshotRequiredRef.current = true;
+            setSafeConnection(connectionState("reconnecting", undefined, streamCursorRef.current), "restoring missing response content");
+            // Abort this subscription once. Its replacement receives an active
+            // content snapshot before new deltas, so a missing chunk is not polled.
+            startStream("reconnecting");
+            return;
+          }
         }
         if (!mountedRef.current || controller.signal.aborted || version !== streamVersionRef.current) return;
         markRuntimeOutputGap(runtimeViewRef.current);
@@ -176,6 +191,12 @@ export function useRuntimeEvents(input: { client: HttpRuntimeClient; options: Ru
     if (applied) setRevision((current) => current + 1);
   }, [applyEventOnce]);
 
+  const hydrateMessages = useCallback((messages: readonly Message[]) => {
+    if (!mountedRef.current) return;
+    hydrateRuntimeMessages(runtimeViewRef.current, messages);
+    setRevision((current) => current + 1);
+  }, []);
+
   useEffect(() => {
     mountedRef.current = true;
     startStream("connecting");
@@ -189,11 +210,13 @@ export function useRuntimeEvents(input: { client: HttpRuntimeClient; options: Ru
   return useMemo(() => ({
     runtimeView: runtimeViewRef.current,
     revision,
+    recoveryRevision,
     connection,
     message,
     reconnect,
     hydrateEvents,
-  }), [connection, hydrateEvents, message, reconnect, revision]);
+    hydrateMessages,
+  }), [connection, hydrateEvents, hydrateMessages, message, reconnect, recoveryRevision, revision]);
 }
 
 function connectionState(

@@ -1413,10 +1413,10 @@ test("replayable windows pin an active tool with its recovered start across an u
     })),
     {
       id: "event_active_tool_tail",
-      type: "tool.output_delta",
+      type: "tool.call_updated",
       time: 104 as TimestampMs,
       sessionId,
-      payload: { callId: "call_active", stream: "stdout", delta: "still running", sequence: 1 },
+      payload: { callId: "call_active", status: "running" },
     },
   ] as RuntimeEvent[]);
   const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });

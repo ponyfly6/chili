@@ -29,10 +29,11 @@ export type ChatDisplayItem =
       id: string;
       text: string;
       phase?: Extract<ChatMessagePart, { type: "text" }>["phase"];
+      completion?: Extract<ChatMessagePart, { type: "text" }>["completion"];
       streaming?: boolean;
       time?: number;
     }
-  | { kind: "reasoning"; id: string; text: string; collapsed: true; active?: boolean; time?: number }
+  | { kind: "reasoning"; id: string; text: string; collapsed: true; completion?: Extract<ChatMessagePart, { type: "reasoning" }>["completion"]; active?: boolean; time?: number }
   | { kind: "tool_activity"; id: string; activity: ToolActivityDisplay; time?: number }
   | { kind: "tool_group"; id: string; label: string; tone: ToolActivityTone; metadata: ToolGroupMetadata; activities: ToolActivityDisplay[]; time?: number }
   | { kind: "approval"; id: string; approval: ChatApprovalRow; time?: number }
@@ -230,18 +231,21 @@ function messageDisplayItems(
 
   const output: ChatDisplayItem[] = [];
   const hideAssistantThinking = hideThinking && message.role === "assistant";
-  let hiddenTraceShown = false;
-  const showHiddenTrace = (active: boolean) => {
-    if (hiddenTraceShown) return;
-    output.push({ kind: "reasoning", id: `${message.id}:hidden-thinking`, text: "", collapsed: true, time: message.createdAt, ...(active ? { active } : {}) });
-    hiddenTraceShown = true;
+  let hiddenTrace: Extract<ChatDisplayItem, { kind: "reasoning" }> | undefined;
+  const showHiddenTrace = (completion: Extract<ChatMessagePart, { type: "text" }>["completion"]) => {
+    if (!hiddenTrace) {
+      hiddenTrace = { kind: "reasoning", id: `${message.id}:hidden-thinking`, text: "", collapsed: true, time: message.createdAt };
+      output.push(hiddenTrace);
+    }
+    if (streaming && completion === undefined) hiddenTrace.active = true;
+    if (completion === "cancelled" || completion === "failed") hiddenTrace.completion = completion;
   };
 
   for (const [index, part] of message.parts.entries()) {
     const id = `${message.id}:${part.id}:${index}`;
     if (part.type === "text") {
       if (hideAssistantThinking && part.phase === "commentary") {
-        if (part.text.trim()) showHiddenTrace(streaming);
+        if (part.text.trim()) showHiddenTrace(part.completion);
         continue;
       }
       if (message.role === "assistant") {
@@ -251,7 +255,8 @@ function messageDisplayItems(
           text: publicSyntheticAssistantText(part.text, part.synthetic),
           time: message.createdAt,
           ...(part.phase === undefined ? {} : { phase: part.phase }),
-          ...(streaming ? { streaming: true } : {}),
+          ...(part.completion === undefined ? {} : { completion: part.completion }),
+          ...(streaming && part.completion === undefined ? { streaming: true } : {}),
         });
       }
       else output.push({ kind: "summary", id, text: `${message.role}: ${part.text}`, time: message.createdAt });
@@ -265,10 +270,14 @@ function messageDisplayItems(
     if (part.type === "reasoning") {
       if (!part.text.trim()) continue;
       if (hideAssistantThinking) {
-        if (part.text.trim()) showHiddenTrace(streaming);
+        if (part.text.trim()) showHiddenTrace(part.completion);
         continue;
       }
-      output.push({ kind: "reasoning", id, text: part.text, collapsed: true, time: message.createdAt, ...(streaming ? { active: true } : {}) });
+      output.push({
+        kind: "reasoning", id, text: part.text, collapsed: true, time: message.createdAt,
+        ...(part.completion === undefined ? {} : { completion: part.completion }),
+        ...(streaming && part.completion === undefined ? { active: true } : {}),
+      });
       continue;
     }
     if (part.type === "summary") {
@@ -531,7 +540,7 @@ function streamingAssistantMessageId(items: readonly ChatTranscriptItem[], optio
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
     if (item?.kind !== "message" || item.role !== "assistant" || item.completedAt !== undefined) continue;
-    if (item.parts.some((part) => part.type === "text")) return item.id;
+    if (item.parts.some((part) => part.type === "text" || part.type === "reasoning")) return item.id;
   }
   return undefined;
 }

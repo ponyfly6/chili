@@ -3,6 +3,7 @@ import {
   RUNTIME_STATE_SNAPSHOT_MAX_BYTES,
   type ChiliEvent, type RuntimeStateSnapshot, type SessionId,
 } from "@chili/protocol";
+import type { StoredContentCodec } from "./content-store.js";
 
 const MAX_SESSIONS = 1_024;
 const MAX_REQUIRED_ROWS = 4_096;
@@ -11,7 +12,7 @@ const JSON_BYTES = 128_000;
 const MAX_NATIVE_JSON_BYTES = 16_000_000;
 const OMITTED = "\n[Snapshot display truncated; full content remains in storage.]";
 type Row = Record<string, string | number | null>;
-interface EventRow extends Row { seq: number; id: string; type: string; time: number; payload_json: string | null; native_too_large: number; }
+interface EventRow extends Row { seq: number; id: string; type: string; time: number; payload_json: string | null; native_too_large: number; content_version: number; }
 interface Seed { seq: number; ordinal: number; event: ChiliEvent; sourceSeq?: number; }
 
 export interface RuntimeSnapshotOptions { sessionId?: SessionId; maxBytes?: number; }
@@ -22,7 +23,11 @@ export class RuntimeSnapshotLimitError extends Error {
 }
 
 /** No awaits inside this transaction: projections and the resume cursor share one SQLite read view. */
-export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotOptions = {}): RuntimeStateSnapshot {
+export function readRuntimeStateSnapshot(
+  db: Database,
+  options: RuntimeSnapshotOptions = {},
+  content?: Pick<StoredContentCodec, "resolveBounded">,
+): RuntimeStateSnapshot {
   const maxBytes = Math.min(options.maxBytes ?? RUNTIME_STATE_SNAPSHOT_MAX_BYTES, RUNTIME_STATE_SNAPSHOT_MAX_BYTES);
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new RangeError("snapshot maxBytes must be positive");
   // A UTF-16 character may consume four UTF-8 bytes. Reserve room for multiple display
@@ -52,10 +57,28 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
     const toolIds = new Set<string>();
     const seededEventSeqs = new Set<number>();
     const markTruncated = () => { snapshot.truncated = true; };
+    // Resolve only rows whose database metadata identifies the stored format;
+    // older user data may legitimately look like a content reference. File reads
+    // and legacy inline SQLite values both remain bounded before materialization.
+    const resolveContent = <T>(value: T, encoded = false): T => encoded && content
+      ? content.resolveBounded(value, FIELD_CHARS, markTruncated)
+      : value;
     const text = (value: string | number | null | undefined, originalLength?: string | number | null): string => {
       const result = String(value ?? "");
       if (Number(originalLength ?? Array.from(result).length) > Array.from(result).length) { markTruncated(); return result + OMITTED; }
       return result;
+    };
+    const storedText = (value: string | number | null | undefined, originalLength?: string | number | null, encoded = false): string => {
+      if (encoded && typeof value === "string" && value.startsWith('{"__chiliStoredValue":1,')) {
+        let parsed: unknown;
+        try { parsed = JSON.parse(value); } catch { /* Older plain output may share the marker prefix. */ }
+        if (parsed !== undefined) {
+          const resolved = resolveContent(parsed, true);
+          if (typeof resolved === "string") return resolved;
+        }
+        return text(unicodePrefix(value, FIELD_CHARS), originalLength);
+      }
+      return text(value, originalLength);
     };
     const add = (type: string, payload: unknown, sessionId: string | undefined, time: number, seq = 0): void => {
       const event = {
@@ -67,12 +90,12 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
       usedBytes += bytes;
       seeds.push({ seq, ordinal: ordinal++, event });
     };
-    const boundedJson = (json: string | number | null | undefined, fallback: unknown = {}): unknown => {
+    const boundedJson = (json: string | number | null | undefined, fallback: unknown = {}, encoded = false): unknown => {
       if (json === null || json === undefined) { markTruncated(); return fallback; }
-      return JSON.parse(String(json));
+      return resolveContent(JSON.parse(String(json)), encoded);
     };
     const latest = (sessionId: string, type: string, extra = "", values: string[] = []): EventRow | null => db.query<EventRow, string[]>(
-      `select seq, id, type, time, length(cast(payload_json as blob)) > ${MAX_NATIVE_JSON_BYTES} as native_too_large,
+      `select seq, id, type, time, content_version, length(cast(payload_json as blob)) > ${MAX_NATIVE_JSON_BYTES} as native_too_large,
        case when length(cast(payload_json as blob)) <= ${JSON_BYTES} then payload_json end as payload_json
        from events where session_id = ? and type = ? ${extra
         ? `and case when length(cast(payload_json as blob)) > ${MAX_NATIVE_JSON_BYTES} then 1 else (${extra.replace(/^and /u, "")}) end`
@@ -80,7 +103,7 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
     ).get(sessionId, type, ...values);
     const eventPayload = (row: EventRow): unknown => {
       if (row.native_too_large) throw new RuntimeSnapshotLimitError();
-      if (row.payload_json !== null) return JSON.parse(row.payload_json);
+      if (row.payload_json !== null) return resolveContent(JSON.parse(row.payload_json), row.content_version === 1);
       // Diagnostic strings can exceed the SSE limit. Select only bounded display fields,
       // never load their entire JSON blob into JavaScript just to truncate it afterwards.
       markTruncated();
@@ -118,7 +141,7 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
           }
         }
         add("message.created", { messageId: id, role: row.role, ...(row.turn_id ? { turnId: row.turn_id } : {}) }, sessionId, Number(row.created_at), seq);
-        const parts = queryRows<Row>(db, `select id, type, ordinal, delta_event_seq, created_at,
+        const parts = queryRows<Row>(db, `select id, type, ordinal, delta_event_seq, created_at, content_version,
           length(cast(data_json as blob)) > ${MAX_NATIVE_JSON_BYTES} as native_too_large,
           case when length(cast(data_json as blob)) <= ${MAX_NATIVE_JSON_BYTES} then
             case when length(cast(json_remove(data_json, '$.structuredData', '$.modelOutput') as blob)) <= ${JSON_BYTES}
@@ -129,14 +152,28 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
           if (++partCount > MAX_REQUIRED_ROWS) throw new RuntimeSnapshotLimitError();
           if (partRow.native_too_large) throw new RuntimeSnapshotLimitError();
           let part: Record<string, unknown>;
-          if (partRow.data_json !== null) part = JSON.parse(String(partRow.data_json)) as Record<string, unknown>;
+          if (partRow.data_json !== null) {
+            const storedPart = JSON.parse(String(partRow.data_json)) as Record<string, unknown>;
+            // A prefix of base64 image data is unusable. Omit images from bounded
+            // recovery instead of opening an image file only to truncate it.
+            if (partRow.content_version === 1 && storedPart.type === "image" && storedPart.data && typeof storedPart.data === "object") {
+              markTruncated();
+              storedPart.data = "";
+              storedPart.displayText = "[Image omitted from recovery snapshot]";
+            }
+            part = resolveContent(storedPart, partRow.content_version === 1);
+            // The generic JSON omission placeholder is suitable for unknown tool
+            // input, but typed array fields must keep their protocol shape.
+            if (part.type === "tool_result" && part.content !== undefined && !Array.isArray(part.content)) delete part.content;
+            if (part.type === "patch" && !Array.isArray(part.files)) part.files = [];
+          }
           else {
             markTruncated();
             // Preserve identity/type anchors even when an image, tool result or text is huge.
-            const fields = db.query<Row, [string]>(`select ${["text", "displayText", "output", "error", "callId", "providerCallId", "toolName", "status", "phase", "mimeType", "filename", "sourcePath", "agentPath", "summary", "artifactId", "boundaryMessageId", "reason"].map((field) =>
+            const fields = db.query<Row, [string]>(`select ${["text", "displayText", "output", "error", "callId", "providerCallId", "toolName", "status", "phase", "mimeType", "filename", "sourcePath", "agentPath", "summary", "artifactId", "boundaryMessageId", "reason", "completion"].map((field) =>
               `substr(json_extract(data_json, '$.${field}'), 1, ${FIELD_CHARS}) as ${field}`).join(", ")}
               from message_parts where id = ?`).get(String(partRow.id))!;
-            part = { id: partRow.id, type: partRow.type, messageId: id, sessionId,
+            part = { id: partRow.id, type: partRow.type, messageId: id, sessionId, ordinal: Number(partRow.ordinal),
               ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== null)) };
             if (partRow.type === "image") { part.data = ""; part.displayText = "[Image omitted from recovery snapshot]"; }
             if (partRow.type === "tool_call") part.input = { omitted: "Snapshot input exceeded display limit" };
@@ -144,8 +181,8 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
             if (partRow.type === "text" || partRow.type === "reasoning") part.text = String(part.text ?? "") + OMITTED;
             if (partRow.type === "tool_result") part.output = String(part.output ?? "") + OMITTED;
           }
-          // The store checkpoints deltas only at turn completion. Fold the pending durable ledger
-          // into each seed before advancing the snapshot high-water mark.
+          // Older stores persisted deltas between content checkpoints. Fold that
+          // legacy ledger into the seed while new writes store completed parts.
           const field = part.type === "text" || part.type === "reasoning" ? "text" : part.type === "tool_result" ? "output" : undefined;
           if (field) {
             if (db.query<{ found: number }, [string, number]>(`select 1 as found from events
@@ -184,10 +221,14 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
       }
     };
     const readTools = (sessionId: string, turnId?: string): void => {
-      const rows = queryRows<Row>(db, `select id, provider_call_id, parent_call_id, turn_id, tool_name, status,
+      const rows = queryRows<Row>(db, `select id, provider_call_id, parent_call_id, turn_id, tool_name, status, input_content_version, output_content_version,
         case when length(cast(input_json as blob)) <= ${JSON_BYTES} then input_json end as input_json,
-        substr(output, 1, ${FIELD_CHARS}) as output, length(output) as output_length,
-        substr(error, 1, ${FIELD_CHARS}) as error, length(error) as error_length,
+        case when output_content_version = 1 then
+          case when length(cast(output as blob)) <= ${JSON_BYTES} then output end
+          else substr(output, 1, ${FIELD_CHARS}) end as output, length(output) as output_length,
+        case when output_content_version = 1 then
+          case when length(cast(error as blob)) <= ${JSON_BYTES} then error end
+          else substr(error, 1, ${FIELD_CHARS}) end as error, length(error) as error_length,
         synthetic, started_at, updated_at,
         (select min(seq) from events where type = 'tool.call_started' and events.session_id = tool_calls.session_id
           and case when length(cast(payload_json as blob)) <= ${MAX_NATIVE_JSON_BYTES}
@@ -204,14 +245,14 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
         toolIds.add(callId);
         add("tool.call_started", {
           callId, turnId: row.turn_id ?? `snapshot-turn:${sessionId}`, toolName: row.tool_name,
-          input: boundedJson(row.input_json, { omitted: "Snapshot input exceeded display limit" }),
+          input: boundedJson(row.input_json, { omitted: "Snapshot input exceeded display limit" }, row.input_content_version === 1),
           ...(row.provider_call_id ? { providerCallId: row.provider_call_id } : {}),
           ...(row.parent_call_id ? { parentCallId: row.parent_call_id } : {}),
         }, sessionId, Number(row.started_at), Number(row.seq ?? 0));
         if (["completed", "failed", "cancelled"].includes(String(row.status))) {
           add("tool.call_finished", { callId, status: row.status,
-            ...(row.output !== null ? { output: text(row.output, row.output_length) } : {}),
-            ...(row.error !== null ? { error: text(row.error, row.error_length) } : {}),
+            ...(row.output !== null ? { output: storedText(row.output, row.output_length, row.output_content_version === 1) } : {}),
+            ...(row.error !== null ? { error: storedText(row.error, row.error_length, row.output_content_version === 1) } : {}),
             ...(row.synthetic ? { synthetic: true } : {}),
           }, sessionId, Number(row.updated_at), Number(row.seq ?? 0) + 0.2);
         } else if (row.status !== "running") add("tool.call_updated", { callId, status: row.status }, sessionId, Number(row.updated_at), Number(row.seq ?? 0) + 0.2);
@@ -251,7 +292,7 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
       const retry = latest(sessionId, "turn.retry_scheduled");
       if (retry) {
         const clearing = db.query<{ seq: number }, [string]>(`select max(seq) as seq from events where session_id = ? and type in
-          ('session.status_changed','turn.started','turn.completed','turn.model_metadata','message.part_added','message.part_delta','tool.call_started')`).get(sessionId);
+          ('session.status_changed','turn.started','turn.completed','turn.model_metadata','message.part_added','message.part_committed','message.part_delta','tool.call_started')`).get(sessionId);
         if (retry.seq > (clearing?.seq ?? 0)) seedEvent(retry, sessionId);
       }
       const approvals = queryRows<Row>(db, `select id, call_id, permission, max_approval_scope, created_at,
@@ -314,7 +355,7 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
       if (db.query<{ found: number }, [string]>(`select 1 as found from events where session_id = ?
         and type in ('user_input.requested', 'user_input.resolved', 'user_input.cancelled')
         and length(cast(payload_json as blob)) > ${MAX_NATIVE_JSON_BYTES} limit 1`).get(sessionId)) throw new RuntimeSnapshotLimitError();
-      const requests = queryRows<EventRow>(db, `select seq, id, type, time,
+      const requests = queryRows<EventRow>(db, `select seq, id, type, time, content_version,
         length(cast(payload_json as blob)) > ${MAX_NATIVE_JSON_BYTES} as native_too_large,
         case when length(cast(payload_json as blob)) <= ${JSON_BYTES} then payload_json end as payload_json
         from events requested where session_id = ? and type = 'user_input.requested' and not exists (

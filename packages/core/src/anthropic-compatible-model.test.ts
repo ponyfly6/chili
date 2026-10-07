@@ -328,7 +328,8 @@ test("legacy Anthropic-compatible router parses successful responses larger than
   }), { status: 200 }));
 
   expect(await collectLegacy(router, "large_success")).toEqual([
-    { type: "text_delta", text },
+    { type: "text_delta", text, index: 0 },
+    { type: "text_end", index: 0 },
     { type: "finish", reason: "end_turn" },
   ]);
 });

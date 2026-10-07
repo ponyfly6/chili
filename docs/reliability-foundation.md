@@ -98,7 +98,8 @@ overflow requests a state resync. Explicit rotation settings remain available as
 operational overrides; they are unnecessary for bounding memory.
 
 The resident data bound includes the SSE queue, one database page, one encoded
-frame, the temporary queue, and a small terminal control frame. This is an
+frame, the temporary queue, a separately byte-bounded active-content bootstrap,
+and a small terminal control frame. This is an
 application-layer bound; Bun and the operating system also maintain transport
 buffers. Byte budgets bound serialized data, not exact JavaScript heap overhead.
 
@@ -121,8 +122,10 @@ responses are byte-bounded during reading, before JSON parsing.
 
 `GET /events/snapshot` (optionally scoped by `sessionId`) reads a compact
 materialized state and its durable high-water cursor in one SQLite read
-transaction. Snapshot seeds contain current state, including active message
-deltas that have not yet been checkpointed. Seed IDs are projection identities;
+transaction. The observable store adds current in-memory text and thinking.
+New SSE subscriptions capture these active blocks after subscribing, before any
+asynchronous replay work; offsets suppress overlapping live fragments. Legacy
+persisted deltas are still folded when reading old messages. Seed IDs are projection identities;
 they must never be used as SSE resume cursors.
 
 The TUI uses this endpoint for an invalid cursor, an excessive replay backlog,
@@ -174,51 +177,43 @@ The sibling Codex implementation informed the queue and recovery boundaries:
 Chili does not adopt Codex's transport or persistence architecture. SQLite,
 SSE, and incremental cursor replay remain the runtime contract.
 
-### Storage amplification: separate follow-up
+### Complete content and file storage
 
-This delivery change does not reduce durable storage. The reported sample
-(roughly 45,000 text deltas carrying 0.38 MB of text in 6.12 MB of payload, and
-roughly 5.89 MB of tool output repeated four times) is consistent with the
-current write paths, but those figures are a workload sample, not a repository
-benchmark. Indexes, WAL, and mirrors require separate accounting.
+New model text and thinking are accumulated in memory. A provider block-end
+commits one complete `message.part_committed`; providers without a block-end
+commit pending content at response finish. Cancellation and handled failures
+commit the received text with `completion: cancelled` or `failed`, and failed
+turns retain their reason. An abrupt process exit loses uncommitted content.
+There are no disk drafts, periodic text checkpoints, or index-rebuild service.
+Original thinking and opaque provider continuation fields remain available.
 
-Every `message.part_delta` is still written to the event ledger. Turn completion
-checkpoints those deltas into `message_parts.data_json` and advances
-`delta_event_seq`; it does not delete the ledger rows. The checkpoint avoids
-repeatedly rewriting a growing projection, while pending deltas remain necessary
-for reads and crash recovery. Live SSE and snapshots do not change this policy.
+`message.part_stream_delta` and `message.part_stream_snapshot` are transient.
+Offsets use JavaScript string code units. Completed blocks replace active text;
+late fragments cannot append to a completed block. Part ordinals preserve the
+order in which blocks first appeared, even when completion is interleaved.
+Tool argument fragments accumulate in memory until their complete call boundary.
 
-Tool result text normally appears in both `tool.call_finished` and the
-`tool_result` message part, and again in `tool_calls.output` and
-`message_parts.data_json`. These records have different lifecycle/transcript
-roles. A future content-addressed immutable blob can let them share a body
-without deleting their distinct semantics. References need atomic publication,
-versioned resolution, retention/garbage collection, and an export strategy.
-Existing large-tool-output sidecars do not provide cross-record deduplication.
+File-backed stores put immutable content under
+`<database-directory>/contents/<database-filename>/`, grouped by session. Text,
+images, tool inputs/results and model-request content are referenced from SQLite.
+Equal content within a session shares a file, including tool results reused in
+message parts, tool records and prepared requests. JSON manifests carry the
+structural data needed to resolve those references. New file contents are synced
+before SQLite publishes their references. SQLite retains event identities,
+ordering, relations, short previews, input acceptance and execution state.
+Back up the database and its content directory together.
 
-Each model attempt records its actual prepared request, including selected and
-trimmed context, instructions, tool schemas, and provenance. Replacing that
-snapshot with mutable message IDs would lose what was actually sent. Immutable
-content/version manifests could preserve that audit guarantee while sharing
-repeated context and schemas.
+The default Host no longer writes a second transcript JSONL mirror. Explicit
+mirror utilities remain available to embedders. Existing inline SQLite records
+remain readable, and the required storage-format and byte-accounting columns are added when opening
+an existing store. This does not rewrite or delete old history or its duplicate
+payloads. Unreferenced files from rejected transactions are not automatically
+imported or collected.
 
-The default Host uses `SessionTranscriptJsonlMirror`: it flushes aggregate
-messages at turn boundaries, rather than mirroring every delta or model request.
-Its `text` and `parts` fields can repeat the same body. Alternative complete
-event-mirror classes also exist. Changing mirror layout or retention requires a
-separate compatibility/export decision.
-
-Real-time temporary text deltas plus periodic durable checkpoints and final
-content are a plausible later protocol change. It requires message-part
-revision/offsets, idempotent checkpoint replacement, atomic checkpoint/cursor
-boundaries, and final flush behavior for completion, cancellation, and errors.
-Only persisting the final answer would weaken the current crash-recovery
-guarantee. Preserving every emitted character requires a durable journal or
-committed batches, with an explicit loss window for any uncommitted output.
-
-Ledger compaction must first prove that a committed checkpoint covers the rows
-being removed. It also needs a retention low-water mark, stable monotonic
-sequence allocation, and an explicit expired-cursor-to-snapshot path. The
-existing event-ID lookup and pending-delta reads must not be broken by deleting
-rows directly. None of these write, deletion, or migration changes are part of
-the SSE buffer and recovery work.
+Event-page limits use the resolved content size before opening referenced bodies.
+Recovery snapshots remain bounded display views, not backups. Active content
+must fit without truncation so subsequent offsets remain meaningful. Historical
+content can still be clipped in a recovery view; the ordinary message API reads
+the stored content, and the TUI reloads the selected session's history after a
+snapshot replacement. The SSE queue and transport backpressure limits continue
+to apply independently of persistent storage.

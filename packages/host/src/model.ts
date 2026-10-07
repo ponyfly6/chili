@@ -956,7 +956,9 @@ function isModelStreamEvent(event: ProviderModelStreamEvent): boolean {
   return (
     event.type === "metadata" ||
     event.type === "text_delta" ||
+    event.type === "text_end" ||
     event.type === "reasoning_delta" ||
+    event.type === "reasoning_end" ||
     event.type === "reasoning_item" ||
     event.type === "tool_call_start" ||
     event.type === "tool_call_delta" ||

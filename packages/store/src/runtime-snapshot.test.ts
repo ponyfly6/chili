@@ -1,5 +1,4 @@
 import { test, expect } from "bun:test";
-import type { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +14,7 @@ import {
   type ToolCallId,
   type TurnId,
 } from "@chili/protocol";
-import { readRuntimeStateSnapshot, RuntimeSnapshotLimitError } from "./runtime-snapshot.js";
+import { RuntimeSnapshotLimitError } from "./runtime-snapshot.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 
 const sessionId = "session_snapshot" as SessionId;
@@ -31,10 +30,6 @@ function event<T extends RuntimeEvent["type"]>(
   time = 1,
 ): Extract<RuntimeEvent, { type: T }> {
   return { id, type, sessionId, time: time as TimestampMs, payload } as Extract<RuntimeEvent, { type: T }>;
-}
-
-function sqliteDatabase(store: SqliteEventStore): Database {
-  return (store as unknown as { db: Database }).db;
 }
 
 function sessionCreated(): RuntimeEvent {
@@ -54,7 +49,7 @@ test("runtime snapshot materializes ongoing message deltas and hands off at the 
       }),
       event("event_delta", "message.part_delta", { messageId, partId, field: "text", delta: "lo" }),
     ]);
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId }));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId }));
     expect(snapshot.version).toBe(1);
     expect(snapshot.afterEventId).toBe("event_delta");
     expect(snapshot.coveredSessionIds).toContain(sessionId);
@@ -77,10 +72,10 @@ test("runtime snapshot materializes ongoing message deltas and hands off at the 
   }
 });
 
-test("runtime snapshot omits a resume cursor when no durable event exists", () => {
+test("runtime snapshot omits a resume cursor when no durable event exists", async () => {
   const store = new SqliteEventStore(":memory:");
   try {
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store)));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot());
     expect(snapshot.afterEventId).toBeUndefined();
     expect(snapshot.events).toEqual([]);
     expect(snapshot.coveredSessionIds).toEqual([]);
@@ -106,7 +101,7 @@ test("runtime snapshot bounds large persisted output by UTF-8 bytes and advertis
       }),
     ]);
     const maxBytes = 64 * 1_024;
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId, maxBytes }));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId, maxBytes }));
     expect(Buffer.byteLength(JSON.stringify(snapshot), "utf8")).toBeLessThanOrEqual(maxBytes);
     expect(snapshot.truncated).toBe(true);
     expect(snapshot.warning).toBeTruthy();
@@ -143,7 +138,7 @@ test("runtime snapshot keeps unresolved approvals and their active tool anchors"
         maxApprovalScope: "once", metadata: { reason: "workspace policy" },
       }),
     ]);
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId }));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId }));
     const approvals = snapshot.events.filter((entry) => entry.type === "approval.requested");
     expect(approvals).toHaveLength(1);
     expect(approvals[0]).toMatchObject({
@@ -172,7 +167,7 @@ test("runtime snapshot restores the latest session lifecycle and retry state", a
       event("event_retry_one", "turn.retry_scheduled", { turnId, attempt: 1, delayMs: 100, reason: "network" }),
       event("event_retry_two", "turn.retry_scheduled", { turnId, attempt: 2, delayMs: 200, reason: "network" }),
     ]);
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId }));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId }));
     expect(snapshot.events.filter((entry) => entry.type === "session.status_changed")).toMatchObject([
       { payload: { sessionId, status: "running", turnId } },
     ]);
@@ -208,7 +203,7 @@ test("runtime snapshot retains an active tool when old transcript history exceed
     }
     await store.appendMany(history);
     const maxBytes = 8 * 1_024;
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId, maxBytes }));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId, maxBytes }));
     expect(Buffer.byteLength(JSON.stringify(snapshot), "utf8")).toBeLessThanOrEqual(maxBytes);
     expect(snapshot.truncated).toBe(true);
     expect(snapshot.events.find((entry) => entry.type === "tool.call_started" && entry.payload.callId === callId)).toMatchObject({
@@ -231,7 +226,7 @@ test("runtime snapshot excludes temporary tool output while preserving durable c
       event("event_preview", "tool.output_delta", { callId, stream: "stdout", delta: "temporary preview" }),
       event("event_tool_finished", "tool.call_finished", { callId, status: "completed", output: "durable result" }),
     ]);
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId }));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId }));
     expect(snapshot.temporaryOutput).toBe("not-replayed");
     expect(snapshot.events.some((entry) => entry.type === "tool.output_delta")).toBe(false);
     expect(snapshot.events.find((entry) => entry.type === "tool.call_finished")).toMatchObject({
@@ -253,7 +248,7 @@ test("runtime snapshot recovers beyond an oversized status event without losing 
         sessionId, status: "running", turnId, reason: "large diagnostic ".repeat(250_000),
       }),
     ]);
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId }));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId }));
     expect(snapshot.afterEventId).toBe("event_oversized_status");
     expect(snapshot.truncated).toBe(true);
     expect(snapshot.warning).toBeTruthy();
@@ -273,8 +268,8 @@ test("runtime snapshot fails explicitly when required state cannot fit the byte 
   const store = new SqliteEventStore(":memory:");
   try {
     await store.append(sessionCreated());
-    expect(() => readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId, maxBytes: 16 }))
-      .toThrow(RuntimeSnapshotLimitError);
+    await expect(store.runtimeSnapshot({ sessionId, maxBytes: 16 }))
+      .rejects.toThrow(RuntimeSnapshotLimitError);
   } finally {
     store.close();
   }
@@ -293,7 +288,7 @@ test("runtime snapshot reads the archived queue projection instead of its older 
     await store.append(event("event_archived", "session.archived", { sessionId }, Date.now()));
     expect(await store.events({ sessionId, type: "session.input_queue_changed" })).toEqual(queueEventsBeforeArchive);
 
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId }));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId }));
     const queue = snapshot.events.find((entry) => entry.type === "session.input_queue_changed");
     expect(queue?.payload).toEqual(store.sessionInputQueue(sessionId));
     expect(queue?.payload).toMatchObject({ paused: true, pendingCount: 0, items: [] });
@@ -315,12 +310,12 @@ test("runtime snapshot covers every existing session including empty and archive
       { ...event("event_archive_session", "session.created", { sessionId: archivedSessionId, cwd: "/repo" }), sessionId: archivedSessionId },
       { ...event("event_archive", "session.archived", { sessionId: archivedSessionId }), sessionId: archivedSessionId },
     ]);
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store)));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot());
     expect(new Set(snapshot.coveredSessionIds)).toEqual(new Set([sessionId, emptySessionId, archivedSessionId]));
     expect(new Set(snapshot.events.filter((entry) => entry.type === "session.created").map((entry) => entry.sessionId)))
       .toEqual(new Set(snapshot.coveredSessionIds));
     expect(snapshot.afterEventId).toBe("event_archive");
-    const scoped = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId: emptySessionId }));
+    const scoped = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId: emptySessionId }));
     expect(scoped.coveredSessionIds).toEqual([emptySessionId]);
     expect(scoped.events.every((entry) => entry.sessionId === emptySessionId)).toBe(true);
   } finally {
@@ -341,7 +336,7 @@ test("runtime snapshot clears stale retry state after a later durable message de
       event("event_retry", "turn.retry_scheduled", { turnId, attempt: 1, delayMs: 100, reason: "network" }),
       event("event_resumed_delta", "message.part_delta", { messageId, partId, field: "text", delta: " again" }),
     ]);
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId }));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId }));
     expect(snapshot.events.some((entry) => entry.type === "turn.retry_scheduled")).toBe(false);
     expect(snapshot.events.find((entry) => entry.type === "message.part_added")).toMatchObject({
       payload: { part: { text: "hello again" } },
@@ -375,11 +370,11 @@ test("runtime snapshot finalizes SQLite iterators after truncating deltas and re
       event("event_large_delta", "message.part_delta", { messageId, partId, field: "text", delta: "y".repeat(32_000) }),
       event("event_tail_delta", "message.part_delta", { messageId, partId, field: "text", delta: "tail" }),
     ]);
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId, maxBytes: 64 * 1_024 }));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId, maxBytes: 64 * 1_024 }));
     expect(snapshot.truncated).toBe(true);
     expect(snapshot.afterEventId).toBe("event_tail_delta");
-    expect(() => readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId, maxBytes: 1_024 }))
-      .toThrow(RuntimeSnapshotLimitError);
+    await expect(store.runtimeSnapshot({ sessionId, maxBytes: 1_024 }))
+      .rejects.toThrow(RuntimeSnapshotLimitError);
     // A WAL checkpoint on file-backed stores detects statements left active by early loop exits.
     expect(() => store.close()).not.toThrow();
   } finally {
@@ -408,7 +403,7 @@ test("runtime snapshot retains completed turn state and latest metadata for hist
       event("event_current_metadata", "turn.model_metadata", { turnId, model: "current-model", responseId: "response_current" }),
       event("event_current_message", "message.created", { messageId, role: "assistant", turnId }),
     ]);
-    const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId }));
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId }));
     expect(snapshot.events.filter((entry) => entry.type === "message.created")).toHaveLength(3);
     expect(snapshot.events.filter((entry) => entry.type === "turn.started" && entry.payload.turnId === oldTurnId)).toHaveLength(1);
     expect(snapshot.events.filter((entry) => entry.type === "turn.completed" && entry.payload.turnId === oldTurnId))
@@ -419,6 +414,76 @@ test("runtime snapshot retains completed turn state and latest metadata for hist
     const currentStarted = snapshot.events.findIndex((entry) => entry.type === "turn.started" && entry.payload.turnId === turnId);
     expect(oldCompleted).toBeLessThan(currentStarted);
     expect(snapshot.events.some((entry) => entry.type === "turn.completed" && entry.payload.turnId === turnId)).toBe(false);
+  } finally {
+    store.close();
+  }
+});
+
+test("runtime snapshot resolves file-backed thinking and tool content after reopening", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "chili-file-snapshot-"));
+  const filename = join(directory, "events.sqlite");
+  let store = new SqliteEventStore(filename);
+  try {
+    await store.appendMany([
+      sessionCreated(),
+      event("event_turn", "turn.started", { turnId }),
+      event("event_message", "message.created", { messageId, role: "assistant", turnId }),
+      event("event_reasoning", "message.part_added", {
+        messageId, part: { id: partId, messageId, sessionId, type: "reasoning", text: "Compare the two options." },
+      }),
+      event("event_tool", "tool.call_started", { turnId, callId, toolName: "bash", input: { command: "pwd" } }),
+      event("event_result", "tool.call_finished", { callId, status: "completed", output: "/repo", error: "diagnostic" }),
+    ]);
+    store.close();
+    store = new SqliteEventStore(filename);
+
+    // This budget makes the display prefix smaller than a file-reference marker.
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId, maxBytes: 2_048 }));
+    expect(snapshot.events.find((entry) => entry.type === "message.part_added")).toMatchObject({
+      payload: { part: { type: "reasoning", text: "Compare the two options." } },
+    });
+    expect(snapshot.events.find((entry) => entry.type === "tool.call_started")).toMatchObject({
+      payload: { callId, input: { command: "pwd" } },
+    });
+    expect(snapshot.events.find((entry) => entry.type === "tool.call_finished")).toMatchObject({
+      payload: { callId, output: "/repo", error: "diagnostic" },
+    });
+    expect(JSON.stringify(snapshot)).not.toContain("$chiliContent");
+    expect(snapshot.truncated).toBe(false);
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("runtime snapshot preserves valid part shapes when referenced JSON exceeds its display budget", async () => {
+  const store = new SqliteEventStore(":memory:");
+  try {
+    await store.appendMany([
+      sessionCreated(),
+      event("event_message", "message.created", { messageId, role: "tool", turnId }),
+      event("event_tool_result", "message.part_added", {
+        messageId,
+        part: {
+          id: partId, messageId, sessionId, type: "tool_result", callId, output: "Saved result",
+          content: [{ type: "text", text: "large result".repeat(10_000) }],
+        },
+      }),
+      event("event_patch", "message.part_added", {
+        messageId,
+        part: {
+          id: "part_patch" as PartId, messageId, sessionId, type: "patch",
+          files: Array.from({ length: 1_000 }, (_, index) => `source/directory/file-${index}.ts`),
+        },
+      }),
+    ]);
+    const snapshot = parseRuntimeStateSnapshot(await store.runtimeSnapshot({ sessionId, maxBytes: 8_192 }));
+    expect(snapshot.truncated).toBe(true);
+    const parts = snapshot.events.filter((entry) => entry.type === "message.part_added");
+    expect(parts).toHaveLength(2);
+    expect(parts[0]?.payload.part).toMatchObject({ type: "tool_result", output: "Saved result" });
+    expect(parts[0]?.payload.part).not.toHaveProperty("content");
+    expect(parts[1]?.payload.part).toMatchObject({ type: "patch", files: [] });
   } finally {
     store.close();
   }

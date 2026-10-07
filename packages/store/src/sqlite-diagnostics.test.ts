@@ -79,7 +79,9 @@ test("inspectSqliteEventStore reports files and the largest storage rows", async
     expect(report.pragmas.journalMode).toBe(journalPolicy.journalMode);
     expect(report.pragmas.pageSize).toBeGreaterThan(0);
     expect(report.events.rows).toBe(5);
-    expect(report.events.totalPayloadBytes).toBeGreaterThan(4_000);
+    expect(report.events.totalPayloadBytes).toBeLessThan(4_000);
+    expect(report.contentFiles.files).toBe(2);
+    expect(report.contentFiles.totalBytes).toBeGreaterThan(2_048);
     expect(report.events.byType.find((row) => row.type === "tool.call_finished")).toMatchObject({ rows: 1 });
     expect(report.events.bySession[0]).toMatchObject({ sessionId, rows: 5 });
     expect(report.events.largestPayloads[0]).toMatchObject({ id: "event_tool_result" });

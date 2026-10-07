@@ -5,6 +5,7 @@ import type {
   MessageImageContent,
 } from "@chili/protocol";
 import type { SessionRunClaimFence } from "./types.js";
+import type { StoredContentCodec } from "./content-store.js";
 
 export interface StoredSessionInput extends RuntimeSessionInput {
   payload: string;
@@ -55,7 +56,7 @@ export class SessionInputConflictError extends Error {
 interface InputRow {
   sequence: number; input_id: string; submission_id: string; session_id: string;
   mode: RuntimeInputMode; state: RuntimeSessionInput["state"]; revision: number;
-  payload: string; identity: string; text: string; source: string;
+  payload: string; identity: string; content_version: number; text: string; source: string;
   accepted_at: number; updated_at: number; claim_id: string | null;
   execution_ref: string | null; message_id: string | null; turn_id: string | null;
   outcome: RuntimeInputOutcome | null; error: string | null;
@@ -63,6 +64,7 @@ interface InputRow {
 }
 
 interface InputRepositoryOptions {
+  content?: Pick<StoredContentCodec, "storeText" | "readText" | "textBytes">;
   commit(events: readonly RuntimeEvent[], fence?: SessionRunClaimFence): void;
   claim(input: { sessionId: SessionId; claimId: string; sessionAccess: "root" | "child"; time: number; leaseDurationMs: number }): { status: string };
   forgetClaim(sessionId: SessionId, claimId: string): void;
@@ -70,7 +72,7 @@ interface InputRepositoryOptions {
   retry<T>(operation: () => T): T;
 }
 
-/** SQLite operations only. RuntimeService owns dispatch and execution. */
+/** Persists input receipts and queue state. RuntimeService owns dispatch and execution. */
 export class SessionInputRepository {
   constructor(private readonly db: Database, private readonly options: InputRepositoryOptions) {}
 
@@ -78,14 +80,14 @@ export class SessionInputRepository {
     const row = this.db.query<InputRow, [string, string]>(
       "select * from session_inputs where session_id = ? and submission_id = ?",
     ).get(sessionId, submissionId);
-    return row ? storedInput(row) : undefined;
+    return row ? storedInput(row, this.options.content) : undefined;
   }
 
   getById(sessionId: SessionId, inputId: string): StoredSessionInput | undefined {
     const row = this.db.query<InputRow, [string, string]>(
       "select * from session_inputs where session_id = ? and input_id = ?",
     ).get(sessionId, inputId);
-    return row ? storedInput(row) : undefined;
+    return row ? storedInput(row, this.options.content) : undefined;
   }
 
   queue(sessionId: SessionId): RuntimeInputQueue {
@@ -132,10 +134,11 @@ export class SessionInputRepository {
           "select * from session_inputs where session_id = ? and submission_id = ?",
         ).get(sessionId, command.submissionId);
         if (existing) {
-          if (existing.identity !== (command.identity ?? command.payload) || existing.mode !== command.mode || existing.source !== command.source) {
+          const identity = existing.content_version === 1 ? this.options.content?.readText(existing.identity) ?? existing.identity : existing.identity;
+          if (identity !== (command.identity ?? command.payload) || existing.mode !== command.mode || existing.source !== command.source) {
             throw new SessionInputConflictError("Submission ID already belongs to different input or delivery mode");
           }
-          return { input: storedInput(existing), queue: this.queue(sessionId), events, duplicate: true };
+          return { input: storedInput(existing, this.options.content), queue: this.queue(sessionId), events, duplicate: true };
         }
         const queue = this.queue(sessionId);
         const revoked = this.db.query<{ found: number }, [string, string]>("select 1 as found from session_input_revocations where session_id = ? and source = ?").get(sessionId, command.source);
@@ -146,21 +149,28 @@ export class SessionInputRepository {
         if (command.mode === "start" && (activeClaim || queue.pendingCount > 0 || queue.items.some((item) => item.state === "claimed"))) {
           throw new SessionInputConflictError("Session is busy or paused; enqueue input or explicitly resume it");
         }
-        const usage = this.db.query<{ count: number; bytes: number }, []>(
-          "select count(*) as count, coalesce(sum(length(cast(payload as blob))), 0) as bytes from session_inputs where state = 'pending'",
-        ).get()!;
-        if (queue.pendingCount >= 128 || usage.count >= 4096 || usage.bytes + Buffer.byteLength(command.payload) > 64 * 1024 * 1024) {
+        const pending = this.db.query<{ payload: string; content_version: number }, []>(
+          "select payload, content_version from session_inputs where state = 'pending'",
+        ).all();
+        const pendingBytes = pending.reduce((bytes, row) => bytes + (row.content_version === 1
+          ? this.options.content?.textBytes(row.payload) ?? Buffer.byteLength(row.payload)
+          : Buffer.byteLength(row.payload)), 0);
+        if (queue.pendingCount >= 128 || pending.length >= 4096 || pendingBytes + Buffer.byteLength(command.payload) > 64 * 1024 * 1024) {
           throw new SessionInputConflictError("Pending input capacity exceeded");
         }
         if (Buffer.byteLength(command.payload) > 16 * 1024 * 1024) throw new Error("Input exceeds 16 MiB");
+        const payload = this.options.content?.storeText(command.payload, sessionId) ?? command.payload;
+        const identity = command.identity === undefined || command.identity === command.payload
+          ? payload
+          : this.options.content?.storeText(command.identity, sessionId) ?? command.identity;
         this.db.query("insert or ignore into session_dispatch(session_id) values (?)").run(sessionId);
         // A deliberate fresh start can begin an idle session. It cannot resume
         // older queued work implicitly: pending inputs were rejected above.
         if (command.mode === "start") this.db.query("update session_dispatch set paused = 0 where session_id = ?").run(sessionId);
-        this.db.query(`insert into session_inputs(input_id, submission_id, session_id, mode, state, payload, identity, text, source, accepted_at, updated_at)
-          values (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`).run(
-          command.inputId, command.submissionId, sessionId, command.mode, command.payload,
-          command.identity ?? command.payload, command.text, command.source, time, time,
+        this.db.query(`insert into session_inputs(input_id, submission_id, session_id, mode, state, payload, identity, content_version, text, source, accepted_at, updated_at)
+          values (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`).run(
+          command.inputId, command.submissionId, sessionId, command.mode, payload,
+          identity, this.options.content ? 1 : 0, command.text.slice(0, 2000), command.source, time, time,
         );
         input = this.get(sessionId, command.submissionId);
         changed = true;
@@ -309,6 +319,7 @@ function publicInput(row: InputRow): RuntimeSessionInput {
   };
 }
 
-function storedInput(row: InputRow): StoredSessionInput {
-  return { ...publicInput(row), payload: row.payload, identity: row.identity, source: row.source, resumed: row.resumed === 1, ...(row.claim_id ? { claimId: row.claim_id } : {}) };
+function storedInput(row: InputRow, content?: Pick<StoredContentCodec, "storeText" | "readText" | "textBytes">): StoredSessionInput {
+  const storedContent = row.content_version === 1 ? content : undefined;
+  return { ...publicInput(row), payload: storedContent?.readText(row.payload) ?? row.payload, identity: storedContent?.readText(row.identity) ?? row.identity, source: row.source, resumed: row.resumed === 1, ...(row.claim_id ? { claimId: row.claim_id } : {}) };
 }

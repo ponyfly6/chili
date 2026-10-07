@@ -117,7 +117,9 @@ test("normalizes a hostile tool Error before return, SQLite persistence, and des
       ).get();
       expect(eventRow?.bytes).toBeLessThan(20_000);
       expect(toolRow?.bytes).toBeLessThanOrEqual(PERSISTED_ERROR_LIMITS.messageBytes);
-      expect(toolRow?.error).toBe(result.error.message);
+      // SQLite holds a content reference; the event API above reads the saved, sanitized body.
+      expect(toolRow?.error).toContain("$chiliContent");
+      expect(toolRow?.error).not.toBe(result.error.message);
       for (const secret of [...Object.values(secrets), "CYCLIC_CAUSE_SECRET", "HOSTILE_NAME_GETTER_SECRET"]) {
         expect(eventRow?.payload_json).not.toContain(secret);
         expect(toolRow?.error).not.toContain(secret);

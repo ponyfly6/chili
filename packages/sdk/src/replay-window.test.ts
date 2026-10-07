@@ -64,6 +64,129 @@ test("keeps message anchors and a visible newest delta inside an exact JSON-arra
   });
 });
 
+test("committed text and reasoning retain their message without a part-added anchor", () => {
+  for (const type of ["text", "reasoning"] as const) {
+    const created = event("message.created", { messageId: "message_1", role: "assistant" }, 15);
+    const committed = event("message.part_committed", {
+      messageId: "message_1",
+      part: {
+        id: "part_1", messageId: "message_1", sessionId: "session_1", type,
+        text: "完整内容😀", completion: "completed",
+      },
+    }, 20);
+    const expected = [created, committed];
+    const result = retainReplayableRuntimeEvents([
+      ...Array.from({ length: 10 }, (_, index) => event(
+        "session.status_changed", { sessionId: "session_1", status: "running" }, index + 2,
+      )),
+      created,
+      committed,
+    ], { maxEvents: 2, maxBytes: jsonEventArrayUtf8Bytes(expected) });
+
+    expect(result.events).toEqual(expected);
+    expect(result.bytes).toBe(jsonEventArrayUtf8Bytes(expected));
+    expect(result.missingDependencies).toEqual([]);
+    expect(reduceRuntimeEvents(result.events).messages.message_1?.parts).toMatchObject([{
+      id: "part_1", type, text: "完整内容😀", completion: "completed",
+    }]);
+  }
+});
+
+test("pins the latest committed content of an active turn ahead of unrelated events", () => {
+  const created = event("message.created", { messageId: "message_1", role: "assistant", turnId: "turn_1" }, 2);
+  const committed = event("message.part_committed", {
+    messageId: "message_1",
+    part: {
+      id: "part_1", messageId: "message_1", sessionId: "session_1", type: "reasoning",
+      text: "The completed thinking remains visible while the tool runs.", completion: "completed",
+    },
+  }, 3);
+  const result = retainReplayableRuntimeEvents([
+    event("turn.started", { turnId: "turn_1" }, 1),
+    created,
+    committed,
+    event("session.status_changed", { sessionId: "session_1", status: "running" }, 4),
+  ], { maxEvents: 2, maxBytes: 10_000 });
+
+  expect(result.events).toEqual([created, committed]);
+  expect(result.missingDependencies).toEqual([]);
+});
+
+test("drops orphan committed content with only a missing message dependency", () => {
+  const result = retainReplayableRuntimeEvents([
+    event("message.part_committed", {
+      messageId: "message_missing",
+      part: {
+        id: "part_1", messageId: "message_missing", sessionId: "session_1", type: "text", text: "orphan",
+      },
+    }, 1),
+  ], { maxEvents: 10, maxBytes: 10_000 });
+
+  expect(result.events).toEqual([]);
+  expect(result.missingDependencies).toEqual(["message:message_missing"]);
+  expect(result.dependencyTruncated).toBe(true);
+});
+
+test("transient content is excluded from durable replay without changing its order or budget", () => {
+  const accumulator = new ReplayableRuntimeEventWindowAccumulator({ maxEvents: 3, maxBytes: 10_000 });
+  const first = event("session.status_changed", { sessionId: "session_1", status: "running" }, 1);
+  const second = event("session.status_changed", { sessionId: "session_1", status: "idle" }, 2);
+  accumulator.addSource([
+    first,
+    event("message.part_stream_snapshot", {
+      messageId: "message_1",
+      part: {
+        id: "part_1", messageId: "message_1", sessionId: "session_1", type: "text", text: "draft",
+      },
+    }, 100),
+    event("message.part_stream_delta", {
+      messageId: "message_1", partId: "part_1", partType: "text", delta: "unfinished", offset: 5,
+    }, 101),
+    event("tool.output_delta", { callId: "call_1", stream: "stdout", delta: "preview" }, 102),
+    second,
+  ], { sourceOrder: 0 });
+  const third = event("session.status_changed", { sessionId: "session_2", status: "idle" }, 3);
+  const result = accumulator.addSource([third], { sourceOrder: 1 });
+
+  expect(result.events).toEqual([first, second, third]);
+  expect(result.bytes).toBe(jsonEventArrayUtf8Bytes([first, second, third]));
+  expect(result.truncated).toBe(false);
+  expect(result.missingDependencies).toEqual([]);
+});
+
+test("explicit live windows preserve streaming snapshots, deltas and their anchors", () => {
+  const created = event("message.created", { messageId: "message_1", role: "assistant" }, 1);
+  const snapshot = event("message.part_stream_snapshot", {
+    messageId: "message_1",
+    part: {
+      id: "part_1", messageId: "message_1", sessionId: "session_1", type: "text", text: "Hello",
+    },
+  }, 2);
+  const delta = event("message.part_stream_delta", {
+    messageId: "message_1", partId: "part_1", partType: "text", delta: " world", offset: 5,
+  }, 3);
+  const started = event("tool.call_started", { turnId: "turn_1", callId: "call_1", toolName: "bash", input: {} }, 4);
+  const output = event("tool.output_delta", { callId: "call_1", stream: "stdout", delta: "preview" }, 5);
+  const events = [created, snapshot, delta, started, output];
+  const result = retainReplayableRuntimeEvents(events, {
+    maxEvents: 5, maxBytes: jsonEventArrayUtf8Bytes(events), preserveTransientEvents: true,
+  });
+
+  expect(result.events).toEqual(events);
+  expect(result.bytes).toBe(jsonEventArrayUtf8Bytes(events));
+  expect(result.truncated).toBe(false);
+  expect(result.missingDependencies).toEqual([]);
+  expect(reduceRuntimeEvents(result.events).messages.message_1?.parts[0]).toMatchObject({
+    text: "Hello world",
+  });
+
+  const orphan = retainReplayableRuntimeEvents([snapshot, delta], {
+    maxEvents: 5, maxBytes: 10_000, preserveTransientEvents: true,
+  });
+  expect(orphan.events).toEqual([]);
+  expect(orphan.missingDependencies).toEqual(["message:message_1"]);
+});
+
 test("prioritizes an unresolved approval and its active tool anchors over unrelated flood", () => {
   const started = event("tool.call_started", {
     turnId: "turn_1",

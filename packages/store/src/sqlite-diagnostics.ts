@@ -1,8 +1,11 @@
 import { readdir, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 import { SQLITE_JOURNAL_SIZE_LIMIT_BYTES, SQLITE_WAL_AUTO_CHECKPOINT_PAGES } from "./sqlite-event-store.js";
 import { sqliteJournalPolicy, type SqliteJournalMode } from "./sqlite-journal-policy.js";
+
+const TOOL_OUTPUT_BYTES_SQL = `case when output_content_version = 1 and substr(output, 1, 24) = '{"__chiliStoredValue":1,' and json_valid(output)
+  then coalesce(json_extract(output, '$.value.$chiliContent.bytes'), length(cast(output as blob))) else length(cast(output as blob)) end`;
 
 export interface SqliteEventStoreDiagnostics {
   path: string;
@@ -12,6 +15,7 @@ export interface SqliteEventStoreDiagnostics {
     shm: DiagnosticFile;
   };
   toolResultFiles: DiagnosticDirectory;
+  contentFiles: DiagnosticDirectory;
   configuredWal: {
     autoCheckpointPages: number;
     journalSizeLimitBytes: number;
@@ -122,6 +126,12 @@ export async function inspectSqliteEventStore(path: string): Promise<SqliteEvent
       .get()?.version ?? "unknown";
     const journalPolicy = sqliteJournalPolicy(sqliteVersion);
     const actualJournalMode = pragmaString(db, "journal_mode");
+    const hasColumn = (table: string, name: string): boolean => db.query<{ name: string }, []>(`pragma table_info(${table})`).all().some((column) => column.name === name);
+    const toolOutputBytesSql = hasColumn("tool_calls", "output_content_version") ? TOOL_OUTPUT_BYTES_SQL : "length(cast(output as blob))";
+    const inlinePartOutputBytes = "length(cast(coalesce(json_extract(mp.data_json, '$.output'), '') as blob))";
+    const partOutputBytesSql = hasColumn("message_parts", "content_version")
+      ? `case when mp.content_version = 1 then coalesce(json_extract(mp.data_json, '$.output.$chiliContent.bytes'), ${inlinePartOutputBytes}) else ${inlinePartOutputBytes} end`
+      : inlinePartOutputBytes;
     return {
       path,
       files: {
@@ -130,6 +140,7 @@ export async function inspectSqliteEventStore(path: string): Promise<SqliteEvent
         shm: await fileDiagnostic(`${path}-shm`),
       },
       toolResultFiles: await directoryDiagnostic(join(dirname(path), "tool-results")),
+      contentFiles: await directoryDiagnostic(join(dirname(path), "contents", basename(path)), true),
       configuredWal: {
         autoCheckpointPages: SQLITE_WAL_AUTO_CHECKPOINT_PAGES,
         journalSizeLimitBytes: SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
@@ -198,7 +209,7 @@ export async function inspectSqliteEventStore(path: string): Promise<SqliteEvent
           `select
              coalesce(nullif(tc.tool_name, ''), '<unknown>') as toolName,
              count(*) as rows,
-             coalesce(sum(length(cast(coalesce(json_extract(mp.data_json, '$.output'), '') as blob))), 0) as outputBytes
+             coalesce(sum(${partOutputBytesSql}), 0) as outputBytes
            from message_parts mp
            left join tool_calls tc on tc.id = json_extract(mp.data_json, '$.callId')
            where mp.type = 'tool_result'
@@ -220,12 +231,12 @@ export async function inspectSqliteEventStore(path: string): Promise<SqliteEvent
       },
       toolCalls: {
         rows: scalarNumber(db, `select count(*) from tool_calls`),
-        totalOutputBytes: scalarNumber(db, `select coalesce(sum(length(cast(output as blob))), 0) from tool_calls where output is not null`),
+        totalOutputBytes: scalarNumber(db, `select coalesce(sum(${toolOutputBytesSql}), 0) from tool_calls where output is not null`),
         byTool: db.query<ToolOutputSummary, [number]>(
           `select
              tool_name as toolName,
              count(*) as rows,
-             coalesce(sum(length(cast(output as blob))), 0) as outputBytes
+             coalesce(sum(${toolOutputBytesSql}), 0) as outputBytes
            from tool_calls
            group by tool_name
            order by outputBytes desc, rows desc, tool_name asc
@@ -237,7 +248,7 @@ export async function inspectSqliteEventStore(path: string): Promise<SqliteEvent
              session_id as sessionId,
              tool_name as toolName,
              status,
-             coalesce(length(cast(output as blob)), 0) as outputBytes
+             coalesce(${toolOutputBytesSql}, 0) as outputBytes
            from tool_calls
            order by outputBytes desc, updated_at desc
            limit ?`,
@@ -258,7 +269,7 @@ async function fileDiagnostic(path: string): Promise<DiagnosticFile> {
   };
 }
 
-async function directoryDiagnostic(path: string): Promise<DiagnosticDirectory> {
+async function directoryDiagnostic(path: string, recursive = false): Promise<DiagnosticDirectory> {
   const entries = await readdir(path, { withFileTypes: true }).catch(() => undefined);
   if (!entries) {
     return {
@@ -270,11 +281,17 @@ async function directoryDiagnostic(path: string): Promise<DiagnosticDirectory> {
     };
   }
 
-  const files = (await Promise.all(
-    entries
-      .filter((entry) => entry.isFile())
-      .map((entry) => fileDiagnostic(join(path, entry.name))),
-  )).filter((file) => file.exists);
+  const files: DiagnosticFile[] = [];
+  const collect = async (directory: string, children: typeof entries): Promise<void> => {
+    for (const entry of children) {
+      if (entry.isFile()) files.push(await fileDiagnostic(join(directory, entry.name)));
+      else if (recursive && entry.isDirectory()) {
+        const nested = join(directory, entry.name);
+        await collect(nested, await readdir(nested, { withFileTypes: true }));
+      }
+    }
+  };
+  await collect(path, entries);
   files.sort((left, right) => right.bytes - left.bytes || left.path.localeCompare(right.path));
 
   return {

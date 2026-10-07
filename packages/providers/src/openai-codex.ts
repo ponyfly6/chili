@@ -152,6 +152,7 @@ type CodexResponseInputItem =
 
 interface CodexStreamPayload {
   type?: string;
+  status?: string;
   response?: {
     id?: string;
     status?: string;
@@ -162,8 +163,12 @@ interface CodexStreamPayload {
   error?: CodexErrorPayload | string;
   item?: CodexOutputItem;
   delta?: string;
+  text?: string;
+  refusal?: string;
+  part?: { text?: string; status?: string };
   arguments?: string;
   output_index?: number;
+  content_index?: number;
   summary_index?: number;
   item_id?: string;
   code?: string | number;
@@ -187,8 +192,9 @@ interface CodexOutputItem extends Record<string, unknown> {
   call_id?: string;
   name?: string;
   arguments?: string;
-  content?: Array<{ type?: string; text?: string; refusal?: string }>;
-  summary?: Array<{ text?: string }>;
+  status?: string;
+  content?: Array<{ type?: string; text?: string; refusal?: string; status?: string }>;
+  summary?: Array<{ text?: string; status?: string }>;
   phase?: string;
   encrypted_content?: string;
 }
@@ -461,8 +467,59 @@ class CodexResponsesModel implements ChiliModel {
     let sawToolCall = false;
     const toolCalls = new Map<string, ToolStreamState>();
     const messagePhases = new Map<number, AssistantMessagePhase>();
+    const textBlockIndexes = new Map<string, number>();
+    const openTextBlocks = new Map<number, number>();
+    const textBlockTexts = new Map<number, string>();
+    const endedTextBlocks = new Set<number>();
+    const incompleteTextBlocks = new Set<number>();
     const reasoningSectionIndexes = new Map<string, number>();
+    const openReasoningSections = new Map<number, { itemId?: string; outputIndex?: number }>();
+    const reasoningSectionTexts = new Map<number, string>();
+    const endedReasoningSections = new Set<number>();
+    const incompleteReasoningSections = new Set<number>();
+    const provider = this.provider;
     let activeToolKey: string | undefined;
+
+    const finishTextBlock = function* (payload: CodexStreamPayload, text?: string, contentStatus?: string): Generator<ModelStreamEvent> {
+      const knownIndex = textBlockIndexes.get(textBlockKey(payload));
+      if (knownIndex === undefined && text === undefined) return;
+      const index = knownIndex ?? textBlockEventIndex(payload, textBlockIndexes);
+      if (endedTextBlocks.has(index)) return;
+      const phase = payload.output_index === undefined ? undefined : messagePhases.get(payload.output_index);
+      if (phase === undefined) {
+        throw codexProtocolError(provider, "OpenAI Codex stream completed text for an undeclared message output", response);
+      }
+      if (hasIncompleteContentStatus(payload, contentStatus)) incompleteTextBlocks.add(index);
+      const suffix = completedContentSuffix(textBlockTexts.get(index) ?? "", text, provider, response);
+      if (text !== undefined) textBlockTexts.set(index, text);
+      if (payload.output_index !== undefined) openTextBlocks.set(index, payload.output_index);
+      if (suffix) yield { type: "text_delta", text: suffix, index, phase };
+      if (incompleteTextBlocks.has(index)) return;
+      openTextBlocks.delete(index);
+      textBlockTexts.delete(index);
+      endedTextBlocks.add(index);
+      yield { type: "text_end", index, phase };
+    };
+
+    const finishReasoningSection = function* (payload: CodexStreamPayload, text?: string, contentStatus?: string): Generator<ModelStreamEvent> {
+      const knownIndex = reasoningSectionIndexes.get(reasoningSectionKey(payload));
+      if (knownIndex === undefined && text === undefined) return;
+      const index = knownIndex ?? reasoningSectionEventIndex(payload, reasoningSectionIndexes);
+      if (endedReasoningSections.has(index)) return;
+      if (hasIncompleteContentStatus(payload, contentStatus)) incompleteReasoningSections.add(index);
+      const suffix = completedContentSuffix(reasoningSectionTexts.get(index) ?? "", text, provider, response);
+      if (text !== undefined) reasoningSectionTexts.set(index, text);
+      openReasoningSections.set(index, {
+        ...(payload.item_id === undefined ? {} : { itemId: payload.item_id }),
+        ...(payload.output_index === undefined ? {} : { outputIndex: payload.output_index }),
+      });
+      if (suffix) yield { type: "reasoning_delta", text: suffix, index };
+      if (incompleteReasoningSections.has(index)) return;
+      openReasoningSections.delete(index);
+      reasoningSectionTexts.delete(index);
+      endedReasoningSections.add(index);
+      yield { type: "reasoning_end", index };
+    };
 
     for await (const event of readSseEvents(body, signal)) {
       if (event.data === "[DONE]") break;
@@ -503,25 +560,44 @@ class CodexResponsesModel implements ChiliModel {
       }
 
       if (payload.type === "response.reasoning_summary_text.delta" && payload.delta) {
+        const index = reasoningSectionEventIndex(payload, reasoningSectionIndexes);
+        reasoningSectionTexts.set(index, (reasoningSectionTexts.get(index) ?? "") + payload.delta);
+        openReasoningSections.set(index, {
+          ...(payload.item_id === undefined ? {} : { itemId: payload.item_id }),
+          ...(payload.output_index === undefined ? {} : { outputIndex: payload.output_index }),
+        });
         yield {
           type: "reasoning_delta",
           text: payload.delta,
-          index: reasoningSectionEventIndex(payload, reasoningSectionIndexes),
+          index,
         };
         continue;
       }
 
+      if (payload.type === "response.reasoning_summary_text.done" || payload.type === "response.reasoning_summary_part.done") {
+        yield* finishReasoningSection(payload, payload.text ?? payload.part?.text);
+        continue;
+      }
+
       if ((payload.type === "response.output_text.delta" || payload.type === "response.refusal.delta") && payload.delta) {
-        const index = payload.output_index;
-        const phase = index === undefined ? undefined : messagePhases.get(index);
-        if (index === undefined || phase === undefined) {
+        const outputIndex = payload.output_index;
+        const phase = outputIndex === undefined ? undefined : messagePhases.get(outputIndex);
+        if (outputIndex === undefined || phase === undefined) {
           throw codexProtocolError(
             this.provider,
             "OpenAI Codex stream has text delta for an undeclared message output",
             response,
           );
         }
+        const index = textBlockEventIndex(payload, textBlockIndexes);
+        openTextBlocks.set(index, outputIndex);
+        textBlockTexts.set(index, (textBlockTexts.get(index) ?? "") + payload.delta);
         yield { type: "text_delta", text: payload.delta, index, phase };
+        continue;
+      }
+
+      if (payload.type === "response.output_text.done" || payload.type === "response.refusal.done") {
+        yield* finishTextBlock(payload, payload.text ?? payload.refusal);
         continue;
       }
 
@@ -546,6 +622,29 @@ class CodexResponsesModel implements ChiliModel {
       }
 
       if (payload.type === "response.output_item.done" && payload.item) {
+        if (payload.item.type === "reasoning") {
+          for (const [summaryIndex, summary] of (payload.item.summary ?? []).entries()) {
+            if (typeof summary.text !== "string") continue;
+            yield* finishReasoningSection({
+              ...payload,
+              ...(payload.item.id === undefined ? {} : { item_id: payload.item.id }),
+              summary_index: summaryIndex,
+            }, summary.text, summary.status);
+          }
+          for (const [index, section] of openReasoningSections) {
+            if (
+              (payload.output_index !== undefined && section.outputIndex === payload.output_index)
+              || (payload.item.id !== undefined && section.itemId === payload.item.id)
+            ) {
+              if (hasIncompleteContentStatus(payload)) incompleteReasoningSections.add(index);
+              if (incompleteReasoningSections.has(index)) continue;
+              openReasoningSections.delete(index);
+              reasoningSectionTexts.delete(index);
+              endedReasoningSections.add(index);
+              yield { type: "reasoning_end", index };
+            }
+          }
+        }
         if (
           payload.item.type === "reasoning"
           && typeof payload.item.encrypted_content === "string"
@@ -561,6 +660,20 @@ class CodexResponsesModel implements ChiliModel {
         }
         if (payload.item.type === "message") {
           recordCodexAssistantPhase(messagePhases, payload.output_index, payload.item.phase, this.provider, response);
+          for (const [contentIndex, content] of (payload.item.content ?? []).entries()) {
+            const text = content.type === "refusal" ? content.refusal : content.type === "output_text" ? content.text : undefined;
+            if (typeof text !== "string") continue;
+            yield* finishTextBlock({ ...payload, content_index: contentIndex }, text, content.status);
+          }
+          for (const [index, outputIndex] of openTextBlocks) {
+            if (outputIndex !== payload.output_index) continue;
+            if (hasIncompleteContentStatus(payload)) incompleteTextBlocks.add(index);
+            if (incompleteTextBlocks.has(index)) continue;
+            openTextBlocks.delete(index);
+            textBlockTexts.delete(index);
+            endedTextBlocks.add(index);
+            yield { type: "text_end", index, phase: messagePhases.get(outputIndex)! };
+          }
         }
         if (payload.item.type === "function_call") {
           const state = findToolState(toolCalls, payload, activeToolKey) ?? createToolState(payload.item, payload.output_index);
@@ -1039,9 +1152,44 @@ function toResponsesTools(tools: readonly ModelTool[]): Array<Record<string, unk
   }));
 }
 
+function reasoningSectionKey(payload: CodexStreamPayload): string {
+  const itemKey = payload.output_index === undefined ? payload.item_id ?? "output:0" : `output:${payload.output_index}`;
+  return `${itemKey}\0${payload.summary_index ?? 0}`;
+}
+
+function hasIncompleteContentStatus(payload: CodexStreamPayload, contentStatus?: string): boolean {
+  return payload.status === "incomplete"
+    || payload.part?.status === "incomplete"
+    || payload.item?.status === "incomplete"
+    || contentStatus === "incomplete";
+}
+
+function completedContentSuffix(
+  streamed: string,
+  completed: string | undefined,
+  provider: typeof OPENAI_CODEX_PROVIDER_ID | typeof CODEX_API_PROVIDER_ID,
+  response: Response,
+): string {
+  if (completed === undefined) return "";
+  if (!completed.startsWith(streamed)) {
+    throw codexProtocolError(provider, "OpenAI Codex completed content disagrees with its streamed prefix", response);
+  }
+  return completed.slice(streamed.length);
+}
+
 function reasoningSectionEventIndex(payload: CodexStreamPayload, indexes: Map<string, number>): number {
-  const itemKey = payload.item_id ?? `output:${payload.output_index ?? 0}`;
-  const key = `${itemKey}\0${payload.summary_index ?? 0}`;
+  return contentEventIndex(reasoningSectionKey(payload), indexes);
+}
+
+function textBlockKey(payload: CodexStreamPayload): string {
+  return `${payload.output_index ?? 0}\0${payload.content_index ?? 0}`;
+}
+
+function textBlockEventIndex(payload: CodexStreamPayload, indexes: Map<string, number>): number {
+  return contentEventIndex(textBlockKey(payload), indexes);
+}
+
+function contentEventIndex(key: string, indexes: Map<string, number>): number {
   const existing = indexes.get(key);
   if (existing !== undefined) return existing;
   const index = indexes.size;

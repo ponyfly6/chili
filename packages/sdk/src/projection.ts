@@ -7,6 +7,7 @@ import type {
   DelegationPolicy,
   EventEnvelope,
   MessageId,
+  Message,
   MessagePart,
   MessageRole,
   ModelMetadataPayload,
@@ -38,6 +39,9 @@ export interface ChiliRuntimeView {
   modelMetadataTurnIds: TurnId[];
   modelMetadataByTurn: Record<string, RuntimeModelMetadataView>;
   partIndex: Record<string, RuntimePartIndexEntry>;
+  /** Confirmed completed parts reject obsolete streamed text. */
+  committedPartIds: Record<string, true>;
+  partStreamGaps: Record<string, RuntimePartStreamGap>;
   /** Stable durable/projection order for transcript rows across clock rollback. */
   transcriptOrder: Record<string, number>;
   nextTranscriptOrder: number;
@@ -148,6 +152,12 @@ export interface RuntimeApprovalView {
   resolvedAt?: number;
 }
 
+export interface RuntimePartStreamGap {
+  messageId: MessageId;
+  expectedOffset: number;
+  receivedOffset: number;
+}
+
 export interface RuntimePartIndexEntry {
   messageId: MessageId;
   index: number;
@@ -192,9 +202,9 @@ export interface ChatMessageRow {
 }
 
 export type ChatMessagePart =
-  | { type: "text"; id: PartId; text: string; phase?: AssistantMessagePhase; rawText?: string; synthetic?: boolean }
+  | { type: "text"; id: PartId; text: string; phase?: AssistantMessagePhase; completion?: Extract<MessagePart, { type: "text" }>["completion"]; rawText?: string; synthetic?: boolean }
   | { type: "image"; id: PartId; mimeType: string; filename?: string; sourcePath?: string; displayText?: string }
-  | { type: "reasoning"; id: PartId; text: string; redacted?: boolean }
+  | { type: "reasoning"; id: PartId; text: string; redacted?: boolean; completion?: Extract<MessagePart, { type: "reasoning" }>["completion"] }
   | { type: "tool_call"; id: PartId; callId: ToolCallId; toolName: string; status: ToolPartStatus; input?: unknown; displayStatus?: ChatToolDisplayStatus }
   | { type: "tool_result"; id: PartId; callId: ToolCallId; output: string; content?: Extract<MessagePart, { type: "tool_result" }>["content"]; error?: string; executionContext?: ChatToolExecutionContext; synthetic?: boolean }
   | { type: "summary"; id: PartId; text: string };
@@ -283,6 +293,8 @@ export function createRuntimeView(): ChiliRuntimeView {
     modelMetadataTurnIds: [],
     modelMetadataByTurn: nullPrototypeRecord(),
     partIndex: nullPrototypeRecord(),
+    committedPartIds: nullPrototypeRecord(),
+    partStreamGaps: nullPrototypeRecord(),
     transcriptOrder: nullPrototypeRecord(),
     nextTranscriptOrder: 0,
   };
@@ -470,26 +482,76 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
         view.messages[message.id] = message;
         assignTranscriptOrder(view, "message", message.id);
         session.messageIds.push(message.id);
+      } else {
+        const message = view.messages[event.payload.messageId]!;
+        if (message.sessionId !== event.sessionId) break;
+        message.role = event.payload.role;
+        message.createdAt = event.time;
+        assignOptional(message, "turnId", event.payload.turnId);
       }
-      session.updatedAt = event.time;
+      session.updatedAt = Math.max(session.updatedAt, event.time);
       break;
     }
     case "message.part_added": {
       const message = view.messages[event.payload.messageId];
+      const part = event.payload.part;
+      if (!message || !partBelongsToMessage(part, message, event.sessionId)) break;
+      const existing = message.parts.find((item) => item.id === part.id);
+      if (view.committedPartIds[part.id]) break;
+      // A delayed creation/history event cannot erase a live prefix.
+      if (isStreamingTextPart(existing) && isStreamingTextPart(part)
+        && !part.completion && existing.text.length > part.text.length) break;
+      replaceRuntimePart(view, message, part, event.time);
+      if (isStreamingTextPart(part) && part.completion) view.committedPartIds[part.id] = true;
+      break;
+    }
+    case "message.part_committed": {
+      const message = ensureStreamMessage(view, event);
+      if (!message || !partBelongsToMessage(event.payload.part, message, event.sessionId)) break;
+      replaceRuntimePart(view, message, event.payload.part, event.time);
+      view.committedPartIds[event.payload.part.id] = true;
+      delete view.partStreamGaps[event.payload.part.id];
+      break;
+    }
+    case "message.part_stream_snapshot": {
+      const message = ensureStreamMessage(view, event);
+      const part = event.payload.part;
+      if (!message || !partBelongsToMessage(part, message, event.sessionId) || view.committedPartIds[part.id]) break;
+      const existing = message.parts.find((item) => item.id === part.id);
+      if (isStreamingTextPart(existing) && existing.text.length > part.text.length) break;
+      replaceRuntimePart(view, message, part, event.time);
+      delete view.partStreamGaps[part.id];
+      break;
+    }
+    case "message.part_stream_delta": {
+      const message = ensureStreamMessage(view, event);
       if (!message) break;
-      if (message.turnId) clearSessionRetry(view, message.sessionId, message.turnId);
-      const existingIndex = message.parts.findIndex((part) => part.id === event.payload.part.id);
-      if (existingIndex >= 0) {
-        message.parts[existingIndex] = event.payload.part;
-        view.partIndex[event.payload.part.id] = { messageId: message.id, index: existingIndex };
-      } else {
-        message.parts.push(event.payload.part);
-        view.partIndex[event.payload.part.id] = { messageId: message.id, index: message.parts.length - 1 };
+      const { partId, partType, offset, delta, ordinal, phase, redacted } = event.payload;
+      if (view.committedPartIds[partId]) break;
+      let part = message.parts.find((item) => item.id === partId);
+      if (part && (!isStreamingTextPart(part) || part.type !== partType || part.completion)) break;
+      const length = isStreamingTextPart(part) ? part.text.length : 0;
+      if (offset > length) {
+        view.partStreamGaps[partId] = { messageId: message.id, expectedOffset: length, receivedOffset: offset };
+        break;
       }
+      if (!part) {
+        const identity = { id: partId as PartId, messageId: message.id, sessionId: message.sessionId,
+          ...(ordinal === undefined ? {} : { ordinal }) };
+        part = partType === "text"
+          ? { ...identity, type: "text", text: "", ...(phase === undefined ? {} : { phase }) }
+          : { ...identity, type: "reasoning", text: "", ...(redacted === undefined ? {} : { redacted }) };
+        replaceRuntimePart(view, message, part, event.time);
+        part = message.parts[view.partIndex[partId]!.index];
+      }
+      if (!isStreamingTextPart(part)) break;
+      // An overlapping replay contributes only the suffix not already in the snapshot.
+      part.text += delta.slice(Math.max(0, length - offset));
+      if (part.type === "text" && phase !== undefined) part.phase = phase;
+      if (part.type === "reasoning" && redacted !== undefined) part.redacted = redacted;
       message.updatedAt = event.time;
-      if (event.payload.part.type === "text" && (event.payload.part.displayText ?? event.payload.part.text).trim().length > 0) {
-        message.lastTextAt = event.time;
-      }
+      if (part.type === "text" && part.text.trim()) message.lastTextAt = event.time;
+      if (message.turnId) clearSessionRetry(view, message.sessionId, message.turnId);
       touchSession(view, message.sessionId, event.time);
       break;
     }
@@ -614,6 +676,110 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
   return view;
 }
 
+/** Full history is projection data; it never advances the live event cursor. */
+export function hydrateRuntimeMessages(view: ChiliRuntimeView, messages: readonly Message[]): ChiliRuntimeView {
+  normalizeRuntimeViewIndexes(view);
+  const addedMessages = new Set<string>();
+  for (const source of messages) {
+    const session = upsertSession(view, source.sessionId, source.createdAt);
+    let message = view.messages[source.id];
+    if (message && message.sessionId !== source.sessionId) continue;
+    if (!message) {
+      message = { id: source.id, sessionId: source.sessionId, role: source.role, parts: [], createdAt: source.createdAt,
+        ...(source.turnId === undefined ? {} : { turnId: source.turnId }) };
+      view.messages[source.id] = message;
+      session.messageIds.push(source.id);
+      addedMessages.add(source.id);
+    }
+    for (const part of source.parts) {
+      if (!partBelongsToMessage(part, message, source.sessionId)) continue;
+      const existing = message.parts.find((item) => item.id === part.id);
+      // A read started before commit may complete after it. Its stale body cannot win.
+      if (isStreamingTextPart(existing) && isStreamingTextPart(part)) {
+        if (view.committedPartIds[part.id] && existing.text.length >= part.text.length) continue;
+        if (existing.text.length > part.text.length) continue;
+      }
+      replaceRuntimePart(view, message, part, message.updatedAt ?? source.createdAt, false);
+      if (isStreamingTextPart(part)) {
+        if (part.completion) view.committedPartIds[part.id] = true;
+        delete view.partStreamGaps[part.id];
+      }
+    }
+  }
+  // Full history is ordered by storage, including when the system clock moved
+  // backwards. Place newly discovered older messages before existing anchors.
+  let previousOrder: number | undefined;
+  for (let index = 0; index < messages.length; index += 1) {
+    const source = messages[index]!;
+    if (!addedMessages.has(source.id)) {
+      previousOrder = view.transcriptOrder[transcriptOrderKey("message", source.id)] ?? previousOrder;
+      continue;
+    }
+    let end = index;
+    while (end < messages.length && addedMessages.has(messages[end]!.id)) end += 1;
+    const nextSource = messages[end];
+    const nextOrder = nextSource ? view.transcriptOrder[transcriptOrderKey("message", nextSource.id)] : undefined;
+    const count = end - index;
+    const lower = previousOrder ?? (nextOrder === undefined ? view.nextTranscriptOrder - 1 : nextOrder - count - 1);
+    const upper = nextOrder ?? Math.max(view.nextTranscriptOrder, lower + count + 1);
+    for (let offset = 0; offset < count; offset += 1) {
+      const id = messages[index + offset]!.id;
+      view.transcriptOrder[transcriptOrderKey("message", id)] = lower + (upper - lower) * (offset + 1) / (count + 1);
+    }
+    view.nextTranscriptOrder = Math.max(view.nextTranscriptOrder, Math.ceil(upper));
+    previousOrder = view.transcriptOrder[transcriptOrderKey("message", messages[end - 1]!.id)];
+    index = end - 1;
+  }
+  return view;
+}
+
+export function hasRuntimePartStreamGap(view: ChiliRuntimeView): boolean {
+  return Object.keys(view.partStreamGaps ?? {}).length > 0;
+}
+
+function isStreamingTextPart(part: MessagePart | undefined): part is Extract<MessagePart, { type: "text" | "reasoning" }> {
+  return part?.type === "text" || part?.type === "reasoning";
+}
+
+function partBelongsToMessage(part: MessagePart, message: RuntimeMessageView, sessionId: SessionId | undefined): boolean {
+  return part.messageId === message.id && part.sessionId === message.sessionId
+    && (sessionId === undefined || sessionId === message.sessionId);
+}
+
+function ensureStreamMessage(
+  view: ChiliRuntimeView,
+  event: Extract<ChiliEvent, { type: "message.part_stream_delta" | "message.part_stream_snapshot" | "message.part_committed" }>,
+): RuntimeMessageView | undefined {
+  if ("part" in event.payload && (event.payload.part.messageId !== event.payload.messageId
+    || (event.sessionId !== undefined && event.payload.part.sessionId !== event.sessionId))) return undefined;
+  let message = view.messages[event.payload.messageId];
+  if (message) return event.sessionId === undefined || message.sessionId === event.sessionId ? message : undefined;
+  if (!event.sessionId) return undefined;
+  message = { id: event.payload.messageId, sessionId: event.sessionId, role: "assistant", parts: [],
+    createdAt: event.time, updatedAt: event.time };
+  view.messages[message.id] = message;
+  upsertSession(view, event.sessionId, event.time).messageIds.push(message.id);
+  assignTranscriptOrder(view, "message", message.id);
+  return message;
+}
+
+function replaceRuntimePart(view: ChiliRuntimeView, message: RuntimeMessageView, source: MessagePart, time: number, live = true): void {
+  const part = structuredClone(source);
+  const existingIndex = message.parts.findIndex((item) => item.id === part.id);
+  const previousOrdinal = message.parts[existingIndex]?.ordinal;
+  if (part.ordinal === undefined && previousOrdinal !== undefined) part.ordinal = previousOrdinal;
+  if (existingIndex >= 0) message.parts[existingIndex] = part;
+  else message.parts.push(part);
+  message.parts.sort((left, right) => (left.ordinal ?? Number.MAX_SAFE_INTEGER) - (right.ordinal ?? Number.MAX_SAFE_INTEGER));
+  for (const [index, item] of message.parts.entries()) view.partIndex[item.id] = { messageId: message.id, index };
+  if (live) {
+    if (message.turnId) clearSessionRetry(view, message.sessionId, message.turnId);
+    message.updatedAt = time;
+    if (part.type === "text" && (part.displayText ?? part.text).trim()) message.lastTextAt = time;
+    touchSession(view, message.sessionId, time);
+  }
+}
+
 function normalizeRuntimeViewIndexes(view: ChiliRuntimeView): void {
   view.sessions = nullPrototypeIndex(view.sessions);
   view.turnStatuses = nullPrototypeIndex(view.turnStatuses);
@@ -623,6 +789,8 @@ function normalizeRuntimeViewIndexes(view: ChiliRuntimeView): void {
   view.approvals = nullPrototypeIndex(view.approvals);
   view.modelMetadataByTurn = nullPrototypeIndex(view.modelMetadataByTurn);
   view.partIndex = nullPrototypeIndex(view.partIndex);
+  view.committedPartIds = nullPrototypeIndex(view.committedPartIds ?? {});
+  view.partStreamGaps = nullPrototypeIndex(view.partStreamGaps ?? {});
   view.transcriptOrder = nullPrototypeIndex(view.transcriptOrder ?? {});
   if (!Number.isSafeInteger(view.nextTranscriptOrder) || view.nextTranscriptOrder < 0) {
     let nextOrder = 0;
@@ -921,6 +1089,7 @@ function chatMessagePart(part: MessagePart): ChatMessagePart {
     const output: ChatMessagePart = { type: "text", id: part.id, text: part.displayText ?? part.text };
     if (part.displayText && part.displayText !== part.text) output.rawText = part.text;
     assignOptional(output, "phase", part.phase);
+    assignOptional(output, "completion", part.completion);
     assignOptional(output, "synthetic", part.synthetic);
     return output;
   }
@@ -934,6 +1103,7 @@ function chatMessagePart(part: MessagePart): ChatMessagePart {
   if (part.type === "reasoning") {
     const output: ChatMessagePart = { type: "reasoning", id: part.id, text: part.text };
     assignOptional(output, "redacted", part.redacted);
+    assignOptional(output, "completion", part.completion);
     return output;
   }
   if (part.type === "tool_call") {
@@ -1463,7 +1633,7 @@ function applyPartDelta(view: ChiliRuntimeView, partId: PartId, field: string, d
   if (!entry) return;
   const message = view.messages[entry.messageId];
   const part = message?.parts[entry.index];
-  if (!part) return;
+  if (!part || view.committedPartIds[partId]) return;
 
   if (field === "text" && (part.type === "text" || part.type === "reasoning")) {
     part.text += delta;

@@ -11,7 +11,9 @@ import {
 test("FauxChiliModel replays scripted Chili stream events", async () => {
   const script: FauxChiliScriptEvent[] = [
     { type: "text_delta", text: "hello ", index: 0 },
+    { type: "text_end", index: 0 },
     { type: "reasoning_delta", text: "thinking", index: 1 },
+    { type: "reasoning_end", index: 1 },
     { type: "tool_call_start", toolCallId: "tool_1", name: "lookup", index: 2 },
     { type: "tool_call_delta", toolCallId: "tool_1", name: "lookup", delta: "{\"query\"", index: 2 },
     {

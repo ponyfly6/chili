@@ -57,7 +57,12 @@ test("reused provider IDs across sessions and turns never share SQLite tool rows
     const rows = db.query<{ id: string; provider_call_id: string; session_id: string; output: string }, []>("select id, provider_call_id, session_id, output from tool_calls").all();
     expect(rows).toHaveLength(3);
     expect(new Set(rows.map((row) => row.id)).size).toBe(3);
-    expect(rows.every((row) => row.id !== "call_0" && row.provider_call_id === "call_0" && row.output === row.session_id)).toBe(true);
+    expect(rows.every((row) => row.id !== "call_0" && row.provider_call_id === "call_0")).toBe(true);
+    const persistedResults = (await Promise.all([f.store.messages(a), f.store.messages(b)]))
+      .flatMap((messages) => messages.flatMap((message) => message.parts))
+      .filter((part) => part.type === "tool_result");
+    expect(rows.every((row) => persistedResults.some((part) => part.callId === row.id && part.output === row.session_id))).toBe(true);
+    expect(rows.every((row) => row.output.includes("$chiliContent"))).toBe(true);
   } finally { db.close(); }
   const calls = seen[2]!.messages.flatMap((message) => message.parts).filter((part) => part.type === "tool_call");
   const results = seen[2]!.messages.flatMap((message) => message.parts).filter((part) => part.type === "tool_result");

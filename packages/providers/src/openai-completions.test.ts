@@ -891,12 +891,16 @@ test("parses OpenAI-compatible SSE text, reasoning, tool deltas, and usage", asy
     "tool_call_start",
     "tool_call_delta",
     "tool_call_delta",
+    "reasoning_end",
+    "text_end",
     "metadata",
     "tool_call_end",
     "finish",
   ]);
   expect(events[1]).toEqual({ type: "reasoning_delta", text: "think ", index: 0 });
   expect(events[2]).toEqual({ type: "text_delta", text: "hello ", index: 0 });
+  expect(events[6]).toEqual({ type: "reasoning_end", index: 0 });
+  expect(events[7]).toEqual({ type: "text_end", index: 0 });
   expect(events[3]).toEqual({ type: "tool_call_start", toolCallId: "call_1", name: "lookup", index: 0 });
   expect(events[5]).toEqual({
     type: "tool_call_delta",
@@ -1104,6 +1108,7 @@ test("falls back to non-streaming OpenAI-compatible JSON responses", async () =>
   expect(events.map((event) => event.type)).toEqual([
     "metadata",
     "text_delta",
+    "text_end",
     "tool_call_start",
     "tool_call_end",
     "finish",
@@ -1114,14 +1119,39 @@ test("falls back to non-streaming OpenAI-compatible JSON responses", async () =>
     usage: { inputTokens: 5, outputTokens: 6, totalTokens: 11 },
   });
   expect(events[1]).toEqual({ type: "text_delta", text: "done", index: 0 });
-  expect(events[3]).toEqual({
+  expect(events[2]).toEqual({ type: "text_end", index: 0 });
+  expect(events[4]).toEqual({
     type: "tool_call_end",
     toolCallId: "call_2",
     name: "edit",
     input: { filePath: "README.md" },
     index: 0,
   });
-  expect(events[4]).toMatchObject({ type: "finish", reason: "tool_use", responseId: "chatcmpl_json" });
+  expect(events[5]).toMatchObject({ type: "finish", reason: "tool_use", responseId: "chatcmpl_json" });
+});
+
+test("leaves truncated or filtered Chat Completions content unfinished", async () => {
+  for (const finishReason of ["length", "max_tokens", "max_output_tokens", "content_filter"]) {
+    for (const stream of [true, false]) {
+      const content = { reasoning_content: "Partial thinking", content: "Partial answer" };
+      const model = new OpenAICompletionsModel({
+        provider: "test-provider",
+        model: "test-model",
+        apiKey: "test-key",
+        baseUrl: "https://model.test",
+        fetch: stream
+          ? sseFetch([
+            data({ choices: [{ index: 0, delta: content }] }),
+            data({ choices: [{ index: 0, delta: {}, finish_reason: finishReason }] }),
+          ])
+          : jsonFetch({ choices: [{ index: 0, message: content, finish_reason: finishReason }] }),
+      });
+      const events = await collect(model.stream({ messages: [] }));
+      expect(events.filter((streamEvent) => streamEvent.type === "text_end" || streamEvent.type === "reasoning_end")).toEqual([]);
+      expect(events.filter((streamEvent) => streamEvent.type === "text_delta" || streamEvent.type === "reasoning_delta")).toHaveLength(2);
+      expect(events.at(-1)?.type).toBe("finish");
+    }
+  }
 });
 
 async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelStreamEvent[]> {

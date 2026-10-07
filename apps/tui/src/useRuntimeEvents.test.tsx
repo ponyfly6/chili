@@ -400,6 +400,55 @@ test("Runtime stream discards a snapshot completed after reconnect supersedes it
   }
 });
 
+test("Runtime stream recovers a missing text offset once and resumes from active content", async () => {
+  const sessionId = "session_missing_part" as SessionId;
+  const messageId = "message_missing_part" as MessageId;
+  const partId = "part_missing_part" as PartId;
+  const created: ChiliEvent = { id: "message_created", type: "message.created", time: 1 as TimestampMs,
+    sessionId, payload: { messageId, role: "assistant" } };
+  const requests: StreamEventsRequest[] = [];
+  let recoveries = 0;
+  const client = {
+    eventSnapshot: async () => { recoveries += 1; return snapshot([created], created.id); },
+    streamEvents: async function* (input: StreamEventsRequest = {}) {
+      requests.push(input);
+      if (requests.length === 1) {
+        yield created;
+        yield { id: "gap", type: "message.part_stream_delta", time: 2 as TimestampMs, sessionId,
+          payload: { messageId, partId, partType: "text", offset: 8, delta: " world" } } satisfies ChiliEvent;
+      } else {
+        yield { id: "active", type: "message.part_stream_snapshot", time: 3 as TimestampMs, sessionId,
+          payload: { messageId, part: { id: partId, messageId, sessionId, type: "text", text: "complete world" } } } satisfies ChiliEvent;
+        yield { id: "duplicate", type: "message.part_stream_delta", time: 2 as TimestampMs, sessionId,
+          payload: { messageId, partId, partType: "text", offset: 8, delta: " world" } } satisfies ChiliEvent;
+        yield { id: "suffix", type: "message.part_stream_delta", time: 4 as TimestampMs, sessionId,
+          payload: { messageId, partId, partType: "text", offset: 14, delta: "!" } } satisfies ChiliEvent;
+      }
+      await waitForAbort(input.signal);
+    },
+  } as unknown as HttpRuntimeClient;
+  let runtime: RuntimeEventsState | undefined;
+  let app!: Awaited<ReturnType<typeof testRender>>;
+  await act(async () => {
+    app = await testRender(<RuntimeEventsProbe client={client} options={{ baseUrl: "http://chili.test" }} onRuntime={(value) => { runtime = value; }} />, { width: 160, height: 4, exitOnCtrlC: false });
+  });
+  try {
+    await waitForFrame(app, (frame) => frame.includes("text:complete world!"));
+    expect(recoveries).toBe(1);
+    expect(requests.map((request) => request.afterEventId)).toEqual([undefined, created.id]);
+    expect(requests[0]?.signal?.aborted).toBe(true);
+    expect(runtime?.runtimeView.lastEventId).toBe(created.id);
+    await act(async () => {
+      runtime?.hydrateMessages([{ id: messageId, sessionId, role: "assistant", createdAt: 1 as TimestampMs,
+        parts: [{ id: partId, messageId, sessionId, type: "text", text: "complete", completion: "completed" }] }]);
+    });
+    expect(runtime?.runtimeView.lastEventId).toBe(created.id);
+    expect(runtime?.runtimeView.messages[messageId]?.parts[0]).toMatchObject({ text: "complete world!" });
+  } finally {
+    act(() => app.renderer.destroy());
+  }
+});
+
 function RuntimeEventsProbe(props: {
   client: HttpRuntimeClient;
   options: RuntimeTuiOptions;

@@ -407,9 +407,9 @@ export function appendRuntimeEvent(
     dependencyTruncated = true;
     truncated = true;
   } else if (existing >= 0) {
-    const replaced = state.events.map((candidate, index) => index === existing ? event : candidate);
+    const replaced = coalesceMessageStreams(state.events.map((candidate, index) => index === existing ? event : candidate));
     budgetTruncated ||= replaced.length > limits.maxEvents || jsonEventArrayUtf8Bytes(replaced) > limits.maxBytes;
-    const retained = retainReplayableRuntimeEvents(replaced, limits);
+    const retained = retainReplayableRuntimeEvents(replaced, { ...limits, preserveTransientEvents: true });
     events = retained.events;
     bytes = retained.bytes;
     providers = providedDependencyKeys(events);
@@ -434,8 +434,8 @@ export function appendRuntimeEvent(
       providers = providedDependencyKeys(events);
       fullRetentionPasses += compacted.passes;
       compactedOrReplaced = true;
-      truncated = true;
-      budgetTruncated = true;
+      truncated ||= compacted.truncated;
+      budgetTruncated ||= compacted.truncated;
       dependencyTruncated ||= compacted.dependencyTruncated;
     }
   }
@@ -459,6 +459,7 @@ export function appendRuntimeEvent(
     pendingInputs: projectPendingInputs(snapshot.pendingInputs, event),
     ...(omittedMessageParts.length > 0 ? { omittedMessageParts } : {}),
   };
+  if (omittedMessageParts.length === 0) delete next.omittedMessageParts;
   if (truncated) next.truncated = true;
   if (budgetTruncated || projectedApprovals.truncated) {
     next.truncated = true;
@@ -710,7 +711,8 @@ function projectRuntimeEvents(
 }
 
 function projectionSafeEvent(event: ChiliEvent): ChiliEvent {
-  if (event.type !== "message.part_added") return event;
+  if (event.type !== "message.part_added" && event.type !== "message.part_committed"
+    && event.type !== "message.part_stream_snapshot") return event;
   return {
     ...event,
     payload: {
@@ -728,6 +730,26 @@ function insertOmissionMarker(value: string, seed: string, marker: string): stri
 }
 
 function applyIncrementalProjection(view: ChiliRuntimeView, event: ChiliEvent): ChiliRuntimeView | undefined {
+  if (event.type === "message.part_stream_delta" || event.type === "message.part_stream_snapshot"
+    || event.type === "message.part_committed") {
+    const message = view.messages[String(event.payload.messageId)];
+    const next: ChiliRuntimeView = {
+      ...view,
+      sessionIds: [...view.sessionIds],
+      messages: cloneIndex(view.messages),
+      sessions: cloneIndex(view.sessions),
+      partIndex: cloneIndex(view.partIndex),
+      committedPartIds: cloneIndex(view.committedPartIds),
+      partStreamGaps: cloneIndex(view.partStreamGaps),
+      transcriptOrder: cloneIndex(view.transcriptOrder),
+    };
+    if (message) {
+      next.messages[message.id] = { ...message, parts: message.parts.map((part) => ({ ...part })) };
+      cloneProjectionSession(next, view, String(message.sessionId));
+    }
+    if (event.sessionId) cloneProjectionSession(next, view, String(event.sessionId));
+    return applyRuntimeEvent(next, projectionSafeEvent(event));
+  }
   if (event.type === "message.part_delta") {
     const entry = view.partIndex[String(event.payload.partId)];
     const message = entry ? view.messages[entry.messageId] : undefined;
@@ -788,10 +810,14 @@ function mergeMessagePartOmissions(
   const anchoredParts = new Set(retained.flatMap((event) => event.type === "message.part_added"
     ? [messagePartKey(String(event.payload.messageId), String(event.payload.part.id))]
     : []));
+  const completeParts = new Set(retained.flatMap((event) => event.type === "message.part_committed"
+    || event.type === "message.part_stream_snapshot"
+    ? [messagePartKey(String(event.payload.messageId), String(event.payload.part.id))]
+    : []));
   const omissions = new Map<string, RuntimeMessagePartOmission>();
   for (const omission of previous ?? []) {
     const partKey = messagePartKey(omission.messageId, omission.partId);
-    if (anchoredParts.has(partKey)) omissions.set(messagePartOmissionKey(omission), omission);
+    if (anchoredParts.has(partKey) && !completeParts.has(partKey)) omissions.set(messagePartOmissionKey(omission), omission);
   }
   for (const event of candidates) {
     if (event.type !== "message.part_delta" || retainedIds.has(event.id)) continue;
@@ -801,7 +827,8 @@ function mergeMessagePartOmissions(
       partId: String(event.payload.partId),
       field: event.payload.field,
     };
-    if (anchoredParts.has(messagePartKey(omission.messageId, omission.partId))) {
+    const partKey = messagePartKey(omission.messageId, omission.partId);
+    if (anchoredParts.has(partKey) && !completeParts.has(partKey)) {
       omissions.set(messagePartOmissionKey(omission), omission);
     }
   }
@@ -833,11 +860,12 @@ function liveWindowState(snapshot: RuntimeSnapshot, limits: RuntimeEventLimits):
   const key = runtimeEventLimitsKey(limits);
   const cached = liveEventWindowCache.get(snapshot);
   if (cached?.limitsKey === key) return cached;
-  const sourceBytes = jsonEventArrayUtf8Bytes(snapshot.events);
-  const overBudget = snapshot.events.length > limits.maxEvents || sourceBytes > limits.maxBytes;
+  const source = coalesceMessageStreams(snapshot.events);
+  const sourceBytes = jsonEventArrayUtf8Bytes(source);
+  const overBudget = source.length > limits.maxEvents || sourceBytes > limits.maxBytes;
   const retained = retainReplayableRuntimeEvents(
-    snapshot.events,
-    overBudget ? lowWaterRuntimeEventLimits(limits) : limits,
+    source,
+    { ...(overBudget ? lowWaterRuntimeEventLimits(limits) : limits), preserveTransientEvents: true },
   );
   const omittedMessageParts = mergeMessagePartOmissions(
     snapshot.omittedMessageParts,
@@ -871,28 +899,51 @@ function compactLiveEvents(
   bytes: number;
   passes: number;
   dependencyTruncated: boolean;
+  truncated: boolean;
 } {
-  function *candidates(): Iterable<ChiliEvent> {
-    yield* events;
-    yield appended;
-  }
+  const candidates = coalesceMessageStreams([...events, appended]);
 
-  const lowWater = retainReplayableRuntimeEvents(candidates(), lowWaterRuntimeEventLimits(limits));
+  const lowWater = retainReplayableRuntimeEvents(candidates, { ...lowWaterRuntimeEventLimits(limits), preserveTransientEvents: true });
   if (lowWater.events.some((event) => event.id === appended.id)) {
     return {
       events: lowWater.events,
       bytes: lowWater.bytes,
       passes: 1,
       dependencyTruncated: lowWater.dependencyTruncated,
+      truncated: lowWater.truncated,
     };
   }
-  const fullBudget = retainReplayableRuntimeEvents(candidates(), limits);
+  const fullBudget = retainReplayableRuntimeEvents(candidates, { ...limits, preserveTransientEvents: true });
   return {
     events: fullBudget.events,
     bytes: fullBudget.bytes,
     passes: 2,
     dependencyTruncated: fullBudget.dependencyTruncated,
+    truncated: fullBudget.truncated,
   };
+}
+
+/** Keep a complete in-memory prefix when the bounded event window is compacted. */
+function coalesceMessageStreams(events: readonly ChiliEvent[]): ChiliEvent[] {
+  const latest = new Map<string, ChiliEvent>();
+  for (const event of events) {
+    if (event.type === "message.part_stream_delta") latest.set(event.payload.partId, event);
+    else if (event.type === "message.part_stream_snapshot") latest.set(event.payload.part.id, event);
+  }
+  if (latest.size === 0) return [...events];
+  const runtime = reduceRuntimeEvents(events.map(projectionSafeEvent));
+  return events.flatMap((event): ChiliEvent[] => {
+    if (event.type !== "message.part_stream_delta" && event.type !== "message.part_stream_snapshot") return [event];
+    const partId = event.type === "message.part_stream_delta" ? event.payload.partId : event.payload.part.id;
+    if (runtime.committedPartIds[partId]) return [];
+    // Preserve a detected gap until a fresh server snapshot can repair it.
+    if (runtime.partStreamGaps[partId]) return [event];
+    if (latest.get(partId) !== event) return [];
+    const entry = runtime.partIndex[partId];
+    const part = entry ? runtime.messages[entry.messageId]?.parts[entry.index] : undefined;
+    if (!part || (part.type !== "text" && part.type !== "reasoning")) return [event];
+    return [{ ...event, type: "message.part_stream_snapshot", payload: { messageId: part.messageId, part: { ...part } } }];
+  });
 }
 
 function providedDependencyKeys(events: readonly ChiliEvent[]): ReadonlySet<string> {

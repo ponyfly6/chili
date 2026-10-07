@@ -507,6 +507,30 @@ describe("desktop IPC contracts", () => {
     }
   });
 
+  test("accepts complete blocks and active streams while rejecting invalid offsets and identities", () => {
+    const part = { id: "part_stream", messageId: "message_1", sessionId: "session_1", type: "reasoning", text: "thinking", ordinal: 0 };
+    const delta = { messageId: "message_1", partId: "part_stream", partType: "reasoning", delta: "😀", offset: 8, ordinal: 0 };
+    const parse = (type: string, payload: Record<string, unknown>) => parseDesktopEvent({
+      type: "runtime.event", event: runtimeEnvelope(type, payload, "event_stream"),
+    });
+    expect(parse("message.part_stream_snapshot", { messageId: "message_1", part })).toMatchObject({
+      event: { type: "message.part_stream_snapshot", payload: { part } },
+    });
+    expect(parse("message.part_stream_delta", delta)).toMatchObject({ event: { payload: delta } });
+    expect(parse("message.part_committed", { messageId: "message_1", part: { ...part, completion: "cancelled" } })).toMatchObject({
+      event: { payload: { part: { completion: "cancelled" } } },
+    });
+    for (const offset of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => parse("message.part_stream_delta", { ...delta, offset })).toThrow();
+    }
+    expect(() => parse("message.part_stream_delta", { ...delta, partId: "__proto__" })).toThrow();
+    expect(() => parse("message.part_stream_snapshot", { messageId: "message_1", part: { ...part, completion: "completed" } })).toThrow();
+    expect(() => parse("message.part_committed", { messageId: "message_2", part })).toThrow();
+    expect(() => parse("message.part_committed", { messageId: "message_1", part: { ...part, sessionId: "other" } })).toThrow();
+    expect(() => parse("message.part_added", { messageId: "message_1", part: { ...part, completion: "interrupted" } })).toThrow();
+    expect(() => parse("message.part_added", { messageId: "message_1", part: { ...part, ordinal: -1 } })).toThrow();
+  });
+
   test("validates sequenced event envelopes and private stream control messages", () => {
     const envelope = {
       version: 1,

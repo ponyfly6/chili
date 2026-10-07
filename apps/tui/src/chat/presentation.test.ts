@@ -277,6 +277,71 @@ test("marks every text part in the active assistant message as streaming", () =>
   ]);
 });
 
+test("finalized content blocks retain their completion and stop streaming while later blocks remain active", () => {
+  const display = buildChatDisplayItems([{
+    id: "msg_block_completion" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      { type: "reasoning", id: "part_completed_thinking" as PartId, text: "Finished thinking.", completion: "completed" },
+      { type: "text", id: "part_cancelled_text" as PartId, text: "Partial answer.", completion: "cancelled" },
+      { type: "reasoning", id: "part_failed_thinking" as PartId, text: "Partial thinking.", completion: "failed" },
+      { type: "text", id: "part_completed_text" as PartId, text: "Finished answer.", completion: "completed" },
+      { type: "text", id: "part_live_text" as PartId, text: "Working on another block." },
+    ],
+  }], { sessionStatus: "running" });
+
+  expect(display).toHaveLength(5);
+  expect(display[0]).toMatchObject({ kind: "reasoning", completion: "completed" });
+  expect(display[1]).toMatchObject({ kind: "assistant_text", completion: "cancelled" });
+  expect(display[2]).toMatchObject({ kind: "reasoning", completion: "failed" });
+  expect(display[3]).toMatchObject({ kind: "assistant_text", completion: "completed" });
+  for (const item of display.slice(0, 4)) {
+    expect(item).not.toHaveProperty("active");
+    expect(item).not.toHaveProperty("streaming");
+  }
+  expect(display[4]).toMatchObject({ streaming: true });
+});
+
+test("reasoning-only messages mark unfinished blocks active", () => {
+  const display = buildChatDisplayItems([{
+    id: "msg_live_thinking" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      { type: "reasoning", id: "part_saved_thinking" as PartId, text: "Finished.", completion: "completed" },
+      { type: "reasoning", id: "part_live_thinking" as PartId, text: "Considering the next step." },
+    ],
+  }], { sessionStatus: "running" });
+
+  expect(display[0]).not.toHaveProperty("active");
+  expect(display[1]).toMatchObject({ kind: "reasoning", active: true });
+});
+
+test("hidden thinking retains incomplete status from later blocks without showing them as active", () => {
+  const display = buildChatDisplayItems([{
+    id: "msg_hidden_completion" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      { type: "reasoning", id: "part_hidden_complete" as PartId, text: "Saved thought.", completion: "completed" },
+      { type: "text", id: "part_hidden_failed" as PartId, text: "Partial progress.", phase: "commentary", completion: "failed" },
+    ],
+  }], { sessionStatus: "running", hideThinking: true });
+
+  expect(display).toEqual([{
+    kind: "reasoning",
+    id: "msg_hidden_completion:hidden-thinking",
+    text: "",
+    collapsed: true,
+    time: 1,
+    completion: "failed",
+  }]);
+});
+
 test("hideThinking hides commentary but keeps the final answer beside tool calls", () => {
   const callId = "tool_phase_visibility" as ToolCallId;
   const display = buildChatDisplayItems([{

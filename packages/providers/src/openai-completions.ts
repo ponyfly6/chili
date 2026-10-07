@@ -230,6 +230,8 @@ export class OpenAICompletionsModel implements ChiliModel {
     const toolCalls = new Map<number, ToolStreamState>();
     const unfinishedChoices = new Set<number>();
     const finishedChoices = new Set<number>();
+    const textChoices = new Set<number>();
+    const reasoningChoices = new Set<number>();
 
     for await (const event of readSseEvents(body, signal)) {
       if (event.data === "[DONE]") break;
@@ -272,15 +274,21 @@ export class OpenAICompletionsModel implements ChiliModel {
           throw providerStreamProtocolError(this.provider, "Model stream continued a finished choice", response, "invalid_stream");
         }
         if (choice.delta?.reasoning_content) {
+          reasoningChoices.add(index);
           yield { type: "reasoning_delta", text: choice.delta.reasoning_content, index };
         }
         if (choice.delta?.content) {
+          textChoices.add(index);
           yield { type: "text_delta", text: choice.delta.content, index };
         }
         for (const toolCall of choice.delta?.tool_calls ?? []) {
           yield* applyToolCallDelta(toolCalls, toolCall, index);
         }
         if (choice.finish_reason) {
+          if (isCompleteFinishReason(choice.finish_reason)) {
+            if (reasoningChoices.delete(index)) yield { type: "reasoning_end", index };
+            if (textChoices.delete(index)) yield { type: "text_end", index };
+          }
           finishReason = choice.finish_reason;
           unfinishedChoices.delete(index);
           finishedChoices.add(index);
@@ -330,9 +338,11 @@ export class OpenAICompletionsModel implements ChiliModel {
       const message = choice.message;
       if (message?.reasoning_content) {
         yield { type: "reasoning_delta", text: message.reasoning_content, index };
+        if (isCompleteFinishReason(choice.finish_reason ?? "stop")) yield { type: "reasoning_end", index };
       }
       if (message?.content) {
         yield { type: "text_delta", text: message.content, index };
+        if (isCompleteFinishReason(choice.finish_reason ?? "stop")) yield { type: "text_end", index };
       }
       for (const [toolIndex, toolCall] of (message?.tool_calls ?? []).entries()) {
         const tool = toolStateFromCompleteToolCall(toolCall, index, toolIndex);
@@ -353,6 +363,10 @@ export class OpenAICompletionsModel implements ChiliModel {
       ...this.options.headers,
     };
   }
+}
+
+function isCompleteFinishReason(reason: string): boolean {
+  return reason === "stop" || reason === "tool_calls" || reason === "function_call";
 }
 
 function resolveInputReasoningLevel(input: ModelStreamInput): ReasoningLevel | undefined {

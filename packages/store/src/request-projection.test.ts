@@ -36,7 +36,7 @@ test("SQLite removes request bodies before decoding transport rows and preserves
     expect(decodedBytes).toHaveLength(2);
     expect(Math.max(...decodedBytes)).toBeLessThan(256);
     expect(await store.events({ sessionId, type: "model.request_prepared" })).toEqual([event]);
-    expect(decodedBytes.at(-1)).toBeGreaterThan(5_000_000);
+    expect(decodedBytes.at(-1)).toBeLessThan(1_024);
     expect(await store.events({ sessionId, afterEventId: event.id, compactRequests: true })).toEqual([]);
   } finally {
     store.close();

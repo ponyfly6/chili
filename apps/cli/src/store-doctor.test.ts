@@ -19,6 +19,17 @@ test("formatStoreDoctorText surfaces file and largest-payload diagnostics", () =
         { path: "/repo/.chili/tool-results/toolcall_big.txt", exists: true, bytes: 49_152 },
       ],
     },
+    contentFiles: {
+      path: "/repo/.chili/contents/chili.sqlite",
+      exists: true,
+      files: 3,
+      totalBytes: 131_072,
+      largestFiles: [
+        { path: "/repo/.chili/contents/chili.sqlite/session_hot/content_big.txt", exists: true, bytes: 98_304 },
+        { path: "/repo/.chili/contents/chili.sqlite/session_hot/content_medium.txt", exists: true, bytes: 24_576 },
+        { path: "/repo/.chili/contents/chili.sqlite/session_other/content_small.txt", exists: true, bytes: 8_192 },
+      ],
+    },
     configuredWal: {
       autoCheckpointPages: 256,
       journalSizeLimitBytes: 16 * 1024 * 1024,
@@ -77,7 +88,10 @@ test("formatStoreDoctorText surfaces file and largest-payload diagnostics", () =
   const output = formatStoreDoctorText(report);
 
   expect(output).toContain("Store doctor: /repo/.chili/chili.sqlite");
+  expect(output).toContain("storage total=211.0 KiB sqlite=35.0 KiB contents=128.0 KiB tool_results=48.0 KiB");
   expect(output).toContain("wal=2.0 KiB");
+  expect(output).toContain("contents files=3 total=128.0 KiB path=/repo/.chili/contents/chili.sqlite");
+  expect(output).toContain("session_hot/content_big.txt\t96.0 KiB");
   expect(output).toContain("toolcall_big.txt\t48.0 KiB");
   expect(output).toContain("autocheckpoint_pages=256");
   expect(output).toContain("sqlite_policy version=3.51.0 wal_reset_safe=false selected=delete actual=delete");

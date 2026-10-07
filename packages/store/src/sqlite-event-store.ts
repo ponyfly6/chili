@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { StoredContentCodec } from "./content-store.js";
 import { SessionInputConflictError, SessionInputRepository, type SessionInputMutation, type SessionInputMutationOptions, type SessionInputMutationResult } from "./session-inputs.js";
 import type {
   ApprovalEvent,
@@ -52,6 +53,7 @@ interface StoredEventRow {
   time: number;
   session_id: string | null;
   payload_json: string;
+  content_version: number;
 }
 
 interface MessageRow {
@@ -65,6 +67,7 @@ interface MessageRow {
 
 interface PartRow {
   data_json: string;
+  content_version: number;
   delta_event_seq: number;
 }
 
@@ -178,6 +181,7 @@ export class SqliteEventStore
     StaleTurnRecoveryStore
 {
   private readonly db: Database;
+  private readonly content: StoredContentCodec;
   private readonly ownedCreationClaims = new Map<SessionId, string>();
   private readonly ownedRunClaims = new Map<SessionId, string>();
   private readonly journalMode: string;
@@ -186,6 +190,7 @@ export class SqliteEventStore
   private inputMirrors: Promise<void> = Promise.resolve();
 
   constructor(path = ".chili/chili.sqlite", private readonly options: SqliteEventStoreOptions = {}) {
+    this.content = new StoredContentCodec(path);
     this.db = new Database(path, { create: true, strict: true });
     try {
       this.db.exec(`pragma busy_timeout = ${Math.max(0, Math.trunc(options.busyTimeoutMs ?? 10_000))}`);
@@ -201,7 +206,19 @@ export class SqliteEventStore
       this.db.exec(`pragma journal_size_limit = ${SQLITE_JOURNAL_SIZE_LIMIT_BYTES}`);
       this.db.exec("pragma foreign_keys = ON");
       for (const statement of SQLITE_SCHEMA) this.db.exec(statement);
+      for (const [table, columns] of Object.entries({
+        events: { payload_bytes: "integer", compact_payload_bytes: "integer", content_version: "integer not null default 0" },
+        message_parts: { content_version: "integer not null default 0" },
+        tool_calls: { input_content_version: "integer not null default 0", output_content_version: "integer not null default 0" },
+        session_inputs: { content_version: "integer not null default 0" },
+      })) {
+        const existing = new Set(this.db.query<{ name: string }, []>(`pragma table_info(${table})`).all().map((column) => column.name));
+        for (const [column, definition] of Object.entries(columns)) {
+          if (!existing.has(column)) this.db.exec(`alter table ${table} add column ${column} ${definition}`);
+        }
+      }
       this.inputs = new SessionInputRepository(this.db, {
+        content: this.content,
         commit: (events, fence) => { this.writeTransactionEvents(events, fence); },
         claim: (input) => this.claimSessionRun(input),
         forgetClaim: (sessionId, claimId) => {
@@ -623,7 +640,7 @@ export class SqliteEventStore
   }
 
   async runtimeSnapshot(query: { sessionId?: SessionId; maxBytes?: number } = {}) {
-    return readRuntimeStateSnapshot(this.db, query);
+    return readRuntimeStateSnapshot(this.db, query, this.content);
   }
 
   async events(query: EventQuery = {}): Promise<EventEnvelope[]> {
@@ -634,8 +651,8 @@ export class SqliteEventStore
     const compactPayload = query.compactRequests
       ? `case when type = 'model.request_prepared' then
            json_remove(json_set(payload_json, '$.contentVersion',
-             coalesce(json_extract(payload_json, '$.contentVersion'), json_extract(payload_json, '$.request.contentVersion'))), '$.request')
-         when type = 'message.part_added' and json_extract(payload_json, '$.part.type') = 'tool_result'
+             coalesce(json_extract(payload_json, '$.contentVersion'), json_extract(payload_json, '$.request.contentVersion'), json_extract(payload_json, '$.request.$chiliContent.contentVersion'))), '$.request')
+         when type in ('message.part_added', 'message.part_committed') and json_extract(payload_json, '$.part.type') = 'tool_result'
            then json_remove(payload_json, '$.part.structuredData')
          else payload_json end`
       : "payload_json";
@@ -650,7 +667,7 @@ export class SqliteEventStore
       }
       const tail = !!query.tail && !query.afterEventId;
       const candidates = this.db.prepare<Omit<StoredEventRow, "payload_json"> & { payload_bytes: number }, any>(
-        `select seq, id, type, time, session_id, length(cast(${payload} as blob)) as payload_bytes
+        `select seq, id, type, time, session_id, content_version, coalesce(${query.compactRequests ? "compact_payload_bytes" : "payload_bytes"}, length(cast(${payload} as blob))) as payload_bytes
          from events ${where} order by seq ${tail ? "desc" : "asc"} limit $limit`,
       );
       const result: EventEnvelope[] = [];
@@ -671,6 +688,12 @@ export class SqliteEventStore
           const body = this.db.query<{ payload_json: string }, [number]>(
             `select ${payload} as payload_json from events where seq = ?`,
           ).get(row.seq)!;
+          const storedPayload = decodeJson<Record<string, unknown>>(body.payload_json, {});
+          const resolvedBytes = Buffer.byteLength(JSON.stringify(envelope), "utf8") - 2 + (row.content_version === 1 ? this.content.resolvedJsonBytes(storedPayload) : Buffer.byteLength(body.payload_json));
+          if (bytes + resolvedBytes > query.maxBytes) {
+            if (result.length === 0) throw new EventPageTooLargeError(row.id, resolvedBytes, query.maxBytes);
+            break;
+          }
           const event = this.eventFromRow({ ...row, payload_json: body.payload_json });
           const eventBytes = Buffer.byteLength(JSON.stringify(event), "utf8");
           if (bytes + eventBytes > query.maxBytes) {
@@ -690,7 +713,7 @@ export class SqliteEventStore
 
     const orderAndLimit = query.tail && !query.afterEventId
       ? `from (
-           select seq, id, type, time, session_id, payload_json
+           select seq, id, type, time, session_id, payload_json, content_version
            from events
            ${where}
            order by seq desc
@@ -704,7 +727,7 @@ export class SqliteEventStore
 
     const rows = this.db
       .query<StoredEventRow, any>(
-        `select seq, id, type, time, session_id, ${payload} as payload_json
+        `select seq, id, type, time, session_id, content_version, ${payload} as payload_json
          ${orderAndLimit}`,
       )
       .all(params);
@@ -729,10 +752,9 @@ export class SqliteEventStore
       }, []>(
         `select s.id, s.cwd, s.title, s.status, s.created_at, s.updated_at,
                 s.parent_session_id, s.agent_name, s.agent_path, s.agent_policy_json,
-                (select coalesce(
-                          nullif(json_extract(mp.data_json, '$.displayText'), ''),
-                          nullif(json_extract(mp.data_json, '$.text'), '')
-                        )
+                (select json_object('encoded', mp.content_version,
+                          'display', json_extract(mp.data_json, '$.displayText'),
+                          'text', json_extract(mp.data_json, '$.text'))
                  from messages m
                  join message_parts mp on mp.message_id = m.id
                  where m.session_id = s.id
@@ -748,7 +770,7 @@ export class SqliteEventStore
         id: row.id as SessionRow["id"],
         cwd: row.cwd,
         ...(row.title ? { title: row.title } : {}),
-        ...(row.preview ? { preview: row.preview } : {}),
+        ...(row.preview ? { preview: this.sessionPreview(row.preview) } : {}),
         status: row.status,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
@@ -773,7 +795,7 @@ export class SqliteEventStore
     return messages.map((message) => {
       const parts = this.db
         .query<PartRow, [string]>(
-          `select data_json, delta_event_seq
+          `select data_json, delta_event_seq, content_version
            from message_parts
            where message_id = ?
            order by ordinal asc`,
@@ -781,6 +803,7 @@ export class SqliteEventStore
         .all(message.id)
         .map((row) => {
           let part = decodeJson<MessagePart>(row.data_json, {} as MessagePart);
+          if (row.content_version === 1) part = this.content.resolve(part);
           for (const delta of pendingDeltas.get(part.id) ?? []) {
             if (delta.seq <= row.delta_event_seq) continue;
             part = applyPartDelta(part, delta.field, delta.delta);
@@ -1131,15 +1154,17 @@ export class SqliteEventStore
   private insertEvent(event: RuntimeEvent): number {
     const result = this.db
       .query(
-        `insert into events (id, type, time, session_id, payload_json)
-         values (?, ?, ?, ?, ?)`,
+        `insert into events (id, type, time, session_id, payload_json, payload_bytes, compact_payload_bytes, content_version)
+         values (?, ?, ?, ?, ?, ?, ?, 1)`,
       )
       .run(
         event.id,
         event.type,
         event.time,
         event.sessionId ?? null,
-        encodeJson(event.payload),
+        encodeJson(this.content.storePayload(event.type, event.payload, event.sessionId)),
+        Buffer.byteLength(encodeJson(event.payload)),
+        Buffer.byteLength(encodeJson(compactEventPayload(event))),
       );
     return Number(result.lastInsertRowid);
   }
@@ -1290,16 +1315,17 @@ export class SqliteEventStore
       return;
     }
 
-    if (event.type === "message.part_added") {
+    if (event.type === "message.part_added" || event.type === "message.part_committed") {
       const part = event.payload.part;
-      const ordinal = this.nextPartOrdinal(part.messageId);
+      const ordinal = part.ordinal ?? this.nextPartOrdinal(part.messageId);
       this.db
         .query(
-          `insert into message_parts (id, message_id, session_id, type, ordinal, data_json, created_at)
-           values (?, ?, ?, ?, ?, ?, ?)
-           on conflict(id) do update set data_json = excluded.data_json`,
+          `insert into message_parts (id, message_id, session_id, type, ordinal, data_json, delta_event_seq, created_at, content_version)
+           values (?, ?, ?, ?, ?, ?, ?, ?, 1)
+           on conflict(id) do update set data_json = excluded.data_json, delta_event_seq = excluded.delta_event_seq, content_version = 1,
+             ordinal = case when json_extract(excluded.data_json, '$.ordinal') is null then message_parts.ordinal else excluded.ordinal end`,
         )
-        .run(part.id, part.messageId, part.sessionId, part.type, ordinal, encodeJson(part), event.time);
+        .run(part.id, part.messageId, part.sessionId, part.type, ordinal, encodeJson(this.content.storePart(part)), event.type === "message.part_committed" ? eventSeq : 0, event.time);
       return;
     }
 
@@ -1342,6 +1368,7 @@ export class SqliteEventStore
                 message_parts.id as part_id,
                 events.payload_json,
                 message_parts.data_json,
+                message_parts.content_version,
                 message_parts.delta_event_seq
            from events
            join message_parts on message_parts.id = json_extract(events.payload_json, '$.partId')
@@ -1357,7 +1384,7 @@ export class SqliteEventStore
       const payload = decodeJson<{ field?: unknown; delta?: unknown }>(row.payload_json, {});
       if (typeof payload.field !== "string" || typeof payload.delta !== "string") continue;
       const current = compacted.get(row.part_id) ?? {
-        part: decodeJson<MessagePart>(row.data_json, {} as MessagePart),
+        part: row.content_version === 1 ? this.content.resolve(decodeJson<MessagePart>(row.data_json, {} as MessagePart)) : decodeJson<MessagePart>(row.data_json, {} as MessagePart),
         seq: row.delta_event_seq,
       };
       current.part = applyPartDelta(current.part, payload.field, payload.delta);
@@ -1366,11 +1393,11 @@ export class SqliteEventStore
     }
     const update = this.db.query(
       `update message_parts
-          set data_json = ?, delta_event_seq = ?
+          set data_json = ?, delta_event_seq = ?, content_version = 1
         where id = ?`,
     );
     for (const [partId, item] of compacted) {
-      update.run(encodeJson(item.part), item.seq, partId);
+      update.run(encodeJson(this.content.storePart(item.part)), item.seq, partId);
     }
   }
 
@@ -1388,8 +1415,8 @@ export class SqliteEventStore
       this.db
         .query(
           `insert into tool_calls
-             (id, provider_call_id, parent_call_id, session_id, turn_id, tool_name, status, input_json, started_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+             (id, provider_call_id, parent_call_id, session_id, turn_id, tool_name, status, input_json, started_at, updated_at, input_content_version)
+           values (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, 1)
            on conflict(id) do update set
              status = excluded.status,
              provider_call_id = coalesce(excluded.provider_call_id, tool_calls.provider_call_id),
@@ -1403,7 +1430,7 @@ export class SqliteEventStore
           event.sessionId ?? null,
           event.payload.turnId,
           event.payload.toolName,
-          encodeJson(event.payload.input),
+          encodeJson({ __chiliStoredValue: 1, value: this.content.jsonReference(event.payload.input, event.sessionId) }),
           event.time,
           event.time,
         );
@@ -1412,8 +1439,11 @@ export class SqliteEventStore
 
     if (event.type === "tool.call_updated") {
       this.db
-        .query(`update tool_calls set status = ?, provider_call_id = coalesce(?, provider_call_id), updated_at = ? where id = ?`)
-        .run(event.payload.status, event.payload.providerCallId ?? null, event.time, event.payload.callId);
+        .query(`update tool_calls set status = ?, provider_call_id = coalesce(?, provider_call_id), input_content_version = case when ? is null then input_content_version else 1 end, input_json = coalesce(?, input_json), updated_at = ? where id = ?`)
+        .run(event.payload.status, event.payload.providerCallId ?? null,
+          event.payload.input === undefined ? null : 1,
+          event.payload.input === undefined ? null : encodeJson({ __chiliStoredValue: 1, value: this.content.jsonReference(event.payload.input, event.sessionId) }),
+          event.time, event.payload.callId);
       return;
     }
 
@@ -1421,13 +1451,13 @@ export class SqliteEventStore
       this.db
         .query(
           `update tool_calls
-           set status = ?, output = ?, error = ?, synthetic = ?, updated_at = ?
+           set status = ?, output = ?, error = ?, synthetic = ?, updated_at = ?, output_content_version = 1
            where id = ?`,
         )
         .run(
           event.payload.status,
-          event.payload.output ?? null,
-          event.payload.error ?? null,
+          event.payload.output === undefined ? null : this.content.storeText(event.payload.output, event.sessionId),
+          event.payload.error === undefined ? null : this.content.storeText(event.payload.error, event.sessionId),
           event.payload.synthetic ? 1 : 0,
           event.time,
           event.payload.callId,
@@ -1478,6 +1508,13 @@ export class SqliteEventStore
     return row?.count ?? 0;
   }
 
+  private sessionPreview(json: string): string {
+    const preview = JSON.parse(json) as { encoded: number; display?: unknown; text?: unknown };
+    if (preview.encoded !== 1) return String(preview.display || preview.text || "").slice(0, 2_000);
+    const value = this.content.resolveBounded({ __chiliContentVersion: 1, displayText: preview.display, text: preview.text }, 2_000);
+    return String(value.displayText || value.text || "");
+  }
+
   private eventFromRow(row: StoredEventRow): EventEnvelope {
     if (row.type.startsWith("session.") && !row.session_id) {
       throw new Error(`Cannot replay ${row.type}: event has no SessionId.`);
@@ -1486,7 +1523,7 @@ export class SqliteEventStore
       id: row.id,
       type: row.type,
       time: row.time as EventEnvelope["time"],
-      payload: decodeJson<Record<string, unknown>>(row.payload_json, {}),
+      payload: row.content_version === 1 ? this.content.resolve(decodeJson<Record<string, unknown>>(row.payload_json, {})) : decodeJson<Record<string, unknown>>(row.payload_json, {}),
     };
     if (row.session_id) {
       event.sessionId = row.session_id as SessionId;
@@ -1573,4 +1610,16 @@ function configureSqliteJournalMode(
 
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function compactEventPayload(event: RuntimeEvent): unknown {
+  if (event.type === "model.request_prepared") {
+    const { request, ...payload } = event.payload;
+    return { ...payload, contentVersion: payload.contentVersion ?? request?.contentVersion ?? null };
+  }
+  if ((event.type === "message.part_added" || event.type === "message.part_committed") && event.payload.part.type === "tool_result") {
+    const { structuredData: _omitted, ...part } = event.payload.part;
+    return { ...event.payload, part };
+  }
+  return event.payload;
 }

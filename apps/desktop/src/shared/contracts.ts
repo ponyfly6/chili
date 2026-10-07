@@ -834,6 +834,14 @@ function parseRuntimeEvent(value: unknown): ChiliEvent {
   if (type === "model.request_prepared" || type === "model.request_identity" || type === "session.identity_bound") {
     return parseChiliEvent(value);
   }
+  if (type === "message.part_stream_delta" || type === "message.part_stream_snapshot" || type === "message.part_committed") {
+    const parsed = parseChiliEvent(value);
+    assertRuntimePayloadIdentifiers(type, payload);
+    if (type !== "message.part_stream_delta") {
+      assertMessagePartIdentifiers(requireRecord(payload.part, "event.payload.part"), "event.payload.part");
+    }
+    return parsed;
+  }
   assertRuntimePayloadSchema(type, payload);
   assertRuntimePayloadIdentifiers(type, payload);
   if (type === "message.part_added") {
@@ -1357,9 +1365,11 @@ function assertMessagePartSchema(part: Record<string, unknown>, field: string): 
   requirePayloadString(part.id, `${field}.id`);
   requirePayloadString(part.messageId, `${field}.messageId`);
   requirePayloadString(part.sessionId, `${field}.sessionId`);
+  if (part.ordinal !== undefined) requireNonNegativeInteger(part.ordinal, `${field}.ordinal`);
   const type = requirePayloadString(part.type, `${field}.type`);
   if (type === "text") {
     requirePayloadString(part.text, `${field}.text`, true);
+    if (part.completion !== undefined) requireEnum(part.completion, ["completed", "cancelled", "failed"], `${field}.completion`);
     if (part.phase !== undefined) requireEnum(part.phase, ["commentary", "final_answer"], `${field}.phase`);
     optionalPayloadString(part.displayText, `${field}.displayText`, true);
     optionalBoolean(part.synthetic, `${field}.synthetic`);
@@ -1375,6 +1385,7 @@ function assertMessagePartSchema(part: Record<string, unknown>, field: string): 
   }
   if (type === "reasoning") {
     requirePayloadString(part.text, `${field}.text`, true);
+    if (part.completion !== undefined) requireEnum(part.completion, ["completed", "cancelled", "failed"], `${field}.completion`);
     optionalBoolean(part.redacted, `${field}.redacted`);
     if (part.modelOutput !== undefined) {
       const output = requireRecord(part.modelOutput, `${field}.modelOutput`);
@@ -1609,6 +1620,9 @@ const RUNTIME_EVENT_ID_FIELDS: Readonly<Record<string, readonly string[]>> = {
   "turn.guard_triggered": ["turnId"],
   "message.created": ["messageId", "turnId"],
   "message.part_added": ["messageId"],
+  "message.part_committed": ["messageId"],
+  "message.part_stream_snapshot": ["messageId"],
+  "message.part_stream_delta": ["messageId", "partId"],
   "message.part_delta": ["messageId", "partId"],
   "tool.call_started": ["turnId", "callId"],
   "tool.call_updated": ["callId"],

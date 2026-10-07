@@ -14,6 +14,7 @@ import { eventMatchesProject, ProjectViewMemory } from "./project-view-state.js"
 import { useDesktopTheme } from "./useDesktopTheme.js";
 import { getDesktopBuildInfo } from "../shared/build-info.js";
 import { SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
+import { hasRuntimePartStreamGap } from "@chili/sdk";
 import type {
   ChiliEvent,
   DelegationPolicy,
@@ -455,6 +456,11 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     const current = selectedRef.current;
     if (current) await openSession(current, { background: true });
   }, [openSession]);
+
+  const streamHasGap = presentation ? hasRuntimePartStreamGap(presentation.runtime) : false;
+  useEffect(() => {
+    if (streamHasGap && healthy && !resyncing) void reloadSelected();
+  }, [streamHasGap, healthy, resyncing, selectedId, reloadSelected]);
 
   useEffect(() => {
     let disposed = false;
@@ -1757,8 +1763,14 @@ function WorkDetail({ item }: { item: ChatTranscriptItem }) {
 }
 
 export function MessagePart({ part, compact = false }: { part: ChatMessagePart; compact?: boolean }) {
-  if (part.type === "text") return <MarkdownText text={part.text} compact={compact} />;
-  if (part.type === "reasoning") return <details className="work-reasoning"><summary>思考过程</summary><MarkdownText text={part.text} compact /></details>;
+  if (part.type === "text" || part.type === "reasoning") {
+    const incomplete = part.completion === "cancelled" ? "已停止，内容未完成"
+      : part.completion === "failed" ? "生成失败，内容未完成" : undefined;
+    const content = <MarkdownText text={part.text} compact={part.type === "reasoning" || compact} />;
+    return part.type === "reasoning"
+      ? <details className="work-reasoning"><summary>思考过程{incomplete ? ` · ${incomplete}` : ""}</summary>{content}</details>
+      : <>{content}{incomplete ? <p className="work-history-note">{incomplete}</p> : null}</>;
+  }
   if (part.type === "summary") return <div className="summary-part"><MarkdownText text={part.text} compact /></div>;
   if (part.type === "image") return <p className="attachment">Image · {part.filename ?? part.mimeType}</p>;
   if (part.type === "tool_call") {

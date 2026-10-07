@@ -14,6 +14,7 @@ import type {
   ToolCallId,
   TurnId,
 } from "@chili/protocol";
+import { StoredContentCodec } from "./content-store.js";
 import { ObservableEventStore } from "./observable-event-store.js";
 import {
   SessionAlreadyExistsError,
@@ -1335,7 +1336,7 @@ test("replays message part deltas without rewriting the full projection until tu
         "select data_json, delta_event_seq from message_parts where id = ?",
       )
       .get(partId);
-    expect(JSON.parse(beforeCompletion?.data_json ?? "{}").text).toBe("hel");
+    expect((store as unknown as { content: StoredContentCodec }).content.resolve(JSON.parse(beforeCompletion?.data_json ?? "{}")).text).toBe("hel");
     expect(beforeCompletion?.delta_event_seq).toBe(0);
 
     const messages = await store.messages(sessionId);
@@ -1363,7 +1364,7 @@ test("replays message part deltas without rewriting the full projection until tu
         "select data_json, delta_event_seq from message_parts where id = ?",
       )
       .get(partId);
-    expect(JSON.parse(afterCompletion?.data_json ?? "{}").text).toBe("hello");
+    expect((store as unknown as { content: StoredContentCodec }).content.resolve(JSON.parse(afterCompletion?.data_json ?? "{}")).text).toBe("hello");
     expect(afterCompletion?.delta_event_seq).toBeGreaterThan(0);
   } finally {
     store.close();

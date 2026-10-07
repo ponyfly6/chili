@@ -51,3 +51,20 @@ test("keeps an orphaned raw tool result collapsed by default", () => {
   expect(html).toContain("Tool result");
   expect(html).toContain("&lt;p align=&quot;center&quot;&gt;");
 });
+
+test("preserves interrupted text and reasoning with an incomplete label", () => {
+  const stopped = renderToStaticMarkup(<MessagePart part={{
+    type: "text", id: "part_text" as never, text: "Partial **answer**", completion: "cancelled",
+  }} />);
+  expect(stopped).toContain("Partial <strong>answer</strong>");
+  expect(stopped).toContain("已停止，内容未完成");
+  const failed = renderToStaticMarkup(<MessagePart part={{
+    type: "reasoning", id: "part_reasoning" as never, text: "Partial thinking", completion: "failed",
+  }} />);
+  expect(failed).toContain("Partial thinking");
+  expect(failed).toContain("生成失败，内容未完成");
+  const complete = renderToStaticMarkup(<MessagePart part={{
+    type: "text", id: "part_complete" as never, text: "Done", completion: "completed",
+  }} />);
+  expect(complete).not.toContain("未完成");
+});

@@ -139,7 +139,7 @@ export interface RuntimeClient {
   waitAgent(input: WaitAgentRequest): Promise<RuntimeAgentWaitResult>;
   stopAgent(input: TargetAgentRequest): Promise<{ agentId: string }>;
   resumeAgent(input: TargetAgentRequest): Promise<{ agentId: string; inputId?: string }>;
-  messages(sessionId: SessionId): Promise<Message[]>;
+  messages(sessionId: SessionId, signal?: AbortSignal): Promise<Message[]>;
   streamEvents(input?: StreamEventsRequest): AsyncIterable<ChiliEvent>;
   /** Atomic projected state and its durable stream watermark. */
   eventSnapshot(input?: EventSnapshotRequest): Promise<RuntimeStateSnapshot>;
@@ -771,8 +771,8 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.post(agentControlPath(input.sessionId, input.agentId, "resume"), {}, input.signal, parseAgentResumeResult);
   }
 
-  messages(sessionId: SessionId): Promise<Message[]> {
-    return this.get(`sessions/${encodeURIComponent(sessionId)}/messages`, undefined, parseRuntimeMessageArray);
+  messages(sessionId: SessionId, signal?: AbortSignal): Promise<Message[]> {
+    return this.get(`sessions/${encodeURIComponent(sessionId)}/messages`, signal, parseRuntimeMessageArray);
   }
 
   eventSnapshot(input: EventSnapshotRequest = {}): Promise<RuntimeStateSnapshot> {

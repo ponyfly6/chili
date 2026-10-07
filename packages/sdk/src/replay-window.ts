@@ -1,4 +1,4 @@
-import type { ChiliEvent } from "@chili/protocol";
+import { isTransientEvent, type ChiliEvent } from "@chili/protocol";
 
 export interface RuntimeEventWindowLimits {
   maxEvents: number;
@@ -6,6 +6,8 @@ export interface RuntimeEventWindowLimits {
   maxBytes: number;
   /** Binds per-source ordering cursors retained by the incremental accumulator. */
   maxSources?: number;
+  /** Live UI windows may retain previews; durable history excludes them by default. */
+  preserveTransientEvents?: boolean;
 }
 
 export interface RuntimeEventWindowInput extends RuntimeEventWindowLimits {
@@ -96,6 +98,8 @@ export class ReplayableRuntimeEventWindowAccumulator {
     const sourceMissing = new Set<string>();
     const requestedSourcePins = new Set(input.pinnedEventIds ?? []);
     for (const event of events) {
+      // Only explicitly live windows may retain previews or advance their order.
+      if (!this.limits.preserveTransientEvents && isTransientEvent(event)) continue;
       cursor.orderTime = Math.max(cursor.orderTime, finiteEventTime(event.time));
       sourceRows.push({
         event,
@@ -198,6 +202,8 @@ export function runtimeEventProvides(event: ChiliEvent): RuntimeEventDependencyR
     case "message.created":
       return [reference("message", event.payload.messageId)];
     case "message.part_added":
+    case "message.part_committed":
+    case "message.part_stream_snapshot":
       return [reference("part", event.payload.part.id)];
     case "tool.call_started":
       return [toolReference(event, event.payload.callId)];
@@ -226,6 +232,9 @@ export function runtimeEventRequires(event: ChiliEvent): RuntimeEventDependencyR
     case "turn.guard_triggered":
       return [reference("turn", event.payload.turnId)];
     case "message.part_added":
+    case "message.part_committed":
+    case "message.part_stream_snapshot":
+    case "message.part_stream_delta":
       return [reference("message", event.payload.messageId)];
     case "message.part_delta":
       return [
@@ -455,7 +464,13 @@ function inferredActivePins(nodes: readonly WindowNode[], latestByChain: Readonl
     if (event.type === "message.created") {
       if (event.payload.turnId) messageTurnById.set(event.payload.messageId, event.payload.turnId);
       latestMessageEventById.set(event.payload.messageId, index);
-    } else if (event.type === "message.part_added" || event.type === "message.part_delta") {
+    } else if (
+      event.type === "message.part_added"
+      || event.type === "message.part_committed"
+      || event.type === "message.part_delta"
+      || event.type === "message.part_stream_snapshot"
+      || event.type === "message.part_stream_delta"
+    ) {
       latestMessageEventById.set(event.payload.messageId, index);
     }
   }

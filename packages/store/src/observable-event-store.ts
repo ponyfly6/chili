@@ -1,4 +1,9 @@
-import type { RuntimeEvent, EventEnvelope, Message, SessionId } from "@chili/protocol";
+import {
+  RUNTIME_STATE_SNAPSHOT_MAX_BYTES,
+  type ChiliEvent, type RuntimeEvent, type EventEnvelope, type Message, type SessionId,
+  type MessagePart, type TextPart, type ReasoningPart, type PartId,
+} from "@chili/protocol";
+import { RuntimeSnapshotLimitError } from "./runtime-snapshot.js";
 import type { SessionInputMutation, SessionInputMutationOptions, SessionInputStore } from "./session-inputs.js";
 import type {
   ApprovalRow,
@@ -30,6 +35,7 @@ export class ObservableEventStore
     StaleTurnRecoveryStore
 {
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
+  private readonly activeParts = new Map<string, Extract<ChiliEvent, { type: "message.part_stream_snapshot" }>>();
   readonly eventReplayBoundary?: NonNullable<EventStore["eventReplayBoundary"]>;
   readonly runtimeSnapshot?: NonNullable<EventStore["runtimeSnapshot"]>;
 
@@ -40,7 +46,32 @@ export class ObservableEventStore
     // Preserve capability absence across wrapper chains so callers can fail
     // explicitly instead of fabricating an incomplete recovery snapshot.
     if (inner.eventReplayBoundary) this.eventReplayBoundary = (query) => inner.eventReplayBoundary!(query);
-    if (inner.runtimeSnapshot) this.runtimeSnapshot = (query) => inner.runtimeSnapshot!(query);
+    if (inner.runtimeSnapshot) this.runtimeSnapshot = async (query) => {
+      const maxBytes = Math.min(query?.maxBytes ?? RUNTIME_STATE_SNAPSHOT_MAX_BYTES, RUNTIME_STATE_SNAPSHOT_MAX_BYTES);
+      // Capture before the asynchronous read: a commit during the await must
+      // not erase text whose durable commit is beyond the returned watermark.
+      const live = this.activeMessageParts({ ...query, maxBytes });
+      const snapshot = await inner.runtimeSnapshot!(query);
+      const completed = new Set<string>();
+      const messages = new Set<string>();
+      const represented = new Set<string>();
+      for (const event of snapshot.events) {
+        if (event.type === "message.created") messages.add(event.payload.messageId);
+        if (event.type === "message.part_stream_snapshot") represented.add(event.payload.part.id);
+        if ((event.type === "message.part_committed" || event.type === "message.part_added")
+          && isCompletedPart(event.payload.part)) completed.add(event.payload.part.id);
+      }
+      if (live.some((event) => event.type === "message.part_stream_snapshot" && !messages.has(event.payload.messageId))) {
+        throw new RuntimeSnapshotLimitError();
+      }
+      const events = [...snapshot.events, ...live.filter((event) => event.type === "message.part_stream_snapshot"
+        && !represented.has(event.payload.part.id) && !completed.has(event.payload.part.id))];
+      const result = { ...snapshot, events };
+      // Active text is never clipped: its full string length is the offset
+      // baseline for subsequent live deltas. Fail instead of creating a gap.
+      if (Buffer.byteLength(JSON.stringify(result), "utf8") > maxBytes) throw new RuntimeSnapshotLimitError();
+      return result;
+    };
   }
 
   async append(event: RuntimeEvent, options?: EventAppendOptions): Promise<void> {
@@ -140,8 +171,41 @@ export class ObservableEventStore
     return store.sessionRunClaim?.(sessionId);
   }
 
-  messages(sessionId: SessionId): Promise<Message[]> {
-    return this.inner.messages(sessionId);
+  async messages(sessionId: SessionId): Promise<Message[]> {
+    const live = this.activeMessageParts({ sessionId });
+    const messages = await this.inner.messages(sessionId);
+    return messages.map((message) => {
+      const additions = live.filter((event) => event.type === "message.part_stream_snapshot"
+        && event.payload.messageId === message.id);
+      if (!additions.length) return message;
+      const parts = [...message.parts];
+      for (const event of additions) {
+        if (event.type !== "message.part_stream_snapshot") continue;
+        const index = parts.findIndex((part) => part.id === event.payload.part.id);
+        if (index < 0) parts.push(event.payload.part);
+        else if (!isCompletedPart(parts[index]!)) parts[index] = event.payload.part;
+      }
+      const originalOrder = new Map(parts.map((part, index) => [part.id, index]));
+      parts.sort((a, b) => (a.ordinal ?? originalOrder.get(a.id)!) - (b.ordinal ?? originalOrder.get(b.id)!));
+      return { ...message, parts };
+    });
+  }
+
+  activeMessageParts(query: { sessionId?: SessionId; maxBytes?: number } = {}): ChiliEvent[] {
+    if (query.maxBytes !== undefined && (!Number.isSafeInteger(query.maxBytes) || query.maxBytes < 1)) {
+      throw new RangeError("active message maxBytes must be positive");
+    }
+    const events: ChiliEvent[] = [];
+    let bytes = 2;
+    for (const event of this.activeParts.values()) {
+      if (query.sessionId && event.sessionId !== query.sessionId) continue;
+      if (query.maxBytes !== undefined) {
+        bytes += Buffer.byteLength(JSON.stringify(event), "utf8") + 1;
+        if (bytes > query.maxBytes) throw new RuntimeSnapshotLimitError();
+      }
+      events.push({ ...event, payload: { ...event.payload, part: { ...event.payload.part } } });
+    }
+    return events;
   }
 
   pendingApprovals(sessionId?: SessionId, limit?: number): Promise<ApprovalRow[]> {
@@ -154,6 +218,7 @@ export class ObservableEventStore
   }
 
   private emit(event: RuntimeEvent): void {
+    this.updateActiveParts(event);
     for (const listener of this.listeners) {
       try {
         listener(event);
@@ -167,4 +232,31 @@ export class ObservableEventStore
       }
     }
   }
+
+  private updateActiveParts(event: RuntimeEvent): void {
+    if (event.type === "message.part_committed") {
+      this.activeParts.delete(event.payload.part.id);
+      return;
+    }
+    if (event.type !== "message.part_stream_delta" || !event.sessionId) return;
+    const { messageId, partId, partType, delta, offset, phase, redacted, ordinal } = event.payload;
+    const previous = this.activeParts.get(partId)?.payload.part;
+    const text = previous?.text ?? "";
+    if (offset > text.length) throw new Error(`Live message part ${partId} has a gap before offset ${offset}`);
+    // Retransmitted/overlapping transient notifications do not duplicate text.
+    const suffix = delta.slice(Math.max(0, text.length - offset));
+    const base = { id: partId as PartId, messageId, sessionId: event.sessionId, text: text + suffix,
+      ...(ordinal !== undefined ? { ordinal } : previous?.ordinal !== undefined ? { ordinal: previous.ordinal } : {}) };
+    const part: TextPart | ReasoningPart = partType === "text"
+      ? { ...base, type: "text", ...(phase ? { phase } : previous?.type === "text" && previous.phase ? { phase: previous.phase } : {}) }
+      : { ...base, type: "reasoning", ...(redacted !== undefined ? { redacted } : previous?.type === "reasoning" && previous.redacted !== undefined ? { redacted: previous.redacted } : {}) };
+    this.activeParts.set(partId, {
+      id: `live:${event.id}`, type: "message.part_stream_snapshot", time: event.time,
+      sessionId: event.sessionId, payload: { messageId, part },
+    });
+  }
+}
+
+function isCompletedPart(part: MessagePart): boolean {
+  return (part.type === "text" || part.type === "reasoning") && part.completion !== undefined;
 }

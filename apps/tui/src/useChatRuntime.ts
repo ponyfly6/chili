@@ -160,6 +160,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   const mcpStatusEpochRef = useRef(0);
   const requestAbortRefs = useRef(new Set<AbortController>());
   const refreshedForStreamingRef = useRef(false);
+  const hydratedRecoveryRevisionRef = useRef(0);
 
   const selectActiveSession = useCallback((sessionId: SessionId | undefined, cwd?: string): void => {
     selectedSessionScopeRef.current = {
@@ -232,9 +233,13 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
       try {
         const session = requireResumableSession(await client.listSessions(), sessionId);
         if (controller.signal.aborted || sessionSelectionEpochRef.current !== epoch) return;
-        const events = await client.sessionEvents({ sessionId, limit: 5_000, signal: controller.signal });
+        const [events, messages] = await Promise.all([
+          client.sessionEvents({ sessionId, limit: 5_000, signal: controller.signal }),
+          client.messages(sessionId, controller.signal),
+        ]);
         if (controller.signal.aborted || sessionSelectionEpochRef.current !== epoch) return;
         eventRuntime.hydrateEvents(events);
+        eventRuntime.hydrateMessages(messages);
         selectActiveSession(sessionId, session.cwd);
         setChatFeedback(undefined);
       } catch (error) {
@@ -254,7 +259,28 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
       controller.abort();
       requestAbortRefs.current.delete(controller);
     };
-  }, [client, options.baseUrl, options.sessionId, selectActiveSession, eventRuntime.hydrateEvents]);
+  }, [client, options.baseUrl, options.sessionId, selectActiveSession, eventRuntime.hydrateEvents, eventRuntime.hydrateMessages]);
+
+  useEffect(() => {
+    if (!activeSessionId || eventRuntime.recoveryRevision <= hydratedRecoveryRevisionRef.current) return;
+    hydratedRecoveryRevisionRef.current = eventRuntime.recoveryRevision;
+    const scope = captureSessionRequestScope(activeSessionId);
+    const controller = new AbortController();
+    requestAbortRefs.current.add(controller);
+    // Recovery snapshots intentionally bound old/large history. Refill only the
+    // selected conversation once per recovery without changing its live cursor.
+    void client.messages(activeSessionId, controller.signal).then((messages) => {
+      if (!controller.signal.aborted && isSessionRequestScopeCurrent(scope)) eventRuntime.hydrateMessages(messages);
+    }).catch((error: unknown) => {
+      if (!controller.signal.aborted && isSessionRequestScopeCurrent(scope) && !isAbortError(error)) {
+        setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      }
+    }).finally(() => requestAbortRefs.current.delete(controller));
+    return () => {
+      controller.abort();
+      requestAbortRefs.current.delete(controller);
+    };
+  }, [activeSessionId, captureSessionRequestScope, client, eventRuntime.hydrateMessages, eventRuntime.recoveryRevision, isSessionRequestScopeCurrent, options.baseUrl]);
 
   const chatView = useMemo(() => {
     const request: Parameters<typeof chatSessionView>[1] = { limit: 120, requireSession: true };
@@ -1025,13 +1051,13 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     try {
       const resumable = requireResumableSession(await client.listSessions(), session.id);
       if (sessionSelectionEpochRef.current !== sessionSelectionEpoch) return false;
-      const events = await withAbort((signal) => client.sessionEvents({
-        sessionId: session.id,
-        limit: 5_000,
-        signal,
-      }));
+      const [events, messages] = await withAbort((signal) => Promise.all([
+        client.sessionEvents({ sessionId: session.id, limit: 5_000, signal }),
+        client.messages(session.id, signal),
+      ]));
       if (sessionSelectionEpochRef.current !== sessionSelectionEpoch) return false;
       eventRuntime.hydrateEvents(events);
+      eventRuntime.hydrateMessages(messages);
       selectActiveSession(session.id, resumable.cwd);
       await refreshDelegationConfigForSession(session.id);
       if (sessionSelectionEpochRef.current !== sessionSelectionEpoch) return false;
@@ -1054,7 +1080,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     } finally {
       if (sessionSelectionEpochRef.current === sessionSelectionEpoch) setSessionSelectionPending(false);
     }
-  }, [abortPendingRequests, activeSessionId, chatView.cwd, chatView.sessionId, client, invalidateSelectedSession, options.baseUrl, refreshDelegationConfigForSession, running, selectActiveSession, eventRuntime.hydrateEvents, withAbort]);
+  }, [abortPendingRequests, activeSessionId, chatView.cwd, chatView.sessionId, client, invalidateSelectedSession, options.baseUrl, refreshDelegationConfigForSession, running, selectActiveSession, eventRuntime.hydrateEvents, eventRuntime.hydrateMessages, withAbort]);
 
   const renameSession = useCallback(async (title: string): Promise<RuntimeSessionSummary | undefined> => {
     setChatFeedback({ status: "pending", message: "renaming saved chat" });

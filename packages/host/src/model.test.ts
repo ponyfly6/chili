@@ -66,3 +66,19 @@ test("a failed identity audit prevents Host model network side effects", async (
   await expect(consume()).rejects.toThrow("audit failed");
   expect(calls).toBe(0);
 });
+
+test("Host forwards completed reasoning and text boundaries from a provider", async () => {
+  const model = await createHostModel({ provider: "deepseek", model: "deepseek-v4-flash" }, {
+    apiKey: "completion-fake-key", baseUrl: "https://provider.invalid",
+    fetch: (async () => new Response(JSON.stringify({
+      id: "completion_blocks", model: "deepseek-v4-flash",
+      choices: [{ index: 0, finish_reason: "stop", message: { reasoning_content: "Consider this", content: "The answer" } }],
+    }), { headers: { "content-type": "application/json" } })) as unknown as typeof fetch,
+  });
+  const events = [];
+  for await (const event of model.stream(input)) events.push(event);
+  expect(events.filter((event) => event.type === "reasoning_end" || event.type === "text_end")).toEqual([
+    { type: "reasoning_end", index: 0 },
+    { type: "text_end", index: 0 },
+  ]);
+});

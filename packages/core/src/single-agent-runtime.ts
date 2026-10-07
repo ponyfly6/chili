@@ -6,6 +6,8 @@ import type {
   Message,
   MessageId,
   MessagePart,
+  TextPart,
+  ReasoningPart,
   ModelSelection,
   ModelUsage,
   PreparedModelRequest,
@@ -85,6 +87,7 @@ interface EventContext {
 }
 
 interface PendingToolCall {
+  ordinal?: number;
   callId: ToolCallId;
   providerCallId?: string;
   toolName: string;
@@ -94,15 +97,21 @@ interface PendingToolCall {
 }
 
 interface StreamingToolCall {
+  ordinal: number;
   callId: ToolCallId;
   providerCallId?: string;
   toolName: string;
   input: unknown;
 }
 
+type AssistantContentPart = TextPart | ReasoningPart;
+type ContentCompletion = "completed" | "cancelled" | "failed";
+
 interface AssistantStreamState {
-  textParts: Map<number, { partId: PartId; phase?: AssistantMessagePhase }>;
-  reasoningPartIds: Map<number, PartId>;
+  textParts: Map<number, TextPart>;
+  reasoningParts: Map<number, ReasoningPart>;
+  /** In first-observed order across text and reasoning blocks. Never persisted as a draft. */
+  pendingContent: Map<PartId, AssistantContentPart>;
   toolCalls: PendingToolCall[];
   streamingToolCalls: Map<string, StreamingToolCall>;
 }
@@ -161,6 +170,8 @@ export type CompactContextResult =
 
 export class SingleAgentRuntime implements AgentRunner {
   private readonly promptGuards = new WeakMap<PromptExecutionScope, DoomLoopGuard>();
+  /** Exists only while its assistant turn is running; includes tool results in the same order. */
+  private readonly assistantPartOrdinals = new Map<MessageId, number>();
 
   constructor(private readonly options: SingleAgentRuntimeOptions) {}
 
@@ -260,7 +271,7 @@ export class SingleAgentRuntime implements AgentRunner {
         ...(boundary ? { boundaryMessageId: boundary.boundaryMessageId } : {}),
         error: persistedError.message,
       });
-      await this.append(input, "turn.completed", { turnId, status });
+      await this.append(input, "turn.completed", { turnId, status, reason: persistedError.message });
       const failed: Extract<CompactContextResult, { status: "failed" | "cancelled" }> = {
         status,
         turnId,
@@ -353,6 +364,7 @@ export class SingleAgentRuntime implements AgentRunner {
       if (context.overflow) throw new ContextWindowExceededError(context.overflow);
 
       assistantMessageId = this.id<MessageId>("msg");
+      this.assistantPartOrdinals.set(assistantMessageId, 0);
       await this.append(input, "message.created", {
         messageId: assistantMessageId,
         role: "assistant",
@@ -468,6 +480,7 @@ export class SingleAgentRuntime implements AgentRunner {
       await this.append(input, "turn.completed", {
         turnId,
         status,
+        reason: persistedError.message,
       });
       const result: Extract<RunTurnResult, { status: "failed" | "cancelled" }> = {
         status,
@@ -478,6 +491,8 @@ export class SingleAgentRuntime implements AgentRunner {
       if (contextUsage) result.contextUsage = contextUsage;
       if (turnUsage) result.usage = turnUsage;
       return result;
+    } finally {
+      if (assistantMessageId) this.assistantPartOrdinals.delete(assistantMessageId);
     }
   }
 
@@ -595,7 +610,8 @@ export class SingleAgentRuntime implements AgentRunner {
       let latestUsage: ModelUsage | undefined;
       const state: AssistantStreamState = {
         textParts: new Map(),
-        reasoningPartIds: new Map(),
+        reasoningParts: new Map(),
+        pendingContent: new Map(),
         toolCalls: [],
         streamingToolCalls: new Map(),
       };
@@ -620,6 +636,21 @@ export class SingleAgentRuntime implements AgentRunner {
           if (event.type === "reasoning_delta") {
             assistantMutated = true;
             await this.appendReasoningDelta(input, assistantMessageId, state, event.text, event.index, event.redacted);
+            continue;
+          }
+
+          if (event.type === "text_end") {
+            const part = state.textParts.get(event.index ?? 0);
+            if (part && event.phase !== undefined && part.phase !== event.phase) {
+              throw incompleteModelStreamError("Model text end changed the block phase");
+            }
+            if (part) await this.commitContentPart(input, assistantMessageId, state, part, "completed");
+            continue;
+          }
+
+          if (event.type === "reasoning_end") {
+            const part = state.reasoningParts.get(event.index ?? 0);
+            if (part) await this.commitContentPart(input, assistantMessageId, state, part, "completed");
             continue;
           }
 
@@ -653,6 +684,7 @@ export class SingleAgentRuntime implements AgentRunner {
               throw incompleteModelStreamError("Model reused a live tool call stream identifier before completing it");
             }
             const toolCall: StreamingToolCall = {
+              ordinal: this.nextAssistantPartOrdinal(assistantMessageId),
               callId: this.id<ToolCallId>("toolcall"),
               providerCallId: normalizeToolCallId(event.toolCallId, event.index),
               toolName: event.name,
@@ -664,11 +696,13 @@ export class SingleAgentRuntime implements AgentRunner {
           }
 
           if (event.type === "tool_call_delta") {
+            assistantMutated = true;
             const key = toolCallKey(event.toolCallId, event.index);
             let toolCall = state.streamingToolCalls.get(key);
             if (!toolCall && event.name) {
               assistantMutated = true;
               toolCall = {
+                ordinal: this.nextAssistantPartOrdinal(assistantMessageId),
                 callId: this.id<ToolCallId>("toolcall"),
                 providerCallId: normalizeToolCallId(event.toolCallId, event.index),
                 toolName: event.name,
@@ -677,11 +711,11 @@ export class SingleAgentRuntime implements AgentRunner {
               state.streamingToolCalls.set(key, toolCall);
               await this.updateStreamingToolCall(input, toolCall);
             }
-            if (toolCall && event.partialInput !== undefined) {
-              assistantMutated = true;
+            if (toolCall) {
               if (event.name) toolCall.toolName = event.name;
-              toolCall.input = event.partialInput;
-              await this.updateStreamingToolCall(input, toolCall);
+              // Partial arguments are only for the live attempt. Persist the complete
+              // input once tool_call_end arrives, before any tool can execute.
+              if (event.partialInput !== undefined) toolCall.input = event.partialInput;
             }
             continue;
           }
@@ -692,6 +726,7 @@ export class SingleAgentRuntime implements AgentRunner {
             const existing = state.streamingToolCalls.get(key);
             state.streamingToolCalls.delete(key);
             const toolCall = {
+              ordinal: existing?.ordinal ?? this.nextAssistantPartOrdinal(assistantMessageId),
               callId: existing?.callId ?? this.id<ToolCallId>("toolcall"),
               providerCallId: existing?.providerCallId ?? normalizeToolCallId(event.toolCallId, event.index),
               toolName: event.name || existing?.toolName || "",
@@ -720,6 +755,9 @@ export class SingleAgentRuntime implements AgentRunner {
               throw incompleteModelStreamError("Model finish event did not include a finish reason");
             }
             const finishReason = normalizePersistedError(event.reason).message.trim();
+            if (finishReason.toLowerCase() === "content_filter") {
+              throw incompleteModelStreamError("Model response was interrupted by content filtering; tool calls were not executed.");
+            }
             if (isOutputLimitFinishReason(finishReason)) {
               throw Object.assign(
                 new Error(`Model response hit output token limit (finish reason: ${finishReason}); response is incomplete and tool calls were not executed.`),
@@ -729,6 +767,7 @@ export class SingleAgentRuntime implements AgentRunner {
             if (state.streamingToolCalls.size > 0) {
               throw incompleteModelStreamError("Tool call stream ended before tool_call_end");
             }
+            await this.commitPendingContent(input, assistantMessageId, state, "completed");
             const usage = addModelUsage(previousAttemptUsage, latestUsage);
             return {
               finishReason,
@@ -758,7 +797,10 @@ export class SingleAgentRuntime implements AgentRunner {
           previousAttemptUsage,
           addModelUsage(latestUsage, takeModelUsage(err)),
         );
-        if (input.signal?.aborted || isAbortError(err)) {
+        const aborted = input.signal?.aborted === true || isAbortError(err);
+        await this.commitPendingContent(input, assistantMessageId, state, aborted ? "cancelled" : "failed");
+        markAssistantMutation(err, assistantMutated);
+        if (aborted) {
           await this.finishUnfinishedStreamingToolCalls(input, state, "cancelled", persistedError);
           await this.finishPendingToolCalls(input, turnId, assistantMessageId, state.toolCalls.splice(0), "cancelled", persistedError);
           throw attachModelUsage(err, previousAttemptUsage);
@@ -777,7 +819,6 @@ export class SingleAgentRuntime implements AgentRunner {
           attempt++;
           continue;
         }
-        markAssistantMutation(err, assistantMutated);
         throw attachModelUsage(err, previousAttemptUsage);
       }
     }
@@ -925,27 +966,26 @@ export class SingleAgentRuntime implements AgentRunner {
     phase?: AssistantMessagePhase,
   ): Promise<void> {
     const textIndex = index ?? 0;
-    const existing = state.textParts.get(textIndex);
-    if (!existing) {
-      const partId = this.id<PartId>("part");
-      state.textParts.set(textIndex, { partId, ...(phase === undefined ? {} : { phase }) });
-      await this.appendPart(input, assistantMessageId, {
-        id: partId,
+    let part = state.textParts.get(textIndex);
+    if (!part) {
+      part = {
+        id: this.id<PartId>("part"),
+        ordinal: this.nextAssistantPartOrdinal(assistantMessageId),
         messageId: assistantMessageId,
         sessionId: input.sessionId,
         type: "text",
-        text,
+        text: "",
         ...(phase === undefined ? {} : { phase }),
-      });
-      return;
+      };
+      state.textParts.set(textIndex, part);
+      state.pendingContent.set(part.id, part);
     }
-
-    if (existing.phase !== phase) {
-      throw new Error(
-        `Model assistant text index ${textIndex} changed phase from ${String(existing.phase)} to ${String(phase)}`,
+    if (part.phase !== phase) {
+      throw incompleteModelStreamError(
+        `Model assistant text index ${textIndex} changed phase from ${String(part.phase)} to ${String(phase)}`,
       );
     }
-    await this.appendPartDelta(input, assistantMessageId, existing.partId, "text", text);
+    await this.streamContentDelta(input, assistantMessageId, state, part, text);
   }
 
   private async appendReasoningDelta(
@@ -957,36 +997,91 @@ export class SingleAgentRuntime implements AgentRunner {
     redacted?: boolean,
   ): Promise<void> {
     const reasoningIndex = index ?? 0;
-    const existingPartId = state.reasoningPartIds.get(reasoningIndex);
-    if (!existingPartId) {
-      const partId = this.id<PartId>("part");
-      state.reasoningPartIds.set(reasoningIndex, partId);
-      await this.appendPart(input, assistantMessageId, {
-        id: partId,
+    let part = state.reasoningParts.get(reasoningIndex);
+    if (!part) {
+      part = {
+        id: this.id<PartId>("part"),
+        ordinal: this.nextAssistantPartOrdinal(assistantMessageId),
         messageId: assistantMessageId,
         sessionId: input.sessionId,
         type: "reasoning",
-        text,
+        text: "",
         ...(redacted ? { redacted } : {}),
-      });
-      return;
+      };
+      state.reasoningParts.set(reasoningIndex, part);
+      state.pendingContent.set(part.id, part);
     }
+    if (redacted) part.redacted = true;
+    await this.streamContentDelta(input, assistantMessageId, state, part, text);
+  }
 
-    await this.appendPartDelta(input, assistantMessageId, existingPartId, "text", text);
+  private async streamContentDelta(
+    input: EventContext,
+    messageId: MessageId,
+    state: AssistantStreamState,
+    part: AssistantContentPart,
+    delta: string,
+  ): Promise<void> {
+    if (!state.pendingContent.has(part.id)) {
+      throw incompleteModelStreamError("Model emitted a delta after the content block ended");
+    }
+    const offset = part.text.length;
+    part.text += delta;
+    await this.append(input, "message.part_stream_delta", {
+      messageId,
+      partId: part.id,
+      partType: part.type,
+      ordinal: part.ordinal,
+      delta,
+      offset,
+      ...(part.type === "text" && part.phase !== undefined ? { phase: part.phase } : {}),
+      ...(part.type === "reasoning" && part.redacted ? { redacted: true } : {}),
+    });
+  }
+
+  private async commitContentPart(
+    input: EventContext,
+    messageId: MessageId,
+    state: AssistantStreamState,
+    part: AssistantContentPart,
+    completion: ContentCompletion,
+  ): Promise<void> {
+    if (!state.pendingContent.has(part.id)) return;
+    await this.append(input, "message.part_committed", {
+      messageId,
+      part: { ...part, completion },
+    });
+    state.pendingContent.delete(part.id);
+  }
+
+  private async commitPendingContent(
+    input: EventContext,
+    messageId: MessageId,
+    state: AssistantStreamState,
+    completion: ContentCompletion,
+  ): Promise<void> {
+    for (const part of state.pendingContent.values()) {
+      await this.commitContentPart(input, messageId, state, part, completion);
+    }
   }
 
   private async appendReasoningItem(
     input: RunTurnInput,
     assistantMessageId: MessageId,
-    modelOutput: NonNullable<Extract<MessagePart, { type: "reasoning" }>["modelOutput"]>,
+    modelOutput: NonNullable<ReasoningPart["modelOutput"]>,
   ): Promise<void> {
-    await this.appendPart(input, assistantMessageId, {
-      id: this.id<PartId>("part"),
+    await this.append(input, "message.part_committed", {
       messageId: assistantMessageId,
-      sessionId: input.sessionId,
-      type: "reasoning",
-      text: "",
-      modelOutput,
+      part: {
+        id: this.id<PartId>("part"),
+        ordinal: this.nextAssistantPartOrdinal(assistantMessageId),
+        messageId: assistantMessageId,
+        sessionId: input.sessionId,
+        type: "reasoning",
+        text: "",
+        modelOutput,
+        completion: "completed",
+      },
     });
   }
 
@@ -1006,6 +1101,7 @@ export class SingleAgentRuntime implements AgentRunner {
       messageId: assistantMessageId,
       sessionId: input.sessionId,
       type: "tool_call",
+      ...(toolCall.ordinal === undefined ? {} : { ordinal: toolCall.ordinal }),
       callId: toolCall.callId,
       ...(toolCall.providerCallId ? { providerCallId: toolCall.providerCallId } : {}),
       toolName: persistedToolName,
@@ -1332,25 +1428,20 @@ export class SingleAgentRuntime implements AgentRunner {
     return { part };
   }
 
-  private async appendPart(input: EventContext, messageId: MessageId, part: MessagePart): Promise<void> {
-    await this.append(input, "message.part_added", {
-      messageId,
-      part,
-    });
+  private nextAssistantPartOrdinal(messageId: MessageId): number {
+    const ordinal = this.assistantPartOrdinals.get(messageId);
+    if (ordinal === undefined) throw new Error("Assistant content has no active message order");
+    this.assistantPartOrdinals.set(messageId, ordinal + 1);
+    return ordinal;
   }
 
-  private async appendPartDelta(
-    input: EventContext,
-    messageId: MessageId,
-    partId: PartId,
-    field: string,
-    delta: string,
-  ): Promise<void> {
-    await this.append(input, "message.part_delta", {
+  private async appendPart(input: EventContext, messageId: MessageId, part: MessagePart): Promise<void> {
+    const orderedPart = part.ordinal === undefined && this.assistantPartOrdinals.has(messageId)
+      ? { ...part, ordinal: this.nextAssistantPartOrdinal(messageId) }
+      : part;
+    await this.append(input, "message.part_added", {
       messageId,
-      partId,
-      field,
-      delta,
+      part: orderedPart,
     });
   }
 

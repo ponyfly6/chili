@@ -1,4 +1,4 @@
-import { compactRuntimeEvent, isTransientEvent, type ChiliEvent, type SessionId } from "@chili/protocol";
+import { compactRuntimeEvent, isTransientEvent, RUNTIME_STATE_SNAPSHOT_MAX_BYTES, type ChiliEvent, type SessionId } from "@chili/protocol";
 import { EventPageTooLargeError, UnknownEventCursorError, type EventPublisher, type EventQuery, type EventStore } from "@chili/store";
 
 export interface EventStreamOptions {
@@ -30,7 +30,8 @@ const HEARTBEAT = Buffer.from(": heartbeat\n\n");
  *
  * Resident transport data is bounded by the stream's byte high-water mark,
  * one byte-bounded database page, one encoded frame, the transient byte budget,
- * and at most one small terminal control frame. Node/Bun/socket buffers belong
+ * a byte-bounded initial active-content snapshot, and one terminal control frame.
+ * Node/Bun/socket buffers belong
  * to the HTTP transport; pull/desiredSize is the pressure boundary exposed here.
  */
 export async function eventStream(options: EventStreamOptions): Promise<Response> {
@@ -51,6 +52,7 @@ export async function eventStream(options: EventStreamOptions): Promise<Response
   let running = false;
   let initialized = false;
   let page: ChiliEvent[] = [];
+  const bootstrap: Uint8Array[] = [];
   const transients: Uint8Array[] = [];
   let transientBytes = 0;
 
@@ -81,6 +83,7 @@ export async function eventStream(options: EventStreamOptions): Promise<Response
     if (stalled) clearTimeout(stalled);
     heartbeat = poll = rotation = stalled = undefined;
     transients.length = 0;
+    bootstrap.length = 0;
     transientBytes = 0;
     page.length = 0;
     dirty = false;
@@ -184,6 +187,13 @@ export async function eventStream(options: EventStreamOptions): Promise<Response
             if (advanced) dirty = true;
             if (dirty) continue;
           }
+          // The complete current prefix precedes deltas received since capture.
+          // Durable commits can overtake it; clients keep committed parts final.
+          const initial = bootstrap.shift();
+          if (initial) {
+            if (!await enqueue(initial)) break;
+            continue;
+          }
           const transient = transients.shift();
           if (!transient) break;
           transientBytes -= transient.byteLength;
@@ -196,7 +206,7 @@ export async function eventStream(options: EventStreamOptions): Promise<Response
       } finally {
         page.length = 0;
         running = false;
-        if (active && (dirty || transients.length)) pump();
+        if (active && (dirty || bootstrap.length || transients.length)) pump();
       }
     })();
   };
@@ -222,6 +232,27 @@ export async function eventStream(options: EventStreamOptions): Promise<Response
       dirty = true;
       pump();
     });
+    try {
+      // No await between subscription and capture. Writes that follow capture
+      // enter the live queue while async replay-boundary lookup is in flight.
+      // Full active text has its own budget: it may legitimately exceed the
+      // small incremental-output queue after a long generation.
+      const snapshots = options.store.activeMessageParts?.({
+        ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+        maxBytes: RUNTIME_STATE_SNAPSHOT_MAX_BYTES,
+      }) ?? [];
+      let bytes = 0;
+      for (const event of snapshots) {
+        const frame = formatSse(event);
+        bytes += frame.byteLength;
+        if (frame.byteLength > options.maxBufferedBytes || bytes > RUNTIME_STATE_SNAPSHOT_MAX_BYTES) {
+          throw new Error("Active message bootstrap exceeds the transport byte boundary");
+        }
+        bootstrap.push(frame);
+      }
+    } catch {
+      resync("event_transport_limit", durableCursor);
+    }
   }
 
   if (active) {

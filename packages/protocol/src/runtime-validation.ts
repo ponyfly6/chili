@@ -599,6 +599,9 @@ const RUNTIME_EVENT_TYPES = [
   "message.created",
   "message.part_added",
   "message.part_delta",
+  "message.part_committed",
+  "message.part_stream_delta",
+  "message.part_stream_snapshot",
   "tool.call_started",
   "tool.call_updated",
   "tool.output_delta",
@@ -619,6 +622,9 @@ const RUNTIME_EVENT_TYPES = [
 ] as const satisfies readonly RuntimeEvent["type"][];
 
 const SESSION_SCOPED_EVENT_TYPES = new Set<ChiliEvent["type"]>([
+  "message.part_committed",
+  "message.part_stream_delta",
+  "message.part_stream_snapshot",
   "session.tools_loaded",
   "session.created",
   "session.identity_bound",
@@ -865,6 +871,7 @@ function validateRuntimeEventPayload(
     case "turn.completed":
       parseRuntimeIdentifier(payload.turnId, `${path}.turnId`);
       parseRuntimeEnum(payload.status, ["completed", "failed", "cancelled"] as const, `${path}.status`);
+      optionalEventString(payload.reason, `${path}.reason`);
       return;
     case "turn.compaction_requested":
     case "turn.compaction_started":
@@ -910,6 +917,29 @@ function validateRuntimeEventPayload(
     case "message.part_added":
       parseRuntimeIdentifier(payload.messageId, `${path}.messageId`);
       validateMessagePart(payload.part, `${path}.part`);
+      return;
+    case "message.part_committed":
+    case "message.part_stream_snapshot": {
+      parseRuntimeIdentifier(payload.messageId, `${path}.messageId`);
+      validateMessagePart(payload.part, `${path}.part`);
+      const part = parseRuntimeRecord(payload.part, `${path}.part`);
+      parseRuntimeEnum(part.type, ["text", "reasoning"] as const, `${path}.part.type`);
+      if (part.messageId !== payload.messageId) throw new RuntimeValidationError(`${path}.part.messageId`, "must match the message id");
+      if (part.sessionId !== envelopeSessionId) throw new RuntimeValidationError(`${path}.part.sessionId`, "must match the session id");
+      if (type === "message.part_stream_snapshot" && part.completion !== undefined) {
+        throw new RuntimeValidationError(`${path}.part.completion`, "must be absent for an active snapshot");
+      }
+      return;
+    }
+    case "message.part_stream_delta":
+      parseRuntimeIdentifier(payload.messageId, `${path}.messageId`);
+      parseRuntimeIdentifier(payload.partId, `${path}.partId`);
+      parseRuntimeEnum(payload.partType, ["text", "reasoning"] as const, `${path}.partType`);
+      parseRuntimeString(payload.delta, `${path}.delta`, { allowEmpty: true });
+      parseRuntimeNonNegativeInteger(payload.offset, `${path}.offset`);
+      optionalEventNonNegativeInteger(payload.ordinal, `${path}.ordinal`);
+      optionalEventBoolean(payload.redacted, `${path}.redacted`);
+      if (payload.phase !== undefined) parseRuntimeEnum(payload.phase, ["commentary", "final_answer"] as const, `${path}.phase`);
       return;
     case "message.part_delta":
       parseRuntimeIdentifier(payload.messageId, `${path}.messageId`);
@@ -1071,6 +1101,7 @@ function validateMessagePart(value: unknown, path: string): void {
   parseRuntimeIdentifier(part.id, `${path}.id`);
   parseRuntimeIdentifier(part.messageId, `${path}.messageId`);
   parseRuntimeIdentifier(part.sessionId, `${path}.sessionId`);
+  optionalEventNonNegativeInteger(part.ordinal, `${path}.ordinal`);
   const type = parseRuntimeEnum(part.type, [
     "text",
     "image",
@@ -1085,6 +1116,7 @@ function validateMessagePart(value: unknown, path: string): void {
   switch (type) {
     case "text":
       parseRuntimeString(part.text, `${path}.text`, { allowEmpty: true });
+      if (part.completion !== undefined) parseRuntimeEnum(part.completion, ["completed", "cancelled", "failed"] as const, `${path}.completion`);
       if (part.phase !== undefined) parseRuntimeEnum(part.phase, ["commentary", "final_answer"] as const, `${path}.phase`);
       optionalEventString(part.displayText, `${path}.displayText`);
       optionalEventBoolean(part.synthetic, `${path}.synthetic`);
@@ -1098,6 +1130,7 @@ function validateMessagePart(value: unknown, path: string): void {
       return;
     case "reasoning":
       parseRuntimeString(part.text, `${path}.text`, { allowEmpty: true });
+      if (part.completion !== undefined) parseRuntimeEnum(part.completion, ["completed", "cancelled", "failed"] as const, `${path}.completion`);
       optionalEventBoolean(part.redacted, `${path}.redacted`);
       if (part.modelOutput !== undefined) validatePersistedModelOutput(part.modelOutput, `${path}.modelOutput`);
       return;

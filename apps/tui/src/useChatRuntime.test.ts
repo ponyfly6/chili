@@ -3,6 +3,9 @@ import { testRender } from "@opentui/react/test-utils";
 import { act, createElement } from "react";
 import type {
   ChiliEvent,
+  Message,
+  MessageId,
+  PartId,
   RuntimeCommandCatalog,
   RuntimeMcpAuthResponse,
   RuntimeMcpLogoutResponse,
@@ -15,7 +18,7 @@ import type {
   SessionId,
   TimestampMs,
 } from "@chili/protocol";
-import type { ChatSessionView, HttpRuntimeClient, RuntimeSessionSummary } from "@chili/sdk";
+import { EventTransportResyncRequiredError, type ChatSessionView, type HttpRuntimeClient, type RuntimeSessionSummary, type StreamEventsRequest } from "@chili/sdk";
 import {
   acceptedFeedbackMatchesStatus,
   useChatRuntime,
@@ -65,6 +68,7 @@ test("a late model-config response from the previous session cannot overwrite th
   const sessions = [sessionSummary(sessionA), sessionSummary(sessionB)];
   const client = {
     listSessions: async () => sessions,
+    messages: async () => [],
     sessionEvents: async (input: { sessionId: SessionId }) => [sessionCreatedEvent(input.sessionId)],
     streamEvents: async function* (input: { signal?: AbortSignal } = {}) {
       await waitForAbort(input.signal);
@@ -350,6 +354,7 @@ test("MCP status follows the selected session and ignores a late prior-workspace
   const sessions = [sessionSummary(sessionA), sessionSummary(sessionB)];
   const client = {
     listSessions: async () => sessions,
+    messages: async () => [],
     sessionEvents: async (input: { sessionId: SessionId }) => [sessionCreatedEvent(input.sessionId)],
     streamEvents: async function* (input: { signal?: AbortSignal } = {}) {
       await waitForAbort(input.signal);
@@ -428,6 +433,7 @@ test("all late MCP operations return undefined and cannot refresh the next sessi
   const sessions = [sessionSummary(sessionA), sessionSummary(sessionB)];
   const client = {
     listSessions: async () => sessions,
+    messages: async () => [],
     sessionEvents: async (input: { sessionId: SessionId }) => [sessionCreatedEvent(input.sessionId)],
     streamEvents: async function* (input: { signal?: AbortSignal } = {}) {
       await waitForAbort(input.signal);
@@ -584,6 +590,7 @@ test("a failed command-catalog load for the resumed session cannot retain a late
   const sessions = [sessionSummary(sessionA), sessionSummary(sessionB)];
   const client = {
     listSessions: async () => sessions,
+    messages: async () => [],
     sessionEvents: async (input: { sessionId: SessionId }) => [sessionCreatedEvent(input.sessionId)],
     streamEvents: async function* (input: { signal?: AbortSignal } = {}) {
       await waitForAbort(input.signal);
@@ -654,6 +661,89 @@ test("a failed command-catalog load for the resumed session cannot retain a late
   }
 });
 
+test("resuming saved history reads complete messages beyond the event window without advancing the stream", async () => {
+  const sessionId = "session_full_saved_history" as SessionId;
+  const messageId = "message_full_saved_history" as MessageId;
+  const partId = "part_full_saved_history" as PartId;
+  const completeMessage: Message = { id: messageId, sessionId, role: "assistant", createdAt: 1 as TimestampMs,
+    parts: [{ id: partId, messageId, sessionId, type: "reasoning", text: "the complete saved thinking", completion: "completed" }] };
+  const messageSignals: Array<AbortSignal | undefined> = [];
+  const client = chatRuntimeClient([sessionSummary(sessionId)], {
+    messages: async (_id: SessionId, signal: AbortSignal | undefined) => { messageSignals.push(signal); return [completeMessage]; },
+  });
+  let runtime: ChatRuntimeState | undefined;
+  let app!: Awaited<ReturnType<typeof testRender>>;
+  await act(async () => {
+    app = await testRender(createElement(ChatRuntimeProbe, { client, options: { baseUrl: "http://chili.test", sessionId },
+      onRuntime: (value) => { runtime = value; } }), { width: 100, height: 4, exitOnCtrlC: false });
+  });
+  try {
+    await waitForRuntime(app, () => runtime?.activeSessionId === sessionId);
+    const message = runtime?.chatView.items.find((item) => item.id === messageId);
+    expect(message?.kind === "message" && message.parts).toEqual([
+      { id: partId, type: "reasoning", text: "the complete saved thinking", completion: "completed" },
+    ]);
+    expect(runtime?.runtimeView.lastEventId).toBeUndefined();
+    expect(messageSignals).toHaveLength(1);
+    expect(messageSignals[0]).toBeInstanceOf(AbortSignal);
+  } finally {
+    act(() => app.renderer.destroy());
+  }
+});
+
+test("snapshot recovery refills complete selected history once while active text keeps streaming", async () => {
+  const sessionId = "session_recovery_history" as SessionId;
+  const messageId = "message_recovery_history" as MessageId;
+  const partId = "part_recovery_history" as PartId;
+  const liveId = "message_recovery_live" as MessageId;
+  const livePartId = "part_recovery_live" as PartId;
+  const recover = deferred<void>();
+  let messageReads = 0;
+  let streams = 0;
+  const client = chatRuntimeClient([sessionSummary(sessionId)], {
+    messages: async () => {
+      messageReads += 1;
+      return [{ id: messageId, sessionId, role: "assistant", createdAt: 1 as TimestampMs,
+        parts: [{ id: partId, messageId, sessionId, type: "reasoning", text: "old complete thinking", completion: "completed" }] } satisfies Message];
+    },
+    eventSnapshot: async () => ({ version: 1, afterEventId: "recovery_cursor", events: [sessionCreatedEvent(sessionId)],
+      coveredSessionIds: [sessionId], truncated: true, temporaryOutput: "not-replayed" }),
+    streamEvents: async function* (input: StreamEventsRequest = {}) {
+      streams += 1;
+      if (streams === 1) {
+        await recover.promise;
+        throw new EventTransportResyncRequiredError("oversize event", "large_commit");
+      }
+      yield { id: "live_snapshot", type: "message.part_stream_snapshot", time: 2 as TimestampMs, sessionId,
+        payload: { messageId: liveId, part: { id: livePartId, messageId: liveId, sessionId, type: "text", text: "live" } } } satisfies ChiliEvent;
+      for (let offset = 4; offset < 8; offset += 1) {
+        yield { id: `delta_${offset}`, type: "message.part_stream_delta", time: 3 as TimestampMs, sessionId,
+          payload: { messageId: liveId, partId: livePartId, partType: "text", offset, delta: "!" } } satisfies ChiliEvent;
+      }
+      await waitForAbort(input.signal);
+    },
+  });
+  let runtime: ChatRuntimeState | undefined;
+  let app!: Awaited<ReturnType<typeof testRender>>;
+  await act(async () => {
+    app = await testRender(createElement(ChatRuntimeProbe, { client, options: { baseUrl: "http://chili.test", sessionId },
+      onRuntime: (value) => { runtime = value; } }), { width: 100, height: 4, exitOnCtrlC: false });
+  });
+  try {
+    await waitForRuntime(app, () => runtime?.activeSessionId === sessionId);
+    expect(messageReads).toBe(1);
+    await act(async () => { recover.resolve(); });
+    await waitForRuntime(app, () => messageReads === 2 && !!runtime?.runtimeView.messages[messageId]);
+    expect(runtime?.runtimeView.messages[messageId]?.parts[0]).toMatchObject({ text: "old complete thinking" });
+    expect(runtime?.runtimeView.messages[liveId]?.parts[0]).toMatchObject({ text: "live!!!!" });
+    expect(runtime?.runtimeView.lastEventId).toBe("recovery_cursor");
+    expect(runtime?.recoveryRevision).toBe(1);
+    expect(messageReads).toBe(2);
+  } finally {
+    act(() => app.renderer.destroy());
+  }
+});
+
 function ChatRuntimeProbe(props: {
   client: HttpRuntimeClient;
   options: RuntimeTuiOptions;
@@ -674,6 +764,7 @@ function chatRuntimeClient(
 ): HttpRuntimeClient {
   return {
     listSessions: async () => sessions,
+    messages: async () => [],
     sessionEvents: async (input: { sessionId: SessionId }) => {
       const session = sessions.find((candidate) => candidate.id === input.sessionId);
       return [sessionCreatedEvent(input.sessionId, session?.cwd)];
