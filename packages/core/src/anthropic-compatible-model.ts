@@ -1,14 +1,13 @@
 import {
   AnthropicCompatibleModel,
+  createMiniMaxM3Model,
   isProviderError,
-  MINIMAX_ANTHROPIC_BASE_URL,
-  MINIMAX_M3_MODEL,
   type AnthropicCompatibleModelOptions as ProviderAnthropicOptions,
   type AnthropicAuthScheme,
 } from "@chili/providers";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
 
-export { MINIMAX_ANTHROPIC_BASE_URL, MINIMAX_M3_MODEL, resolveMessagesUrl } from "@chili/providers";
+export { MINIMAX_BASE_URL, MINIMAX_M3_MODEL, resolveMessagesUrl } from "@chili/providers";
 export type { AnthropicAuthScheme };
 
 /** Compatibility options. Authentication and execution belong to @chili/providers. */
@@ -21,12 +20,10 @@ export interface MiniMaxModelOptions {
   maxTokens?: number;
   temperature?: number;
   reasoning?: boolean;
-  serviceTier?: ProviderAnthropicOptions["serviceTier"];
+  serviceTier?: NonNullable<ProviderAnthropicOptions["serviceTier"]>;
   fetch?: typeof fetch;
   env?: Readonly<Record<string, string | undefined>>;
 }
-
-const DEFAULT_MINIMAX_MAX_TOKENS = 128 * 1024;
 
 /**
  * @deprecated Prefer Host model routing or @chili/providers directly.
@@ -61,30 +58,27 @@ export class AnthropicCompatibleModelRouter implements ModelRouter {
 }
 
 /** @deprecated Prefer createMiniMaxM3Model from @chili/providers or shared Host routing. */
-export function createMiniMaxM3Router(options: MiniMaxModelOptions = {}): AnthropicCompatibleModelRouter {
-  const env = options.env ?? process.env;
-  const routerOptions: AnthropicCompatibleModelOptions = {
-    provider: "minimax",
-    model: options.model ?? env.MINIMAX_MODEL ?? env.ANTHROPIC_MODEL ?? MINIMAX_M3_MODEL,
-    baseUrl: options.baseUrl
-      ?? env.MINIMAX_ANTHROPIC_BASE_URL
-      ?? env.ANTHROPIC_BASE_URL
-      ?? env.MINIMAX_BASE_URL
-      ?? MINIMAX_ANTHROPIC_BASE_URL,
-    apiKey: options.apiKey ?? env.MINIMAX_API_KEY ?? env.ANTHROPIC_API_KEY ?? "",
-    authScheme: "bearer",
-    maxTokens: options.maxTokens ?? DEFAULT_MINIMAX_MAX_TOKENS,
-    reasoning: options.reasoning ?? true,
-    inputCapabilities: ["text", "image"],
+export function createMiniMaxM3Router(options: MiniMaxModelOptions = {}): ModelRouter {
+  const model = createMiniMaxM3Model(options);
+  return {
+    async *stream(input) {
+      try {
+        for await (const event of model.stream({
+          ...input,
+          metadata: { sessionId: input.sessionId, turnId: input.turnId },
+        })) {
+          if (event.type === "error") throw event.error;
+          yield event;
+        }
+      } catch (error) {
+        throw legacyErrorLabel(error);
+      }
+    },
   };
-  if (options.temperature !== undefined) routerOptions.temperature = options.temperature;
-  if (options.serviceTier !== undefined) routerOptions.serviceTier = options.serviceTier;
-  if (options.fetch !== undefined) routerOptions.fetch = options.fetch;
-  return new AnthropicCompatibleModelRouter(routerOptions);
 }
 
 /** @deprecated Use createMiniMaxM3Router. */
-export function createMiniMaxM27HighspeedRouter(options: MiniMaxModelOptions = {}): AnthropicCompatibleModelRouter {
+export function createMiniMaxM27HighspeedRouter(options: MiniMaxModelOptions = {}): ModelRouter {
   return createMiniMaxM3Router(options);
 }
 

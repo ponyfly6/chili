@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import type { Message, MessageId, PartId, SessionId, TimestampMs } from "@chili/protocol";
-import { createKimiModel } from "./kimi.js";
-import { createMiniMaxM3Model } from "./minimax.js";
+import { createKimiModel } from "./vendors/kimi/provider.js";
+import { createMiniMaxM3Model } from "./vendors/minimax/provider.js";
 import { findKnownModel, listKnownModels } from "./models.js";
-import { resolveChatCompletionsCompatibility } from "./compat.js";
+import { resolveChatCompletionsCompatibility } from "./protocols/compat.js";
 import { resolveModelSelectionPattern } from "./model-selection.js";
 import type { BuiltinProviderId } from "./provider-definition.js";
 import { createRegisteredProviderModel, resolveProviderModelOptions } from "./provider-registry.js";
@@ -23,8 +23,10 @@ function transport(capture: (body: Record<string, unknown>) => void): typeof fet
   return (async (_url, init) => {
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     capture(body);
-    return String(body.model).startsWith("MiniMax-")
-      ? Response.json({ id: "msg_catalog", content: [], stop_reason: "end_turn" })
+    return new URL(String(_url)).pathname.endsWith("/responses")
+      ? new Response(`data: ${JSON.stringify({ type: "response.completed", response: {
+        id: "response_catalog", status: "completed", output: [],
+      } })}\n\n`, { headers: { "content-type": "text/event-stream" } })
       : Response.json({ id: "chat_catalog", choices: [{ index: 0, message: { content: "ok" }, finish_reason: "stop" }] });
   }) as typeof fetch;
 }
@@ -55,16 +57,22 @@ for (const [provider, model] of visionModels) {
       tools: [{ name: "inspect", description: "Inspect", inputSchema: { type: "object" } }],
     });
     expect(sent.model).toBe(model);
-    expect(sent.messages).toEqual([{ role: "user", content: provider === "minimax"
-      ? [{ type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2U=" } }]
-      : [{ type: "image_url", image_url: { url: "data:image/png;base64,aW1hZ2U=" } }],
-    }]);
+    if (["deepseek", "xai", "minimax"].includes(provider)) {
+      expect(sent.input).toEqual([{ role: "user", content: [
+        { type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
+      ] }]);
+      expect(sent).not.toHaveProperty("messages");
+    } else {
+      expect(sent.messages).toEqual([{ role: "user", content: [
+        { type: "image_url", image_url: { url: "data:image/png;base64,aW1hZ2U=" } },
+      ] }]);
+    }
     if (provider === "zai") {
       expect(sent).toMatchObject({ thinking: { type: "enabled", clear_thinking: false }, reasoning_effort: "max", tool_stream: true });
     }
-    if (provider === "deepseek") expect(sent).toMatchObject({ thinking: { type: "enabled" }, reasoning_effort: "max" });
-    if (provider === "xai") expect(sent.reasoning_effort).toBe("xhigh");
-    if (provider === "minimax") expect(sent.output_config).toEqual({ effort: "max" });
+    if (provider === "deepseek") expect(sent.reasoning).toEqual({ effort: "max" });
+    if (provider === "xai") expect(sent.reasoning).toEqual({ effort: "xhigh" });
+    if (provider === "minimax") expect(sent.reasoning).toEqual({ effort: "max" });
   });
 }
 
@@ -95,15 +103,15 @@ test("MiniMax preview maps per-request effort and keeps omitted effort at the se
   const bodies: Record<string, unknown>[] = [];
   const model = createMiniMaxM3Model({ env: {}, model: "MiniMax-M3.1-Flash-Preview", apiKey: "fake-key", fetch: transport((body) => bodies.push(body)) });
   await consume(model, { messages: [] });
-  expect(bodies[0]).not.toHaveProperty("output_config");
+  expect(bodies[0]).not.toHaveProperty("reasoning");
   const levels: readonly [ReasoningLevel, string][] = [["off", "low"], ["medium", "medium"], ["xhigh", "xhigh"], ["ultra", "max"]];
   for (const [reasoning, expected] of levels) {
     await consume(model, { messages: [], reasoning });
-    expect(bodies.at(-1)).toMatchObject({ thinking: { type: "adaptive" }, output_config: { effort: expected } });
+    expect(bodies.at(-1)).toMatchObject({ reasoning: { effort: expected } });
   }
   const legacy = createMiniMaxM3Model({ env: {}, apiKey: "fake-key", reasoningEffort: "max", fetch: transport((body) => bodies.push(body)) });
   await consume(legacy, { messages: [], reasoning: "off" });
-  expect(bodies.at(-1)).toMatchObject({ thinking: { type: "disabled" } });
+  expect(bodies.at(-1)).toMatchObject({ reasoning: { effort: "none" } });
   expect(bodies.at(-1)).not.toHaveProperty("output_config");
 });
 

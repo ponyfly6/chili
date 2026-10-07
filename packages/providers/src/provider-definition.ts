@@ -1,48 +1,30 @@
-import { canonicalizeCodexApiModel, canonicalizeOpenAICodexModel } from "./models.js";
+import type { ProviderDefinition } from "./provider-types.js";
+import { ALIBABA_DEFINITION } from "./vendors/alibaba/config.js";
+import { ANTHROPIC_DEFINITION } from "./vendors/anthropic/config.js";
+import { DEEPSEEK_DEFINITION } from "./vendors/deepseek/config.js";
+import { DOUBAO_DEFINITION } from "./vendors/doubao/config.js";
+import { KIMI_DEFINITION } from "./vendors/kimi/config.js";
+import { MINIMAX_DEFINITION } from "./vendors/minimax/config.js";
+import { OPENAI_CODEX_DEFINITION, CODEX_API_DEFINITION, OPENAI_DEFINITION } from "./vendors/openai/config.js";
+import { XAI_DEFINITION } from "./vendors/xai/config.js";
+import { ZAI_DEFINITION } from "./vendors/zhipu/config.js";
+import { ZHIPU_DEFINITION } from "./vendors/zhipu/domestic-config.js";
 
-export interface ProviderDefinition {
-  displayName: string;
-  aliases: readonly string[];
-  modelPrefixes: readonly string[];
-  auth: "api_key" | "oauth";
-  defaultRequestMaxTokens: number;
-  reasoning: "toggle" | "toggle-effort" | "effort" | "responses";
-  serviceTier: boolean;
-  connectionLabel?: string;
-  canonicalizeModel?: (model: string) => string;
-}
+export type { ProviderDefinition } from "./provider-types.js";
 
 const definitions = {
-  minimax: {
-    displayName: "MiniMax", aliases: [], modelPrefixes: ["minimax-"], auth: "api_key",
-    defaultRequestMaxTokens: 128 * 1024, reasoning: "toggle-effort", serviceTier: true,
-  },
-  deepseek: {
-    displayName: "DeepSeek", aliases: [], modelPrefixes: ["deepseek-"], auth: "api_key",
-    defaultRequestMaxTokens: 128 * 1024, reasoning: "toggle-effort", serviceTier: false,
-  },
-  kimi: {
-    displayName: "Kimi", aliases: ["moonshot"], modelPrefixes: ["kimi-", "moonshot-"], auth: "api_key",
-    defaultRequestMaxTokens: 128 * 1024, reasoning: "effort", serviceTier: false,
-  },
-  zai: {
-    displayName: "Z.ai", aliases: ["z.ai", "glm"], modelPrefixes: ["glm-"], auth: "api_key",
-    defaultRequestMaxTokens: 128 * 1024, reasoning: "effort", serviceTier: false,
-  },
-  xai: {
-    displayName: "xAI", aliases: ["x.ai", "grok"], modelPrefixes: ["grok-"], auth: "api_key",
-    defaultRequestMaxTokens: 128_000, reasoning: "effort", serviceTier: false,
-  },
-  "openai-codex": {
-    displayName: "ChatGPT", aliases: ["codex"], modelPrefixes: ["gpt-"], auth: "oauth",
-    defaultRequestMaxTokens: 128_000, reasoning: "responses", serviceTier: true,
-    connectionLabel: "ChatGPT OAuth", canonicalizeModel: canonicalizeOpenAICodexModel,
-  },
-  "codex-api": {
-    displayName: "Api", aliases: [], modelPrefixes: [], auth: "api_key",
-    defaultRequestMaxTokens: 128_000, reasoning: "responses", serviceTier: true,
-    connectionLabel: "Third-party API", canonicalizeModel: canonicalizeCodexApiModel,
-  },
+  minimax: MINIMAX_DEFINITION,
+  deepseek: DEEPSEEK_DEFINITION,
+  kimi: KIMI_DEFINITION,
+  zai: ZAI_DEFINITION,
+  xai: XAI_DEFINITION,
+  "openai-codex": OPENAI_CODEX_DEFINITION,
+  "codex-api": CODEX_API_DEFINITION,
+  alibaba: ALIBABA_DEFINITION,
+  doubao: DOUBAO_DEFINITION,
+  anthropic: ANTHROPIC_DEFINITION,
+  zhipu: ZHIPU_DEFINITION,
+  openai: OPENAI_DEFINITION,
 } satisfies Record<string, ProviderDefinition>;
 
 export type BuiltinProviderId = keyof typeof definitions;

@@ -30,6 +30,7 @@ import {
   ZAI_GLM_53_MODEL,
   ZAI_PROVIDER_ID,
 } from "./index.js";
+import { snapshotProviderEnvironment } from "./env.js";
 
 test("provider environment specs expose the supported variable names and precedence", () => {
   expect(DEEPSEEK_ENVIRONMENT).toEqual({
@@ -48,9 +49,9 @@ test("provider environment specs expose the supported variable names and precede
     model: ["ZAI_MODEL"],
   });
   expect(MINIMAX_ENVIRONMENT).toEqual({
-    apiKey: ["MINIMAX_API_KEY", "ANTHROPIC_API_KEY"],
-    baseUrl: ["MINIMAX_ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL", "MINIMAX_BASE_URL"],
-    model: ["MINIMAX_MODEL", "ANTHROPIC_MODEL"],
+    apiKey: ["MINIMAX_API_KEY"],
+    baseUrl: ["MINIMAX_BASE_URL"],
+    model: ["MINIMAX_MODEL"],
   });
   expect(XAI_ENVIRONMENT).toEqual({
     apiKey: ["XAI_API_KEY"],
@@ -120,7 +121,7 @@ test("Z.ai environment resolution uses GLM provider-specific variables", () => {
   expect(readProviderEnvironment(ZAI_PROVIDER_ID, env)).toEqual(readZaiEnvironment(env));
 });
 
-test("MiniMax environment resolution preserves Anthropic-compatible fallback precedence", () => {
+test("MiniMax environment resolution uses MiniMax variables without consuming Anthropic credentials", () => {
   const env = {
     MINIMAX_API_KEY: "minimax-key",
     ANTHROPIC_API_KEY: "anthropic-key",
@@ -133,12 +134,22 @@ test("MiniMax environment resolution preserves Anthropic-compatible fallback pre
   expect(readMiniMaxEnvironment(env)).toEqual({
     apiKey: "minimax-key",
     apiKeyEnv: "MINIMAX_API_KEY",
-    baseUrl: "https://minimax-anthropic.test",
-    baseUrlEnv: "MINIMAX_ANTHROPIC_BASE_URL",
+    baseUrl: "https://minimax-generic.test/v1",
+    baseUrlEnv: "MINIMAX_BASE_URL",
     model: MINIMAX_M3_MODEL,
     modelEnv: "MINIMAX_MODEL",
   });
   expect(readProviderEnvironment(MINIMAX_PROVIDER_ID, env)).toEqual(readMiniMaxEnvironment(env));
+  expect(findConfiguredEnvironmentNames(MINIMAX_PROVIDER_ID, env)).toEqual([
+    "MINIMAX_API_KEY",
+    "MINIMAX_BASE_URL",
+    "MINIMAX_MODEL",
+  ]);
+  expect(snapshotProviderEnvironment(MINIMAX_PROVIDER_ID, env)).toEqual({
+    MINIMAX_API_KEY: "minimax-key",
+    MINIMAX_BASE_URL: "https://minimax-generic.test/v1",
+    MINIMAX_MODEL: MINIMAX_M3_MODEL,
+  });
 
   expect(readMiniMaxEnvironment({
     ANTHROPIC_API_KEY: "anthropic-key",
@@ -146,13 +157,28 @@ test("MiniMax environment resolution preserves Anthropic-compatible fallback pre
     MINIMAX_BASE_URL: "https://minimax-generic.test/v1",
     ANTHROPIC_MODEL: MINIMAX_M3_MODEL,
   })).toEqual({
-    apiKey: "anthropic-key",
-    apiKeyEnv: "ANTHROPIC_API_KEY",
-    baseUrl: "https://anthropic.test",
-    baseUrlEnv: "ANTHROPIC_BASE_URL",
-    model: MINIMAX_M3_MODEL,
-    modelEnv: "ANTHROPIC_MODEL",
+    baseUrl: "https://minimax-generic.test/v1",
+    baseUrlEnv: "MINIMAX_BASE_URL",
   });
+});
+
+test("MiniMax ignores an Anthropic-only connection in reads, discovery, and snapshots", () => {
+  const env = {
+    ANTHROPIC_API_KEY: "anthropic-key",
+    ANTHROPIC_BASE_URL: "https://anthropic.test",
+    ANTHROPIC_MODEL: "claude-custom",
+  };
+  expect(readMiniMaxEnvironment(env)).toEqual({});
+  expect(findConfiguredEnvironmentNames(MINIMAX_PROVIDER_ID, env)).toEqual([]);
+  expect(snapshotProviderEnvironment(MINIMAX_PROVIDER_ID, env)).toEqual({});
+});
+
+test("MiniMax ignores its retired Anthropic endpoint variable in reads, discovery, and snapshots", () => {
+  const env = { MINIMAX_ANTHROPIC_BASE_URL: "https://minimax-anthropic.test" };
+  expect(readMiniMaxEnvironment(env)).toEqual({});
+  expect(readProviderEnvironment(MINIMAX_PROVIDER_ID, env)).toEqual({});
+  expect(findConfiguredEnvironmentNames(MINIMAX_PROVIDER_ID, env)).toEqual([]);
+  expect(snapshotProviderEnvironment(MINIMAX_PROVIDER_ID, env)).toEqual({});
 });
 
 test("xAI environment resolution supports Grok API key, endpoint, and model variables", () => {

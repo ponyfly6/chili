@@ -105,6 +105,36 @@ test("context builder preserves an encrypted reasoning output with no display te
   expect(built.usage.contextChars).toBeGreaterThan(0);
 });
 
+test("context builder independently snapshots opaque model output connection provenance", () => {
+  const sessionId = "session_reasoning_source" as SessionId;
+  const messageId = "msg_reasoning_source" as MessageId;
+  const source = { provider: "openai", connection: "sha256:original-connection" };
+  const part: Extract<MessagePart, { type: "reasoning" }> = {
+    id: "part_reasoning_source" as MessagePart["id"],
+    messageId,
+    sessionId,
+    type: "reasoning",
+    text: "",
+    modelOutput: {
+      apiFamily: "openai-responses",
+      source,
+      item: { type: "reasoning", encrypted_content: "ciphertext" },
+    },
+  };
+  const message: Message = { id: messageId, sessionId, role: "assistant", createdAt: 1 as TimestampMs, parts: [part] };
+
+  const built = new ContextWindowBuilder({ maxInputChars: 10_000 }).build([message]);
+  const snapshot = built.messages[0]?.parts[0];
+  expect(snapshot?.type).toBe("reasoning");
+  if (snapshot?.type !== "reasoning") throw new Error("Missing reasoning snapshot");
+  expect(snapshot.modelOutput?.source).toEqual(source);
+  expect(snapshot.modelOutput?.source).not.toBe(source);
+
+  source.provider = "codex-api";
+  source.connection = "sha256:other-connection";
+  expect(snapshot.modelOutput?.source).toEqual({ provider: "openai", connection: "sha256:original-connection" });
+});
+
 test("compacted message view reorders appended summary before retained messages", () => {
   const sessionId = "session_compacted_order" as SessionId;
   const oldUser = textMessage("msg_order_old_user", sessionId, "user", "old request");

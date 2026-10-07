@@ -1,8 +1,12 @@
 import {
+  BUILTIN_PROVIDERS,
   CODEX_API_PROVIDER_ID,
   OPENAI_CODEX_DEFAULT_MODEL,
   OPENAI_CODEX_PROVIDER_ID,
+  canonicalizeProviderModel,
+  isBuiltinProviderId,
   listKnownModels,
+  resolveBuiltinProviderId,
 } from "@chili/providers";
 import type { RuntimeModelAuthSource, RuntimeModelCapabilities, ServiceTier } from "@chili/protocol";
 
@@ -243,16 +247,18 @@ function normalizeModelReferenceAlias(reference: string): string {
   if (slashIndex === -1) return normalized;
   const provider = normalizeProviderAlias(normalized.slice(0, slashIndex));
   const model = normalized.slice(slashIndex + 1);
-  const canonicalModel = model === "gpt-5.6" && (provider === "openai-codex" || provider === "codex-api")
-    ? "gpt-5.6-sol"
-    : model;
-  return `${provider}/${canonicalModel}`;
+  if (isBuiltinProviderId(provider)) {
+    try {
+      return `${provider}/${canonicalizeProviderModel(provider, model).toLowerCase()}`;
+    } catch {
+      // Unsupported IDs remain searchable instead of throwing from the picker.
+    }
+  }
+  return `${provider}/${model}`;
 }
 
 function normalizeProviderAlias(provider: string): string {
-  if (provider === "grok" || provider === "x.ai") return "xai";
-  if (provider === "codex") return "openai-codex";
-  return provider;
+  return resolveBuiltinProviderId(provider) ?? provider;
 }
 
 function modelSearchScore(candidate: ModelCandidate, query: string): number | undefined {
@@ -265,6 +271,7 @@ function modelSearchScore(candidate: ModelCandidate, query: string): number | un
     candidate.provider,
     candidate.providerDisplayName,
     candidate.connectionLabel,
+    ...(isBuiltinProviderId(candidate.provider) ? BUILTIN_PROVIDERS[candidate.provider].aliases : []),
   ].filter((value): value is string => Boolean(value)).map((value) => value.toLowerCase());
   const auxiliaryFields = [
     candidate.authSource,

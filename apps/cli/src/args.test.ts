@@ -89,6 +89,17 @@ test("keeps current model aliases parseable", () => {
   }
 });
 
+test("CLI help exposes the registered vendors and their selection aliases", () => {
+  const help = usage();
+  for (const provider of ["alibaba", "doubao", "zhipu", "anthropic", "openai", "openai-codex", "codex-api"]) {
+    expect(help).toContain(provider);
+    expect(parseArgs(["--provider", provider, "hello"])).toMatchObject({ provider, prompt: "hello" });
+  }
+  for (const alias of ["qwen=alibaba", "dashscope=alibaba", "ark=doubao", "bigmodel=zhipu"]) {
+    expect(help).toContain(alias);
+  }
+});
+
 test("parses provider and concrete model references", () => {
   expect(parseArgs(["--provider", "openai-codex", "--model", "gpt-5.6", "hello"])).toMatchObject({
     command: "run",

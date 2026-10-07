@@ -1,3 +1,5 @@
+import type { BuiltinProviderId } from "./provider-definition.js";
+import type { ProviderEnvironmentSpec } from "./provider-types.js";
 import {
   CODEX_API_PROVIDER_ID,
   DEEPSEEK_PROVIDER_ID,
@@ -7,15 +9,30 @@ import {
   XAI_PROVIDER_ID,
   ZAI_PROVIDER_ID,
 } from "./models.js";
-import type { BuiltinProviderId } from "./provider-definition.js";
+import { ALIBABA_ENVIRONMENT } from "./vendors/alibaba/config.js";
+import { ANTHROPIC_ENVIRONMENT } from "./vendors/anthropic/config.js";
+import { DEEPSEEK_ENVIRONMENT } from "./vendors/deepseek/config.js";
+import { DOUBAO_ENVIRONMENT } from "./vendors/doubao/config.js";
+import { KIMI_ENVIRONMENT } from "./vendors/kimi/config.js";
+import { MINIMAX_ENVIRONMENT } from "./vendors/minimax/config.js";
+import { OPENAI_CODEX_ENVIRONMENT, CODEX_API_ENVIRONMENT, LEGACY_CODEX_API_ENVIRONMENT, OPENAI_ENVIRONMENT } from "./vendors/openai/config.js";
+import { XAI_ENVIRONMENT } from "./vendors/xai/config.js";
+import { ZAI_ENVIRONMENT } from "./vendors/zhipu/config.js";
+import { ZHIPU_ENVIRONMENT } from "./vendors/zhipu/domestic-config.js";
+
+export { ZHIPU_ENVIRONMENT } from "./vendors/zhipu/domestic-config.js";
+export { ANTHROPIC_ENVIRONMENT } from "./vendors/anthropic/config.js";
+export { DOUBAO_ENVIRONMENT } from "./vendors/doubao/config.js";
+export { ALIBABA_ENVIRONMENT } from "./vendors/alibaba/config.js";
+export type { ProviderEnvironmentSpec } from "./provider-types.js";
+export { MINIMAX_ENVIRONMENT } from "./vendors/minimax/config.js";
+export { DEEPSEEK_ENVIRONMENT } from "./vendors/deepseek/config.js";
+export { KIMI_ENVIRONMENT } from "./vendors/kimi/config.js";
+export { ZAI_ENVIRONMENT } from "./vendors/zhipu/config.js";
+export { XAI_ENVIRONMENT } from "./vendors/xai/config.js";
+export { OPENAI_CODEX_ENVIRONMENT, CODEX_API_ENVIRONMENT, OPENAI_ENVIRONMENT } from "./vendors/openai/config.js";
 
 export type EnvironmentSource = Record<string, string | undefined>;
-
-export interface ProviderEnvironmentSpec {
-  apiKey?: readonly string[];
-  baseUrl?: readonly string[];
-  model?: readonly string[];
-}
 
 export interface ProviderEnvironment {
   apiKey?: string;
@@ -26,54 +43,6 @@ export interface ProviderEnvironment {
   modelEnv?: string;
 }
 
-export const MINIMAX_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
-  apiKey: ["MINIMAX_API_KEY", "ANTHROPIC_API_KEY"],
-  baseUrl: ["MINIMAX_ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL", "MINIMAX_BASE_URL"],
-  model: ["MINIMAX_MODEL", "ANTHROPIC_MODEL"],
-};
-
-export const DEEPSEEK_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
-  apiKey: ["DEEPSEEK_API_KEY"],
-  baseUrl: ["DEEPSEEK_BASE_URL"],
-  model: ["DEEPSEEK_MODEL"],
-};
-
-export const KIMI_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
-  apiKey: ["MOONSHOT_API_KEY", "KIMI_API_KEY"],
-  baseUrl: ["MOONSHOT_BASE_URL", "KIMI_BASE_URL"],
-  model: ["MOONSHOT_MODEL", "KIMI_MODEL"],
-};
-
-export const ZAI_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
-  apiKey: ["ZAI_API_KEY"],
-  baseUrl: ["ZAI_BASE_URL"],
-  model: ["ZAI_MODEL"],
-};
-
-export const XAI_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
-  apiKey: ["XAI_API_KEY"],
-  baseUrl: ["XAI_BASE_URL"],
-  model: ["XAI_MODEL"],
-};
-
-export const OPENAI_CODEX_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
-  apiKey: [],
-  baseUrl: [],
-  model: [],
-};
-
-export const CODEX_API_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
-  apiKey: ["CODEX_API_KEY"],
-  baseUrl: ["CODEX_API_BASE_URL"],
-  model: ["CODEX_API_MODEL"],
-};
-
-const LEGACY_CODEX_API_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
-  apiKey: ["OPENAI_CODEX_ACCESS_TOKEN"],
-  baseUrl: ["OPENAI_CODEX_BASE_URL"],
-  model: ["OPENAI_CODEX_MODEL"],
-};
-
 const PROVIDER_ENVIRONMENT: Record<string, ProviderEnvironmentSpec> = {
   [DEEPSEEK_PROVIDER_ID]: DEEPSEEK_ENVIRONMENT,
   [KIMI_PROVIDER_ID]: KIMI_ENVIRONMENT,
@@ -82,6 +51,11 @@ const PROVIDER_ENVIRONMENT: Record<string, ProviderEnvironmentSpec> = {
   [CODEX_API_PROVIDER_ID]: CODEX_API_ENVIRONMENT,
   [XAI_PROVIDER_ID]: XAI_ENVIRONMENT,
   [ZAI_PROVIDER_ID]: ZAI_ENVIRONMENT,
+  alibaba: ALIBABA_ENVIRONMENT,
+  doubao: DOUBAO_ENVIRONMENT,
+  anthropic: ANTHROPIC_ENVIRONMENT,
+  zhipu: ZHIPU_ENVIRONMENT,
+  openai: OPENAI_ENVIRONMENT,
 } satisfies Record<BuiltinProviderId, ProviderEnvironmentSpec>;
 
 /** Capture only this provider's inputs, preserving legacy-vs-explicit credential provenance. */
@@ -173,7 +147,7 @@ function configuredEnvironmentNames(spec: ProviderEnvironmentSpec, env: Environm
   return [...configuredNames(spec.apiKey, env), ...configuredNames(spec.baseUrl, env), ...configuredNames(spec.model, env)];
 }
 
-function readEnvironmentSpec(spec: ProviderEnvironmentSpec, env: EnvironmentSource): ProviderEnvironment {
+export function readEnvironmentSpec(spec: ProviderEnvironmentSpec, env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
   const apiKey = firstEnvironmentValue(spec.apiKey, env);
   const baseUrl = firstEnvironmentValue(spec.baseUrl, env);
   const model = firstEnvironmentValue(spec.model, env);

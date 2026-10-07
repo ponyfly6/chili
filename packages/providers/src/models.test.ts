@@ -22,7 +22,7 @@ import {
   KIMI_OPENAI_BASE_URL,
   KIMI_PROVIDER_ID,
   listKnownModels,
-  MINIMAX_ANTHROPIC_BASE_URL,
+  MINIMAX_BASE_URL,
   MINIMAX_M3_MODEL,
   MINIMAX_M31_FLASH_PREVIEW_MODEL,
   MINIMAX_PROVIDER_ID,
@@ -62,7 +62,7 @@ test("catalog exposes current DeepSeek Pro and Flash, retaining the legacy Flash
     provider: DEEPSEEK_PROVIDER_ID,
     model: DEEPSEEK_V4_PRO_MODEL,
     displayName: "DeepSeek V4 Pro (0813)",
-    apiFamily: "openai-completions",
+    apiFamily: "openai-responses",
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     default: true,
     inputCapabilities: ["text"],
@@ -71,10 +71,7 @@ test("catalog exposes current DeepSeek Pro and Flash, retaining the legacy Flash
     reasoningLevels: ["off", "low", "high", "max"],
     capabilities: FULL_CAPABILITIES,
     compatibility: {
-      chatCompletions: {
-        supportsStore: false,
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: true,
+      responses: {
         reasoningEffortMap: {
           off: "low",
           minimal: "low",
@@ -85,11 +82,6 @@ test("catalog exposes current DeepSeek Pro and Flash, retaining the legacy Flash
           max: "max",
           ultra: "max",
         },
-        supportsUsageInStreaming: true,
-        maxTokensField: "max_tokens",
-        requiresReasoningContentOnAssistantMessages: true,
-        reasoningParameterStyle: "deepseek",
-        toolCallDeltaMode: "standard",
       },
     },
   });
@@ -110,7 +102,7 @@ test("catalog exposes Kimi K3 and K2.7 Code with image input and current token l
     provider: KIMI_PROVIDER_ID,
     model: KIMI_K3_MODEL,
     displayName: "Kimi K3",
-    apiFamily: "openai-completions",
+    apiFamily: "openai-responses",
     baseUrl: KIMI_OPENAI_BASE_URL,
     default: true,
     inputCapabilities: ["text", "image"],
@@ -119,10 +111,7 @@ test("catalog exposes Kimi K3 and K2.7 Code with image input and current token l
     reasoningLevels: ["low", "high", "max"],
     capabilities: FULL_CAPABILITIES,
     compatibility: {
-      chatCompletions: {
-        supportsStore: false,
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: true,
+      responses: {
         reasoningEffortMap: {
           off: "low",
           minimal: "low",
@@ -133,11 +122,6 @@ test("catalog exposes Kimi K3 and K2.7 Code with image input and current token l
           max: "max",
           ultra: "max",
         },
-        supportsUsageInStreaming: true,
-        maxTokensField: "max_completion_tokens",
-        requiresReasoningContentOnAssistantMessages: true,
-        reasoningParameterStyle: "moonshot-k3",
-        toolCallDeltaMode: "standard",
       },
     },
   });
@@ -197,8 +181,8 @@ test("catalog keeps MiniMax M3 as the default alongside its plan-only preview wi
     provider: MINIMAX_PROVIDER_ID,
     model: MINIMAX_M3_MODEL,
     displayName: "MiniMax M3",
-    apiFamily: "anthropic-messages",
-    baseUrl: MINIMAX_ANTHROPIC_BASE_URL,
+    apiFamily: "openai-responses",
+    baseUrl: MINIMAX_BASE_URL,
     default: true,
     inputCapabilities: ["text", "image"],
     contextWindowTokens: 1_000_000,
@@ -207,7 +191,6 @@ test("catalog keeps MiniMax M3 as the default alongside its plan-only preview wi
     serviceTiers: ["standard", "fast"],
     cost: { input: 2.1, output: 8.4, cacheRead: 0.42, cacheWrite: 0, currency: "CNY" },
     capabilities: FULL_CAPABILITIES,
-    compatibility: { messages: { supportsEagerToolInputStreaming: true } },
   });
   for (const unlisted of ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3[1m]"]) {
     expect(findKnownModel(MINIMAX_PROVIDER_ID, unlisted)).toBeUndefined();
@@ -221,7 +204,7 @@ test("catalog defaults to xAI Grok 4.7 and retains explicit 4.6 selections with 
     provider: XAI_PROVIDER_ID,
     model: XAI_GROK_47_MODEL,
     displayName: "Grok 4.7",
-    apiFamily: "openai-completions",
+    apiFamily: "openai-responses",
     baseUrl: XAI_OPENAI_BASE_URL,
     default: true,
     inputCapabilities: ["text", "image"],
@@ -230,10 +213,7 @@ test("catalog defaults to xAI Grok 4.7 and retains explicit 4.6 selections with 
     cost: { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
     capabilities: FULL_CAPABILITIES,
     compatibility: {
-      chatCompletions: {
-        supportsStore: false,
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: true,
+      responses: {
         reasoningEffortMap: {
           off: "low",
           minimal: "low",
@@ -244,11 +224,6 @@ test("catalog defaults to xAI Grok 4.7 and retains explicit 4.6 selections with 
           max: "xhigh",
           ultra: "xhigh",
         },
-        supportsUsageInStreaming: true,
-        maxTokensField: "max_completion_tokens",
-        requiresReasoningContentOnAssistantMessages: false,
-        reasoningParameterStyle: "xai",
-        toolCallDeltaMode: "standard",
       },
     },
   });
@@ -258,15 +233,15 @@ test("catalog defaults to xAI Grok 4.7 and retains explicit 4.6 selections with 
 
 test("catalog lookups deep-clone nested compatibility maps", () => {
   const first = findKnownModel(XAI_PROVIDER_ID, XAI_GROK_46_MODEL);
-  const chatCompletions = first?.compatibility?.chatCompletions;
-  expect(chatCompletions).toBeDefined();
-  if (!chatCompletions) throw new Error("Grok descriptor is missing Chat Completions compatibility");
-  const reasoningEffortMap = chatCompletions.reasoningEffortMap;
+  const responses = first?.compatibility?.responses;
+  expect(responses).toBeDefined();
+  if (!responses) throw new Error("Grok descriptor is missing Responses compatibility");
+  const reasoningEffortMap = responses.reasoningEffortMap;
   if (!reasoningEffortMap) throw new Error("Grok descriptor is missing its reasoning effort map");
   reasoningEffortMap.high = "mutated";
 
   const fresh = findKnownModel(XAI_PROVIDER_ID, XAI_GROK_46_MODEL);
-  expect(fresh?.compatibility?.chatCompletions?.reasoningEffortMap?.high).toBe("high");
+  expect(fresh?.compatibility?.responses?.reasoningEffortMap?.high).toBe("high");
 });
 
 test("ChatGPT and Codex API catalogs offer GPT-6 models and retain GPT-5.6 selections", () => {

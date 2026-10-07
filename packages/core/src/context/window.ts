@@ -871,6 +871,7 @@ function snapshotMessagePart(part: MessagePart): MessagePart {
         snapshot.modelOutput = {
           apiFamily: part.modelOutput.apiFamily,
           ...(part.modelOutput.outputIndex === undefined ? {} : { outputIndex: part.modelOutput.outputIndex }),
+          ...(part.modelOutput.source === undefined ? {} : { source: { ...part.modelOutput.source } }),
           item: jsonSnapshot(part.modelOutput.item) as Record<string, unknown>,
         };
       }
