@@ -36,7 +36,8 @@ selection, controls, budget, source hashes and inclusion/omission reasons. No
 handler or credential is stored in the tool schema snapshot. A content hash
 identifies the preparation version; `sourceEventId` locates the session event
 boundary. `sessionRevision` is a message/part count, not an optimistic-lock token.
-The execution identity records the profile, project and workspace binding.
+Historical requests may contain creation-time execution identity metadata;
+new requests do not copy the session's historical environment bindings.
 
 When an adapter has resolved the actual account and passed its concurrency gate,
 it records `model.request_identity` before network dispatch, with the matching
@@ -80,7 +81,7 @@ requirement over repeated compression.
 The complete request path is `buildHostPromptFragments` (or the child equivalent)
 → `PromptAssembler` → `ContextWindowBuilder` → `SingleAgentRuntime`'s prepared
 request → `ModelRouter.stream`. Host and child runtimes use the same path and
-selected profile/project binding. `RuntimeService` rebuilds supplied prompt
+current profile/project configuration. `RuntimeService` rebuilds supplied prompt
 material at each model step; lifecycle labels are not a cache. The standard Host
 supplies Memory directory paths, while the Agent reads Memory and project files
 through ordinary tools when needed. Rebuilding the prompt does not reread them.

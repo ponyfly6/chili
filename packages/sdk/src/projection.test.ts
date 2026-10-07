@@ -2350,3 +2350,16 @@ test("hydrating an active message leaves following stream offsets live", () => {
   expect(view.messages[messageId]?.parts[0]).toMatchObject({ text: "hello world" });
   expect(view.lastEventId).toBeUndefined();
 });
+
+
+test("opening a saved session acquires ownership through its mutation endpoint", async () => {
+  const sessionId = "session/open" as SessionId;
+  const controller = new AbortController();
+  const requests: Array<{ url: string; method: string | undefined; body: unknown; signal: AbortSignal | null | undefined }> = [];
+  const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: (async (input, init) => {
+    requests.push({ url: String(input), method: init?.method, body: JSON.parse(String(init?.body)), signal: init?.signal });
+    return Response.json({ sessionId });
+  }) as typeof fetch });
+  await client.openSession(sessionId, controller.signal);
+  expect(requests).toEqual([{ url: "http://runtime.test/api/sessions/session%2Fopen/open", method: "POST", body: {}, signal: controller.signal }]);
+});

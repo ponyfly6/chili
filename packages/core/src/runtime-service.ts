@@ -49,6 +49,8 @@ import {
   type StoredSessionInput,
   type SessionInputMutation,
   SessionInputConflictError,
+  HostSessionOwnerConflictError,
+  type StaleTurnRecoveryStore,
 } from "@chili/store";
 import { executionPolicyFor, type ToolAccessPolicy } from "@chili/tools";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -112,6 +114,7 @@ export interface RuntimeServiceOptions {
   runtime: AgentRunner;
   store: EventStore;
   cwd: string;
+  /** Creation-time metadata; does not bind a session to an execution environment. */
   executionIdentityResolver?: (cwd: string) => ExecutionIdentity | Promise<ExecutionIdentity>;
   executionContext?: <T>(operation: () => T) => T;
   maxTurns?: number;
@@ -384,13 +387,6 @@ export class RuntimeSessionClaimCapabilityError extends Error {
   }
 }
 
-export class RuntimeSessionIdentityError extends Error {
-  constructor(readonly sessionId: SessionId, readonly dimensions: readonly string[]) {
-    super(`Session ${sessionId} belongs to a different execution identity (${dimensions.join(", ")}); use its original profile, project and workspace.`);
-    this.name = "RuntimeSessionIdentityError";
-  }
-}
-
 export class RuntimeSessionInactiveError extends Error {
   constructor(readonly sessionId: SessionId, readonly status: string) {
     super(`Session is not active: ${sessionId} (${status})`);
@@ -588,35 +584,35 @@ export class RuntimeService {
     await this.assertSessionAccessAllowed(sessionId, false);
   }
 
+  /** Open an existing conversation for this Host without starting a turn. */
+  async acquireSession(sessionId: SessionId): Promise<void> {
+    return this.withMutationAdmission(async () => {
+      await this.assertSessionAccessAllowed(sessionId, true);
+      const acquired = this.options.store.acquireSessionOwnership?.(sessionId);
+      this.assertControlOwner(sessionId);
+      if (acquired) {
+        const recovery = this.options.store as Partial<StaleTurnRecoveryStore>;
+        await recovery.reconcileStaleTurns?.({
+          staleBefore: Date.now(),
+          createId: (prefix) => this.id(prefix),
+          status: "failed",
+          reason: "session_reopened",
+        });
+      }
+      if (!this.running.has(sessionId) && this.inputStore()?.sessionInputQueue(sessionId).items.some(
+        (item) => item.state === "claimed" || (acquired && item.state === "pending"),
+      )) {
+        this.mutateSessionInputs({ kind: "recover", sessionId });
+      }
+      // A read-only preview may have cached settings before another Host closed.
+      this.sessionModelState.delete(sessionId);
+      delete this.globalModelState;
+    });
+  }
+
   async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
     this.assertControlOwner(sessionId);
     await this.assertSessionAccessAllowed(sessionId, true);
-    await this.assertSessionIdentity(sessionId);
-  }
-
-  private async assertSessionIdentity(sessionId: SessionId): Promise<void> {
-    if (!this.options.executionIdentityResolver) return;
-    const session = (await this.options.store.sessions()).find((candidate) => candidate.id === sessionId);
-    if (!session) throw new RuntimeSessionNotFoundError(sessionId);
-    const expected = await this.options.executionIdentityResolver(await canonicalWorkspacePath(session.cwd));
-    const bound = await this.options.store.events({ sessionId, type: "session.identity_bound", tail: true, limit: 1 });
-    const created = bound.length === 0
-      ? await this.options.store.events({ sessionId, type: "session.created", tail: true, limit: 1 })
-      : [];
-    const recorded = ((bound[0] ?? created[0])?.payload as { identity?: ExecutionIdentity } | undefined)?.identity;
-    if (recorded) {
-      const dimensions = (["profileId", "projectId", "workspaceId"] as const).filter((key) => recorded[key] !== expected[key]);
-      if (dimensions.length > 0) throw new RuntimeSessionIdentityError(sessionId, dimensions);
-      return;
-    }
-    // Legacy sessions bind once at the first fenced execution. Merely reading
-    // or accepting an input never grants a different profile permission to run.
-    const run = this.running.get(sessionId);
-    if (run) {
-      run.operationContext.capability.assertCurrent();
-      await this.append({ sessionId }, "session.identity_bound", { sessionId, identity: expected },
-        run.operationContext.capability.runClaim ? { runClaim: run.operationContext.capability.runClaim } : undefined);
-    }
   }
 
   private async assertSessionAccessAllowed(sessionId: SessionId, requireActive: boolean): Promise<void> {
@@ -1055,6 +1051,9 @@ export class RuntimeService {
   async resumeInputs(sessionId: SessionId): Promise<RuntimeInputQueue> {
     return this.withMutationAdmission(async () => {
       this.assertControlOwner(sessionId);
+      if (!this.running.has(sessionId) && this.inputQueue(sessionId).items.some((item) => item.state === "claimed")) {
+        this.mutateSessionInputs({ kind: "recover", sessionId });
+      }
       const before = this.inputQueue(sessionId);
       await this.assertSessionTurnAllowed(sessionId);
       if (this.running.has(sessionId) || before.items.some((item) => item.state === "claimed")) throw new RuntimeBusyError(sessionId);
@@ -1073,16 +1072,23 @@ export class RuntimeService {
     for (const session of await this.options.store.sessions()) {
       if (session.status !== "active" || this.running.has(session.id)) continue;
       if (Boolean(session.agent) !== (this.options.sessionAccess === "child")) continue;
+      if (this.options.store.canRecoverSession?.(session.id) === false) continue;
       if (store.sessionInputQueue(session.id).items.some((item) => item.state === "claimed"
         || (options.includePending !== false && item.state === "pending"))) {
-        this.assertControlOwner(session.id);
-        this.mutateSessionInputs({ kind: "recover", sessionId: session.id });
+        try {
+          this.assertControlOwner(session.id);
+          this.mutateSessionInputs({ kind: "recover", sessionId: session.id });
+        } catch (error) {
+          // Another Host can open the session after the read-only filter above.
+          if (!(error instanceof HostSessionOwnerConflictError)) throw error;
+        }
       }
     }
   }
 
   private assertControlOwner(sessionId: SessionId): void {
     const store = this.options.store as typeof this.options.store & Partial<RuntimeAtomicSessionStore>;
+    store.assertSessionOwnership?.(sessionId);
     const claim = store.sessionRunClaim?.(sessionId);
     if (claim && claim.leaseExpiresAt > Date.now()
       && this.running.get(sessionId)?.durableClaimId !== claim.claimId) {
@@ -1724,7 +1730,9 @@ export class RuntimeService {
 
   private async resolveSessionModelState(sessionId: SessionId): Promise<RuntimeSessionModelState> {
     const cached = this.sessionModelState.get(sessionId);
-    if (cached) return cloneSessionModelState(cached);
+    // Shared stores can change while this Host only previews a session, before
+    // explicit open or the first write. Read their settings from durable events.
+    if (cached && !this.options.store.acquireSessionOwnership) return cloneSessionModelState(cached);
 
     const state = await this.resolveGlobalModelState();
     const modelEvents = await this.options.store.events({
@@ -1766,7 +1774,7 @@ export class RuntimeService {
   }
 
   private async resolveGlobalModelState(): Promise<RuntimeSessionModelState> {
-    if (this.globalModelState) return cloneSessionModelState(this.globalModelState);
+    if (this.globalModelState && !this.options.store.acquireSessionOwnership) return cloneSessionModelState(this.globalModelState);
 
     const state = defaultSessionModelState(this.options);
     const modelEvents = await this.options.store.events({
@@ -1865,10 +1873,9 @@ export class RuntimeService {
   async interrupt(sessionId: SessionId, reason = "user_interrupt", expectedExecutionRef?: string): Promise<boolean> {
     return this.withMutationAdmission(async () => {
       this.assertControlOwner(sessionId);
-      // A local run already passed identity admission. Preserve synchronous
+      // A local run already passed access admission. Preserve synchronous
       // cancellation of its controller while validating idle control targets.
       if (!this.running.has(sessionId)) await this.assertSessionAccessAllowed(sessionId, true);
-      if (this.options.executionIdentityResolver && !this.running.has(sessionId)) await this.assertSessionIdentity(sessionId);
       if (expectedExecutionRef !== undefined) this.assertExecutionRef(sessionId, expectedExecutionRef);
       const steering = reason === "desktop_steer" || reason === "steer";
       if (!steering) this.mutateSessionInputs({ kind: "pause", sessionId });
@@ -2708,8 +2715,8 @@ function isRuntimeSessionBoundaryError(error: Error): boolean {
   return error instanceof RuntimeServiceClosedError
     || error instanceof RuntimeForeignOwnerError
     || error.name === "RuntimeForeignOwnerError"
-    || error instanceof RuntimeSessionIdentityError
-    || error.name === "RuntimeSessionIdentityError"
+    || error instanceof HostSessionOwnerConflictError
+    || error.name === "HostSessionOwnerConflictError"
     || error instanceof RuntimeSessionInactiveError
     || error instanceof RuntimeSessionAccessError
     || error instanceof RuntimeSessionNotFoundError

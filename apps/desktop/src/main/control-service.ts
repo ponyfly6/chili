@@ -500,6 +500,22 @@ export class DesktopControlService {
         return result;
       });
     }
+    if (request.type === "session.open") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        const sessions = await lease.client.listSessions();
+        this.assertClientLease(lease);
+        const session = sessions.find((candidate) => String(candidate.id) === request.sessionId);
+        if (!session) throw new Error(`Saved task not found: ${request.sessionId}`);
+        if (isChildAgentSession(session)) throw new Error("Use Agent controls to open a child Agent");
+        const sessionId = request.sessionId as SessionId;
+        if (session.status === "active") {
+          await lease.client.openSession(sessionId, lease.signal);
+          this.assertClientLease(lease);
+        }
+        return this.sessionSnapshot(sessionId, lease);
+      });
+    }
     if (request.type === "session.resume") {
       const lease = this.captureClientLease();
       return this.withSessionActor(request.sessionId, async () => {
@@ -510,6 +526,8 @@ export class DesktopControlService {
         if (isChildAgentSession(session)) throw new Error("Use Agent controls to resume a child Agent");
         if (session.status !== "active") throw new Error("Archived tasks cannot be resumed");
         const sessionId = request.sessionId as SessionId;
+        await lease.client.openSession(sessionId, lease.signal);
+        this.assertClientLease(lease);
         const queue = await lease.client.resumeInputs({ sessionId, signal: lease.signal });
         this.assertClientLease(lease);
         this.observeInputQueue(queue);

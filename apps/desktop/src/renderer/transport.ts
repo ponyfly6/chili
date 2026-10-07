@@ -31,6 +31,7 @@ export interface ControlTransport {
   createSession(options?: DesktopCreateSessionOptions): Promise<DesktopResponseMap["sessions.create"]>;
   listModels(provider?: string): Promise<DesktopResponseMap["models.list"]>;
   snapshot(sessionId: string): Promise<RuntimeSnapshot>;
+  openSession(sessionId: string): Promise<RuntimeSnapshot>;
   resumeSession(sessionId: string): Promise<RuntimeSnapshot>;
   renameSession(sessionId: string, title: string): Promise<DesktopResponseMap["session.rename"]>;
   archiveSession(sessionId: string): Promise<DesktopResponseMap["session.archive"]>;

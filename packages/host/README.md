@@ -128,9 +128,11 @@ Host resolves canonical profile, authentication path, project and workspace
 identities. Git worktrees share the common repository project ID while retaining
 separate workspace IDs. Session-specific cwd selection continues to work: skills,
 Memory and child execution follow that session's project rather than the
-initial Host directory. The identity is persisted when a session is created;
-legacy sessions bind on their first owned execution. Resume and execution reject
-a changed profile/project/workspace binding before model or tool effects.
+initial Host directory. Creation-time environment metadata is stored separately
+from the session ID. Resume looks up the original ID only in the current Host's
+`<workspace>/.chili/chili.sqlite`; a missing ID fails. Environment changes do not
+rebind or replace the session. Historical identity bindings remain readable but
+do not restrict execution or become the identity of a new model request.
 
 An explicit `chiliHome` isolates auth, Memory, skills, commands, MCP and model
 selection. Without one, `CHILI_HOME` and the legacy `CHILI_AUTH_FILE` override
@@ -138,13 +140,22 @@ remain supported. The auth path contributes to profile identity. CLI exposes
 `--chili-home`. Account resolution is recorded separately, immediately before
 provider dispatch; no credential value is stored in the audit identity.
 
-Each SQLite store now admits one live Host. A second Host throws
-`HostOwnerConflictError`; it does not pretend to attach or forward Stop. Host
-ownership has no time-based expiry. After an owner dies, recorded guardians and
-their process groups must also be gone before a new Host can open the store.
-Session leases still fence individual operations; a lease expiry alone proves
-nothing about an external process. PID reuse is handled conservatively by
-refusing takeover. Cross-process attach and independent background residency
+Multiple Hosts may open the same project store and run different root sessions.
+Creation or the first mutation, and explicit open/resume through
+`RuntimeService.acquireSession()`, acquire the root session and all descendants
+for that Host until `Host.close()` finishes draining resources. Another Host
+receives `HostSessionOwnerConflictError` for that session, including between
+turns. Listing sessions and reading history acquire no ownership; they do not
+attach to or forward control to the owning Host. Closing one Host releases only
+its own session trees and resources. Session IDs remain unchanged on resume.
+
+Ownership has no time-based expiry. After an owner dies, its registered guardians
+and process groups must be gone before another Host acquires its sessions.
+Session leases still fence individual operations; lease expiry alone does not
+prove an external process has stopped. PID reuse is handled conservatively by
+refusing takeover. When upgrading a store with the old singleton Host ownership
+format, close the old Host and let its resources stop before opening the new
+version. Cross-process control forwarding and independent background residency
 remain unimplemented.
 
 Prompt, Stop, Steer, archive and snapshot recovery use the same runtime operation
@@ -232,7 +243,9 @@ a stale Resume cannot override it. Pending inputs stay saved until explicit
 Resume. A deliberate new `start` may clear pause only when no older pending or
 claimed input exists. Queue/steer and duplicate retries never implicitly unpause.
 
-On startup and maintenance, recovery leaves live leases alone. Expired claimed
+Startup and maintenance only recover session trees already owned by this Host;
+unopened history remains available for another Host to acquire. Opening a saved
+session first acquires its tree, then repairs interrupted state. Expired claimed
 inputs become interrupted, unknown unfinished tool results become synthetic
 failures, and remaining work is paused. Recovery never replays a tool operation.
 Explicit Resume reopens the latest eligible interrupted, failed or cancelled
@@ -258,9 +271,10 @@ schema and continues reading inline history. It does not migrate unrelated older
 schemas. The default Host does not create a secondary transcript mirror. Backups
 must include `chili.sqlite` and `contents/chili.sqlite/` together.
 
-A second Host is rejected until the current owner and its resources have stopped.
+A second Host may run another root session; the same session tree remains with
+its current owner until close or safe crash recovery. Recovery skips session
+trees this Host has not acquired and leaves their pending inputs alone.
 There is no control forwarding or attach protocol. Stores without durable input
 support retain the legacy runtime behavior; they do not provide these receipt
-guarantees. A synchronous accepted receipt may precede asynchronous identity
-validation; a mismatch settles as a failure before execution and is never allowed
-to silently switch the queued task's profile.
+guarantees. Execution uses the current Host configuration and the session's
+stored cwd; accepting an input does not bypass ownership or permission checks.

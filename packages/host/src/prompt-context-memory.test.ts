@@ -208,9 +208,9 @@ test("root and child Agents discover and read shared profile Memory while isolat
     const childrenB = await host.store.childSessions(rootB.sessionId);
     expect(childrenA).toHaveLength(1);
     expect(childrenB).toHaveLength(1);
-    for (const [root, child, expected, forbidden, rule, identity, directories] of [
-      [rootA.sessionId, childrenA[0]!.id, a, b, "QUARTZ_PROJECT_A_RULE", host.identity, directoriesA],
-      [rootB.sessionId, childrenB[0]!.id, b, a, "QUARTZ_PROJECT_B_RULE", identityB, directoriesB],
+    for (const [root, child, expected, forbidden, rule, directories] of [
+      [rootA.sessionId, childrenA[0]!.id, a, b, "QUARTZ_PROJECT_A_RULE", directoriesA],
+      [rootB.sessionId, childrenB[0]!.id, b, a, "QUARTZ_PROJECT_B_RULE", directoriesB],
     ] as const) {
       for (const sessionId of [root, child]) {
         const sessionRequests = requests.filter((candidate) => candidate.sessionId === sessionId);
@@ -232,7 +232,7 @@ test("root and child Agents discover and read shared profile Memory while isolat
         expect(occurrences(privileged, "Memory locations (directories may not exist):")).toBe(1);
         const prepared = await preparedRequests(host, sessionId);
         prepared.forEach((snapshot, index) => expectPreparedMatches(snapshot, sessionRequests[index]!));
-        expect(prepared.at(-1)!.executionIdentity).toMatchObject({ profileId: host.identity.profileId, projectId: identity.projectId });
+        expect(prepared.at(-1)!).not.toHaveProperty("executionIdentity");
         expect(prepared.at(-1)!.sources.some((source) => source.kind === "contextual_user" && source.metadata?.memoryId)).toBe(false);
         expect(request.messages.every((message) => message.sessionId === sessionId)).toBe(true);
       }

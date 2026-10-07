@@ -155,6 +155,12 @@ export interface EventAppendOptions {
 }
 
 export interface EventStore {
+  /** Acquire control of this root conversation until its Host closes. Reads do not acquire. */
+  acquireSessionOwnership?(sessionId: SessionId): boolean;
+  /** Check admission without acquiring ownership. Durable mutations check again atomically. */
+  assertSessionOwnership?(sessionId: SessionId): void;
+  /** Read-only maintenance filter: Host-backed stores repair only their already-owned roots. */
+  canRecoverSession?(sessionId: SessionId): boolean;
   append(event: RuntimeEvent, options?: EventAppendOptions): Promise<void>;
   appendMany(events: readonly RuntimeEvent[], options?: EventAppendOptions): Promise<void>;
   /**

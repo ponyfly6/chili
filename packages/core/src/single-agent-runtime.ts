@@ -2,7 +2,6 @@ import type {
   AssistantMessagePhase,
   RuntimeEvent,
   EventEnvelope,
-  ExecutionIdentity,
   Message,
   MessageId,
   MessagePart,
@@ -587,16 +586,9 @@ export class SingleAgentRuntime implements AgentRunner {
     const sourceMessages = await messagesForContext(this.options.store, modelInput.sessionId);
     const lastEvent = (await this.options.store.events({ sessionId: modelInput.sessionId, tail: true, limit: 1, compactRequests: true }))[0];
     const revision = advertisedCatalogRevision ?? this.options.toolRegistry.getRevision?.();
-    const identityEvents = await Promise.all([
-      this.options.store.events({ sessionId: modelInput.sessionId, type: "session.identity_bound", tail: true, limit: 1 }),
-      this.options.store.events({ sessionId: modelInput.sessionId, type: "session.created", tail: true, limit: 1 }),
-    ]);
-    const identityEvent = identityEvents[0][0] ?? identityEvents[1][0];
-    const identity = (identityEvent?.payload as { identity?: ExecutionIdentity } | undefined)?.identity;
     return prepareModelRequest({
       modelInput, sourceMessages, sourceSurface, purpose,
       ...(compactionSource ? { compactionSource } : {}),
-      ...(identity ? { executionIdentity: identity } : {}),
       ...(usage ? { usage } : {}),
       ...(lastEvent ? { sourceEventId: lastEvent.id } : {}),
       ...(revision !== undefined ? { toolCatalogRevision: revision } : {}),

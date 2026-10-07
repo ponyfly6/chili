@@ -88,6 +88,10 @@ bun run smoke:desktop
 
 运行时会话使用 `session-id` 标识；旧的 `--thread` 参数不再支持。`--resume` 只接受已存在且活跃的交互式 session。每个 Agent 的 `agentId` 就是其会话身份，`inputId` 标识提交给它的一次持久输入；消息、等待和恢复都沿用这套身份。
 
+会话 ID 不包含目录或环境信息，关闭和恢复后保持不变。`--resume <session-id>` 只查当前工作区的 `.chili/chili.sqlite`，不存在就失败；cwd 和创建时的环境元数据独立保存，不因历史环境哈希不同而拒绝继续。工作区范围由启动目录（或 `--cwd`）确定，不向上查找 Git 根目录，也不跨项目搜索。
+
+同一项目可以在多个终端或桌面 Host 中运行不同根会话。创建或首次修改会话、显式 open/`--resume` 会取得该根会话及全部后代的归属，直到 Host 关闭并清理完资源；另一 Host 打开同一会话会失败，即使当前没有 turn。启动维护、列表和历史查看不会占用未打开的会话，也不提供跨 Host 控制。原 Host 异常退出后，须等待其外部进程清理完才能恢复原 ID。首次从旧版的全库 Host 独占格式升级时，请先关闭旧 Host 一次。
+
 Agent 管理统一使用六个操作：`agent_spawn` 创建、`agent_list` 查看层级与状态、`agent_send` 提交输入、`agent_wait` 等待输入结果、`agent_stop` 暂停、`agent_resume` 恢复。`agent_spawn({ name, prompt, cwd? })` 异步返回 `{ agentId, inputId }`；`agent_send` 同样返回输入回执。`agent_wait` 按 `agentId + inputId` 等待具体输入，超时只结束本次等待。`agent_stop` 持久暂停调度并取消当前执行，保留队列和历史；`agent_resume` 恢复原 Agent 身份。[参数与生命周期说明](packages/tools/AGENT_TOOLS.md)。
 
 同一根会话下的 Agent 可以互相发送输入和等待结果，列表包含根 Agent 与调用者自身；暂停和恢复仅控制调用者的后代。消息携带发送 Agent 的可信身份，不能冒充用户指令。

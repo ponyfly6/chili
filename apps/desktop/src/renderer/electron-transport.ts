@@ -44,6 +44,7 @@ export function createElectronTransport(api: ChiliDesktopApi, projectId?: string
     createSession: (options = {}) => invoke({ type: "sessions.create", ...options }),
     listModels: (provider) => invoke({ type: "models.list", ...(provider ? { provider } : {}) }),
     snapshot: (sessionId) => invokeAfterWorkspaceSelection({ type: "session.snapshot", sessionId }),
+    openSession: (sessionId) => invokeAfterWorkspaceSelection({ type: "session.open", sessionId }),
     resumeSession: (sessionId) => invokeAfterWorkspaceSelection({ type: "session.resume", sessionId }),
     renameSession: (sessionId, title) => invoke({ type: "session.rename", sessionId, title }),
     archiveSession: (sessionId) => invoke({ type: "session.archive", sessionId }),

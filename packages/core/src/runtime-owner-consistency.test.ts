@@ -139,42 +139,53 @@ test("revert and prompts exclude one another across store connections for the wh
   }
 });
 
-test("execution identity binds legacy work once and blocks another profile before model or recovery effects", async () => {
+test("historical execution identity does not block local session operations or bind legacy work", async () => {
   const f = await fixture();
   const identity: ExecutionIdentity = { profileId: "profile_A", profilePath: f.cwd, projectId: "project_A", projectRoot: f.cwd, workspaceId: "workspace_A", workspaceRoot: f.cwd };
+  const currentIdentity: ExecutionIdentity = { ...identity, profileId: "profile_B", projectId: "project_B", workspaceId: "workspace_B" };
   const context = new AsyncLocalStorage<string>();
   let calls = 0;
   let restores = 0;
   const run = runner(f.first, async (input) => {
-    expect(context.getStore()).toBe("owner_A");
+    expect(context.getStore()).toBe("current_owner");
     calls++;
     return answer(f.first, input, "Verified the parser and regression test.");
   });
-  const owner = new RuntimeService({ store: f.first, runtime: run, cwd: f.cwd,
-    executionIdentityResolver: () => identity,
-    executionContext: (operation) => context.run("owner_A", operation),
+  const service = new RuntimeService({ store: f.first, runtime: run, cwd: f.cwd,
+    executionIdentityResolver: () => currentIdentity,
+    executionContext: (operation) => context.run("current_owner", operation),
   });
-  const foreign = new RuntimeService({ store: f.second, runtime: run, cwd: f.cwd,
-    executionIdentityResolver: () => ({ ...identity, profileId: "profile_B" }),
-  });
-  const recovery = new SnapshotRecoveryService({ store: f.first, sessionOperations: owner, snapshotProvider: {
+  const recovery = new SnapshotRecoveryService({ store: f.first, sessionOperations: service, snapshotProvider: {
     async create() { return undefined; },
-    async revert() { expect(context.getStore()).toBe("owner_A"); restores++; return { snapshotId, paths: [], restored: [], removed: [] }; },
+    async revert() { expect(context.getStore()).toBe("current_owner"); restores++; return { snapshotId, paths: [], restored: [], removed: [] }; },
   } });
   try {
-    await owner.submitPrompt({ sessionId, text: "legacy task" });
-    expect((await f.first.events({ sessionId, type: "session.identity_bound" })).map((event) => event.payload)).toEqual([{ sessionId, identity }]);
-    await expect(foreign.submitPrompt({ sessionId, text: "use another profile" })).rejects.toThrow("different execution identity");
-    await expect(foreign.resumeInputs(sessionId)).rejects.toThrow("different execution identity");
-    await expect(foreign.interrupt(sessionId)).rejects.toThrow("different execution identity");
-    expect(calls).toBe(1);
-    await recovery.revert({ sessionId, snapshotId });
+    // Legacy sessions continue without acquiring a permanent environment binding.
+    expect((await service.submitPrompt({ sessionId, text: "legacy task" })).status).toBe("completed");
+    expect(await f.first.events({ sessionId, type: "session.identity_bound" })).toHaveLength(0);
+
+    const historicalSessionId = "historical_identity_session" as SessionId;
+    await f.first.appendMany([
+      { id: id(), type: "session.created", sessionId: historicalSessionId, time: time(), payload: { sessionId: historicalSessionId, cwd: f.cwd, identity } },
+      { id: id(), type: "snapshot.created", sessionId: historicalSessionId, time: time(), payload: { snapshotId, paths: ["file.ts"], reason: "test" } },
+    ]);
+    // Creation metadata alone does not restrict execution in the same local store.
+    expect((await service.submitPrompt({ sessionId: historicalSessionId, text: "continue with current environment" })).status).toBe("completed");
+    await f.first.append({ id: id(), type: "session.identity_bound", sessionId: historicalSessionId, time: time(), payload: { sessionId: historicalSessionId, identity } });
+    // Existing binding events remain readable history, without restricting operations.
+    expect((await service.submitPrompt({ sessionId: historicalSessionId, text: "continue after historical binding" })).status).toBe("completed");
+    await service.interrupt(historicalSessionId);
+    expect(f.first.sessionInputQueue(historicalSessionId).paused).toBe(true);
+    await service.resumeInputs(historicalSessionId);
+    expect(f.first.sessionInputQueue(historicalSessionId).paused).toBe(false);
+    await recovery.revert({ sessionId: historicalSessionId, snapshotId });
     expect(restores).toBe(1);
-    expect(await f.first.events({ sessionId, type: "session.identity_bound" })).toHaveLength(1);
-    const created = await owner.createSession({ cwd: f.cwd });
-    expect((await f.first.events({ sessionId: created.sessionId, type: "session.created" }))[0]?.payload).toMatchObject({ identity });
+    expect(calls).toBe(3);
+    expect((await f.first.events({ sessionId: historicalSessionId, type: "session.identity_bound" })).map((event) => event.payload)).toEqual([{ sessionId: historicalSessionId, identity }]);
+    const created = await service.createSession({ cwd: f.cwd });
+    expect((await f.first.events({ sessionId: created.sessionId, type: "session.created" }))[0]?.payload).toMatchObject({ identity: currentIdentity });
   } finally {
-    await Promise.all([owner.shutdown(), foreign.shutdown()]);
+    await service.shutdown();
     await f.close();
   }
 });

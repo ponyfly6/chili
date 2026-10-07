@@ -67,6 +67,7 @@ test("a late model-config response from the previous session cannot overwrite th
   const requestedConfigs: SessionId[] = [];
   const sessions = [sessionSummary(sessionA), sessionSummary(sessionB)];
   const client = {
+    openSession: async () => undefined,
     listSessions: async () => sessions,
     messages: async () => [],
     sessionEvents: async (input: { sessionId: SessionId }) => [sessionCreatedEvent(input.sessionId)],
@@ -353,6 +354,7 @@ test("MCP status follows the selected session and ignores a late prior-workspace
   const requestedScopes: Array<SessionId | undefined> = [];
   const sessions = [sessionSummary(sessionA), sessionSummary(sessionB)];
   const client = {
+    openSession: async () => undefined,
     listSessions: async () => sessions,
     messages: async () => [],
     sessionEvents: async (input: { sessionId: SessionId }) => [sessionCreatedEvent(input.sessionId)],
@@ -432,6 +434,7 @@ test("all late MCP operations return undefined and cannot refresh the next sessi
   let deferSessionAStatus = false;
   const sessions = [sessionSummary(sessionA), sessionSummary(sessionB)];
   const client = {
+    openSession: async () => undefined,
     listSessions: async () => sessions,
     messages: async () => [],
     sessionEvents: async (input: { sessionId: SessionId }) => [sessionCreatedEvent(input.sessionId)],
@@ -589,6 +592,7 @@ test("a failed command-catalog load for the resumed session cannot retain a late
   const requestedCatalogs: Array<SessionId | undefined> = [];
   const sessions = [sessionSummary(sessionA), sessionSummary(sessionB)];
   const client = {
+    openSession: async () => undefined,
     listSessions: async () => sessions,
     messages: async () => [],
     sessionEvents: async (input: { sessionId: SessionId }) => [sessionCreatedEvent(input.sessionId)],
@@ -744,6 +748,36 @@ test("snapshot recovery refills complete selected history once while active text
   }
 });
 
+test("saved-session startup and picker resume acquire ownership before reading history", async () => {
+  const first = "session_open_first" as SessionId;
+  const second = "session_open_second" as SessionId;
+  const calls: string[] = [];
+  let conflict = false;
+  const client = chatRuntimeClient([sessionSummary(first), sessionSummary(second)], {
+    openSession: async (sessionId: SessionId) => {
+      calls.push(`open:${sessionId}`);
+      if (conflict) throw new Error("Session is open in another Host");
+    },
+    messages: async (sessionId: SessionId) => { calls.push(`messages:${sessionId}`); return []; },
+  });
+  let runtime: ChatRuntimeState | undefined;
+  let app!: Awaited<ReturnType<typeof testRender>>;
+  await act(async () => {
+    app = await testRender(createElement(ChatRuntimeProbe, { client,
+      options: { baseUrl: "http://chili.test", sessionId: first }, onRuntime: (value) => { runtime = value; } }),
+      { width: 100, height: 4, exitOnCtrlC: false });
+  });
+  try {
+    await waitForRuntime(app, () => runtime?.activeSessionId === first);
+    expect(calls.indexOf(`open:${first}`)).toBeLessThan(calls.indexOf(`messages:${first}`));
+    conflict = true;
+    await act(async () => { expect(await runtime!.resumeSession({ id: second })).toBe(false); });
+    expect(calls).not.toContain(`messages:${second}`);
+    expect(runtime?.activeSessionId).toBe(first);
+    expect(runtime?.chatFeedback).toEqual({ status: "error", message: "Session is open in another Host" });
+  } finally { act(() => app.renderer.destroy()); }
+});
+
 function ChatRuntimeProbe(props: {
   client: HttpRuntimeClient;
   options: RuntimeTuiOptions;
@@ -763,6 +797,7 @@ function chatRuntimeClient(
   overrides: Record<string, unknown> = {},
 ): HttpRuntimeClient {
   return {
+    openSession: async () => undefined,
     listSessions: async () => sessions,
     messages: async () => [],
     sessionEvents: async (input: { sessionId: SessionId }) => {

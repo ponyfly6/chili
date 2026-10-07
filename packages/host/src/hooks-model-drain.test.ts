@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HostOwnerConflictError } from "@chili/store";
+import { HostSessionOwnerConflictError } from "@chili/store";
 import { createChiliHost, type ChiliHost, type ChiliHostOptions } from "./host.js";
 import * as userModelState from "./user-model-state.js";
 
@@ -40,13 +40,19 @@ test("Host close drains an already started model preference write before releasi
     closing = host.close();
     expect(await Promise.race([changing.then(() => true), Bun.sleep(50).then(() => false)])).toBe(false);
     expect(await Promise.race([closing.then(() => true), Bun.sleep(50).then(() => false)])).toBe(false);
-    await expect(createChiliHost(options)).rejects.toBeInstanceOf(HostOwnerConflictError);
+    const other = await createChiliHost(options);
+    try {
+      await expect(other.service.acquireSession(sessionId)).rejects.toBeInstanceOf(HostSessionOwnerConflictError);
+      const independent = await other.service.createSession();
+      expect(independent.sessionId).not.toBe(sessionId);
+    } finally { await other.close(); }
 
     release();
     expect(await changing).toMatchObject({ status: "fulfilled", value: { modelSelection } });
     await closing;
     expect(await userModelState.readUserModelSelection({ chiliHome })).toEqual(modelSelection);
     reopened = await createChiliHost(options);
+    await reopened.service.acquireSession(sessionId);
     const nextSessionId = (await reopened.service.createSession()).sessionId;
     const nextSelection = { provider: "fixture", model: "saved-by-next-host" };
     await reopened.service.setModel({ sessionId: nextSessionId, modelSelection: nextSelection });
@@ -107,7 +113,12 @@ test("a synchronous committed model observer can close the Host before the manda
     expect(observerSawStartedWrite).toBe(false);
     expect(closing).toBeDefined();
     expect(await Promise.race([closing!.then(() => true), Bun.sleep(50).then(() => false)])).toBe(false);
-    await expect(createChiliHost(options)).rejects.toBeInstanceOf(HostOwnerConflictError);
+    const other = await createChiliHost(options);
+    try {
+      await expect(other.service.acquireSession(sessionId)).rejects.toBeInstanceOf(HostSessionOwnerConflictError);
+      const independent = await other.service.createSession();
+      expect(independent.sessionId).not.toBe(sessionId);
+    } finally { await other.close(); }
     release();
     expect(await changing).toMatchObject({ status: "fulfilled", value: { modelSelection } });
     await closing;

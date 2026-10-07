@@ -186,6 +186,7 @@ type DesktopOperation =
   | ({ type: "sessions.create" } & DesktopCreateSessionOptions)
   | { type: "models.list"; provider?: string }
   | { type: "session.snapshot"; sessionId: string }
+  | { type: "session.open"; sessionId: string }
   | { type: "session.resume"; sessionId: string }
   | { type: "session.rename"; sessionId: string; title: string }
   | { type: "session.archive"; sessionId: string }
@@ -225,6 +226,7 @@ export interface DesktopResponseMap {
   "sessions.create": DesktopCreateSessionResult;
   "models.list": RuntimeModelDescriptor[];
   "session.snapshot": RuntimeSnapshot;
+  "session.open": RuntimeSnapshot;
   "session.resume": RuntimeSnapshot;
   "session.rename": RuntimeSessionSummary;
   "session.archive": { archived: boolean };
@@ -325,6 +327,7 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
   }
   if (
     type === "session.snapshot"
+    || type === "session.open"
     || type === "session.resume"
     || type === "session.stop"
     || type === "session.config.get"
@@ -591,7 +594,7 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
   } else if (request.type === "models.list") {
     if (!Array.isArray(value) || value.length > 1_000) throw new TypeError("Invalid model list");
     response = value.map((item, index) => parseRuntimeModelDescriptor(item, `models[${index}]`));
-  } else if (request.type === "session.snapshot" || request.type === "session.resume") {
+  } else if (request.type === "session.snapshot" || request.type === "session.open" || request.type === "session.resume") {
     response = parseRuntimeSnapshot(value);
   } else if (request.type === "session.rename") {
     response = parseSessionSummary(value);
@@ -707,7 +710,7 @@ function assertDesktopResponseScope(request: DesktopRequest, response: unknown):
     if ((response as { agentId: string }).agentId !== request.agentId) throw new TypeError("Agent response belongs to a different agentId");
     return;
   }
-  if (request.type === "session.snapshot" || request.type === "session.resume") {
+  if (request.type === "session.snapshot" || request.type === "session.open" || request.type === "session.resume") {
     requireMatchingSessionId(request.sessionId, (response as RuntimeSnapshot).sessionId, "snapshot.sessionId");
     return;
   }
@@ -1121,6 +1124,7 @@ function requestKeys(type: string): readonly string[] {
   if (type === "models.list") return ["type", "provider"];
   if (
     type === "session.snapshot"
+    || type === "session.open"
     || type === "session.resume"
     || type === "session.stop"
     || type === "session.archive"

@@ -223,6 +223,8 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
       try {
         const session = requireResumableSession(await client.listSessions(), sessionId);
         if (controller.signal.aborted || sessionSelectionEpochRef.current !== epoch) return;
+        await client.openSession(sessionId, controller.signal);
+        if (controller.signal.aborted || sessionSelectionEpochRef.current !== epoch) return;
         const [events, messages] = await Promise.all([
           client.sessionEvents({ sessionId, limit: 5_000, signal: controller.signal }),
           client.messages(sessionId, controller.signal),
@@ -1040,6 +1042,8 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     setChatFeedback({ status: "pending", message: "loading saved chat" });
     try {
       const resumable = requireResumableSession(await client.listSessions(), session.id);
+      if (sessionSelectionEpochRef.current !== sessionSelectionEpoch) return false;
+      await withAbort((signal) => client.openSession(session.id, signal));
       if (sessionSelectionEpochRef.current !== sessionSelectionEpoch) return false;
       const [events, messages] = await withAbort((signal) => Promise.all([
         client.sessionEvents({ sessionId: session.id, limit: 5_000, signal }),

@@ -4531,6 +4531,7 @@ function fakeChatClient(
         reasoningLevel: currentReasoningLevel,
       };
     },
+    openSession: async () => undefined,
     createSession: async (input: Record<string, unknown> = {}) => {
       const index = records.create.length + 1;
       records.create.push(input);

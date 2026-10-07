@@ -1,4 +1,8 @@
 import { expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createChiliHost, type ChiliHost, type ChiliHostOptions } from "@chili/host";
 import type { RuntimeService } from "@chili/core";
 import type { SessionId } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
@@ -9,7 +13,9 @@ test("CLI resume accepts only an existing active root session without creating e
   const archivedSessionId = "session_resume_archived" as SessionId;
   const childSessionId = "session_resume_child" as SessionId;
   let createCalls = 0;
+  const opened: SessionId[] = [];
   const service = {
+    async acquireSession(sessionId: SessionId) { opened.push(sessionId); },
     async createSession() {
       createCalls += 1;
       return { sessionId: "session_created" as SessionId };
@@ -63,4 +69,70 @@ test("CLI resume accepts only an existing active root session without creating e
     resume: activeSessionId,
   })).resolves.toEqual({ sessionId: activeSessionId, isNew: false });
   expect(createCalls).toBe(0);
+  expect(opened).toEqual([activeSessionId]);
+});
+
+test("CLI resumes the persisted project session after restart and execution settings change", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-session-resume-"));
+  const cwd = join(root, "project-a");
+  let host: ChiliHost | undefined;
+  try {
+    await mkdir(cwd);
+    const options: ChiliHostOptions = {
+      cwd, chiliHome: join(root, "home-a"), model: "fake",
+      permissionProfile: "auto-review", mcpConnectMode: "manual",
+      staleTurnRecoveryIntervalMs: false,
+    };
+    host = await createChiliHost(options);
+    const created = await resolveSession({ service: host.service, store: host.store, cwd });
+    expect(created.isNew).toBe(true);
+    expect((await host.service.submitPrompt({ sessionId: created.sessionId, text: "remember this session" })).status)
+      .toBe("completed");
+    await host.close();
+    host = undefined;
+
+    host = await createChiliHost({ ...options, chiliHome: join(root, "home-b"), permissionProfile: "full-access" });
+    const before = await host.store.events({ sessionId: created.sessionId });
+    expect(await resolveSession({ service: host.service, store: host.store, cwd, resume: created.sessionId }))
+      .toEqual({ sessionId: created.sessionId, isNew: false });
+    expect((await host.store.sessions()).map((session) => session.id)).toEqual([created.sessionId]);
+    expect(await host.store.events({ sessionId: created.sessionId })).toEqual(before);
+    expect((await host.service.submitPrompt({ sessionId: created.sessionId, text: "continue the same session" })).status)
+      .toBe("completed");
+    expect((await host.store.sessions()).map((session) => session.id)).toEqual([created.sessionId]);
+  } finally {
+    await host?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI resume cannot find another project's session or create a replacement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-session-scope-"));
+  const cwdA = join(root, "project-a");
+  const cwdB = join(root, "project-b");
+  let hostA: ChiliHost | undefined;
+  let hostB: ChiliHost | undefined;
+  try {
+    await mkdir(cwdA);
+    await mkdir(cwdB);
+    const options: ChiliHostOptions = {
+      cwd: cwdA, chiliHome: join(root, "home"), model: "fake",
+      permissionProfile: "full-access", mcpConnectMode: "manual",
+      staleTurnRecoveryIntervalMs: false,
+    };
+    hostA = await createChiliHost(options);
+    hostB = await createChiliHost({ ...options, cwd: cwdB });
+    const sessionA = await resolveSession({ service: hostA.service, store: hostA.store, cwd: cwdA });
+    const sessionB = await resolveSession({ service: hostB.service, store: hostB.store, cwd: cwdB });
+    const before = await hostA.store.events({});
+    await expect(resolveSession({ service: hostA.service, store: hostA.store, cwd: cwdA, resume: sessionB.sessionId }))
+      .rejects.toThrow(`Session not found: ${sessionB.sessionId}`);
+    expect((await hostA.store.sessions()).map((session) => session.id)).toEqual([sessionA.sessionId]);
+    expect((await hostB.store.sessions()).map((session) => session.id)).toEqual([sessionB.sessionId]);
+    expect(await hostA.store.events({})).toEqual(before);
+  } finally {
+    await hostB?.close();
+    await hostA?.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
