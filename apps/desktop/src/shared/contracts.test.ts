@@ -15,15 +15,11 @@ import {
 } from "./contracts.js";
 
 describe("desktop IPC contracts", () => {
-  test("preserves strict read-only history flags and identifies child sessions only through metadata", () => {
+  test("identifies child sessions through Agent metadata", () => {
     const row = { id: "session_1", cwd: "/repo", status: "active", createdAt: 1, updatedAt: 2 };
     const agent = { parentSessionId: "root", name: "child", path: "/root/child", policy: {} };
-    expect<unknown>(parseDesktopResponse({ type: "sessions.list" }, [row, { ...row, id: "history", readOnly: true }, { ...row, id: "child", agent }]))
-      .toEqual([row, { ...row, id: "history", readOnly: true }, { ...row, id: "child", agent }]);
-    expect<unknown>(parseDesktopResponse({ type: "sessions.list" }, [{ ...row, readOnly: false }])).toEqual([{ ...row, readOnly: false }]);
-    for (const readOnly of [null, "true", 1, {}]) {
-      expect(() => parseDesktopResponse({ type: "sessions.list" }, [{ ...row, readOnly }])).toThrow("readOnly");
-    }
+    expect<unknown>(parseDesktopResponse({ type: "sessions.list" }, [row, { ...row, id: "child", agent }]))
+      .toEqual([row, { ...row, id: "child", agent }]);
     expect(() => parseDesktopResponse({ type: "sessions.list" }, [{ ...row, agent: { ...agent, parentSessionId: "__proto__" } }])).toThrow();
     expect(() => parseDesktopResponse({ type: "sessions.list" }, [{ ...row, agent: { ...agent, name: "other" } }])).toThrow();
   });

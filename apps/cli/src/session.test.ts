@@ -7,7 +7,6 @@ import { resolveSession } from "./session.js";
 test("CLI resume accepts only an existing active root session without creating events", async () => {
   const activeSessionId = "session_resume_active" as SessionId;
   const archivedSessionId = "session_resume_archived" as SessionId;
-  const historySessionId = "session_resume_history" as SessionId;
   const childSessionId = "session_resume_child" as SessionId;
   let createCalls = 0;
   const service = {
@@ -41,14 +40,6 @@ test("CLI resume accepts only an existing active root session without creating e
           createdAt: 1,
           updatedAt: 1,
         },
-        {
-          id: historySessionId,
-          cwd: "/repo",
-          readOnly: true,
-          status: "active" as const,
-          createdAt: 1,
-          updatedAt: 1,
-        },
       ];
     },
   } as unknown as Pick<EventStore, "sessions">
@@ -71,6 +62,5 @@ test("CLI resume accepts only an existing active root session without creating e
     ...input,
     resume: activeSessionId,
   })).resolves.toEqual({ sessionId: activeSessionId, isNew: false });
-  await expect(resolveSession({ ...input, resume: historySessionId })).rejects.toThrow("read-only history");
   expect(createCalls).toBe(0);
 });

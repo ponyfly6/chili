@@ -989,7 +989,6 @@ function parseSessionSummary(value: unknown): RuntimeSessionSummary {
   };
   if (record.title !== undefined) summary.title = requireString(record.title, "title", 2_000, true);
   if (record.preview !== undefined) summary.preview = requireString(record.preview, "preview", 20_000, true);
-  if (record.readOnly !== undefined) summary.readOnly = requireBoolean(record.readOnly, "session readOnly");
   if (record.agent !== undefined) {
     summary.agent = parseSessionAgentMetadata(record.agent, "session agent");
     requireIdentifier(summary.agent.parentSessionId, "session agent.parentSessionId");

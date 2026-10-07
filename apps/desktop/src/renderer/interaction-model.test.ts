@@ -38,9 +38,9 @@ test("composer is immutable while a request, resync, load, or outage is active",
   ]) expect(canEditComposer(blocked)).toBe(false);
 });
 
-test("read-only history can be opened while its composer remains immutable", () => {
+test("archived sessions can be opened while their composer remains immutable", () => {
   const ready = {
-    selectedId: "session_history",
+    selectedId: "session_archived",
     healthy: true,
     resyncing: false,
     loadingSession: false,

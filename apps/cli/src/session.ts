@@ -16,7 +16,6 @@ export async function resolveSession(input: {
   if (input.resume) {
     const sessionId = input.resume as SessionId;
     const session = (await input.store.sessions()).find((candidate) => candidate.id === sessionId);
-    if (session?.readOnly) throw new Error(`Session ${sessionId} is read-only history and cannot be resumed.`);
     if (session?.agent) {
       throw new Error(`Session ${sessionId} belongs to an agent; use agent-resume with its parent session.`);
     }

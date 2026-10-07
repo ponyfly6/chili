@@ -6,7 +6,6 @@ import { revertSessionSnapshot } from "./session-recovery.js";
 test("direct CLI revert resolves an active root session before invoking recovery", async () => {
   const activeSessionId = "session_revert_active" as SessionId;
   const archivedSessionId = "session_revert_archived" as SessionId;
-  const historySessionId = "session_revert_history" as SessionId;
   const childSessionId = "session_revert_child" as SessionId;
   const snapshotId = "snapshot_cli_revert" as SnapshotId;
   const service = {
@@ -39,14 +38,6 @@ test("direct CLI revert resolves an active root session before invoking recovery
           createdAt: 1,
           updatedAt: 1,
         },
-        {
-          id: historySessionId,
-          cwd: "/repo",
-          readOnly: true,
-          status: "active" as const,
-          createdAt: 1,
-          updatedAt: 1,
-        },
       ];
     },
   } as unknown as Parameters<typeof revertSessionSnapshot>[0]["store"];
@@ -70,7 +61,6 @@ test("direct CLI revert resolves an active root session before invoking recovery
     .rejects.toThrow(`Session is not active: ${archivedSessionId}`);
   await expect(revertSessionSnapshot({ ...baseInput, resume: childSessionId }))
     .rejects.toThrow("belongs to an agent");
-  await expect(revertSessionSnapshot({ ...baseInput, resume: historySessionId })).rejects.toThrow("read-only history");
   expect(recoveryCalls).toEqual([]);
 
   await expect(revertSessionSnapshot({ ...baseInput, resume: activeSessionId }))

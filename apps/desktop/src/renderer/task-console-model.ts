@@ -222,13 +222,13 @@ export function canResumeTask(
 }
 
 export function isSessionReadOnly(
-  session: Pick<RuntimeSessionSummary, "status" | "readOnly"> | undefined,
+  session: Pick<RuntimeSessionSummary, "status"> | undefined,
 ): boolean {
-  return session?.status === "archived" || session?.readOnly === true;
+  return session?.status === "archived";
 }
 
-export function canExposeTaskActions(session: Pick<RuntimeSessionSummary, "status" | "readOnly">): boolean {
-  return session.status === "active" && !isSessionReadOnly(session);
+export function canExposeTaskActions(session: Pick<RuntimeSessionSummary, "status">): boolean {
+  return session.status === "active";
 }
 
 export function canReloadSessionMcp(

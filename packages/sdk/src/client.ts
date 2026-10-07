@@ -375,7 +375,6 @@ export interface RuntimeSessionSummary {
   cwd: string;
   title?: string;
   preview?: string;
-  readOnly?: boolean;
   agent?: SessionAgentMetadata;
   status: "active" | "archived";
   createdAt: number;
@@ -1083,7 +1082,6 @@ function parseRuntimeSessionSummary(value: unknown, path = "session"): RuntimeSe
   parseRuntimeNonNegativeInteger(record.updatedAt, `${path}.updatedAt`);
   optionalString(record.title, `${path}.title`);
   optionalString(record.preview, `${path}.preview`);
-  if (record.readOnly !== undefined) parseRuntimeBoolean(record.readOnly, `${path}.readOnly`);
   if (record.agent !== undefined) parseSessionAgentMetadata(record.agent, `${path}.agent`);
   return record as unknown as RuntimeSessionSummary;
 }

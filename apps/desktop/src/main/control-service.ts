@@ -253,7 +253,6 @@ export class DesktopControlService {
         const session = sessions.find((candidate) => String(candidate.id) === request.sessionId);
         if (!session) throw new Error("Task is not available for remote control in this workspace");
         if (session.status !== "active") throw new Error("Archived tasks cannot be controlled remotely");
-        if (session.readOnly) throw new Error("Read-only sessions cannot be controlled remotely");
         const remote = this.remoteScopes.get(scope)!;
         const source = deviceId ? `${remote.source}:${deviceId}` : remote.source;
         if (remote.revokedSources.has(source)) throw new Error("Remote device authorization was revoked");
@@ -393,7 +392,7 @@ export class DesktopControlService {
     this.hydratedGeneration = sidecarGeneration;
     void boundedControlRead(lease, (signal) => lease.client.listSessions({ signal })).then(async (sessions) => {
       for (const session of sessions) {
-        if (isChildAgentSession(session) || session.readOnly || session.status !== "active") continue;
+        if (isChildAgentSession(session) || session.status !== "active") continue;
         const queue = await boundedControlRead(lease, (signal) => lease.client.inputQueue({ sessionId: session.id, signal }));
         this.assertClientLease(lease);
         this.observeInputQueue(queue);
@@ -503,7 +502,6 @@ export class DesktopControlService {
         const session = sessions.find((candidate) => String(candidate.id) === request.sessionId);
         if (!session) throw new Error(`Saved task not found: ${request.sessionId}`);
         if (isChildAgentSession(session)) throw new Error("Use Agent controls to resume a child Agent");
-        if (session.readOnly) throw new Error("Read-only sessions cannot be resumed");
         if (session.status !== "active") throw new Error("Archived tasks cannot be resumed");
         const sessionId = request.sessionId as SessionId;
         const goal = await lease.client.getGoal({ sessionId, signal: lease.signal });

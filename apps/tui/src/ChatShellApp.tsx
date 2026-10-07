@@ -2718,7 +2718,7 @@ function resolveResumeTarget(
 }
 
 function isResumableRootSession(session: RuntimeSessionSummary): boolean {
-  return !session.agent && session.readOnly !== true;
+  return !session.agent;
 }
 
 function sessionDisplayTitle(session: RuntimeSessionSummary): string {

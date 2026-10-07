@@ -235,12 +235,6 @@ for (const scenario of [
     sessions: [runtimeSessionSummary("session_child" as SessionId, { agent: agentMetadata() })],
     error: "Session session_child belongs to an agent and cannot be resumed directly.",
   },
-  {
-    name: "read-only",
-    sessionId: "session_read_only" as SessionId,
-    sessions: [runtimeSessionSummary("session_read_only" as SessionId, { readOnly: true })],
-    error: "Session session_read_only is read-only and cannot be resumed.",
-  },
 ] as const) {
   test(`exact resume rejects a ${scenario.name} session before hydration`, async () => {
     const records = chatClientRecords();
@@ -3410,15 +3404,6 @@ test("/session resume opens a searchable project-scoped picker and switches sess
       createdAt: 2,
       updatedAt: 5,
     },
-    {
-      id: "session_history" as SessionId,
-      cwd: "/repo/chili",
-      title: "Read-only history",
-      readOnly: true,
-      status: "active" as const,
-      createdAt: 2,
-      updatedAt: 6,
-    },
   ];
   const app = await mountShell(runtimeFixture(), {
     runtime: {
@@ -3459,13 +3444,11 @@ test("/session resume opens a searchable project-scoped picker and switches sess
     expect(frame).toContain("Fix resume flow");
     expect(frame).not.toContain("Other project");
     expect(frame).not.toContain("Internal worker");
-    expect(frame).not.toContain("Read-only history");
 
     await press(app, () => app.mockInput.pressKey("a", { ctrl: true }));
     frame = app.captureCharFrame();
     expect(frame).toContain("Other project");
     expect(frame).not.toContain("Internal worker");
-    expect(frame).not.toContain("Read-only history");
 
     await typeText(app, "Fix resume");
     await press(app, () => app.mockInput.pressEnter());

@@ -1104,7 +1104,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                       <span className="session-title">{session.title || session.preview || "新会话"}</span>
                       <span className="session-meta">
                         {formatRelativeTime(session.updatedAt)}
-                        {session.readOnly ? " · 历史只读" : ""}
                         {(desktop.queuedBySession[session.id] ?? 0) > 0 ? ` · ${desktop.queuedBySession[session.id]} queued` : ""}
                       </span>
                     </span>
@@ -1186,7 +1185,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           {selectedReadOnly ? (
             <div className="read-only-banner" role="status">
               <Icon name="archive" />
-              <span>{selectedSession?.readOnly ? "此会话为历史只读记录，可以查看历史内容。" : "此会话已归档，可以查看历史记录。"}</span>
+              <span>此会话已归档，可以查看历史记录。</span>
             </div>
           ) : null}
 
@@ -1282,7 +1281,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                     else if (composerEditable) void submit("queue");
                   }
                 }}
-                placeholder={selectedSession?.readOnly ? "历史只读会话仅供查看" : selectedReadOnly ? "已归档的会话仅供查看" : sessionBusy ? "补充想法，或告诉 Chili 调整方向…" : "说说你想做什么…"}
+                placeholder={selectedReadOnly ? "已归档的会话仅供查看" : sessionBusy ? "补充想法，或告诉 Chili 调整方向…" : "说说你想做什么…"}
                 aria-expanded={commandsOpen && commands.length > 0}
                 aria-controls={commandsOpen && commands.length > 0 ? "composer-commands" : undefined}
                 aria-activedescendant={commandsOpen && commands.length > 0 ? `command-${commands[commandIndex % commands.length]!.id}` : undefined}

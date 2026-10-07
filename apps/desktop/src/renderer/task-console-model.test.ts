@@ -379,29 +379,23 @@ test("filters active and archived tasks across title, preview, path, and id", ()
   expect(filterSessions(sessions, "AUTH", "archived").map(StringId)).toEqual(["session_archived"]);
 });
 
-test("keeps historical read-only sessions visible without offering execution controls", () => {
-  const history: RuntimeSessionSummary = {
-    ...session("session_history", "active", 40, "Historical work", "Previous agent result"),
-    readOnly: true,
-  };
-  expect(filterSessions([history], "historical", "active")).toEqual([history]);
-  expect(filterSessions([{ ...history, status: "archived" }], "historical", "archived")).toHaveLength(1);
-  const readOnly = isSessionReadOnly(history);
+test("keeps archived sessions visible without offering execution controls", () => {
+  const archived = session("session_archived", "archived", 40, "Archived work", "Previous result");
+  expect(filterSessions([archived], "archived", "archived")).toEqual([archived]);
+  const readOnly = isSessionReadOnly(archived);
   expect(readOnly).toBe(true);
-  expect(canExposeTaskActions(history)).toBe(false);
-  expect(canReloadSessionMcp(history.id, readOnly, false)).toBe(false);
+  expect(canExposeTaskActions(archived)).toBe(false);
+  expect(canReloadSessionMcp(archived.id, readOnly, false)).toBe(false);
   expect(canResumeTask("cancelled", "paused", readOnly)).toBe(false);
   expect(canResumeTask("failed", "active", readOnly)).toBe(false);
   expect(canResumeTask("idle", undefined, readOnly, true)).toBe(false);
 });
 
-test("read-only state is independent of the active or archived list and defaults to editable", () => {
+test("only archived sessions are read-only", () => {
   expect(isSessionReadOnly(undefined)).toBe(false);
   expect(isSessionReadOnly({ status: "active" })).toBe(false);
-  expect(isSessionReadOnly({ status: "active", readOnly: false })).toBe(false);
-  expect(isSessionReadOnly({ status: "active", readOnly: true })).toBe(true);
-  expect(isSessionReadOnly({ status: "archived", readOnly: false })).toBe(true);
-  expect(canExposeTaskActions({ status: "active", readOnly: false })).toBe(true);
+  expect(isSessionReadOnly({ status: "archived" })).toBe(true);
+  expect(canExposeTaskActions({ status: "active" })).toBe(true);
 });
 
 test("bounds Goal progress while preserving an unbudgeted state", () => {

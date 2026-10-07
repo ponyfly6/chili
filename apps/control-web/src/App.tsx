@@ -219,7 +219,7 @@ export function App() {
   }, [client, setNotice]);
 
   const task = snapshot?.session.id === selectedId ? snapshot.session : tasks.find((candidate) => candidate.id === selectedId);
-  const taskControllable = task?.status === "active" && !task.readOnly;
+  const taskControllable = task?.status === "active";
 
   const send = async (mode: "queue" | "steer") => {
     if (!client || !connected || !selectedId || !taskControllable || !canSendPrompt(draft) || sendPending.current) return;
