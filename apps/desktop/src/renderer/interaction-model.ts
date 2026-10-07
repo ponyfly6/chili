@@ -129,10 +129,13 @@ export function sidecarRecoveryGuidance(
   }
   if (state.phase !== "recovering" && state.phase !== "error") return undefined;
   const normalized = state.error?.trim();
-  const detail = normalized
-    ? normalized.length <= maximumErrorLength
-      ? normalized
-      : `${normalized.slice(0, maximumErrorLength)}…`
+  const explanation = normalized && /\bno such column\s*:/iu.test(normalized)
+    ? `现有会话数据与当前版本不兼容，请先备份旧会话，再使用新会话库。${normalized}`
+    : normalized;
+  const detail = explanation
+    ? explanation.length <= maximumErrorLength
+      ? explanation
+      : `${explanation.slice(0, maximumErrorLength)}…`
     : undefined;
   if (state.phase === "recovering") {
     const attempt = state.attempt > 0 ? ` (attempt ${state.attempt})` : "";

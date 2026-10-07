@@ -177,3 +177,14 @@ test("welcome security copy describes the actual renderer credential boundary", 
   expect(RENDERER_CREDENTIAL_BOUNDARY_COPY).toContain("never enter the renderer");
   expect(RENDERER_CREDENTIAL_BOUNDARY_COPY).not.toContain("main process");
 });
+
+test("sidecar guidance explains an incompatible existing conversation database", () => {
+  const guidance = sidecarRecoveryGuidance({
+    phase: "error",
+    attempt: 3,
+    error: "Sidecar stopped after 3 restart attempts: no such column: parent_session_id",
+  });
+  expect(guidance?.message).toContain("现有会话数据与当前版本不兼容");
+  expect(guidance?.message).toContain("parent_session_id");
+  expect(guidance?.message).toContain("Automatic retries stopped");
+});
