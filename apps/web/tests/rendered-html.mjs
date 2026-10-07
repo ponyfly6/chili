@@ -31,9 +31,12 @@ test("server-renders the Chili landing page", async () => {
   const html = await response.text();
   assert.match(html, /<html[^>]*lang="zh-CN"/i);
   assert.match(html, /<title>Chili · 终端优先的 Coding Agent<\/title>/i);
-  assert.match(html, /不止聊天。/);
-  assert.match(html, /进仓库，把事情做完。/);
-  assert.match(html, /EXPERIMENTAL · OPEN SOURCE/);
+  assert.match(html, /你的想法，/);
+  assert.match(html, /行动派/);
+  assert.match(html, /个人代理 · 规划中/);
+  assert.match(html, /移动端 · 开发预览/);
+  assert.match(html, /持续跟进与主动提醒尚未上线/);
+  assert.match(html, /role="tablist"/);
   assert.match(html, /git clone/);
   assert.match(html, /https:\/\/github\.com\/ponyfly6\/chili/);
   assert.match(html, /property="og:image" content="https:\/\/chili\.example\/og\.png"/i);
