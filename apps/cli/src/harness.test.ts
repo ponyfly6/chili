@@ -421,7 +421,7 @@ test("CLI harness exposes one shared request_user_input tool only when a queue i
   }
 });
 
-test("CLI prompt fragments include base, memory/project context, and skills catalog", async () => {
+test("CLI prompt exposes Memory and project-reading guidance without injecting their contents", async () => {
   const root = await mkdtempName();
   const home = join(root, "home");
   const repo = join(root, "repo");
@@ -440,12 +440,14 @@ test("CLI prompt fragments include base, memory/project context, and skills cata
     });
 
     const contextual = fragments.filter((fragment) => fragment.layer === "contextual_user");
-    const developer = fragments.filter((fragment) => fragment.layer === "developer");
-
-    expect(fragments[0]).toEqual(chiliBasePromptFragment());
-    expect(contextual.some((fragment) => fragment.source === "memory" && fragment.content.includes("project uses bun"))).toBe(true);
-    expect(contextual.some((fragment) => fragment.source === "project" && fragment.content.includes("prefer focused patches"))).toBe(true);
-    expect(developer.some((fragment) => fragment.id === "chili.memory.mechanics" && fragment.source === "memory")).toBe(true);
+    expect(fragments[0]).toMatchObject({ id: "chili.base", layer: "base", source: "core" });
+    expect(fragments[0]?.content.startsWith(chiliBasePromptFragment().content)).toBe(true);
+    expect(fragments[0]?.content).toContain(join(home, ".chili", "memory", "personal"));
+    expect(fragments.some((fragment) => fragment.content.includes("project uses bun"))).toBe(false);
+    expect(fragments.some((fragment) => fragment.content.includes("prefer focused patches"))).toBe(false);
+    expect(fragments.some((fragment) => fragment.id === "chili.memory.mechanics")).toBe(false);
+    expect(fragments[0]?.content).toContain("tool_search");
+    expect(fragments[0]?.content).toContain("AGENTS.md");
     const skills = contextual.find((fragment) => fragment.id === "chili.skills.catalog");
     expect(skills).toMatchObject({
       id: "chili.skills.catalog",
@@ -885,7 +887,6 @@ test("CLI prompt fragments warn instead of choosing ambiguous plain skill mentio
   const projectSkill = skill("same", "project");
   const fragments = await buildCliPromptFragments({
     cwd: "/repo",
-    memoryScopes: [],
     skillRegistry: new SkillRegistry([projectSkill], [], [userSkill, projectSkill]),
     turn: {
       text: "try $same",
@@ -901,7 +902,6 @@ test("CLI prompt fragments use structured skill path bindings for duplicate name
   const projectSkill = skill("same", "project");
   const fragments = await buildCliPromptFragments({
     cwd: "/repo",
-    memoryScopes: [],
     skillRegistry: new SkillRegistry([projectSkill], [], [userSkill, projectSkill]),
     turn: {
       text: "try $same",

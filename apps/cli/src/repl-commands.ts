@@ -34,7 +34,6 @@ export interface CliReplCommandContext {
   resumeAgent(sessionId: SessionId, agentId: string): Promise<void>;
   showMemory(cwd: string, scope: string): Promise<void>;
   addMemory(cwd: string, input: string): Promise<void>;
-  reloadMemory(cwd: string, scope: string): Promise<void>;
   runPromptCommand(sessionId: SessionId, commandId: string, args: string): Promise<void>;
 }
 
@@ -58,7 +57,6 @@ type CliReplCommandAction =
   | { type: "agent_resume"; agentId: string }
   | { type: "memory_show"; scope: string }
   | { type: "memory_add"; input: string }
-  | { type: "memory_reload"; scope: string }
   | { type: "prompt"; commandId: string; args: string };
 
 export type CliReplCommandRegistry = CommandRegistry<CliReplCommandContext, CliReplCommandAction>;
@@ -90,7 +88,6 @@ export function createCliReplCommandRegistry(runtimeCatalog?: RuntimeCommandCata
     memory: { run: () => ({ type: "memory_show", scope: "" }) },
     "memory.show": { run: (_context, input) => ({ type: "memory_show", scope: input.raw }) },
     "memory.add": { run: (_context, input) => ({ type: "memory_add", input: input.raw }) },
-    "memory.reload": { run: (_context, input) => ({ type: "memory_reload", scope: input.raw }) },
     app: {},
     "app.exit": { run: () => ({ type: "exit" }) },
   });
@@ -178,9 +175,6 @@ async function executeAction(
       break;
     case "memory_add":
       await context.addMemory(context.cwd, action.input);
-      break;
-    case "memory_reload":
-      await context.reloadMemory(context.cwd, action.scope);
       break;
     case "prompt":
       await context.runPromptCommand(context.sessionId, action.commandId, action.args);

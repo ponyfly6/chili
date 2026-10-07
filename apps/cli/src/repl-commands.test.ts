@@ -20,7 +20,6 @@ function context(calls: string[], sessionId = currentSessionId): CliReplCommandC
     resumeAgent: async (id, agentId) => { calls.push(`resume:${id}:${agentId}`); },
     showMemory: async (cwd, scope) => { calls.push(`memory-show:${cwd}:${scope}`); },
     addMemory: async (cwd, input) => { calls.push(`memory-add:${cwd}:${input}`); },
-    reloadMemory: async (cwd, scope) => { calls.push(`memory-reload:${cwd}:${scope}`); },
     runPromptCommand: async (id, commandId, args) => { calls.push(`prompt:${id}:${commandId}:${args}`); },
   };
 }
@@ -40,7 +39,6 @@ test("CLI dispatcher scopes session and agent commands to the active session", a
   await dispatchCliReplCommand(registry, ctx, "/agents resume session_worker");
   await dispatchCliReplCommand(registry, ctx, "/memory show --all");
   await dispatchCliReplCommand(registry, ctx, "/memory add --project remember this");
-  await dispatchCliReplCommand(registry, ctx, "/memory reload --user");
 
   expect(calls).toEqual([
     "sessions",
@@ -53,8 +51,14 @@ test("CLI dispatcher scopes session and agent commands to the active session", a
     "resume:session_current:session_worker",
     "memory-show:/repo:--all",
     "memory-add:/repo:--project remember this",
-    "memory-reload:/repo:--user",
   ]);
+});
+
+test("retired Memory reload is not a REPL command", async () => {
+  const calls: string[] = [];
+  const result = await dispatchCliReplCommand(createCliReplCommandRegistry(), context(calls), "/memory reload");
+  expect(result.status).toBe("error");
+  expect(calls).toEqual([]);
 });
 
 test("model, reasoning, service, and delegation changes use persisted session controls", async () => {

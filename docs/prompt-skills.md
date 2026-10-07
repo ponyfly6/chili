@@ -14,10 +14,10 @@ Each runtime turn assembles `PromptFragment[]` through `PromptAssembler`. The as
 : Stable Chili identity and core behavior. This is owned by core and should stay compact. It lives in `chiliBasePromptFragment()`.
 
 `developer`
-: Runtime rules and control-plane context. Examples are memory mechanics, task follow-up policy, and the available skills catalog. These are instructions about how Chili should operate, not user-authored project facts.
+: Runtime rules and control-plane context, such as delegation and execution review instructions. These are instructions about how Chili should operate, not user-authored project facts.
 
 `contextual_user`
-: Background material that should inform the turn but must not override the user request or higher layers. Examples are `AGENTS.md`, `CHILI.md`, `.chili/memory.md`, `.chili/rules/*.md`, and activated skill bodies.
+: Background material that should inform the turn but must not override the user request or higher layers. The standard Host uses it for the skills catalog and activated skill bodies. Explicit library callers can still supply other material.
 
 `conversation`
 : The real session history, tool calls, tool results, and compaction summaries. This is carried by the runtime and providers, not by hand-written prompt text.
@@ -27,25 +27,27 @@ Each runtime turn assembles `PromptFragment[]` through `PromptAssembler`. The as
 
 ## Memory And Project Context
 
-Memory mechanics are injected as a `developer` fragment:
+The standard Host does not automatically load Memory bodies, `AGENTS.md`,
+`CHILI.md`, or `.chili/rules/*.md`. The base prompt explains the available
+capabilities and Memory directory paths; the Agent decides when to inspect
+relevant files with ordinary file tools or Bash under existing execution policy.
 
-```text
-chili.memory.mechanics
-```
+Memory bodies are ordinary Markdown under `<profile>/memory/personal` and
+`<profile>/memory/projects/<projectId>`. There is no dedicated Memory model tool,
+database body, pagination API, or entry ID/revision protocol. Normal file
+observations enter tool history and use the same context budget and request-source
+recording as other results. Main and child Agents use the same directory resolver
+for their respective execution cwd, with their own session history.
 
-Memory documents and project instructions are injected as `contextual_user` fragments:
+User Memory belongs to the active profile; project Memory belongs to the current
+project in that profile. Memory may be stale; current user corrections take
+precedence. Writes, updates and deletion use ordinary file operations.
+Automatic extraction and scheduled consolidation are not enabled. See the
+[Memory contract](../packages/core/src/memory/README.md) for directory ownership,
+file freshness and existing permission boundaries.
 
-```text
-~/.chili/memory.md
-<project>/.chili/memory.md
-AGENTS.md
-CHILI.md
-.chili/rules/*.md
-```
-
-Project instructions are loaded from `projectRoot` toward `cwd`, so nearer project files appear later and can refine broader context. `.chili/rules/*.md` are unconditional today. Future path-aware rules should remain `contextual_user` unless they become runtime policy.
-
-Memory is intentionally low priority. It can be stale and should never override current user intent, base instructions, developer instructions, or tool results.
+The former combined Memory/project-rule loader is removed. CLI Memory inspection
+reads current Markdown directly; it does not import or migrate older storage.
 
 ## Skills Flow
 
@@ -58,7 +60,7 @@ Skills live in:
 
 Compatibility aliases under `.agents/skills` are loaded by default and can be disabled by loader options.
 
-The skills catalog is a lightweight `developer` fragment:
+The skills catalog is a lightweight `contextual_user` fragment:
 
 ```text
 chili.skills.catalog
@@ -128,14 +130,14 @@ Default output shows the manifest only:
 id layer source trust lifecycle chars metadata
 ```
 
-`--content` prints rendered fragment content. Use it carefully because it can contain memory, project instructions, and skill bodies.
+`--content` prints rendered fragment content. Actual request inspection can also
+include Memory and project instructions previously read through tools. The
+record describes the shared model-adapter input, not provider HTTP bytes.
 
 Useful fragment ids:
 
 ```text
 chili.base
-chili.memory.mechanics
-chili.context.<kind>.<index>
 chili.skills.catalog
 chili.skill.<name>
 chili.skill_mentions.warnings
@@ -145,18 +147,12 @@ chili.skill_mentions.warnings
 
 Keep these boundaries unless there is a deliberate architecture change:
 
-- Do not put memory or project instructions back into `base` or `developer`.
+- Keep Memory directory guidance in the base prompt; read and edit Memory with ordinary file tools or Bash.
 - Do not inject every skill body by default.
 - Do not use prompt text for tool schemas.
 - Do not make hidden or disabled skills visible in catalogs.
 - Do not let ambiguous plain `$skill` mentions silently pick one skill.
 - Prefer debug manifest metadata over ad hoc logging when adding new prompt sources.
 
-## Next Extensions
-
-The next natural extensions are:
-
-- [path-aware `.chili/rules/*.md` frontmatter](path-aware-rules-rfc.md) — **not implemented / 尚未实现**; the RFC defines the activation contract
-- a model-driven skill activation tool path
-- retrieval memory and memory write/delete policy
-- MCP/deferred tool discovery once tool counts become large
+The older [path-aware rules RFC](path-aware-rules-rfc.md) is a historical proposal
+for automatic loading. That direction and its loader have been retired.

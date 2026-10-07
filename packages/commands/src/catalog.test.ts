@@ -29,7 +29,6 @@ const EXPECTED_PATHS = [
   "/memory",
   "/memory show",
   "/memory add",
-  "/memory reload",
   "/auth",
   "/auth status",
   "/auth login",

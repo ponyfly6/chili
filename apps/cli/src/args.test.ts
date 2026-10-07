@@ -174,10 +174,20 @@ test("parses memory commands", () => {
     memoryScope: "user",
     prompt: "prefer small patches",
   });
-  expect(parseArgs(["memory", "reload", "--project"])).toMatchObject({
-    command: "memory-reload",
-    memoryScope: "project",
+  expect(parseArgs(["memory", "show", "--scope", "all"])).toMatchObject({
+    command: "memory-show",
+    memoryScope: "all",
   });
+  expect(() => parseArgs(["memory", "add", "--all", "ambiguous write scope"])).toThrow("memory add scope must be user or project");
+});
+
+test("Memory commands expose no legacy reload or migration path", () => {
+  expect(() => parseArgs(["memory", "reload"])).toThrow("Unknown memory command: reload");
+  expect(() => parseArgs(["memory", "refresh"])).toThrow("Unknown memory command: refresh");
+  expect(() => parseArgs(["memory", "migrate"])).toThrow("Unknown memory command: migrate");
+  expect(() => parseArgs(["memory", "show", "--to", "./export"])).toThrow("Unknown memory option: --to");
+  expect(usage()).not.toContain("memory migrate");
+  expect(usage()).not.toContain("memory reload");
 });
 
 test("parses prompt-debug command and session-only flags", () => {

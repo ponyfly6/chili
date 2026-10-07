@@ -1,6 +1,9 @@
 # Path-Aware Project Rules RFC
 
-Status: design contract; **not implemented**.
+Status: **retired proposal**. The automatic project-rule loader has been removed.
+The Agent now discovers and reads applicable project instructions through ordinary
+tools. The descriptions and source links below document an earlier implementation,
+not the current runtime. See [Prompt and Skills](prompt-skills.md) for the current contract.
 
 This RFC defines the executable contract for activating `.chili/rules/*.md` files. It does not implement the contract. The v1 decision is intentionally narrower than general touched-file awareness: activation uses the runtime `cwd` plus caller-supplied, structured `contextPaths`. Chili never extracts paths from user-authored free text. Successful file-tool calls may contribute paths in v2, but not in v1.
 

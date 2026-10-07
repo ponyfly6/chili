@@ -33,7 +33,6 @@ export const BUILTIN_COMMAND_IDS = [
   "memory",
   "memory.show",
   "memory.add",
-  "memory.reload",
   "auth",
   "auth.status",
   "auth.login",
@@ -178,19 +177,15 @@ const BUILTIN_COMMAND_SPECS: readonly BuiltinCommandSpec[] = [
       selectionMode: "complete",
     }),
   ]),
-  parent("memory", "memory", "Memory", "Inspect and update Chili memory", "memory", [
-    leaf("memory.show", "show", "Show memory", "Show loaded memory and instructions", "memory", {
+  parent("memory", "memory", "Memory", "Inspect and write Memory Markdown files", "memory", [
+    leaf("memory.show", "show", "Show memory", "Read personal and current-project Memory Markdown files", "memory", {
       argumentMode: "optional",
       argumentHint: "[--user|--project|--all]",
     }),
-    leaf("memory.add", "add", "Add memory", "Save a memory entry", "memory", {
+    leaf("memory.add", "add", "Add memory", "Create a Memory Markdown file", "memory", {
       argumentMode: "variadic",
       argumentHint: "[--user|--project] <text>",
       selectionMode: "complete",
-    }),
-    leaf("memory.reload", "reload", "Reload memory", "Reload memory sources", "memory", {
-      argumentMode: "optional",
-      argumentHint: "[--user|--project|--all]",
     }),
   ]),
   parent("auth", "auth", "Authentication", "Manage ChatGPT Codex authentication", "auth", [

@@ -15,7 +15,6 @@ export interface CliArgs {
     | "skills-disable"
     | "memory-show"
     | "memory-add"
-    | "memory-reload"
     | "store-doctor"
     | "mcp"
     | "help";
@@ -196,9 +195,8 @@ export function usage(): string {
     "  bun run chili -- agent-stop <agent-id> --resume <session-id>",
     "  bun run chili -- agent-resume <agent-id> --resume <session-id>",
     "  bun run chili -- skills [list|enable|disable] [--user|--project] [skill-name]",
-    "  bun run chili -- memory show",
+    "  bun run chili -- memory show [--user|--project|--all]",
     "  bun run chili -- memory add [--user|--project] \"remember this\"",
-    "  bun run chili -- memory reload",
     "  bun run chili -- store doctor [--json]",
     "  bun run chili -- mcp list [--json]",
     "  bun run chili -- mcp status [server-name] [--json]",
@@ -449,11 +447,6 @@ function parseMemoryCommand(result: CliArgs, args: string[], prompt: string[]): 
   const action = args[0] && !args[0].startsWith("-") ? args.shift() : "show";
   if (action === "show" || action === "list") {
     result.command = "memory-show";
-    parseMemoryFlags(result, args, false);
-    return;
-  }
-  if (action === "reload" || action === "refresh") {
-    result.command = "memory-reload";
     parseMemoryFlags(result, args, false);
     return;
   }

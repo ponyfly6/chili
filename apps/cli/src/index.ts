@@ -3,7 +3,7 @@ import { waitForMcpAuthorization } from "./mcp-auth.js";
 import { stat } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { addChiliMemoryEntry, loadChiliMemoryContext } from "@chili/core";
+import { addChiliMemoryEntry, listChiliMemoryEntries } from "@chili/core";
 import { resolveHostExecutionIdentity } from "@chili/host";
 import type {
   RuntimeMcpAddServerRequest,
@@ -55,6 +55,11 @@ async function main(): Promise<void> {
 
   if (args.command === "store-doctor") {
     await handleStoreDoctorCommand(args);
+    return;
+  }
+
+  if (args.command === "memory-show" || args.command === "memory-add") {
+    await handleMemoryCommand(args);
     return;
   }
 
@@ -136,22 +141,6 @@ async function main(): Promise<void> {
         ? await agents.stopAgent(input)
         : await agents.resumeAgent(input);
       console.log(jsonStringify(result));
-      return;
-    }
-
-    if (args.command === "memory-show") {
-      await printMemory(harness, args.memoryScope);
-      return;
-    }
-
-    if (args.command === "memory-add") {
-      if (!args.prompt) throw new Error("memory add requires text");
-      await addMemory(harness, args.prompt, args.memoryScope);
-      return;
-    }
-
-    if (args.command === "memory-reload") {
-      await reloadMemory(harness, args.memoryScope);
       return;
     }
 
@@ -806,56 +795,48 @@ async function handleStoreDoctorCommand(args: ReturnType<typeof parseArgs>): Pro
 }
 
 type MemoryScopeArg = "user" | "project" | "all" | undefined;
+type CliMemoryContext = Pick<Parameters<typeof listChiliMemoryEntries>[0], "cwd" | "chiliHome" | "projectRoot" | "projectId">;
+
+async function handleMemoryCommand(args: ReturnType<typeof parseArgs>): Promise<void> {
+  const context = await cliMemoryContext(args.cwd, args.chiliHome);
+  if (args.command === "memory-add") {
+    if (!args.prompt) throw new Error("memory add requires text");
+    await addMemory(context, args.prompt, args.memoryScope);
+    return;
+  }
+  await printMemory(context, args.memoryScope);
+}
 
 async function printMemory(
-  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  context: CliMemoryContext,
   scope: MemoryScopeArg,
-  cwd = harness.cwd,
 ): Promise<void> {
-  const snapshot = await loadChiliMemoryContext(await cliMemoryContext(harness, cwd));
-  const documents = filterMemoryDocuments(snapshot.documents, scope);
-  if (documents.length === 0) {
-    console.log("No Chili memory or project instructions loaded.");
+  const entries = await listChiliMemoryEntries({ ...context, scope: scope ?? "all" });
+  console.log("[memory] Explicit Markdown file inspection; Agents read Memory through file tools as needed.");
+  if (entries.length === 0) {
+    console.log("No Memory Markdown files found in the selected scope.");
     return;
   }
 
-  for (const document of documents) {
-    console.log(`[memory] ${document.label}\t${document.path}`);
-    console.log(document.content);
-    if (document.truncated) console.log("[memory] document truncated in context");
+  for (const entry of entries) {
+    console.log(`[memory] ${entry.scope}\t${entry.path}`);
+    console.log(entry.text);
     console.log("");
   }
 }
 
 async function addMemory(
-  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  context: CliMemoryContext,
   text: string,
   scope: MemoryScopeArg,
-  cwd = harness.cwd,
 ): Promise<void> {
   const result = await addChiliMemoryEntry({
-    ...await cliMemoryContext(harness, cwd),
+    ...context,
     text,
     scope: memoryWriteScope(scope),
   });
   console.log(`[memory] saved ${result.scope}: ${result.path}`);
-  console.log(`- ${result.text}`);
-}
-
-async function reloadMemory(
-  harness: Awaited<ReturnType<typeof createCliHarness>>,
-  scope: MemoryScopeArg,
-  cwd = harness.cwd,
-): Promise<void> {
-  const snapshot = await loadChiliMemoryContext(await cliMemoryContext(harness, cwd));
-  const documents = filterMemoryDocuments(snapshot.documents, scope);
-  console.log(`[memory] reloaded ${documents.length} source(s)`);
-  if (documents.length > 0) {
-    console.log("");
-    for (const document of documents) {
-      console.log(`[memory] ${document.label}\t${document.path}`);
-    }
-  }
+  console.log(result.text);
 }
 
 async function handleSkillsCommand(args: ReturnType<typeof parseArgs>): Promise<void> {
@@ -912,8 +893,8 @@ async function printSkills(context: Parameters<typeof loadSkillSettings>[0], asJ
   }
 }
 
-async function cliMemoryContext(harness: Awaited<ReturnType<typeof createCliHarness>>, cwd: string) {
-  const identity = await resolveHostExecutionIdentity({ cwd, chiliHome: harness.identity.profilePath });
+async function cliMemoryContext(cwd: string, chiliHome?: string) {
+  const identity = await resolveHostExecutionIdentity({ cwd, ...(chiliHome !== undefined ? { chiliHome } : {}) });
   return { cwd: identity.workspaceRoot, chiliHome: identity.profilePath, projectRoot: identity.projectRoot, projectId: identity.projectId };
 }
 
@@ -933,15 +914,6 @@ function skillListItem(skill: Skill, disabled: Set<string>): {
     baseDir: skill.baseDir,
     description: skill.metadata.description,
   };
-}
-
-function filterMemoryDocuments(
-  documents: Awaited<ReturnType<typeof loadChiliMemoryContext>>["documents"],
-  scope: MemoryScopeArg,
-): Awaited<ReturnType<typeof loadChiliMemoryContext>>["documents"] {
-  if (!scope || scope === "all") return documents;
-  if (scope === "user") return documents.filter((document) => document.kind === "user_memory");
-  return documents.filter((document) => document.kind === "project_memory" || document.kind === "project_instruction");
 }
 
 function memoryWriteScope(scope: MemoryScopeArg): "user" | "project" {
@@ -1037,7 +1009,6 @@ async function repl(input: {
     showMemory: async (cwd, scope) => handleMemoryReplCommand(input.harness, `show ${scope}`.trim(), cwd),
     addMemory: async (cwd, value) => input.harness.service.withSessionOperation(input.sessionId,
       () => handleMemoryReplCommand(input.harness, `add ${value}`.trim(), cwd)),
-    reloadMemory: async (cwd, scope) => handleMemoryReplCommand(input.harness, `reload ${scope}`.trim(), cwd),
     runPromptCommand: async (sessionId, commandId, args) => {
       const interrupt = installReplInterruptHandler(input.shutdownSignal);
       try {
@@ -1105,18 +1076,15 @@ async function handleMemoryReplCommand(
 ): Promise<void> {
   const action = command.split(/\s+/, 1)[0] || "show";
   const rest = command.slice(action.length).trim();
+  const context = await cliMemoryContext(cwd, harness.identity.profilePath);
   if (action === "show" || action === "list") {
-    await printMemory(harness, parseReplMemoryScope(rest), cwd);
-    return;
-  }
-  if (action === "reload" || action === "refresh") {
-    await reloadMemory(harness, parseReplMemoryScope(rest), cwd);
+    await printMemory(context, parseReplMemoryScope(rest));
     return;
   }
   if (action === "add") {
     const parsed = parseReplMemoryAdd(rest);
     if (!parsed.text) throw new Error("/memory add requires text");
-    await addMemory(harness, parsed.text, parsed.scope, cwd);
+    await addMemory(context, parsed.text, parsed.scope);
     return;
   }
   throw new Error(`Unknown /memory command: ${action}`);
@@ -1131,12 +1099,11 @@ function parseReplMemoryScope(input: string): MemoryScopeArg {
 }
 
 function parseReplMemoryAdd(input: string): { scope: MemoryScopeArg; text: string } {
-  if (input.startsWith("--user ")) {
-    return { scope: "user", text: input.slice("--user ".length).trim() };
+  const flag = input.split(/\s+/, 1)[0];
+  if (flag === "--user" || flag === "--project") {
+    return { scope: flag === "--user" ? "user" : "project", text: input.slice(flag.length).trim() };
   }
-  if (input.startsWith("--project ")) {
-    return { scope: "project", text: input.slice("--project ".length).trim() };
-  }
+  if (flag?.startsWith("--")) throw new Error("memory add requires --user or --project followed by text");
   return { scope: "project", text: input.trim() };
 }
 
