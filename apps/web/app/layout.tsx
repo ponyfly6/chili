@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import { headers } from "next/headers";
 import "./globals.css";
 
-const title = "Chili · 终端优先的 Coding Agent";
-const description = "Chili 是一个本地运行、终端优先、真正面向代码库工作的 coding agent runtime 与 CLI。";
+const title = "Chili · 为你做事的个人 AI";
+const description = "认识 Chili，为你做事的个人 AI。在自己的电脑上把需求变成成果，查看结果、继续修改，探索手机接续与个人代理的未来。";
 
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();

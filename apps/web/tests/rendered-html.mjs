@@ -30,7 +30,7 @@ test("server-renders the Chili landing page", async () => {
 
   const html = await response.text();
   assert.match(html, /<html[^>]*lang="zh-CN"/i);
-  assert.match(html, /<title>Chili · 终端优先的 Coding Agent<\/title>/i);
+  assert.match(html, /<title>Chili · 为你做事的个人 AI<\/title>/i);
   assert.match(html, /你的想法，/);
   assert.match(html, /行动派/);
   assert.match(html, /个人代理 · 规划中/);
