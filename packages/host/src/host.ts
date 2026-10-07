@@ -8,11 +8,15 @@ import {
   RuntimeService,
   SingleAgentRuntime,
   SnapshotRecoveryService,
+  withModelLifecycle,
   buildChiliMemoryPromptFragments,
   chiliBasePromptFragment,
   createMemoryTool,
   type ModelRouter,
+  type ModelLifecycleHooks,
+  type ModelLifecycleOptions,
   type PromptFragment,
+  type RuntimePromptFragmentsProvider,
   type RuntimePromptTurnContext,
 } from "@chili/core";
 import type { ChiliEvent, ExecutionIdentity, ModelSelection, RuntimeEvent, RuntimePermissionConfig, RuntimePermissionProfileId, RuntimePermissionUpdateOptions, ServiceTier, SessionId } from "@chili/protocol";
@@ -77,9 +81,8 @@ import { targetPathsForSession } from "./context-targets.js";
 import { createFilesystemPromptCommandControl, type PromptCommandControl } from "@chili/commands";
 import {
   assertSupportedPermissionProfile,
-  createHostExecutionGate,
+  createExecutionReviewModule,
   DEFAULT_REVIEW_INSTRUCTIONS,
-  reviewPromptFragment,
   runtimePermissionConfig,
   type ReviewSettings,
 } from "./approval.js";
@@ -97,6 +100,8 @@ import {
   type HostMcpRuntimeOptions,
 } from "./mcp-control.js";
 import { readUserModelSelection, writeUserModelSelection } from "./user-model-state.js";
+import { HostModuleRegistry, type HostModule, type HostHookDiagnostic } from "./hooks.js";
+import { createModuleExecutionGate } from "./module-gate.js";
 
 const DEV_MAX_TURNS = 128;
 const DEV_MAX_REPEATED_TOOL_CALLS = 20;
@@ -131,6 +136,8 @@ export interface ChiliHostOptions {
   serviceTier?: ServiceTier;
   permissionProfile?: RuntimePermissionProfileId;
   onEvent?: (event: ChiliEvent) => void;
+  modules?: readonly HostModule[];
+  onHookError?: (diagnostic: HostHookDiagnostic) => void;
   userInputQueue?: DeferredUserInputQueue;
   chiliHome?: string;
   projectRoot?: string;
@@ -177,6 +184,7 @@ export interface HostPermissionProfileControl {
 
 export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliHost> {
   assertSupportedPermissionProfile(options.permissionProfile ?? "auto-review");
+  let hooks: HostModuleRegistry | undefined;
   const identity = await resolveHostExecutionIdentity(options);
   const cwd = identity.workspaceRoot;
   const stateDir = join(cwd, ".chili");
@@ -212,12 +220,16 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       else owner.unregisterGuardian(event.pid);
     });
   } catch (error) {
+    hooks?.close();
     owner.release();
     throw error;
   }
   const eventStore = new ObservableEventStore(sqliteStore);
-  const unsubscribeObserver = options.onEvent ? eventStore.subscribe((event) => options.onEvent!(compactRuntimeEvent(event))) : undefined;
+  const unsubscribeObserver = eventStore.subscribe((event) => {
+    if (hooks?.observesRuntime) hooks.observeRuntime(compactRuntimeEvent(event));
+  });
   const initializationDrains: Array<() => unknown> = [];
+  const pendingModelSelectionWrites = new Set<Promise<void>>();
   let cleanupMcp: (() => unknown) | undefined;
   try {
     const staleTurnRecoveryMs = nonNegativeDuration(
@@ -300,12 +312,9 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       modelInput.provider = persistedUserModelSelection.provider;
       modelInput.model = persistedUserModelSelection.model;
     }
-    const model = options.modelRouter ?? await createHostModel(modelInput, { authStorage: new FileAuthStorage(identity.authPath ?? defaultAuthPath(chiliHome)), profileId: identity.profileId });
+    const providerModel = options.modelRouter ?? await createHostModel(modelInput, { authStorage: new FileAuthStorage(identity.authPath ?? defaultAuthPath(chiliHome)), profileId: identity.profileId });
     const runtimeModelSelection = explicitModelSelection ? resolveHostRuntimeModelSelection(hostModelInput) : undefined;
     const serviceDefaultModelSelection = runtimeModelSelection ?? persistedUserModelSelection;
-    const persistUserModelSelection = async (input: { modelSelection: ModelSelection }): Promise<void> => {
-      await writeUserModelSelection(input.modelSelection, { chiliHome }).catch(() => undefined);
-    };
     const skillRegistryForCwd = async (requestedCwd: string): Promise<SkillRegistry> => {
       const canonicalCwd = await canonicalSkillWorkspace(requestedCwd);
       const current = await executionIdentityForCwd(canonicalCwd);
@@ -318,9 +327,33 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       reviewInstructions: savedReviewSettings?.reviewInstructions ?? DEFAULT_REVIEW_INSTRUCTIONS,
       ...(savedReviewSettings?.reviewerModel ? { reviewerModel: savedReviewSettings.reviewerModel } : {}),
     }, chiliHome);
-    const executionGate = createHostExecutionGate({
+    const modelHooks: ModelLifecycleHooks = {
+      ...(options.modules?.some((module) => module.model?.started) ? {
+        started: (context) => hooks!.modelLifecycle.started?.(context),
+      } : {}),
+      ...(options.modules?.some((module) => module.model?.event) ? {
+        event: (context, event) => hooks!.modelLifecycle.event?.(context, event),
+      } : {}),
+      ...(options.modules?.some((module) => module.model?.ended) ? {
+        ended: (outcome) => hooks!.modelLifecycle.ended?.(outcome),
+      } : {}),
+    };
+    const modelScope: ModelLifecycleOptions = {
+      onError: (diagnostic) => hooks!.diagnose({ moduleId: "chili.model-lifecycle", point: `model.${diagnostic.point}`,
+        error: diagnostic.error instanceof Error ? diagnostic.error : new Error(String(diagnostic.error)) }),
+      resolveContext: async (input) => {
+        const session = await eventStore.session(input.sessionId);
+        if (!session) throw new Error(`Missing model request session: ${input.sessionId}`);
+        return { agentRole: session.agent ? "child" : "root",
+          ...(session.agent ? { parentSessionId: session.agent.parentSessionId } : {}) };
+      },
+    };
+    const model = withModelLifecycle(providerModel, modelHooks, modelScope);
+    const reviewerModel = options.reviewerModelRouter
+      ? withModelLifecycle(options.reviewerModelRouter, modelHooks, modelScope) : model;
+    const reviewModule = createExecutionReviewModule({
       settings: () => permissions.settings(),
-      model: options.reviewerModelRouter ?? model,
+      model: reviewerModel,
       contextForRequest: (request) => buildToolReviewContext(eventStore, request),
       modelSelectionForRequest: async (request) => {
         const events = await eventStore.events({ sessionId: request.sessionId, type: "session.model_changed", tail: true, limit: 1 });
@@ -351,26 +384,45 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     }
     let mcpRuntime: HostMcpRuntime | undefined;
     cleanupMcp = () => mcpRuntime?.close();
-    const promptFragments = async (context: { sessionId: SessionId; cwd: string; turn?: RuntimePromptTurnContext }) =>
-      buildHostPromptFragments({
-        cwd: context.cwd,
-        ...(await memoryOptionsForCwd(context.cwd)),
-        memoryScopes: ["user", "project"],
-        targetPaths: await targetPathsForSession(eventStore, context.sessionId, context.cwd),
-        skillRegistry: await skillRegistryForCwd(context.cwd),
-        ...(context.turn ? { turn: context.turn } : {}),
-      }).then((fragments) => [...fragments, agentExpansionPromptFragment(config.agents), reviewPromptFragment(permissions.get())]);
-    const childPromptFragments = async (context: { sessionId: SessionId; cwd: string; turn?: RuntimePromptTurnContext }) =>
-      buildHostChildPromptFragments({
-        cwd: context.cwd,
-        ...(await memoryOptionsForCwd(context.cwd)),
-        memoryScopes: ["user", "project"],
-        sessionId: context.sessionId,
-        targetPaths: await targetPathsForSession(eventStore, context.sessionId, context.cwd),
-        skillRegistry: await skillRegistryForCwd(context.cwd),
-        store: eventStore,
-        ...(context.turn ? { turn: context.turn } : {}),
-      }).then((fragments) => [...fragments, agentExpansionPromptFragment(config.agents), reviewPromptFragment(permissions.get())]);
+    hooks = new HostModuleRegistry({
+      builtins: [{
+        id: "chili.prompt.context",
+        prompt: { collect: async (context) => {
+          const input = {
+            cwd: context.cwd,
+            ...(await memoryOptionsForCwd(context.cwd)),
+            memoryScopes: ["user", "project"] as const,
+            targetPaths: await targetPathsForSession(eventStore, context.sessionId, context.cwd),
+            skillRegistry: await skillRegistryForCwd(context.cwd),
+            ...(context.turn ? { turn: context.turn } : {}),
+          };
+          return context.agentKind === "child"
+            ? buildHostChildPromptFragments({ ...input, sessionId: context.sessionId, store: eventStore })
+            : buildHostPromptFragments(input);
+        } },
+      }, {
+        id: "chili.agent-expansion",
+        prompt: { collect: () => [agentExpansionPromptFragment(config.agents)] },
+      }, reviewModule, {
+        id: "chili.model-selection",
+        modelSelection: { changed: async (input) => {
+          const write = writeUserModelSelection(input.modelSelection, { chiliHome });
+          pendingModelSelectionWrites.add(write);
+          try { await write; } finally { pendingModelSelectionWrites.delete(write); }
+        } },
+      }],
+      modules: [
+        ...(options.modules ?? []),
+        ...(options.onEvent ? [{ id: "host.legacy-on-event", runtime: { event: (event: RuntimeEvent) => options.onEvent!(event) } }] : []),
+      ],
+      ...(options.onHookError ? { onError: options.onHookError } : {}),
+    });
+    const executionGate = createModuleExecutionGate({ modules: hooks, settings: () => permissions.settings(),
+      assertRequestCurrent: async (request) => { await resolveAgentAncestry(eventStore, request.sessionId); } });
+    const promptFragments: RuntimePromptFragmentsProvider = ({ signal, ...context }) =>
+      hooks!.collectPrompt({ ...context, agentKind: "root" }, signal);
+    const childPromptFragments: RuntimePromptFragmentsProvider = ({ signal, ...context }) =>
+      hooks!.collectPrompt({ ...context, agentKind: "child" }, signal);
     const snapshotProvider = new FileSystemSnapshotProvider({
       rootDir: join(stateDir, "snapshots"),
       createId,
@@ -380,6 +432,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       executionContext: (operation) => withProcessOwner(owner.token, operation),
       events: { publish: (event: RuntimeEvent) => eventStore.append(event) },
       gate: executionGate,
+      lifecycle: hooks.toolLifecycle,
       policyResolver: combinedChildToolPolicyResolver,
       snapshotProvider,
       createId,
@@ -422,7 +475,8 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       ...(serviceDefaultModelSelection ? { defaultModelSelection: serviceDefaultModelSelection } : {}),
       ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
       ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
-      onModelChanged: persistUserModelSelection,
+      onModelChanged: (input) => hooks!.modelChanged(input),
+      agentLifecycle: hooks.agentLifecycle,
       sessionAccess: "child",
       stopSessionResources: (sessionId, reason) => processes.stopSession(sessionId, reason),
       runInput: async (sessionId, signal, run) => {
@@ -438,6 +492,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       executionContext: (operation) => withProcessOwner(owner.token, operation),
       events: { publish: (event: RuntimeEvent) => eventStore.append(event) },
       gate: executionGate,
+      lifecycle: hooks.toolLifecycle,
       policyResolver: rootToolPolicyResolver,
       snapshotProvider,
       createId,
@@ -480,7 +535,8 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       ...(serviceDefaultModelSelection ? { defaultModelSelection: serviceDefaultModelSelection } : {}),
       ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
       ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
-      onModelChanged: persistUserModelSelection,
+      onModelChanged: (input) => hooks!.modelChanged(input),
+      agentLifecycle: hooks.agentLifecycle,
       stopSessionResources: (sessionId, reason) => processes.stopSession(sessionId, reason),
       ...(options.sessionClaimLeaseMs !== undefined ? { sessionClaimLeaseMs: options.sessionClaimLeaseMs } : {}),
       ...(options.sessionClaimHeartbeatMs !== undefined ? { sessionClaimHeartbeatMs: options.sessionClaimHeartbeatMs } : {}),
@@ -555,6 +611,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       // Publish the one close promise before any shutdown call can synchronously
       // abort a model/tool and let its listener reenter close().
       hostClosing = true;
+      hooks?.abortPending();
       if (staleTurnRecoveryTimer) clearTimeout(staleTurnRecoveryTimer);
       staleTurnRecoveryTimer = undefined;
       const errors: unknown[] = [];
@@ -580,13 +637,19 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
         for (const result of drainResults) {
           if (result.status === "rejected") errors.push(result.reason);
         }
+        // Cancelling a hook does not cancel an already started atomic file write.
+        // Keep ownership until it settles so an old Host cannot overwrite a new one.
+        for (const result of await Promise.allSettled(pendingModelSelectionWrites)) {
+          if (result.status === "rejected") errors.push(result.reason);
+        }
         try {
           await mcpRuntime?.close();
         } catch (error) {
           errors.push(error);
         } finally {
           try {
-            unsubscribeObserver?.();
+            unsubscribeObserver();
+            hooks?.close();
             try { await sqliteStore.flushInputMirrors(); } finally {
               sqliteStore.close();
               unsubscribeGuardians?.();
@@ -625,9 +688,13 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     };
   } catch (error) {
     // Begin every abort path before waiting so dependent services can settle.
+    hooks?.abortPending();
     const cleanup = await Promise.allSettled(initializationDrains.map((drain) => Promise.resolve().then(drain)));
     const errors: unknown[] = [error];
     for (const result of cleanup) {
+      if (result.status === "rejected") errors.push(result.reason);
+    }
+    for (const result of await Promise.allSettled(pendingModelSelectionWrites)) {
       if (result.status === "rejected") errors.push(result.reason);
     }
     // MCP can be used by a settling tool; close it only after runtime drains.
@@ -636,7 +703,8 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     } catch (closeError) {
       errors.push(closeError);
     }
-    unsubscribeObserver?.();
+    unsubscribeObserver();
+    hooks?.close();
     try {
       try {
         await sqliteStore.flushInputMirrors();
