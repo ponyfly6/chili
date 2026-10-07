@@ -401,7 +401,7 @@ export class SidecarManager {
     this.attempt = Math.min(this.consecutiveFailures, MAX_RESTARTS);
     this.error = safeErrorMessage(error);
     if (this.consecutiveFailures > MAX_RESTARTS) {
-      this.error = `Sidecar stopped after ${MAX_RESTARTS} restart attempts`;
+      this.error = safeErrorMessage(`Sidecar stopped after ${MAX_RESTARTS} restart attempts: ${this.error}`);
       this.setPhase("error", this.error);
       return;
     }

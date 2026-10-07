@@ -18,6 +18,73 @@ import { SidecarManager } from "./sidecar-manager.js";
 import { retryShutdownContainment } from "./shutdown-containment.js";
 
 describe("desktop sidecar security boundary", () => {
+  test("keeps the safe startup cause after all restart attempts are exhausted", async () => {
+    if (process.platform === "win32") return;
+    const workspace = await mkdtemp(join(tmpdir(), "chili-sidecar-startup-cause-"));
+    const states: ReturnType<SidecarManager["state"]>[] = [];
+    const logs: string[] = [];
+    const childPids: number[] = [];
+    const manager = new SidecarManager({
+      repositoryRoot: resolve(import.meta.dirname, "../../../.."),
+      spawnSidecar: ({ env }) => {
+        const child = spawn(process.execPath, ["-e", String.raw`
+const { createReadStream, writeSync } = require("node:fs");
+const chunks = [];
+const credentials = createReadStream("", { fd: 3, autoClose: true });
+credentials.on("data", (chunk) => chunks.push(chunk));
+credentials.on("error", (error) => {
+  writeSync(2, "fixture credential read failed: " + error.code + "\n");
+  process.exit(2);
+});
+credentials.on("end", () => {
+  const credential = Buffer.concat(chunks);
+  const token = credential.toString().trim().split(":").at(-1);
+  credential.fill(0);
+  for (const chunk of chunks) chunk.fill(0);
+  writeSync(2, "unstructured stderr must not become desktop state\n");
+  writeSync(1, JSON.stringify({
+    type: "chili.sidecar.startup_error",
+    message: "no such column: parent_session_id api_key=private-key " + token,
+  }) + "\n");
+});
+process.stdin.resume();
+setInterval(() => undefined, 1000);
+`], {
+          cwd: workspace,
+          env,
+          detached: true,
+          stdio: ["pipe", "pipe", "pipe", "pipe"],
+        });
+        childPids.push(child.pid ?? 0);
+        return child;
+      },
+      healthCheck: async () => {
+        throw new Error("A failed sidecar must not reach its health check");
+      },
+      onState: (state) => states.push(state),
+      onLog: (stream, text) => logs.push(`${stream}: ${text}`),
+    });
+    try {
+      await expect(manager.switchWorkspace(workspace)).rejects.toThrow("no such column: parent_session_id");
+      await waitUntil(() => {
+        const { sidecar } = manager.state();
+        return sidecar.phase === "error" && sidecar.attempt === 3
+          && sidecar.error?.startsWith("Sidecar stopped after 3 restart attempts:") === true;
+      }, 8_000);
+      expect(manager.state().sidecar.error).toContain("Sidecar stopped after 3 restart attempts: no such column: parent_session_id");
+      const reflected = JSON.stringify(states);
+      expect(reflected).not.toContain("private-key");
+      expect(reflected).not.toContain("unstructured stderr");
+      expect(childPids).toHaveLength(4);
+      expect(childPids.every((pid) => pid > 0 && !processGroupExists(pid))).toBe(true);
+    } catch (error) {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}\nFixture state: ${JSON.stringify(manager.state())}\nFixture logs:\n${logs.join("\n")}`, { cause: error });
+    } finally {
+      await manager.stop().catch(() => undefined);
+      await rm(workspace, { recursive: true, force: true });
+    }
+  }, 12_000);
+
   test("renderer contract never exposes endpoint, token, or pid", async () => {
     const contracts = await readFile(resolve(import.meta.dirname, "../shared/contracts.ts"), "utf8");
     const desktopState = contracts.slice(contracts.indexOf("export interface DesktopState"), contracts.indexOf("export interface RuntimeSnapshot"));
@@ -904,7 +971,7 @@ process.stdin.resume();
     expect(manager.state().sidecar).toEqual({
       phase: "error",
       attempt: 3,
-      error: "Sidecar stopped after 3 restart attempts",
+      error: "Sidecar stopped after 3 restart attempts: launch 3 failed",
     });
 
     const child = Object.create(null) as ChildProcessWithoutNullStreams;

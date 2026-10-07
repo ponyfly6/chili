@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { terminateProcessGroup } from "./process-groups.js";
+import { MAX_DESKTOP_ERROR_MESSAGE_BYTES } from "../shared/safe-error.js";
 import {
   encodeSidecarCredentialFrame,
+  createSidecarStartupErrorMessage,
   MAX_SIDECAR_CREDENTIAL_FRAME_BYTES,
   MAX_SIDECAR_CONTROL_LINE_BYTES,
   observeSidecarControlStream,
@@ -81,6 +83,90 @@ describe("sidecar credential channel", () => {
 });
 
 describe("sidecar control stream", () => {
+  test("redacts startup credentials before UTF-8 diagnostic truncation", () => {
+    const diagnostic = createSidecarStartupErrorMessage(new Error(
+      `${"界".repeat(675)} ${FIXTURE_CREDENTIAL} api_key=private-key`,
+    ), FIXTURE_CREDENTIAL);
+    expect(diagnostic.type).toBe("chili.sidecar.startup_error");
+    expect(Buffer.byteLength(diagnostic.message, "utf8")).toBeLessThanOrEqual(MAX_DESKTOP_ERROR_MESSAGE_BYTES);
+    expect(diagnostic.message).not.toContain("AAA");
+    expect(diagnostic.message).not.toContain("private-key");
+  });
+
+  test("retains a structured startup failure and redacts secrets before rejecting readiness", async () => {
+    const stream = new PassThrough();
+    const exit = deferred<SidecarExitInfo>();
+    const logs: string[] = [];
+    const observer = observeSidecarControlStream(stream, exit.promise, FIXTURE_CREDENTIAL, {
+      onProcess: () => undefined,
+      onLog: (text) => logs.push(text),
+      onFatal: () => undefined,
+    });
+    const failure = observer.ready.catch((error: Error) => error);
+    const line = `${JSON.stringify({
+      type: "chili.sidecar.startup_error",
+      message: `no such column: parent_session_id\napi_key=private-key ${FIXTURE_CREDENTIAL}`,
+    })}\n`;
+    stream.write(line.slice(0, 17));
+    stream.write(line.slice(17));
+    exit.resolve({ code: 1, signal: null });
+
+    const error = await failure;
+    expect(error).toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    expect(message).toContain("no such column: parent_session_id");
+    expect(message).not.toContain("private-key");
+    expect(message).not.toContain(FIXTURE_CREDENTIAL);
+    expect(message).not.toContain("\n");
+    expect(logs).toEqual([]);
+    observer.dispose();
+    stream.end();
+  });
+
+  test("rejects malformed startup diagnostic frames without reflecting their contents", async () => {
+    for (const frame of [
+      { message: "" },
+      { message: { secret: "private-value" } },
+      { message: "private-value", extra: "unexpected" },
+      { message: "界".repeat(Math.ceil(MAX_DESKTOP_ERROR_MESSAGE_BYTES / 3)) },
+    ]) {
+      const stream = new PassThrough();
+      const exit = deferred<SidecarExitInfo>();
+      const logs: string[] = [];
+      const observer = observeSidecarControlStream(stream, exit.promise, FIXTURE_CREDENTIAL, {
+        onProcess: () => undefined,
+        onLog: (text) => logs.push(text),
+        onFatal: () => undefined,
+      });
+      stream.write(`${JSON.stringify({ type: "chili.sidecar.startup_error", ...frame })}\n`);
+      await expect(observer.ready).rejects.toThrow("Sidecar reported an invalid startup failure");
+      expect(logs).toEqual([]);
+      observer.dispose();
+      stream.end();
+    }
+  });
+
+  test("reports a post-ready diagnostic once and keeps draining process cleanup frames", async () => {
+    const stream = new PassThrough();
+    const exit = deferred<SidecarExitInfo>();
+    const failures: Error[] = [];
+    const processMessages: unknown[] = [];
+    const observer = observeSidecarControlStream(stream, exit.promise, FIXTURE_CREDENTIAL, {
+      onProcess: (message) => processMessages.push(message),
+      onLog: () => undefined,
+      onFatal: (error) => failures.push(error),
+    });
+    stream.write(`${JSON.stringify({ type: "chili.sidecar.ready", url: "http://127.0.0.1:3210", pid: 42 })}\n`);
+    await observer.ready;
+    const diagnostic = `${JSON.stringify({ type: "chili.sidecar.startup_error", message: "startup failed" })}\n`;
+    stream.write(diagnostic + diagnostic);
+    stream.write(`${JSON.stringify({ type: "chili.sidecar.process", action: "finished", pid: 43 })}\n`);
+    expect(failures.map((error) => error.message)).toEqual(["startup failed"]);
+    expect(processMessages).toEqual([{ type: "chili.sidecar.process", action: "finished", pid: 43 }]);
+    observer.dispose();
+    stream.end();
+  });
+
   test("keeps draining process frames after ready without exposing the token", async () => {
     const stream = new PassThrough();
     const exit = deferred<SidecarExitInfo>();

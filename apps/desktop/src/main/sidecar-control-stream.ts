@@ -1,8 +1,10 @@
 import type { Readable } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { MAX_DESKTOP_ERROR_MESSAGE_BYTES, safeDesktopErrorMessage } from "../shared/safe-error.js";
 
 export const SIDECAR_READY_TYPE = "chili.sidecar.ready";
 export const SIDECAR_PROCESS_TYPE = "chili.sidecar.process";
+export const SIDECAR_STARTUP_ERROR_TYPE = "chili.sidecar.startup_error";
 export const MAX_SIDECAR_CONTROL_LINE_BYTES = 64 * 1024;
 export const SIDECAR_CREDENTIAL_FD = 3;
 export const SIDECAR_CREDENTIAL_HANDSHAKE_TIMEOUT_MS = 5_000;
@@ -29,6 +31,18 @@ export interface SidecarProcessMessage {
   type: typeof SIDECAR_PROCESS_TYPE;
   action: "started" | "finished";
   pid: number;
+}
+
+export function createSidecarStartupErrorMessage(error: unknown, token?: string): {
+  type: typeof SIDECAR_STARTUP_ERROR_TYPE;
+  message: string;
+} {
+  const text = error instanceof Error ? error.message : typeof error === "string" ? error : safeDesktopErrorMessage(error);
+  return {
+    type: SIDECAR_STARTUP_ERROR_TYPE,
+    // Remove the complete token before truncation can leave a partial credential.
+    message: safeDesktopErrorMessage(token ? redactControlLog(text, token) : text),
+  };
 }
 
 export interface SidecarExitInfo {
@@ -200,6 +214,7 @@ export function observeSidecarControlStream(
   let buffer = "";
   let bufferBytes = 0;
   let readySettled = false;
+  let failureReported = false;
   let disposed = false;
   let resolveReady: ((ready: SidecarReadyMessage) => void) | undefined;
   let rejectReady: ((error: Error) => void) | undefined;
@@ -214,6 +229,18 @@ export function observeSidecarControlStream(
   }, timeoutMs);
   timeout.unref?.();
 
+  const reportFailure = (error: Error): void => {
+    if (failureReported) return;
+    failureReported = true;
+    clearTimeout(timeout);
+    if (!readySettled) {
+      readySettled = true;
+      rejectReady?.(error);
+    } else {
+      callbacks.onFatal(error);
+    }
+  };
+
   const consumeLine = (rawLine: string): void => {
     const line = rawLine.trim();
     if (!line) return;
@@ -222,6 +249,13 @@ export function observeSidecarControlStream(
       parsed = JSON.parse(line);
     } catch {
       callbacks.onLog(redactControlLog(line, token));
+      return;
+    }
+    if (
+      parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      && (parsed as Record<string, unknown>).type === SIDECAR_STARTUP_ERROR_TYPE
+    ) {
+      reportFailure(parseSidecarStartupError(parsed, token));
       return;
     }
     const readyMessage = parseSidecarReadyMessage(parsed);
@@ -249,12 +283,7 @@ export function observeSidecarControlStream(
     buffer = "";
     bufferBytes = 0;
     const error = new Error(SIDECAR_CONTROL_LINE_LIMIT_MESSAGE);
-    if (!readySettled) {
-      readySettled = true;
-      rejectReady?.(error);
-    } else {
-      callbacks.onFatal(error);
-    }
+    reportFailure(error);
   };
 
   const appendSegment = (segment: string): boolean => {
@@ -327,6 +356,19 @@ export function parseSidecarProcessMessage(value: unknown): SidecarProcessMessag
   ) return undefined;
   if (typeof record.pid !== "number" || !Number.isSafeInteger(record.pid) || record.pid <= 0) return undefined;
   return { type: SIDECAR_PROCESS_TYPE, action: record.action, pid: record.pid };
+}
+
+function parseSidecarStartupError(value: object, token: string): Error {
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).length !== 2
+    || typeof record.message !== "string"
+    || !record.message.trim()
+    || Buffer.byteLength(record.message, "utf8") > MAX_DESKTOP_ERROR_MESSAGE_BYTES
+  ) return new Error("Sidecar reported an invalid startup failure");
+  // Only this bounded diagnostic frame reaches desktop state. Raw stdout/stderr
+  // remain logs; redact both structured credentials and the private IPC token.
+  return new Error(safeDesktopErrorMessage(redactControlLog(record.message, token)));
 }
 
 export function redactControlLog(text: string, token: string): string {

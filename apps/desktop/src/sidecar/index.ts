@@ -13,6 +13,7 @@ import {
 import { safeDesktopErrorMessage as safeErrorMessage } from "../shared/safe-error.js";
 import {
   readSidecarCredentialStream,
+  createSidecarStartupErrorMessage,
   SIDECAR_CREDENTIAL_FD,
 } from "../main/sidecar-control-stream.js";
 import {
@@ -44,6 +45,7 @@ for (const name of [
 const activeToolProcessGroups = new Set<number>();
 const userInputQueue = new DeferredUserInputQueue();
 let host: ChiliHost | undefined;
+let token: string | undefined;
 let server: ReturnType<typeof startRuntimeHttpServer> | undefined;
 let fixtureToolStart: {
   resolve(pid: number): void;
@@ -163,7 +165,7 @@ process.once("unhandledRejection", (error) => {
 });
 
 try {
-  const token = await readSidecarCredentialStream(createReadStream("", {
+  token = await readSidecarCredentialStream(createReadStream("", {
     fd: SIDECAR_CREDENTIAL_FD,
     autoClose: true,
   }));
@@ -213,7 +215,9 @@ try {
 
   writeControlFrame({ type: READY_TYPE, url: server.url, pid: process.pid });
 } catch (error) {
-  safeWriteStderr(`[sidecar] startup failed: ${safeErrorMessage(error)}\n`);
+  const diagnostic = createSidecarStartupErrorMessage(error, token);
+  writeControlFrame(diagnostic);
+  safeWriteStderr(`[sidecar] startup failed: ${diagnostic.message}\n`);
   fixtureToolStart?.reject(error);
   fixtureToolStart = undefined;
   coordinator.requestGraceful("Desktop sidecar startup failed.", 1);
