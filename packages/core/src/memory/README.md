@@ -104,3 +104,27 @@ library, preserved older prompt content, scoped rules, and content version chang
 A real Host test exercises a fake model calling the Memory tool and captures
 subsequent model requests in two profiles, including profile-specific skills.
 No paid model or real account data is used in these checks.
+
+## Current context and source provenance
+
+Each load reads the current Memory records and applicable instruction files.
+Successful updates, deletions, and rule scope changes take effect on the next
+load; previously assembled requests retain their earlier content and revisions.
+Current user corrections take precedence over stale Memory and older summaries.
+A summary does not restore a Memory entry or rule that is now deleted, changed,
+or outside the current target scope. This is a context policy, not a guarantee
+that a model preserves every semantic detail in a summary.
+
+Loaded documents and unrendered fragments keep `sourceContent` in memory before
+their display preview is clipped. For project files this is the exact text,
+including frontmatter and whitespace; for Memory it is the persisted entry text.
+The source hash and character count describe that source, while the rendered
+content hash describes the actual preview. This does not create another durable
+Memory log or change the database schema. Display clipping remains explicit and
+does not claim that the entire source reached the model.
+
+Project instruction fragments are ordered before background Memory when sharing
+the prompt budget. Memory limits are finite nonnegative character counts and
+previews do not split Unicode surrogate pairs. Retrieval is still bounded lexical
+selection, and oversized entries may require an explicit `memory get` to inspect
+their complete persisted content.
