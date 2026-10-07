@@ -13,13 +13,21 @@ import {
 } from "electron";
 import {
   decideRendererAsset,
+  isAllowedExternalWindowOpen,
+  isAllowedResultFrameNavigation,
   isTrustedRendererUrl,
   productionSecurityHeaders,
   PRODUCTION_CSP,
   RENDERER_HOST,
   RENDERER_SCHEME,
   responseSecurityHeaders,
+  type RendererTrustPolicy,
 } from "./window-security.js";
+import {
+  installResultPreviewProtocol,
+  isResultPreviewDocumentUrl,
+  RESULT_PREVIEW_SCHEME,
+} from "./result-preview-protocol.js";
 
 const trustedWebContents = new Set<number>();
 
@@ -31,9 +39,13 @@ protocol.registerSchemesAsPrivileged([{
     supportFetchAPI: true,
     corsEnabled: false,
   },
+}, {
+  scheme: RESULT_PREVIEW_SCHEME,
+  privileges: { standard: true, secure: true },
 }]);
 
 export async function installRendererProtocol(): Promise<void> {
+  await installResultPreviewProtocol();
   if (developmentRendererUrl()) return;
   const rendererRoot = resolve(import.meta.dirname, "../renderer");
   await protocol.handle(RENDERER_SCHEME, async (request) => {
@@ -75,6 +87,7 @@ export function configureSessionSecurity(): void {
       "script-src 'self' 'unsafe-eval'",
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data:",
+      "frame-src chili-result:",
       `connect-src ${url.origin} ${url.protocol === "https:" ? `wss://${url.host}` : `ws://${url.host}`}`,
       "object-src 'none'",
       "base-uri 'none'",
@@ -105,6 +118,7 @@ export function createDesktopWindow(): BrowserWindow {
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      nodeIntegrationInSubFrames: false,
       webSecurity: true,
       allowRunningInsecureContent: false,
       spellcheck: true,
@@ -114,11 +128,28 @@ export function createDesktopWindow(): BrowserWindow {
   trustedWebContents.add(window.webContents.id);
   window.webContents.once("destroyed", () => trustedWebContents.delete(window.webContents.id));
 
-  window.webContents.setWindowOpenHandler(({ url }) => {
-    if (isAllowedExternalUrl(url)) void shell.openExternal(url);
+  window.webContents.setWindowOpenHandler(({ url, referrer }) => {
+    if (isAllowedExternalWindowOpen(url, referrer.url, currentRendererTrustPolicy())) void shell.openExternal(url);
     return { action: "deny" };
   });
+  window.webContents.on("will-frame-navigate", (event) => {
+    if (event.isMainFrame) {
+      if (event.initiator && event.initiator !== window.webContents.mainFrame) event.preventDefault();
+      return;
+    }
+    if (!isAllowedResultFrameNavigation({
+      registeredDocument: isResultPreviewDocumentUrl(event.url),
+      parentIsMainFrame: event.frame?.parent === window.webContents.mainFrame,
+      initiatorIsMainFrame: event.initiator === window.webContents.mainFrame,
+      hasInitiator: Boolean(event.initiator),
+      currentUrl: event.frame?.url,
+    })) event.preventDefault();
+  });
   window.webContents.on("will-navigate", (event, url) => {
+    if (event.initiator && event.initiator !== window.webContents.mainFrame) {
+      event.preventDefault();
+      return;
+    }
     if (isCurrentRendererUrl(url)) return;
     event.preventDefault();
     if (isAllowedExternalUrl(url)) void shell.openExternal(url);
@@ -134,11 +165,15 @@ export async function loadDesktopWindow(window: BrowserWindow): Promise<void> {
 }
 
 function isCurrentRendererUrl(input: string): boolean {
+  return isTrustedRendererUrl(input, currentRendererTrustPolicy());
+}
+
+function currentRendererTrustPolicy(): RendererTrustPolicy {
   const developmentUrl = developmentRendererUrl();
-  return isTrustedRendererUrl(input, {
+  return {
     packaged: app.isPackaged,
     ...(developmentUrl ? { developmentRendererUrl: developmentUrl } : {}),
-  });
+  };
 }
 
 function developmentRendererUrl(): string | undefined {

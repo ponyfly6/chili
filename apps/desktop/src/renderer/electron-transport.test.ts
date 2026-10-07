@@ -40,6 +40,28 @@ test("binds every task operation to its project even after another transport act
   expect(calls.map((request) => request.projectId)).toEqual(["project-a", "project-b", "project-a", "project-b"]);
 });
 
+test("result reads retain their project owner and wait for its workspace activation", async () => {
+  const selection = deferred<DesktopState>();
+  const calls: DesktopRequest[] = [];
+  const api = {
+    invoke: async (request: DesktopRequest) => {
+      calls.push(request);
+      if (request.type === "workspace.activate") return selection.promise;
+      return { status: "unavailable", reason: "missing" };
+    },
+    subscribe: () => () => undefined,
+  } as ChiliDesktopApi;
+  const owner = createElectronTransport(api, "project-a");
+  const activating = owner.activateProject!("project-a");
+  const reading = owner.readResult!("output/report.md");
+  await Promise.resolve();
+  expect(calls).toEqual([{ type: "workspace.activate", id: "project-a", projectId: "project-a" }]);
+  selection.resolve({ workspace: "/a", sidecar: { phase: "healthy", attempt: 0 }, queuedBySession: {} });
+  await activating;
+  expect(await reading).toEqual({ status: "unavailable", reason: "missing" });
+  expect(calls.at(-1)).toEqual({ type: "result.read", path: "output/report.md", projectId: "project-a" });
+});
+
 test("forwards review settings and reviewer reset with the selected permission mode", async () => {
   const calls: DesktopRequest[] = [];
   const api = {
@@ -61,6 +83,18 @@ test("forwards review settings and reviewer reset with the selected permission m
     },
     { type: "permissions.set", projectId: "project-a", profile: "auto-review", reviewerModel: null },
     { type: "permissions.set", projectId: "project-a", profile: "full-access" },
+  ]);
+});
+
+test("explicit MCP connect and disconnect are bound to the initiating project and session", async () => {
+  const calls: DesktopRequest[] = [];
+  const api = { invoke: async (request: DesktopRequest) => { calls.push(request); return {}; }, subscribe: () => () => undefined } as ChiliDesktopApi;
+  const owner = createElectronTransport(api, "project-a");
+  await owner.connectMcp!("MiniMax", "session-a");
+  await owner.disconnectMcp!("MiniMax", "session-a");
+  expect(calls).toEqual([
+    { type: "mcp.connect", server: "MiniMax", sessionId: "session-a", projectId: "project-a" },
+    { type: "mcp.disconnect", server: "MiniMax", sessionId: "session-a", projectId: "project-a" },
   ]);
 });
 

@@ -55,6 +55,8 @@ export function createElectronTransport(api: ChiliDesktopApi, projectId?: string
     setPermission: (profile, options) => invoke({ type: "permissions.set", profile, ...options }),
     setDelegation: (sessionId, policy) => invoke({ type: "session.delegation.set", sessionId, policy }),
     reloadMcp: (sessionId) => invoke({ type: "mcp.reload", ...(sessionId ? { sessionId } : {}) }),
+    connectMcp: (server, sessionId) => invoke({ type: "mcp.connect", server, ...(sessionId ? { sessionId } : {}) }),
+    disconnectMcp: (server, sessionId) => invoke({ type: "mcp.disconnect", server, ...(sessionId ? { sessionId } : {}) }),
     send: async (sessionId, text, mode) => {
       const key = JSON.stringify([projectId, sessionId, mode]);
       let pending = pendingSubmissions.get(key);
@@ -78,6 +80,7 @@ export function createElectronTransport(api: ChiliDesktopApi, projectId?: string
       sessionId,
       ...(turnId ? { turnId } : {}),
     }),
+    readResult: (path) => invokeAfterWorkspaceSelection({ type: "result.read", path }),
     subscribe: (listener) => api.subscribe(listener),
   };
 }

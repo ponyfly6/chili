@@ -49,8 +49,8 @@ function ProjectGroup({ project, active, selectedSessionId, revealKey, disabled,
         aria-expanded={expanded} aria-controls={contentId}
         disabled={disabled} title={project.path} onClick={() => { if (active) toggle(); else { setInitialLimit(SESSION_PAGE_SIZE); activate(); } }}>
         <span className="project-name"><strong>{name}</strong></span>
-        {project.attentionCount > 0 ? <span className="project-badge attention" title="Tasks need your attention">{project.attentionCount}</span>
-          : project.runningCount > 0 ? <span className="project-badge running" title="Running in this project">{project.runningCount}</span>
+        {project.attentionCount > 0 ? <span className="project-badge attention" title={`${project.attentionCount} 个会话需要你处理`}>待处理 {project.attentionCount}</span>
+          : project.runningCount > 0 ? <span className="project-badge running" title={`${project.runningCount} 个会话正在处理`}>处理中 {project.runningCount}</span>
             : <span className={`mini-status phase-${project.phase}`} aria-label={project.phase} />}
       </button>
       {active ? <button className="icon-button directory-new" type="button" aria-label={`在 ${name} 新建会话`} disabled={disabled}
@@ -58,9 +58,11 @@ function ProjectGroup({ project, active, selectedSessionId, revealKey, disabled,
     </div>
     <div id={contentId} hidden={!expanded}>
       {expanded ? active ? children(initialLimit) : <div className="project-task-preview">
-        {recentTasks.slice(0, SESSION_PAGE_SIZE).map((task) => <button key={task.id}
+        {recentTasks.slice(0, SESSION_PAGE_SIZE).map((task) => <button key={task.id} className="project-task-row"
           type="button" disabled={disabled} title={task.title} aria-label={`Open ${task.title} in ${name}`}
-          onClick={() => { setInitialLimit(SESSION_PAGE_SIZE); activate(task.id); }}>{task.title}</button>)}
+          onClick={() => { setInitialLimit(SESSION_PAGE_SIZE); activate(task.id); }}>
+          <span className="project-task-dot" aria-hidden="true" /><span className="project-task-title">{task.title}</span>
+        </button>)}
         {project.tasksLoaded && recentTasks.length === 0 && project.recentTasks.length < 8 ? <span>还没有会话</span> : null}
         {!project.tasksLoaded || recentTasks.length > SESSION_PAGE_SIZE || project.recentTasks.length === 8 ? <button className="session-list-more" type="button"
           disabled={disabled} onClick={() => { setInitialLimit(project.tasksLoaded ? SESSION_PAGE_SIZE * 2 : SESSION_PAGE_SIZE); activate(); }}>

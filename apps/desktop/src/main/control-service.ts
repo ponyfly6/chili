@@ -20,6 +20,8 @@ import type {
 import { safeDesktopErrorMessage } from "../shared/safe-error.js";
 import { DetachedProcessGroupRegistry } from "./detached-process-group-registry.js";
 import { desktopDiff } from "./git-diff.js";
+import { readDesktopResult } from "./result-reader.js";
+import { issueResultPreview } from "./result-preview-protocol.js";
 import type { SidecarManager } from "./sidecar-manager.js";
 import { projectRendererRuntimeEvent } from "./renderer-event-projection.js";
 
@@ -450,6 +452,15 @@ export class DesktopControlService {
 
     if (this.workspaceSelectionsPending > 0) throw new Error("Workspace selection is in progress");
 
+    if (request.type === "result.read") {
+      const workspace = this.requireWorkspace();
+      const result = await readDesktopResult(workspace, request.path);
+      if (this.closing || this.requireWorkspace() !== workspace) throw new Error("Result project is no longer selected");
+      return result.status === "ready" && result.kind === "html"
+        ? { ...result, previewUrl: issueResultPreview(workspace, result.path, result.content) }
+        : result;
+    }
+
     if (request.type === "sessions.list") {
       const lease = this.captureClientLease();
       const sessions = await lease.client.listSessions();
@@ -637,6 +648,23 @@ export class DesktopControlService {
         });
         this.assertClientLease(lease);
         return result;
+      };
+      return request.sessionId ? this.withSessionActor(request.sessionId, run) : this.withWorkspaceActor(run);
+    }
+    if (request.type === "mcp.connect" || request.type === "mcp.disconnect") {
+      const lease = this.captureClientLease();
+      const run = async () => {
+        this.assertClientLease(lease);
+        const input = { server: request.server, ...(request.sessionId ? { sessionId: request.sessionId as SessionId } : {}), signal: lease.signal };
+        const result = request.type === "mcp.connect"
+          ? await lease.client.connectMcpServer(input)
+          : await lease.client.disconnectMcpServer(input);
+        this.assertClientLease(lease);
+        return {
+          name: result.name, status: result.status, enabled: result.enabled,
+          ...(result.transport !== undefined ? { transport: result.transport } : {}),
+          ...(result.toolCount !== undefined ? { toolCount: result.toolCount } : {}),
+        };
       };
       return request.sessionId ? this.withSessionActor(request.sessionId, run) : this.withWorkspaceActor(run);
     }
@@ -843,6 +871,21 @@ export class DesktopControlService {
     let inputQueue = await boundedControlRead(lease, (signal) => lease.client.inputQueue({ sessionId, signal }));
     this.assertClientLease(lease);
     this.observeInputQueue(inputQueue);
+    // The queue read above verifies the root's runtime admission. Child identities
+    // cannot call scoped snapshot endpoints, but the workspace recovery snapshot
+    // legally includes their live prefixes. Capture it once before durable reads
+    // so later commits supersede prefixes, then use only authorized hierarchy rows.
+    const activeSnapshot = typeof lease.client.eventSnapshot === "function"
+      ? await lease.client.eventSnapshot({ signal: lease.signal })
+      : undefined;
+    this.assertClientLease(lease);
+    const activeEventsBySession = new Map<string, ChiliEvent[]>();
+    for (const event of activeSnapshot?.events ?? []) {
+      if (!event.sessionId || (event.type !== "message.created" && event.type !== "message.part_stream_snapshot")) continue;
+      const scoped = activeEventsBySession.get(event.sessionId) ?? [];
+      scoped.push(event);
+      activeEventsBySession.set(event.sessionId, scoped);
+    }
     const pendingSessionIds: SessionId[] = [sessionId];
     const discoveredSessionIds = new Set<string>([sessionId]);
     const sessionOrder = new Map<string, number>([[sessionId, 0]]);
@@ -870,18 +913,14 @@ export class DesktopControlService {
       const snapshots = await Promise.all(batch.map(async (candidate): Promise<SessionControlSnapshot> => {
         const [eventWindow, sessionAgents, pendingInputs] = await Promise.all([
           limiter(async () => {
-            // Capture the active prefix before reading durable history. A block
-            // committed during that read then supersedes its captured prefix.
-            const activeSnapshot = typeof lease.client.eventSnapshot === "function"
-              ? await lease.client.eventSnapshot({ sessionId: candidate, signal: lease.signal })
-              : undefined;
+            const activeEvents = activeEventsBySession.get(candidate) ?? [];
             if (lease.client.sessionEventWindow) {
               const history = await lease.client.sessionEventWindow({
                 sessionId: candidate,
                 limit: 5_000,
                 signal: lease.signal,
               });
-              return withActiveMessageParts(history, activeSnapshot?.events ?? []);
+              return withActiveMessageParts(history, activeEvents);
             }
             const sessionEvents = await lease.client.sessionEvents({
               sessionId: candidate,
@@ -903,7 +942,7 @@ export class DesktopControlService {
               bytes: jsonByteLength(sessionEvents),
               pinnedEventIds: [],
               approvalsTruncated: approvalWindow.truncated,
-            }, activeSnapshot?.events ?? []);
+            }, activeEvents);
           }),
           candidate === sessionId ? limiter(async () => {
             try {

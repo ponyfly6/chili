@@ -15,6 +15,7 @@ import { assertDelegatedConversation } from "./delegated-conversation.js";
 import { assertResponsiveNavigation } from "./responsive-navigation.js";
 import { assertTimelineFollowStream, TIMELINE_FOLLOW_PROMPT, TimelineFollowFixture } from "./timeline-follow-stream.js";
 import { assertTimelineNavigation } from "./timeline-navigation.js";
+import { assertDesktopResults, isExpectedResultPreviewDiagnostic } from "./results-preview.js";
 import {
   _electron as electron,
   type ElectronApplication,
@@ -162,6 +163,7 @@ try {
     logStep("launch 1/4: create a conversation through the New Task dialog");
     currentLaunch = await launchDesktop("conversation-create", "fake");
     await assertConversationDesign(currentLaunch.page, artifacts);
+    await assertDesktopResults(currentLaunch.page, workspace, artifacts, currentLaunch.app);
     await createConversationThroughUi(currentLaunch.page);
     await assertConversationAndSettings(currentLaunch.page);
     await assertDesktopAppearance(currentLaunch.page, artifacts);
@@ -339,7 +341,7 @@ async function launchDesktop(
   page.setDefaultTimeout(ACTION_TIMEOUT_MS);
   page.on("pageerror", (error) => rendererErrors.push(error.message));
   page.on("console", (message) => {
-    if (message.type() === "error") rendererErrors.push(message.text());
+    if (message.type() === "error" && !isExpectedResultPreviewDiagnostic(message.text(), message.location().url)) rendererErrors.push(message.text());
   });
   await app.context().tracing.start({ screenshots: true, snapshots: true, sources: true });
   const launch: DesktopLaunch = {
@@ -461,7 +463,7 @@ async function proveCloseAbortRetryInvariant(launch: DesktopLaunch): Promise<voi
   assert.equal(request.aborted, false);
   await expectVisible(launch.page.locator(".timeline")
     .getByText(`Fixture stream opened: ${SLOW_STEER_PROMPT}`, { exact: true }));
-  await expectVisible(launch.page.locator(".composer-buttons")
+  await expectVisible(launch.page.locator(".conversation-activity")
     .getByRole("button", { name: "Stop current turn", exact: true }));
   let closeAttempts = 0;
   launch.closeOverride = async () => {
@@ -562,6 +564,7 @@ async function assertConversationAndSettings(page: Page): Promise<void> {
   const settings = await openDesktopSettings(page);
   await settings.getByRole("button", { name: "权限与协作", exact: true }).click();
   const permissionMode = settings.getByLabel("Task permission profile", { exact: true });
+  await expectVisible(permissionMode);
   assert.deepEqual((await permissionMode.locator("option").evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value))).sort(), ["auto-review", "full-access"]);
   await permissionMode.selectOption("auto-review");
   const reviewInstructions = settings.getByLabel("审查说明", { exact: true });
@@ -625,7 +628,24 @@ async function resolveUserInputThroughUi(page: Page): Promise<void> {
   });
   const inputCard = page.locator(".input-card").filter({ has: inputGroup });
   await expectVisible(inputCard);
-  await inputCard.getByRole("button", { name: /^Continue\b/iu }).click();
+  const primaryChoice = inputCard.getByRole("button", { name: /^Continue\b/iu });
+  const customAnswer = inputCard.getByLabel("Custom answer for Desktop QA", { exact: true });
+  const switchTo = async (title: string) => {
+    await page.locator(".project-active .session-row").filter({ has: page.getByText(title, { exact: true }) }).click();
+    await waitForTaskTitle(page, title);
+  };
+  await primaryChoice.click();
+  await switchTo(CONVERSATION_TITLE);
+  await switchTo(REVIEW_TITLE);
+  assert.equal(await primaryChoice.getAttribute("aria-pressed"), "true", "A question choice survives leaving and returning to its conversation");
+  await customAnswer.fill("保留这个问题的补充说明");
+  await switchTo(CONVERSATION_TITLE);
+  await switchTo(REVIEW_TITLE);
+  assert.equal(await customAnswer.inputValue(), "保留这个问题的补充说明", "Custom question answers survive conversation switches");
+  assert.equal(await primaryChoice.getAttribute("aria-pressed"), "false", "A custom single-choice answer replaces the predefined choice");
+  await primaryChoice.click();
+  assert.equal(await customAnswer.inputValue(), "");
+  await page.screenshot({ path: join(artifacts, "conversation-input-restored.png") });
   await inputCard.getByRole("button", { name: "Submit answer", exact: true }).click();
   await inputCard.waitFor({ state: "hidden" });
   await waitUntil("resolved user-input completion", async () => (
@@ -734,7 +754,7 @@ async function submitSlowInputThroughUi(page: Page): Promise<void> {
 
 async function steerSlowTurnThroughUi(page: Page): Promise<void> {
   const controls = page.locator(".composer-buttons");
-  await expectVisible(controls.getByRole("button", { name: "Stop current turn", exact: true }));
+  await expectVisible(page.locator(".conversation-activity").getByRole("button", { name: "Stop current turn", exact: true }));
   const slowRequestsBefore = provider.requests.filter((request) => request.text.includes(SLOW_STEER_PROMPT)).length;
   const slowAbortsBefore = provider.requests.filter((request) => (
     request.text.includes(SLOW_STEER_PROMPT) && request.aborted
@@ -757,20 +777,20 @@ async function stopSlowTurnThroughUi(page: Page): Promise<void> {
   const slowAbortsBefore = provider.requests.filter((request) => (
     request.text.includes(SLOW_STEER_PROMPT) && request.aborted
   )).length;
-  const stop = page.locator(".composer-buttons")
+  const stop = page.locator(".conversation-activity")
     .getByRole("button", { name: "Stop current turn", exact: true });
   await expectVisible(stop);
   await stop.click();
   await stop.waitFor({ state: "hidden" });
   await waitForProviderAbort(SLOW_STEER_PROMPT, slowAbortsBefore + 1);
-  await expectVisible(page.locator(".conversation-heading-actions")
+  await expectVisible(page.locator(".conversation-activity")
     .getByRole("button", { name: "继续处理", exact: true }));
 }
 
 async function resumeStoppedTaskThroughUi(page: Page): Promise<void> {
   const inputBeforeResume = await latestSlowInput();
   const slowRequestsBefore = provider.requests.filter((request) => request.text.includes(SLOW_STEER_PROMPT)).length;
-  const resume = page.locator(".conversation-heading-actions")
+  const resume = page.locator(".conversation-activity")
     .getByRole("button", { name: "继续处理", exact: true });
   await expectVisible(resume);
   await resume.click();
@@ -779,7 +799,7 @@ async function resumeStoppedTaskThroughUi(page: Page): Promise<void> {
   const resumed = await latestSlowInput();
   assert.equal(resumed.input_id, inputBeforeResume.input_id, "Resume must retain the stopped input identity");
   assert.equal(resumed.resumed, 1);
-  await expectVisible(page.locator(".composer-buttons")
+  await expectVisible(page.locator(".conversation-activity")
     .getByRole("button", { name: "Stop current turn", exact: true }));
 }
 
@@ -789,9 +809,11 @@ async function sendRecoveryFollowUpThroughUi(page: Page): Promise<void> {
   const composer = activeComposer(page);
   await expectVisible(composer);
   await composer.fill(RECOVERY_PROMPT);
-  await page.locator(".composer-buttons").getByRole("button", { name: "Send message", exact: true }).click();
+  await page.locator(".composer-buttons").getByRole("button", { name: "Queue message", exact: true }).click();
   assert.equal(provider.requests.some((request) => request.text.includes(RECOVERY_PROMPT)), false,
     "Input submitted while paused must stay queued");
+  await page.getByRole("list", { name: "待处理消息", exact: true }).getByText(RECOVERY_PROMPT, { exact: true }).waitFor();
+  await page.screenshot({ path: join(artifacts, "conversation-paused-queue.png") });
   await page.getByRole("button", { name: "继续处理", exact: true }).click();
   await waitForProviderRequest(SLOW_STEER_PROMPT, slowRequestsBefore + 1);
   assert.equal((await latestSlowInput()).input_id, inputBeforeResume.input_id);

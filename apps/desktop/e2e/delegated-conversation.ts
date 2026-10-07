@@ -18,6 +18,9 @@ export async function assertDelegatedConversation(page: Page, workspace: string,
   await dialog.getByRole("button", { name: "Create & run", exact: true }).click();
   await dialog.waitFor({ state: "hidden" });
   await page.getByRole("heading", { name: "Delegated conversation E2E", exact: true }).waitFor();
+  // First verify the user's completed response, then inspect the delegated
+  // result and its final runtime state.
+  await page.locator(".timeline").getByText("I read the file and the tool loop works.", { exact: true }).waitFor();
 
   let agentPath: string | undefined;
   const deadline = Date.now() + 30_000;
@@ -30,7 +33,7 @@ export async function assertDelegatedConversation(page: Page, workspace: string,
       const snapshot = await api.invoke({ type: "session.snapshot", sessionId: String(session.id) });
       const agent = snapshot.agents.find((candidate) => candidate.name === "reader");
       if (!agent) return undefined;
-      const completed = snapshot.events.some((event) => event.type === "message.part_added"
+      const completed = snapshot.events.some((event) => (event.type === "message.part_added" || event.type === "message.part_committed")
         && event.sessionId === agent.agentId && event.payload.part.type === "text"
         && event.payload.part.text === "I read the file and the tool loop works.");
       return completed && agent.state === "idle" ? agent.path : undefined;
@@ -38,7 +41,6 @@ export async function assertDelegatedConversation(page: Page, workspace: string,
     if (!agentPath) await delay(100);
   }
   assert.ok(agentPath, "The real delegated read task must complete before inspecting its result");
-  await page.locator(".timeline").getByText("I read the file and the tool loop works.", { exact: true }).waitFor();
   assert.equal(await page.locator(".inspector").count(), 0);
   await page.screenshot({ path: join(artifacts, "delegated-conversation.png") });
 }

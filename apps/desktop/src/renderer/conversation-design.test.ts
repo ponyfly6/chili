@@ -16,7 +16,8 @@ test("first message titles preserve whole Unicode characters and avoid long mult
 });
 
 test("reading preferences recover safely from old or invalid local values", () => {
-  expect(parseReadingPreferences(null)).toEqual({ expandWork: false });
-  expect(parseReadingPreferences({ autoResult: false, expandWork: true })).toEqual({ expandWork: true });
-  expect(parseReadingPreferences({ autoResult: "false", expandWork: 1 })).toEqual({ expandWork: false });
+  expect(parseReadingPreferences({ autoOpenResults: false, expandWork: true })).toEqual({ expandWork: true, autoOpenResults: false });
+  expect(parseReadingPreferences(null)).toEqual({ expandWork: false, autoOpenResults: true });
+  expect(parseReadingPreferences({ autoResult: false, expandWork: true })).toEqual({ expandWork: true, autoOpenResults: true });
+  expect(parseReadingPreferences({ autoResult: "false", expandWork: 1 })).toEqual({ expandWork: false, autoOpenResults: true });
 });

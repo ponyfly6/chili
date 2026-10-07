@@ -156,7 +156,7 @@ try {
     }
     const after = await inspect("observe", pid);
     await switchProject(page, 0);
-    await page.locator(".composer-buttons").getByRole("button", { name: "Stop current turn", exact: true }).click();
+    await page.locator(".conversation-activity").getByRole("button", { name: "Stop current turn", exact: true }).click();
     await waitFor(() => streams.get(`project-process-${mode}-stream-a`)?.aborted === true);
     for (const letter of "bc") assert.equal(streams.get(`project-process-${mode}-stream-${letter}`)?.aborted, false, `Stop A aborted ${letter}`);
     log(`${mode}: Stop A isolated; creating shell child groups in all three projects`);

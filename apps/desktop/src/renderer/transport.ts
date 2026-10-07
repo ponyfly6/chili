@@ -42,6 +42,8 @@ export interface ControlTransport {
   setPermission(profile: RuntimePermissionProfileId, options?: RuntimePermissionUpdateOptions): Promise<DesktopResponseMap["permissions.set"]>;
   setDelegation(sessionId: string, policy: DelegationPolicy): Promise<DesktopResponseMap["session.delegation.set"]>;
   reloadMcp(sessionId?: string): Promise<DesktopResponseMap["mcp.reload"]>;
+  connectMcp?(server: string, sessionId?: string): Promise<DesktopResponseMap["mcp.connect"]>;
+  disconnectMcp?(server: string, sessionId?: string): Promise<DesktopResponseMap["mcp.disconnect"]>;
   send(sessionId: string, text: string, mode: SendMode): Promise<DesktopResponseMap["session.send"]>;
   stop(sessionId: string): Promise<DesktopResponseMap["session.stop"]>;
   sendAgent(sessionId: string, agentId: string, text: string, mode?: SendMode): Promise<DesktopResponseMap["agent.send"]>;
@@ -50,5 +52,6 @@ export interface ControlTransport {
   resolveUserInput(inputId: string, answers: Record<string, string[]>): Promise<DesktopResponseMap["user-input.resolve"]>;
   completeResync(barrierId: string): Promise<DesktopResponseMap["events.resync.complete"]>;
   diff(scope: DiffScope, sessionId: string, turnId?: string): Promise<DesktopResponseMap["diff.get"]>;
+  readResult?(path: string): Promise<DesktopResponseMap["result.read"]>;
   subscribe(listener: (event: DesktopEventEnvelope) => void): () => void;
 }

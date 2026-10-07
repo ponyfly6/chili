@@ -1,7 +1,16 @@
 import { useId, useState, type ReactNode } from "react";
 import type { RuntimeSessionSummary } from "@chili/sdk";
+import { sessionActivity, type SessionActivityInput } from "./sidebar-status.js";
+import "./sidebar-status.css";
 
 export const SESSION_PAGE_SIZE = 5;
+
+export function SessionActivityBadge(props: SessionActivityInput) {
+  const activity = sessionActivity(props);
+  if (!activity) return null;
+  return <span className="session-activity" data-tone={activity.tone} title={activity.description}
+    aria-label={activity.description}>{activity.label}</span>;
+}
 
 export function SessionList({ sessions, selectedId, initialLimit = SESSION_PAGE_SIZE, children }: {
   sessions: readonly RuntimeSessionSummary[];
