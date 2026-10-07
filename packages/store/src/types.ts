@@ -2,6 +2,7 @@ import type {
   RuntimeEvent,
   EventEnvelope,
   Message,
+  MessageId,
   SessionId,
   ToolCallId,
   ToolCallStatus,
@@ -168,6 +169,10 @@ export interface EventStore {
   runtimeSnapshot?(query?: { sessionId?: SessionId; maxBytes?: number }): Promise<RuntimeStateSnapshot>;
   sessions(): Promise<SessionRow[]>;
   messages(sessionId: SessionId): Promise<Message[]>;
+  /** Message role/text never establishes provenance; consult its durable accepted input. */
+  sessionInputForMessage?(sessionId: SessionId, messageId: MessageId): StoredSessionInput | undefined;
+  /** Durable queue revision also covers accepted inputs not yet promoted to messages. */
+  sessionInputQueue?(sessionId: SessionId): RuntimeInputQueue;
   pendingApprovals(sessionId?: SessionId, limit?: number): Promise<ApprovalRow[]>;
 }
 

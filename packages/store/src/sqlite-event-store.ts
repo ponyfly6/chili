@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { SessionInputConflictError, SessionInputRepository, type SessionInputMutation, type SessionInputMutationOptions, type SessionInputMutationResult } from "./session-inputs.js";
 import type {
+  ApprovalId,
   ApprovalEvent,
   RuntimeEvent,
   EventEnvelope,
@@ -12,6 +13,7 @@ import type {
   SessionEvent,
   TimestampMs,
   ToolEvent,
+  ToolCallId,
   TurnId,
 } from "@chili/protocol";
 import {
@@ -241,6 +243,8 @@ export class SqliteEventStore
   sessionInput(sessionId: SessionId, submissionId: string) { return this.inputs.get(sessionId, submissionId); }
 
   sessionInputById(sessionId: SessionId, inputId: string) { return this.inputs.getById(sessionId, inputId); }
+
+  sessionInputForMessage(sessionId: SessionId, messageId: MessageId) { return this.inputs.forMessage(sessionId, messageId); }
 
   mutateSessionInputs(input: SessionInputMutation, options?: SessionInputMutationOptions): SessionInputMutationResult {
     const result = this.inputs.mutate(input, options);
@@ -1087,6 +1091,69 @@ export class SqliteEventStore
             reason,
           },
         });
+      }
+
+      // Approval waiters belonged to the interrupted process. Preserve their
+      // audit history, but never present a stale request as a live decision or
+      // carry it forward as authority for a future execution. This also closes
+      // requests left behind by older recovery code in already terminal sessions.
+      const approvals = this.db.query<{
+        id: string;
+        session_id: string | null;
+        call_id: string | null;
+        tool_status: string | null;
+      }, { now: number; staleBefore: number }>(
+        `select approval.id, approval.session_id, approval.call_id, tool.status as tool_status
+           from approvals approval
+           left join tool_calls tool
+             on tool.id = approval.call_id and tool.session_id = approval.session_id
+          where approval.status = 'pending'
+            and approval.created_at < $staleBefore
+            and not exists (
+              select 1 from events event
+               where event.session_id = approval.session_id and event.time >= $staleBefore
+            )
+            and not exists (
+              select 1 from session_creation_claims creation
+               where creation.session_id = approval.session_id and creation.lease_expires_at > $now
+            )
+            and not exists (
+              select 1 from session_run_claims run
+               where run.session_id = approval.session_id and run.lease_expires_at > $now
+            )
+          order by approval.created_at, approval.id`,
+      ).all({ now: Number(now), staleBefore: input.staleBefore });
+      const finishedCalls = new Set<string>();
+      for (const approval of approvals) {
+        const sessionId = approval.session_id as SessionId | null;
+        if (sessionId && (this.ownedCreationClaims.has(sessionId) || this.ownedRunClaims.has(sessionId))) continue;
+        const base = { time: now, ...(sessionId ? { sessionId } : {}) };
+        events.push({
+          ...base,
+          id: input.createId("event"),
+          type: "approval.resolved",
+          payload: {
+            approvalId: approval.id as ApprovalId,
+            decision: "deny",
+            feedback: "Approval expired because its execution was interrupted. A new execution must be reviewed again.",
+          },
+        });
+        if (sessionId && approval.call_id && !finishedCalls.has(approval.call_id)
+          && ["pending", "running", "waiting_for_approval"].includes(approval.tool_status ?? "")) {
+          finishedCalls.add(approval.call_id);
+          events.push({
+            ...base,
+            sessionId,
+            id: input.createId("event"),
+            type: "tool.call_finished",
+            payload: {
+              callId: approval.call_id as ToolCallId,
+              status: "failed",
+              synthetic: true,
+              error: "Execution was interrupted while awaiting approval. Inspect current state before retrying.",
+            },
+          });
+        }
       }
 
       if (events.length > 0) this.writeTransactionEvents(events);

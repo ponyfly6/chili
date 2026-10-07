@@ -138,6 +138,7 @@ export const SQLITE_SCHEMA = [
     unique(session_id, submission_id)
   )`,
   `create index if not exists session_inputs_pending on session_inputs(session_id, state, sequence)`,
+  `create index if not exists session_inputs_message on session_inputs(session_id, message_id)`,
   `create table if not exists session_input_revocations (
     session_id text not null,
     source text not null,

@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type {
-  RuntimeEvent, MessageId, PartId, RuntimeInputMode, RuntimeInputOutcome,
+  ApprovalId, RuntimeEvent, MessageId, PartId, RuntimeInputMode, RuntimeInputOutcome,
   RuntimeInputQueue, RuntimeSessionInput, SessionId, TimestampMs, TurnId,
   MessageImageContent,
 } from "@chili/protocol";
@@ -45,6 +45,8 @@ export interface SessionInputStore {
   sessionInputQueue(sessionId: SessionId): RuntimeInputQueue;
   sessionInput(sessionId: SessionId, submissionId: string): StoredSessionInput | undefined;
   sessionInputById(sessionId: SessionId, inputId: string): StoredSessionInput | undefined;
+  /** Trusted accepted-input provenance, including inputs that have already settled. */
+  sessionInputForMessage?(sessionId: SessionId, messageId: MessageId): StoredSessionInput | undefined;
   mutateSessionInputs(input: SessionInputMutation, options?: SessionInputMutationOptions): SessionInputMutationResult;
 }
 
@@ -85,6 +87,13 @@ export class SessionInputRepository {
     const row = this.db.query<InputRow, [string, string]>(
       "select * from session_inputs where session_id = ? and input_id = ?",
     ).get(sessionId, inputId);
+    return row ? storedInput(row) : undefined;
+  }
+
+  forMessage(sessionId: SessionId, messageId: MessageId): StoredSessionInput | undefined {
+    const row = this.db.query<InputRow, [string, string]>(
+      "select * from session_inputs where session_id = ? and message_id = ?",
+    ).get(sessionId, messageId);
     return row ? storedInput(row) : undefined;
   }
 
@@ -264,6 +273,11 @@ export class SessionInputRepository {
             for (const tool of tools) events.push({ id: crypto.randomUUID(), type: "tool.call_finished", sessionId, time: time as TimestampMs, payload: {
               callId: tool.id as import("@chili/protocol").ToolCallId, status: "failed", synthetic: true,
               error: "Execution interrupted; the external outcome is unknown. Inspect current state before retrying this operation.",
+            } });
+            const approvals = this.db.query<{ id: string }, [string]>("select id from approvals where session_id = ? and status = 'pending'").all(sessionId);
+            for (const approval of approvals) events.push({ id: crypto.randomUUID(), type: "approval.resolved", sessionId, time: time as TimestampMs, payload: {
+              approvalId: approval.id as ApprovalId, decision: "deny",
+              feedback: "Approval expired because its execution was interrupted. A new execution must be reviewed again.",
             } });
           }
           const remote = this.db.query(`update session_inputs set state = 'settled', outcome = 'cancelled', error = 'Remote authorization must be renewed after runtime recovery', revision = revision + 1, updated_at = ? where session_id = ? and state = 'pending' and source like 'remote:%'`).run(time, sessionId);

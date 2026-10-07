@@ -32,6 +32,7 @@ export class ObservableEventStore
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
   readonly eventReplayBoundary?: NonNullable<EventStore["eventReplayBoundary"]>;
   readonly runtimeSnapshot?: NonNullable<EventStore["runtimeSnapshot"]>;
+  readonly sessionInputForMessage?: NonNullable<EventStore["sessionInputForMessage"]>;
 
   constructor(
     private readonly inner: EventStore,
@@ -41,6 +42,7 @@ export class ObservableEventStore
     // explicitly instead of fabricating an incomplete recovery snapshot.
     if (inner.eventReplayBoundary) this.eventReplayBoundary = (query) => inner.eventReplayBoundary!(query);
     if (inner.runtimeSnapshot) this.runtimeSnapshot = (query) => inner.runtimeSnapshot!(query);
+    if (inner.sessionInputForMessage) this.sessionInputForMessage = (sessionId, messageId) => inner.sessionInputForMessage!(sessionId, messageId);
   }
 
   async append(event: RuntimeEvent, options?: EventAppendOptions): Promise<void> {
