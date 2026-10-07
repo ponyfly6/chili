@@ -1,3 +1,4 @@
+import { BUILTIN_PROVIDERS } from "@chili/providers";
 import type { CliModelName, CliReasoningLevel } from "./model.js";
 
 export interface CliArgs {
@@ -211,6 +212,10 @@ export function usage(): string {
     "  bun run chili -- --model fake \"hello\"",
     "  bun run chili -- --model deepseek \"hello\"",
     "  bun run chili -- --model kimi \"hello\"",
+    "  bun run chili -- --model alibaba \"hello\"",
+    "  bun run chili -- --model doubao \"hello\"",
+    "  bun run chili -- --model anthropic \"hello\"",
+    "  bun run chili -- --provider openai \"hello\"",
     "  bun run chili -- --model glm-5.3 \"hello\"",
     "  bun run chili -- --model grok \"hello\"",
     "  bun run chili -- --model xai/grok-4.7:high \"hello\"",
@@ -226,7 +231,8 @@ export function usage(): string {
     "  --host <host>       Runtime server host, default 127.0.0.1",
     "  --port <port>       Runtime server port for serve, default 4777",
     "  --resume, -r <id>   Resume a session",
-    "  --provider <name>   Provider name: minimax | deepseek | kimi | zai | xai | grok | codex | openai-codex | codex-api",
+    `  --provider <name>   Provider name: ${Object.keys(BUILTIN_PROVIDERS).join(" | ")}`,
+    `                      Aliases: ${Object.entries(BUILTIN_PROVIDERS).flatMap(([provider, definition]) => definition.aliases.map((alias) => `${alias}=${provider}`)).join(", ")}`,
     "  --model <pattern>   Provider alias, provider/model, or bare model id; default last selected model, then minimax",
     "  --thinking <level>  Thinking level: off | minimal | low | medium | high | xhigh | max | ultra",
     "  --reasoning <level> Alias for --thinking",

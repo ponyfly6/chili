@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import type { Message, MessageId, PartId, SessionId, TimestampMs } from "@chili/protocol";
-import { createKimiModel } from "./kimi.js";
-import { createMiniMaxM3Model } from "./minimax.js";
+import { createKimiModel } from "./vendors/kimi/provider.js";
+import { createMiniMaxM3Model } from "./vendors/minimax/provider.js";
 import { findKnownModel, listKnownModels } from "./models.js";
-import { resolveChatCompletionsCompatibility } from "./compat.js";
+import { resolveChatCompletionsCompatibility } from "./protocols/compat.js";
 import { resolveModelSelectionPattern } from "./model-selection.js";
 import type { BuiltinProviderId } from "./provider-definition.js";
 import { createRegisteredProviderModel, resolveProviderModelOptions } from "./provider-registry.js";

@@ -452,6 +452,7 @@ test("CLI ChatGPT Codex ignores API env and uses OAuth endpoint and headers", as
     type: "reasoning_item",
     output: {
       apiFamily: "openai-responses",
+      source: { provider: "openai-codex", connection: expect.any(String) },
       outputIndex: 0,
       item: {
         id: "reasoning_cli",

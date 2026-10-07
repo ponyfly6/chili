@@ -1,5 +1,5 @@
 import type { AssistantMessagePhase, Message, PersistedModelOutput, PreparedModelIdentity, ServiceTier } from "@chili/protocol";
-import type { ModelCompatibilityOverrides } from "./compat.js";
+import type { ModelCompatibilityOverrides } from "./protocols/compat.js";
 
 export type ModelApiFamily = "anthropic-messages" | "openai-completions" | "openai-responses" | (string & {});
 

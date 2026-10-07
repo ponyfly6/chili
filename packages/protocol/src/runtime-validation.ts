@@ -1217,6 +1217,11 @@ function validatePersistedModelOutput(value: unknown, path: string): void {
   if (output.outputIndex !== undefined) {
     parseRuntimeNonNegativeInteger(output.outputIndex, `${path}.outputIndex`);
   }
+  if (output.source !== undefined) {
+    const source = parseRuntimeRecord(output.source, `${path}.source`);
+    parseRuntimeString(source.provider, `${path}.source.provider`);
+    parseRuntimeString(source.connection, `${path}.source.connection`);
+  }
   parseRuntimeRecord(output.item, `${path}.item`);
 }
 

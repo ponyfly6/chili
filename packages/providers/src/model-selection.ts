@@ -146,14 +146,14 @@ export function resolveModelSelectionPattern(
 }
 
 function canonicalizeOfficialModelAlias(pattern: string, defaultProvider: string | undefined): string {
-  const match = /^(?:(openai-codex|codex-api)\/)?gpt-5\.6(.*)$/i.exec(pattern);
+  const match = /^(?:(openai-codex|codex-api|openai)\/)?gpt-5\.6(.*)$/i.exec(pattern);
   if (!match) return pattern;
   const suffix = match[2] ?? "";
   if (suffix && !suffix.startsWith(":")) return pattern;
 
   const explicitProvider = match[1]?.toLowerCase();
   const provider = explicitProvider
-    ?? (defaultProvider === OPENAI_CODEX_PROVIDER_ID || defaultProvider === CODEX_API_PROVIDER_ID
+    ?? (defaultProvider === OPENAI_CODEX_PROVIDER_ID || defaultProvider === CODEX_API_PROVIDER_ID || defaultProvider === "openai"
       ? defaultProvider
       : undefined);
   if (!provider) return pattern;

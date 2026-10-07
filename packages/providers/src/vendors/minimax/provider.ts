@@ -1,0 +1,135 @@
+import { MINIMAX_DEFINITION, MINIMAX_ENVIRONMENT } from "./config.js";
+import type { ServiceTier } from "@chili/protocol";
+import type { ChiliModelProvider, ModelDescriptor, ReasoningLevel } from "../../types.js";
+import {
+  AnthropicCompatibleModel,
+  type AnthropicAuthScheme,
+  type AnthropicCompatibleModelOptions,
+} from "../../protocols/messages.js";
+import type { ProviderBackpressureCoordinator } from "../../runtime/backpressure.js";
+import { type EnvironmentSource, readEnvironmentSpec } from "../../env.js";
+import { findDefaultKnownModel, findKnownModel, listKnownModels } from "../../models.js";
+import {
+  MINIMAX_ANTHROPIC_BASE_URL,
+  MINIMAX_M3_MODEL,
+  MINIMAX_PROVIDER_ID,
+} from "./models.js";
+
+export { MINIMAX_ANTHROPIC_BASE_URL, MINIMAX_M3_MODEL, MINIMAX_M31_FLASH_PREVIEW_MODEL, MINIMAX_PROVIDER_ID } from "./models.js";
+
+export interface MiniMaxModelOptions {
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  maxTokens?: number;
+  temperature?: number;
+  fetch?: typeof fetch;
+  headers?: Record<string, string>;
+  authScheme?: AnthropicAuthScheme;
+  reasoning?: boolean;
+  reasoningEffort?: ReasoningLevel;
+  serviceTier?: ServiceTier;
+  backpressureCoordinator?: ProviderBackpressureCoordinator;
+  env?: EnvironmentSource;
+}
+
+
+export class MiniMaxAnthropicProvider implements ChiliModelProvider {
+  readonly id = MINIMAX_PROVIDER_ID;
+  readonly name = "MiniMax";
+
+  constructor(private readonly options: MiniMaxModelOptions = {}) {}
+
+  models(): readonly ModelDescriptor[] {
+    const models = listKnownModels(this.id);
+    const defaultModel = this.defaultModel();
+    if (models.some((model) => model.model === defaultModel)) {
+      return models.map((model) => {
+        const descriptor: ModelDescriptor = { ...model };
+        if (model.model === defaultModel) {
+          descriptor.baseUrl = this.defaultBaseUrl();
+          descriptor.default = true;
+        } else {
+          delete descriptor.default;
+        }
+        return descriptor;
+      });
+    }
+
+    const fallback = findDefaultKnownModel(this.id);
+    const descriptor: ModelDescriptor = {
+      provider: this.id,
+      model: defaultModel,
+      displayName: defaultModel,
+      apiFamily: fallback?.apiFamily ?? "anthropic-messages",
+      baseUrl: this.defaultBaseUrl(),
+      default: true,
+    };
+    if (fallback?.capabilities) descriptor.capabilities = fallback.capabilities;
+    if (fallback?.compatibility) descriptor.compatibility = fallback.compatibility;
+    if (fallback?.inputCapabilities) descriptor.inputCapabilities = fallback.inputCapabilities;
+    if (fallback?.contextWindowTokens !== undefined) descriptor.contextWindowTokens = fallback.contextWindowTokens;
+    if (fallback?.maxOutputTokens !== undefined) descriptor.maxOutputTokens = fallback.maxOutputTokens;
+    return [descriptor, ...models.map(withoutDefaultFlag)];
+  }
+
+  getModel(model?: string): AnthropicCompatibleModel {
+    return createMiniMaxM3Model({ ...this.options, ...(model ? { model } : {}) });
+  }
+
+  private defaultModel(): string {
+    const env = readEnvironmentSpec(MINIMAX_ENVIRONMENT, this.options.env);
+    return this.options.model ?? env.model ?? MINIMAX_M3_MODEL;
+  }
+
+  private defaultBaseUrl(): string {
+    const env = readEnvironmentSpec(MINIMAX_ENVIRONMENT, this.options.env);
+    const descriptor = findKnownModel(this.id, this.defaultModel()) ?? findDefaultKnownModel(this.id);
+    return this.options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? MINIMAX_ANTHROPIC_BASE_URL;
+  }
+}
+
+function withoutDefaultFlag(model: ModelDescriptor): ModelDescriptor {
+  const descriptor: ModelDescriptor = { ...model };
+  delete descriptor.default;
+  return descriptor;
+}
+
+export function createMiniMaxProvider(options: MiniMaxModelOptions = {}): MiniMaxAnthropicProvider {
+  return new MiniMaxAnthropicProvider(options);
+}
+
+export function createMiniMaxRouter(options: MiniMaxModelOptions = {}): AnthropicCompatibleModel {
+  return createMiniMaxM3Model(options);
+}
+
+export function createMiniMaxM3Model(options: MiniMaxModelOptions = {}): AnthropicCompatibleModel {
+  const env = readEnvironmentSpec(MINIMAX_ENVIRONMENT, options.env);
+  const model = options.model ?? env.model ?? MINIMAX_M3_MODEL;
+  const descriptor = findKnownModel(MINIMAX_PROVIDER_ID, model) ?? findDefaultKnownModel(MINIMAX_PROVIDER_ID);
+  const modelOptions: AnthropicCompatibleModelOptions = {
+    provider: MINIMAX_PROVIDER_ID,
+    model,
+    baseUrl: options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? MINIMAX_ANTHROPIC_BASE_URL,
+    apiKey: options.apiKey ?? env.apiKey ?? "",
+    authScheme: options.authScheme ?? "bearer",
+    reasoning: options.reasoning ?? true,
+    maxTokens: options.maxTokens ?? MINIMAX_DEFINITION.defaultRequestMaxTokens,
+  };
+  if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
+  if (descriptor?.compatibility?.messages) modelOptions.compatibility = descriptor.compatibility.messages;
+  if (options.reasoningEffort !== undefined) modelOptions.reasoningEffort = options.reasoningEffort;
+  if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
+  if (options.serviceTier !== undefined) modelOptions.serviceTier = options.serviceTier;
+  if (options.fetch !== undefined) modelOptions.fetch = options.fetch;
+  if (options.headers !== undefined) modelOptions.headers = options.headers;
+  if (options.backpressureCoordinator !== undefined) {
+    modelOptions.backpressureCoordinator = options.backpressureCoordinator;
+  }
+  return new AnthropicCompatibleModel(modelOptions);
+}
+
+/** @deprecated Use createMiniMaxM3Model. */
+export function createMiniMaxM27HighspeedModel(options: MiniMaxModelOptions = {}): AnthropicCompatibleModel {
+  return createMiniMaxM3Model(options);
+}

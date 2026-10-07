@@ -75,7 +75,15 @@ export interface ReasoningPart extends BasePart {
 export interface PersistedModelOutput {
   apiFamily: string;
   outputIndex?: number;
+  source?: PersistedModelOutputSource;
   item: Record<string, unknown>;
+}
+
+/** Identifies the connection that can safely consume opaque provider output. */
+export interface PersistedModelOutputSource {
+  provider: string;
+  /** Irreversible fingerprint of the endpoint and stable account or effective authorization; never a raw secret. */
+  connection: string;
 }
 
 export interface ToolCallPart extends BasePart {

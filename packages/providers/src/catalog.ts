@@ -1,5 +1,5 @@
 import { BUILTIN_PROVIDERS } from "./provider-definition.js";
-import type { AuthStatus, FileAuthStorage } from "./auth.js";
+import type { AuthStatus, FileAuthStorage } from "./auth/storage.js";
 import {
   findConfiguredEnvironmentNames,
   isAbsoluteHttpUrl,
@@ -62,7 +62,7 @@ export function getProviderCatalogStatus(
   const configuredEnvironmentNames = findConfiguredEnvironmentNames(provider, env);
   const environmentConfigured = provider === CODEX_API_PROVIDER_ID
     ? Boolean(environment.apiKey?.trim()) && isAbsoluteHttpUrl(environment.baseUrl)
-    : environment.apiKey !== undefined;
+    : Boolean(environment.apiKey?.trim());
   const authStatus = options.authStatus;
   const storedAuthConfigured = provider === OPENAI_CODEX_PROVIDER_ID
     ? authStatus?.configured === true && authStatus.type === "oauth"

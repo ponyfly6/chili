@@ -1,16 +1,21 @@
+import type { FileAuthStorage } from "./auth/storage.js";
 import type { ServiceTier } from "@chili/protocol";
-import type { FileAuthStorage } from "./auth.js";
-import { createMiniMaxRouter } from "./minimax.js";
-import { createDeepSeekRouter } from "./deepseek.js";
-import { createKimiRouter } from "./kimi.js";
-import { createZaiRouter } from "./zai.js";
-import { createXaiRouter } from "./xai.js";
-import { createCodexApiRouter, createOpenAICodexRouter } from "./openai-codex.js";
 import { readProviderEnvironment, snapshotProviderEnvironment, type EnvironmentSource } from "./env.js";
 import { clampModelReasoningLevel } from "./model-selection.js";
 import { findDefaultKnownModel, findKnownModel } from "./models.js";
 import { BUILTIN_PROVIDERS, canonicalizeProviderModel, type BuiltinProviderId } from "./provider-definition.js";
 import { REASONING_LEVELS, type ChiliModel, type ReasoningLevel } from "./types.js";
+import { createAlibabaRouter } from "./vendors/alibaba/provider.js";
+import { createAnthropicRouter } from "./vendors/anthropic/provider.js";
+import { createDeepSeekRouter } from "./vendors/deepseek/provider.js";
+import { createDoubaoRouter } from "./vendors/doubao/provider.js";
+import { createKimiRouter } from "./vendors/kimi/provider.js";
+import { createMiniMaxRouter } from "./vendors/minimax/provider.js";
+import { createCodexApiRouter, createOpenAICodexRouter } from "./vendors/openai/index.js";
+import { createOpenAIModel } from "./vendors/openai/provider.js";
+import { createXaiRouter } from "./vendors/xai/provider.js";
+import { createZhipuRouter } from "./vendors/zhipu/domestic-provider.js";
+import { createZaiRouter } from "./vendors/zhipu/provider.js";
 
 /** Shared construction options; protocol-specific wire options stay in the adapters. */
 export interface ProviderModelOptions {
@@ -45,6 +50,11 @@ const factories = {
   xai: createXaiRouter,
   "openai-codex": createOpenAICodexRouter,
   "codex-api": createCodexApiRouter,
+  alibaba: createAlibabaRouter,
+  doubao: createDoubaoRouter,
+  anthropic: createAnthropicRouter,
+  zhipu: createZhipuRouter,
+  openai: createOpenAIModel,
 } satisfies Record<BuiltinProviderId, (options: ProviderModelOptions) => ChiliModel>;
 
 export function assertProviderConnectionOptions(provider: BuiltinProviderId, input: ProviderModelOptions): void {
@@ -66,15 +76,18 @@ export function resolveProviderModelOptions(
   const selectedModel = input.model ?? environment.model ?? findDefaultKnownModel(provider)?.model;
   if (!selectedModel) throw new Error(`No default model registered for ${provider}`);
   const model = canonicalizeProviderModel(provider, selectedModel);
+  const descriptor = findKnownModel(provider, model);
+  const defaultMaxTokens = descriptor
+    ? Math.min(definition.defaultRequestMaxTokens, descriptor.maxOutputTokens ?? Infinity)
+    : definition.unknownModelRequestMaxTokens ?? definition.defaultRequestMaxTokens;
   const options: ResolvedProviderModelOptions = {
-    ...input, model, env, maxTokens: input.maxTokens ?? definition.defaultRequestMaxTokens,
+    ...input, model, env, maxTokens: input.maxTokens ?? defaultMaxTokens,
     ...(input.headers ? { headers: { ...input.headers } } : {}),
   };
   // Keep environment credentials in the snapshot, rather than disguising them as
   // explicit options. Adapters validate their provenance (notably legacy OAuth tokens).
   if (!definition.serviceTier) delete options.serviceTier;
   else if (controls.serviceTier !== undefined) options.serviceTier = controls.serviceTier;
-  const descriptor = findKnownModel(provider, model);
   const requested = controls.reasoningLevel;
   const mapped = requested && requested !== "off" ? descriptor?.compatibility?.chatCompletions?.reasoningEffortMap?.[requested] : undefined;
   const level = requested ? clampModelReasoningLevel(

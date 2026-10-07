@@ -120,6 +120,10 @@ test("model references canonicalize the official GPT alias", () => {
     provider: "codex-api",
     model: "gpt-5.6-sol",
   });
+  expect(findExactModelSelection("openai/gpt-5.6", candidates)).toEqual({
+    provider: "openai",
+    model: "gpt-5.6-sol",
+  });
   expect(parseModelCommand("codex/gpt-5.6:high", candidates)).toEqual({
     selection: { provider: "openai-codex", model: "gpt-5.6-sol" },
     reasoningLevel: "high",
@@ -143,6 +147,36 @@ test("Grok aliases select xAI and expose image and reasoning controls", () => {
   });
   expect(grok?.inputCapabilities).toEqual(["text", "image"]);
   expect(grok?.reasoningLevels).toEqual(["low", "medium", "high", "xhigh"]);
+});
+
+test("vendor commands and search use the same aliases as Host routing", () => {
+  const candidates = defaultModelCandidates();
+  const aliases = [
+    ["qwen", "alibaba"], ["dashscope", "alibaba"], ["aliyun", "alibaba"],
+    ["ark", "doubao"], ["volcengine", "doubao"], ["bytedance", "doubao"],
+    ["moonshot", "kimi"], ["glm", "zai"], ["z.ai", "zai"],
+    ["bigmodel", "zhipu"], ["智谱", "zhipu"],
+  ] as const;
+  for (const [alias, provider] of aliases) {
+    const selected = candidates.find((model) => model.provider === provider && model.default);
+    expect(selected).toBeDefined();
+    const selection = { provider, model: selected!.model };
+    expect(parseModelCommand(alias, candidates)).toEqual({ selection });
+    expect(parseModelCommand(`${alias}/${selected!.model}:high`, candidates)).toEqual({ selection, reasoningLevel: "high" });
+    expect(filterModelCandidates(candidates, alias, undefined).some((model) => model.provider === provider)).toBe(true);
+  }
+});
+
+test("official APIs remain distinct selectable connections in the picker", () => {
+  const candidates = defaultModelCandidates();
+  for (const provider of ["openai", "anthropic", "openai-codex", "codex-api"]) {
+    const selected = candidates.find((model) => model.provider === provider && model.default);
+    expect(selected).toBeDefined();
+    expect(parseModelCommand(provider, candidates)).toEqual({ selection: { provider, model: selected!.model } });
+    expect(findExactModelSelection(`${provider}/${selected!.model}`, candidates)).toEqual({ provider, model: selected!.model });
+  }
+  expect(findExactModelSelection("gpt-6.1-sol", candidates)).toBeUndefined();
+  expect(parseModelCommand("openai/gpt-unsupported", candidates)).toEqual({ query: "openai/gpt-unsupported" });
 });
 
 test("unknown custom models retain the legacy reasoning fallback without claiming fast service", () => {

@@ -174,6 +174,14 @@ test("MiniMax M3 env precedence matches the provider and supports MINIMAX_BASE_U
   });
 });
 
+test("legacy MiniMax router does not take another vendor's credentials", () => {
+  expect(() => createMiniMaxM3Router({ env: {
+    ANTHROPIC_API_KEY: "anthropic-only-key",
+    ANTHROPIC_BASE_URL: "https://anthropic.invalid",
+    ANTHROPIC_MODEL: "claude-custom",
+  } })).toThrow("requires an API key");
+});
+
 test("passes AbortSignal through to the provider fetch", async () => {
   const controller = new AbortController();
   let signal: AbortSignal | null | undefined;

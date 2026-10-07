@@ -115,6 +115,48 @@ test("event validation accepts multiline text and rejects nested projection pois
   })).toThrow("event.payload.status");
 });
 
+test("persisted model output accepts optional connection provenance and rejects malformed sources", () => {
+  const eventWithSource = (source: unknown) => ({
+    id: "event_reasoning_source",
+    type: "message.part_added",
+    time: 1,
+    payload: {
+      messageId: "message_1",
+      part: {
+        id: "part_1",
+        messageId: "message_1",
+        sessionId: "session_1",
+        type: "reasoning",
+        text: "",
+        modelOutput: { apiFamily: "openai-responses", source, item: { type: "reasoning" } },
+      },
+    },
+  });
+
+  const valid = eventWithSource({ provider: "openai", connection: "sha256:connection-fingerprint" });
+  const parsed = parseChiliEvent(valid);
+  expect(parsed.type).toBe("message.part_added");
+  if (parsed.type !== "message.part_added" || parsed.payload.part.type !== "reasoning") {
+    throw new Error("Missing parsed reasoning part");
+  }
+  expect(parsed.payload.part.modelOutput?.source).toEqual({ provider: "openai", connection: "sha256:connection-fingerprint" });
+  expect(parseChiliEvent(eventWithSource(undefined)).type).toBe("message.part_added");
+
+  for (const [source, field] of [
+    [null, ""],
+    [[], ""],
+    ["connection", ""],
+    [{}, ".provider"],
+    [{ provider: 7, connection: "fingerprint" }, ".provider"],
+    [{ provider: "", connection: "fingerprint" }, ".provider"],
+    [{ provider: "openai" }, ".connection"],
+    [{ provider: "openai", connection: null }, ".connection"],
+    [{ provider: "openai", connection: "" }, ".connection"],
+  ] as const) {
+    expect(() => parseChiliEvent(eventWithSource(source))).toThrow(`event.payload.part.modelOutput.source${field}`);
+  }
+});
+
 test("message part events reject malformed nested reasoning and tool result fields", () => {
   const eventWithPart = (part: Record<string, unknown>) => ({
     id: "event_message_part",

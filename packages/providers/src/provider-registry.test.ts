@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
-import { FileAuthStorage, type OAuthCredential } from "./auth.js";
+import { FileAuthStorage, type OAuthCredential } from "./auth/storage.js";
 import { getProviderDisplayName } from "./catalog.js";
-import { findDefaultKnownModel } from "./models.js";
-import { BUILTIN_PROVIDERS, resolveBuiltinProviderId, type BuiltinProviderId } from "./provider-definition.js";
+import { findDefaultKnownModel, listKnownModels } from "./models.js";
+import { BUILTIN_PROVIDERS, isBuiltinProviderId, resolveBuiltinProviderId, type BuiltinProviderId } from "./provider-definition.js";
 import { createRegisteredProviderModel, resolveProviderModelOptions } from "./provider-registry.js";
 
 class TestAuth extends FileAuthStorage {
@@ -17,19 +17,22 @@ for (const provider of Object.keys(BUILTIN_PROVIDERS) as BuiltinProviderId[]) {
   test(`registered ${provider} sends its default model through the expected protocol`, async () => {
     let sent: Record<string, unknown> | undefined;
     let authorization: string | null = null;
+    let apiKeyHeader: string | null = null;
     const definition = BUILTIN_PROVIDERS[provider];
+    const descriptor = findDefaultKnownModel(provider);
     const options = resolveProviderModelOptions(provider, {
       env: {}, authStorage: new TestAuth(),
       ...(definition.auth === "api_key" ? { apiKey: "fake-registry-key", baseUrl: "https://registry.invalid/v1" } : {}),
       fetch: (async (_url, init) => {
         sent = JSON.parse(String(init?.body)) as Record<string, unknown>;
         authorization = new Headers(init?.headers).get("authorization");
-        if (definition.reasoning === "responses") {
+        apiKeyHeader = new Headers(init?.headers).get("x-api-key");
+        if (descriptor?.apiFamily === "openai-responses") {
           return new Response(`data: ${JSON.stringify({ type: "response.completed", response: { id: "response_registry", status: "completed", model: options.model } })}\n\n`, {
             headers: { "content-type": "text/event-stream" },
           });
         }
-        if (provider === "minimax") return Response.json({ id: "message_registry", type: "message", role: "assistant", model: options.model, content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" });
+        if (descriptor?.apiFamily === "anthropic-messages") return Response.json({ id: "message_registry", type: "message", role: "assistant", model: options.model, content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" });
         return Response.json({ id: "completion_registry", model: options.model, choices: [{ index: 0, message: { content: "ok" }, finish_reason: "stop" }] });
       }) as typeof fetch,
     });
@@ -39,11 +42,35 @@ for (const provider of Object.keys(BUILTIN_PROVIDERS) as BuiltinProviderId[]) {
     expect(sent?.model).toBe(findDefaultKnownModel(provider)?.model);
     expect(model.provider).toBe(provider);
     expect(events.at(-1)?.type).toBe("finish");
-    expect<string | null>(authorization).toBe(definition.auth === "oauth" ? "Bearer fake-oauth-access" : "Bearer fake-registry-key");
+    if (provider === "anthropic") {
+      expect<string | null>(apiKeyHeader).toBe("fake-registry-key");
+      expect<string | null>(authorization).toBeNull();
+    } else {
+      expect<string | null>(authorization).toBe(definition.auth === "oauth" ? "Bearer fake-oauth-access" : "Bearer fake-registry-key");
+    }
     expect(getProviderDisplayName(provider)).toBe(definition.displayName);
     for (const alias of [provider, ...definition.aliases]) expect(resolveBuiltinProviderId(` ${alias.toUpperCase()} `)).toBe(provider);
   });
 }
+
+test("registered model defaults fit verified output limits", () => {
+  for (const descriptor of listKnownModels()) {
+    const provider = descriptor.provider;
+    if (!isBuiltinProviderId(provider)) continue;
+    const options = resolveProviderModelOptions(provider, { model: descriptor.model, env: {} });
+    if (descriptor.maxOutputTokens !== undefined) {
+      expect(options.maxTokens).toBeLessThanOrEqual(descriptor.maxOutputTokens);
+    }
+  }
+});
+
+test("unknown deployments use a conservative request allowance without inheriting metadata", () => {
+  for (const provider of ["alibaba", "doubao"] as const) {
+    const options = resolveProviderModelOptions(provider, { model: "ep-custom-deployment", env: {} });
+    expect(options.maxTokens).toBe(4096);
+    expect(resolveProviderModelOptions(provider, { model: "ep-custom-deployment", maxTokens: 8192, env: {} }).maxTokens).toBe(8192);
+  }
+});
 
 test("resolved attempts use an isolated provider environment snapshot and explicit options win", async () => {
   const env = { DEEPSEEK_MODEL: "deepseek-v4-flash", DEEPSEEK_API_KEY: "snapshot-key", DEEPSEEK_BASE_URL: "https://snapshot.invalid/chat/completions", KIMI_API_KEY: "unrelated-secret" };

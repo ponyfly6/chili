@@ -2,16 +2,33 @@
 
 ## Registration and configuration
 
-`provider-definition.ts` owns built-in provider IDs, aliases, display names,
-model-prefix inference, connection labels and default request output allowances.
-Model capabilities, model defaults and wire compatibility remain in `models.ts`
-and `compat.ts`. An output allowance is a request default, not a claim about a
-custom model's context window.
+Each vendor is an independent maintenance unit under `src/vendors/`. A vendor
+owns its `models.ts` (IDs, capabilities, prices and defaults), `config.ts`
+(aliases, environment names and request defaults), `provider.ts` (connection and
+wire configuration), behavioral tests and README with official sources. OpenAI
+contains separate official API, ChatGPT OAuth and gateway adapters. 智谱 contains
+separate domestic `zhipu` and international `zai` connections.
 
-`provider-registry.ts` connects every definition to one statically imported,
-typed factory. Missing factories fail compilation; Host no longer guesses export
-names or accepts structurally unknown provider modules. This is an internal
-registration table, without dynamic plugin loading.
+Shared protocol implementations live in `protocols/`, request execution in
+`runtime/`, and credential storage/refresh coordination in `auth/`.
+`models.ts`, `provider-definition.ts` and `env.ts` aggregate vendor declarations;
+`provider-registry.ts` connects every definition to a statically imported typed
+factory. Vendor configuration does not import the registry. Missing factories
+fail compilation. This remains a static built-in catalog, with no remote model
+updates or dynamic plugin loading. Public named exports from `@chili/providers`
+remain available; source file paths are internal.
+
+| Vendor module | Provider IDs | Maintenance notes |
+| --- | --- | --- |
+| `vendors/deepseek` | `deepseek` | [DeepSeek](src/vendors/deepseek/README.md) |
+| `vendors/minimax` | `minimax` | [MiniMax](src/vendors/minimax/README.md) |
+| `vendors/kimi` | `kimi` | [Kimi](src/vendors/kimi/README.md) |
+| `vendors/zhipu` | `zhipu`, `zai` | [Domestic 智谱](src/vendors/zhipu/domestic.md), [Z.ai](src/vendors/zhipu/README.md) |
+| `vendors/alibaba` | `alibaba` | [Alibaba Qwen](src/vendors/alibaba/README.md) |
+| `vendors/doubao` | `doubao` | [Doubao / Ark](src/vendors/doubao/README.md) |
+| `vendors/openai` | `openai`, `openai-codex`, `codex-api` | [OpenAI](src/vendors/openai/README.md) |
+| `vendors/anthropic` | `anthropic` | [Anthropic](src/vendors/anthropic/README.md) |
+| `vendors/xai` | `xai` | [xAI](src/vendors/xai/README.md) |
 
 Host owns user selection (including CLI aliases/suffixes and the fake model),
 profile binding and per-request overrides. It delegates provider construction
@@ -37,11 +54,33 @@ event; compatibility with Core's stream contract is checked by TypeScript.
 Provider events still carry text/reasoning block completion and opaque protocol
 continuation data, independently of user-visible reasoning persistence.
 
-To add a built-in provider, register its definition and typed factory, its
-environment names in `env.ts`, and its model descriptors/compatibility in
-`models.ts`. Reuse an existing protocol adapter where appropriate. Host needs no
-new factory, provider-name switch or environment parser. Public legacy factory
-aliases remain available to existing callers.
+New Responses opaque outputs carry a top-level connection fingerprint, separate
+from the raw provider item. Runtime replay requires the same provider, endpoint
+and OAuth account or effective API authorization. OAuth refresh retains the
+account scope. Changing a key or gateway drops incompatible opaque output from
+that request without modifying stored conversation text or tool history. The new
+official `openai` connection rejects legacy unscoped ciphertext; existing
+ChatGPT/`codex-api` modes still accept it for history compatibility. Source
+metadata stores no raw key, account ID or endpoint. Anthropic and Doubao use
+their own protocol-specific continuation handling; see their vendor notes.
+
+To maintain one vendor, begin with its README, update only that vendor's
+metadata/configuration/adapter when possible, and run its tests. Every model
+entry must have a verified official API ID; do not infer pricing, limits or
+account entitlement from a product name. Unknown fields stay absent. Keep
+custom deployment IDs separate from known-model capability claims.
+
+To add a vendor, create its directory and register the exported definition,
+factory, environment spec and model array in the four aggregate modules. Reuse
+an existing protocol adapter where appropriate; add shared wire behavior only
+when the API contract requires it. Host, CLI help and TUI aliases consume this
+registry. Run `bun test`, `bun run typecheck`, and `bun run smoke:all` before
+submitting. All routine verification uses fake transports.
+
+MiniMax now reads only `MINIMAX_*` variables. Migrate previous
+`ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL` MiniMax settings to
+those names; `ANTHROPIC_*` belongs exclusively to the official Anthropic vendor.
+The deprecated Core MiniMax factory follows the same isolation rule.
 
 `provider-registry.test.ts` exercises all registered factories with fake
 transports, environment snapshots and credential-source validation. Host and CLI
@@ -125,16 +164,16 @@ provider IDs remain unchanged.
 
 ## Regression evidence
 
-`oauth-refresh.test.ts` uses temporary profiles, fake credentials and a loopback
+`auth/refresh.test.ts` uses temporary profiles, fake credentials and a loopback
 token transport. It exercises two actual Bun processes, concurrent updates,
 dead claim owners, per-consumer cancellation, deadlines, version changes and
-legacy migration. `request-lifecycle.test.ts` verifies each protocol's transport
+legacy migration. `runtime/request-lifecycle.test.ts` verifies each protocol's transport
 cancellation/deadline, sibling rate limiting and replay mapping. These tests do
 not contact real providers or establish model task-solving quality.
 
 The deprecated core `AnthropicCompatibleModelRouter` and MiniMax router factories
 are compatibility wrappers around this implementation. They retain their
-constructor options, MiniMax environment precedence and non-streaming request
+constructor options, provider-specific MiniMax environment precedence and non-streaming request
 default, and use the same provider-ID replay, request identity callback, deadline,
 cancellation and backpressure. Tool results now use the common typed streaming
 events even for a JSON response, preserving the provider call ID. Legacy rejected

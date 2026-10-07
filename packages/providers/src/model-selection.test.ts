@@ -198,6 +198,16 @@ test("selection canonicalizes the gpt-5.6 alias for both Codex providers", () =>
   });
 });
 
+test("official OpenAI selection canonicalizes the GPT alias independently of ChatGPT", () => {
+  const models = listKnownModels("openai");
+  expect(resolveModelSelectionPattern("openai/gpt-5.6:high", models)).toMatchObject({
+    selection: { provider: "openai", model: "gpt-5.6-sol", reasoning: "high" },
+  });
+  expect(resolveModelSelectionPattern("gpt-5.6", models, { defaultProvider: "openai" })).toMatchObject({
+    selection: { provider: "openai", model: "gpt-5.6-sol" },
+  });
+});
+
 test("retired model IDs do not resolve from the built-in catalog", () => {
   const models = listKnownModels();
   for (const retired of [

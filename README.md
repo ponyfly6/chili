@@ -139,7 +139,7 @@ MINIMAX_BASE_URL=https://api.minimaxi.com/anthropic
 MINIMAX_MODEL=MiniMax-M3
 ```
 
-也兼容旧的 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL` 命名。默认使用 `MiniMax-M3`：1M context、524,288 最大输出；CLI 默认申请 131,072 输出 token。`--thinking off|high` 对应 disabled/adaptive thinking，`--service-tier fast` 对应 priority tier。另可选择 `MiniMax-M3.1-Flash-Preview`（仅限 M Plan／MiniMax Code），支持 `low|medium|high|xhigh|max` 推理强度，不能关闭思考；它不会替换 M3 默认值。
+MiniMax 只读取 `MINIMAX_*`；曾使用 `ANTHROPIC_*` 配置 MiniMax 的用户需要迁移变量名，`ANTHROPIC_*` 现在专用于 Anthropic。默认使用 `MiniMax-M3`：1M context、524,288 最大输出；CLI 默认申请 131,072 输出 token。`--thinking off|high` 对应 disabled/adaptive thinking，`--service-tier fast` 对应 priority tier。另可选择 `MiniMax-M3.1-Flash-Preview`（仅限 M Plan／MiniMax Code），支持 `low|medium|high|xhigh|max` 推理强度，不能关闭思考；它不会替换 M3 默认值。
 
 DeepSeek V4 使用 OpenAI-compatible 接入：
 
@@ -201,14 +201,43 @@ XAI_MODEL=grok-4.7
 
 `grok`、`xai` 和 `x.ai` 都可作为 provider alias。Grok 4.7 支持 text/image、500k context 与 `low|medium|high|xhigh` reasoning；reasoning 不能关闭。Chat Completions 未显式设置时使用 128,000 的可见输出默认值，仍可显式选择 Grok 4.6。
 
+新增接入也可直接通过 provider 选择：
+
+| 厂商 / 连接 | 选择方式 | API key 环境变量 | 接入说明 |
+| --- | --- | --- | --- |
+| 智谱国内 | `--model zhipu` | `ZHIPU_API_KEY` 或 `BIGMODEL_API_KEY` | [国内接口与套餐地址](packages/providers/src/vendors/zhipu/domestic.md) |
+| 阿里通义千问 | `--model alibaba` 或 `--model qwen` | `DASHSCOPE_API_KEY` 或 `ALIBABA_API_KEY` | [地区与模型说明](packages/providers/src/vendors/alibaba/README.md) |
+| 火山豆包 | `--model doubao` | `ARK_API_KEY` 或 `DOUBAO_API_KEY` | [模型与自定义接入点](packages/providers/src/vendors/doubao/README.md) |
+| Anthropic | `--model anthropic` 或 `--model claude` | `ANTHROPIC_API_KEY` | [Claude API 说明](packages/providers/src/vendors/anthropic/README.md) |
+| OpenAI 官方 API | `--model openai` | `OPENAI_API_KEY` | [Responses API 说明](packages/providers/src/vendors/openai/README.md) |
+
+智谱国内 `zhipu` 和国际 `zai` 使用独立凭据及地址；显式选择相应 provider。
+阿里默认北京区，豆包默认北京 Ark API。API key 的地区、模型开通和套餐权限需与
+所选 endpoint 对应。`--model doubao/ep-你的接入点` 可指定自定义部署；未知 ID
+默认只声明文本能力、使用保守输出额度，不自动猜测底层模型的思考和图片能力。
+高级用法见对应厂商文档。模型目录中的“已配置”表示存在凭据，不等于已核验套餐权限。
+
 以上目录于 2026-10-07 核对；官方来源、计价条件与接入限制见 [模型目录维护记录](packages/providers/README.md#model-catalog-verification-2026-10-07)。
 
-Codex 有两条独立的连接，通过 provider 明确区分：
+OpenAI 有三条独立的连接，通过 provider 明确区分：
+
+- `openai`：使用 `OPENAI_API_KEY`，默认连接 OpenAI 官方 Responses API。
 
 - `openai-codex`：使用 ChatGPT 订阅的 OAuth 凭据，只连接 ChatGPT Codex 后端。
 - `codex-api`：使用 API key 和自定义 base URL，连接第三方 OpenAI Responses-compatible API。
 
-两者不会互相回退或混用凭据。ChatGPT OAuth token 不会发往 `codex-api` 的自定义 endpoint，第三方 API key 也不会被 `openai-codex` 使用。
+三者不会互相回退或混用凭据。ChatGPT OAuth token 不会发往 `codex-api` 的自定义 endpoint，第三方 API key 也不会被 `openai-codex` 使用。
+
+### OpenAI 官方 API (`openai`)
+
+```bash
+OPENAI_API_KEY=... bun run chili -- --model openai/gpt-6.1-sol "总结这个仓库"
+```
+
+默认 endpoint 为 `https://api.openai.com/v1`；可通过 `OPENAI_BASE_URL`、
+`OPENAI_MODEL` 配置。裸 `gpt-*` 仍按已有行为选择 ChatGPT；使用官方 API 时显式
+选择 `openai`。官方 API 接入、模型来源和验证方式见
+[OpenAI 厂商说明](packages/providers/src/vendors/openai/README.md)。
 
 ### ChatGPT OAuth (`openai-codex`)
 
@@ -259,17 +288,18 @@ OPENAI_CODEX_MODEL        -> CODEX_API_MODEL
 
 ### 选择与检查连接
 
-模型选择器用 `[ChatGPT]` 标记订阅 OAuth 连接，用 `[Api]` 标记第三方 API 连接；实际 provider ID 仍分别是 `openai-codex` 和 `codex-api`。
+模型选择器分别显示 OpenAI、ChatGPT 和 Api；实际 provider ID 是 `openai`、`openai-codex` 和 `codex-api`。
 
-在 TUI 中可以显式切换两个 provider：
+在 TUI 中可以显式选择连接：
 
 ```text
+/model openai/gpt-6.1-sol
 /model openai-codex/gpt-6.1-sol
 /model codex-api/gpt-6.1-sol
 /status
 ```
 
-`/status` 会同时显示当前 `model`、`connection`、`auth` 和脱敏后的 `endpoint`，可用来确认请求实际会走 ChatGPT OAuth 还是第三方 API。
+`/status` 会同时显示当前 `model`、`connection`、`auth` 和脱敏后的 `endpoint`，可用来确认请求实际走的厂商、连接和身份。
 
 ---
 

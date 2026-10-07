@@ -3,6 +3,7 @@ import {
   isProviderError,
   MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M3_MODEL,
+  readMiniMaxEnvironment,
   type AnthropicCompatibleModelOptions as ProviderAnthropicOptions,
   type AnthropicAuthScheme,
 } from "@chili/providers";
@@ -62,16 +63,14 @@ export class AnthropicCompatibleModelRouter implements ModelRouter {
 
 /** @deprecated Prefer createMiniMaxM3Model from @chili/providers or shared Host routing. */
 export function createMiniMaxM3Router(options: MiniMaxModelOptions = {}): AnthropicCompatibleModelRouter {
-  const env = options.env ?? process.env;
+  const env = readMiniMaxEnvironment(options.env);
   const routerOptions: AnthropicCompatibleModelOptions = {
     provider: "minimax",
-    model: options.model ?? env.MINIMAX_MODEL ?? env.ANTHROPIC_MODEL ?? MINIMAX_M3_MODEL,
+    model: options.model ?? env.model ?? MINIMAX_M3_MODEL,
     baseUrl: options.baseUrl
-      ?? env.MINIMAX_ANTHROPIC_BASE_URL
-      ?? env.ANTHROPIC_BASE_URL
-      ?? env.MINIMAX_BASE_URL
+      ?? env.baseUrl
       ?? MINIMAX_ANTHROPIC_BASE_URL,
-    apiKey: options.apiKey ?? env.MINIMAX_API_KEY ?? env.ANTHROPIC_API_KEY ?? "",
+    apiKey: options.apiKey ?? env.apiKey ?? "",
     authScheme: "bearer",
     maxTokens: options.maxTokens ?? DEFAULT_MINIMAX_MAX_TOKENS,
     reasoning: options.reasoning ?? true,
