@@ -53,6 +53,7 @@ import {
   createMcpResourceReadTool,
   createMcpResourcesListTool,
   createReadFileTool,
+  createPresentFileTool,
   createReadImageTool,
   createRequestUserInputTool,
   createToolSearchTool,
@@ -1031,6 +1032,7 @@ function createToolRegistry(
   } });
   registry.register(createReadFileTool({ defaultMaxBytes: DEFAULT_READ_MAX_BYTES, maxBytesLimit: READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
+  registry.register(createPresentFileTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
   registry.register(createActivateSkillTool((context) => skillRegistryForCwd(context.cwd)));

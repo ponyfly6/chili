@@ -12,6 +12,7 @@ export * from "./builtins/grep.js";
 export * from "./builtins/git-apply-patch.js";
 export * from "./builtins/mcp-resources.js";
 export * from "./builtins/process.js";
+export * from "./builtins/present-file.js";
 export * from "./builtins/read-file.js";
 export * from "./builtins/read-image.js";
 export * from "./builtins/tool-search.js";

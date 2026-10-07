@@ -3,7 +3,7 @@ import type { ChiliToolDefinition } from "./types.js";
 /** The interactive coding surface. Registration and execution permissions are separate. */
 export const DEFAULT_CODING_TOOLS = [
   "read", "glob", "grep", "edit", "write", "apply_patch", "bash", "process",
-  "code_mode", "tool_search", "activate_skill", "request_user_input",
+  "code_mode", "tool_search", "activate_skill", "request_user_input", "present_file",
 ] as const;
 
 export const AGENT_CONTROL_TOOLS = [
