@@ -101,20 +101,36 @@ bounded to 20,000 candidates and 2 MB of names. Complex resource-deny patterns
 that cannot be safely represented by the shared denial compiler cause discovery
 to fail closed. No result is streamed before the final check.
 
-Git can read historical paths and invoke hooks, so pathspecs are insufficient
-proof of resource isolation. Even `git diff` and `git status` can execute
-repository clean filters or filesystem-monitor helpers. All Git operations
-therefore conservatively reject any file read/write deny or a scoped
-write/process policy, including an explicit empty scope. Read-only Git tools
-disable `core.fsmonitor` and inspect effective Git configuration at each process
-dispatch. Configured `filter.*.clean`, `.process`, or `.smudge` commands cause
-those read tools to refuse execution and direct the caller to the isolated Bash
-path. This refusal also applies without resource scopes, preserving their
-read-only scheduling promise. Explicit Git mutators retain existing hooks and
-approval semantics. Every Git subprocess rechecks current
-authorization immediately before its guardian receives execution permission;
-final read checks prevent buffered results escaping after revocation. Diff
-disables external diff drivers and text conversion.
+Ordinary Git operations use Bash. They inherit the shell's execution policy,
+resource isolation, approval and scheduling behavior. Git can read historical
+paths and invoke repository hooks, filters or filesystem-monitor helpers, so
+pathspecs and read-like command names are not proof of resource isolation. A
+runner that cannot enforce file resource denials or scoped policies refuses the
+command. The macOS sandbox continues to protect `.git` and linked-worktree
+metadata; authorized Git writes requiring that access use explicit one-time
+elevated execution, never an automatic fallback. Commits preserve configured
+hooks and signing, with no tool-added attribution trailer.
+
+For classified read-only Bash commands, the macOS runner narrows workspace writes
+to an empty scope, including when a caller otherwise permits editing `AGENTS.md`.
+Configured Git helpers inherit that restriction. The tool reports read-only
+effects to the desktop only after its backend confirms this enforcement;
+unsandboxed execution does not make that promise. When file read denials exist,
+the sandbox also denies the workspace repository's Git metadata and historical
+objects, including enclosing-repository and linked-worktree metadata. Ordinary
+nested `.git` directories are blocked as well. Unsupported alternate object
+stores fail closed; undiscovered nested gitdir pointers or independently copied
+object stores are outside this path-based protection.
+
+The retained `git_worktree` and `git_apply_patch` tools conservatively reject any
+file read/write deny or scoped write/process policy, including an explicit empty
+scope. Their fixed Git subprocesses disable hooks and `core.fsmonitor`, inspect
+effective filter configuration at dispatch, and reject configured
+`filter.*.clean`, `.process`, or `.smudge` commands. Each subprocess rechecks
+current authorization immediately before its guardian receives execution
+permission; final checks prevent buffered results escaping after revocation.
+These narrow tools retain workspace ownership and patch integration checks;
+filter-dependent operations require an authorized Bash command.
 
 These paths are covered by
 [`discovery-resource-policy.test.ts`](../packages/tools/src/discovery-resource-policy.test.ts),

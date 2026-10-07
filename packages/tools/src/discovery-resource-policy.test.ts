@@ -9,7 +9,9 @@ import { PolicyApprovalBroker } from "./approval.js";
 import { createGlobTool } from "./builtins/glob.js";
 import { createGrepTool } from "./builtins/grep.js";
 import { createReadImageTool } from "./builtins/read-image.js";
-import { createGitBranchTool, createGitCommitTool, createGitDiffTool, createGitStageTool, createGitStatusTool } from "./builtins/git-diff.js";
+import { createBashTool } from "./builtins/bash.js";
+import { createGitWorktreeTool } from "./builtins/git-worktree.js";
+import { createGitApplyPatchTool } from "./builtins/git-apply-patch.js";
 import { ToolExecutor } from "./executor.js";
 import { InMemoryToolRegistry } from "./registry.js";
 import { observeProcessGuardianLifecycle, runProcess } from "./process.js";
@@ -19,7 +21,7 @@ const secret = "PRIVATE_MARKER_c065751adf";
 
 function harness(rules: () => readonly PermissionRule[], events: ChiliEvent[] = [], policy?: ToolAccessPolicy, ask?: () => Promise<{ action: "allow_session" }>): ToolExecutor {
   const registry = new InMemoryToolRegistry();
-  for (const tool of [createGlobTool(), createGrepTool(), createReadImageTool(), createGitDiffTool(), createGitStatusTool(), createGitStageTool(), createGitCommitTool(), createGitBranchTool()]) registry.register(tool);
+  for (const tool of [createGlobTool(), createGrepTool(), createReadImageTool(), createBashTool(), createGitWorktreeTool(), createGitApplyPatchTool()]) registry.register(tool);
   const approvals = new PolicyApprovalBroker({ rulesetsForRequest: () => [rules()], ...(ask ? { ask } : {}) });
   return new ToolExecutor({
     registry, approvals, events: { publish: async (event) => { events.push(event); } },
@@ -122,7 +124,7 @@ test("image reads honor resource denies from other read-tool permission names", 
   });
 });
 
-test("Git broad, selected-path, renamed historical and status reads fail closed under file read denies", async () => {
+test("Bash Git broad, selected-path, renamed historical and status reads require an enforcing resource sandbox", async () => {
   await withWorkspace(async (cwd) => {
     await initializeGit(cwd);
     await git(cwd, ["add", "."]);
@@ -133,11 +135,8 @@ test("Git broad, selected-path, renamed historical and status reads fail closed 
     await git(cwd, ["commit", "-m", "renamed"]);
     const events: ChiliEvent[] = [];
     const executor = harness(() => rules("read(blocked.txt)"), events);
-    for (const [tool, input] of [
-      ["git_diff", {}], ["git_diff", { base: "HEAD~1", paths: ["renamed.txt"] }],
-      ["git_diff", { staged: true }], ["git_status", {}],
-    ] as const) {
-      const result = await call(executor, cwd, tool, input);
+    for (const command of ["git diff", "git diff HEAD~1 -- renamed.txt", "git diff --staged", "git status"]) {
+      const result = await call(executor, cwd, "bash", { command });
       expect(result.status).toBe("failed");
       expect(JSON.stringify(result)).not.toContain(secret);
     }
@@ -145,7 +144,7 @@ test("Git broad, selected-path, renamed historical and status reads fail closed 
   });
 });
 
-test("Git mutations and hooks cannot bypass file write denies or an empty scoped policy", async () => {
+test("Bash Git mutations and hooks cannot bypass file write denies or an empty scoped policy", async () => {
   await withWorkspace(async (cwd) => {
     await initializeGit(cwd);
     await git(cwd, ["add", "."]);
@@ -158,12 +157,11 @@ test("Git mutations and hooks cannot bypass file write denies or an empty scoped
     await chmod(hook, 0o755);
     for (const executor of [
       harness(() => rules("write(blocked.txt)")),
-      harness(() => [{ permission: "*", pattern: "*", action: "allow" }], [], { writeScope: [], executeScope: [], allowedTools: ["git_commit", "git_stage", "git_branch"] }),
+      harness(() => [{ permission: "*", pattern: "*", action: "allow" }], [], { writeScope: [], executeScope: [], allowedTools: ["bash"] }),
     ]) {
-      for (const [tool, input] of [
-        ["git_branch", { action: "switch", name: "other" }], ["git_stage", { all: true }],
-        ["git_commit", { message: "must not run hooks" }],
-      ] as const) expect((await call(executor, cwd, tool, input)).status).toBe("failed");
+      for (const command of ["git switch other", "git add --all", "git commit -m 'must not run hooks'"]) {
+        expect((await call(executor, cwd, "bash", { command })).status).toBe("failed");
+      }
     }
     expect((await git(cwd, ["branch", "--show-current"])).trim()).toBe("main");
     expect((await git(cwd, ["log", "-1", "--pretty=%s"])).trim()).toBe("baseline");
@@ -190,15 +188,11 @@ test("discovery loads resource rules per batch rather than once per candidate", 
   });
 });
 
-test("Git rechecks a write revocation immediately before dispatching each process", async () => {
+test("managed Git tools recheck write revocation immediately before dispatching each process", async () => {
   await withWorkspace(async (cwd) => {
     await initializeGit(cwd);
     await git(cwd, ["add", "."]);
     await git(cwd, ["commit", "-m", "baseline"]);
-    await git(cwd, ["switch", "-c", "other"]);
-    await writeFile(join(cwd, "blocked.txt"), "different branch contents\n");
-    await git(cwd, ["commit", "-am", "other branch"]);
-    await git(cwd, ["switch", "main"]);
     let active: PermissionRule[] = [{ permission: "*", pattern: "*", action: "allow" }];
     let started = 0;
     const stop = observeProcessGuardianLifecycle((event) => {
@@ -207,16 +201,16 @@ test("Git rechecks a write revocation immediately before dispatching each proces
       active = rules("write(blocked.txt)");
     });
     try {
-      const result = await call(harness(() => active), cwd, "git_branch", { action: "switch", name: "other" });
+      const result = await call(harness(() => active), cwd, "git_worktree", { action: "create", name: "revoked" });
       expect(result.status).toBe("failed");
       expect(started).toBe(1);
       expect(await readFile(join(cwd, "blocked.txt"), "utf8")).toContain(secret);
     } finally { stop(); }
-    expect((await git(cwd, ["branch", "--show-current"])).trim()).toBe("main");
+    await expect(access(join(cwd, ".chili", "worktrees", "revoked"))).rejects.toThrow();
   });
 });
 
-test("Git read commands refuse repository filters even without resource scopes", async () => {
+test("managed Git read commands refuse repository filters even without resource scopes", async () => {
   await withWorkspace(async (cwd) => {
     await initializeGit(cwd);
     await git(cwd, ["add", "."]);
@@ -229,20 +223,21 @@ test("Git read commands refuse repository filters even without resource scopes",
     await git(cwd, ["diff", "--no-ext-diff", "--no-textconv"]);
     expect(await readFile(join(cwd, "filter-ran.txt"), "utf8")).toBe("filter");
     await rm(join(cwd, "filter-ran.txt"));
+    const calls = await managedGitReadCalls(cwd);
     for (const executor of [
       harness(() => [{ permission: "*", pattern: "*", action: "allow" }]),
       harness(() => rules("write(filter-ran.txt)")),
-      harness(() => [{ permission: "*", pattern: "*", action: "allow" }], [], { writeScope: [], executeScope: [], allowedTools: ["git_diff", "git_status"] }),
+      harness(() => [{ permission: "*", pattern: "*", action: "allow" }], [], { writeScope: [], executeScope: [], allowedTools: ["git_worktree", "git_apply_patch"] }),
     ]) {
-      for (const tool of ["git_diff", "git_status"]) {
-        expect((await call(executor, cwd, tool, {})).status).toBe("failed");
+      for (const [tool, input] of calls) {
+        expect((await call(executor, cwd, tool, input)).status).toBe("failed");
         await expect(access(join(cwd, "filter-ran.txt"))).rejects.toThrow();
       }
     }
   });
 });
 
-test("Git read commands disable filesystem-monitor helpers", async () => {
+test("managed Git read commands disable filesystem-monitor helpers", async () => {
   await withWorkspace(async (cwd) => {
     await initializeGit(cwd);
     await git(cwd, ["add", "."]);
@@ -254,14 +249,14 @@ test("Git read commands disable filesystem-monitor helpers", async () => {
     expect(await readFile(join(cwd, "monitor-ran.txt"), "utf8")).toBe("monitor");
     await rm(join(cwd, "monitor-ran.txt"));
     const executor = harness(() => [{ permission: "*", pattern: "*", action: "allow" }]);
-    for (const tool of ["git_diff", "git_status"]) {
-      expect((await call(executor, cwd, tool, {})).status).toBe("completed");
+    for (const [tool, input] of await managedGitReadCalls(cwd)) {
+      expect((await call(executor, cwd, tool, input)).status).toBe("completed");
       await expect(access(join(cwd, "monitor-ran.txt"))).rejects.toThrow();
     }
   });
 });
 
-test("Git read dispatch detects filters added while the command is being prepared", async () => {
+test("managed Git read dispatch detects filters added while the command is being prepared", async () => {
   await withWorkspace(async (cwd) => {
     await initializeGit(cwd);
     await git(cwd, ["add", "."]);
@@ -277,12 +272,21 @@ test("Git read dispatch detects filters added while the command is being prepare
       writeFileSync(configPath, `${originalConfig}\n[filter "probe"]\n\tclean = printf filter > filter-ran.txt; cat\n`);
     });
     try {
-      const result = await call(harness(() => [{ permission: "*", pattern: "*", action: "allow" }]), cwd, "git_diff", {});
+      const result = await call(harness(() => [{ permission: "*", pattern: "*", action: "allow" }]), cwd, "git_worktree", { action: "list" });
       expect(result.status).toBe("failed");
       await expect(access(join(cwd, "filter-ran.txt"))).rejects.toThrow();
     } finally { stop(); }
   });
 });
+
+async function managedGitReadCalls(cwd: string) {
+  const expectedHead = (await git(cwd, ["rev-parse", "HEAD"])).trim();
+  const patchText = "diff --git a/visible.txt b/visible.txt\n--- a/visible.txt\n+++ b/visible.txt\n@@ -1 +1 @@\n-public needle\n+updated needle\n";
+  return [
+    ["git_worktree", { action: "list" }],
+    ["git_apply_patch", { expectedHead, patchText, checkOnly: true }],
+  ] as const;
+}
 
 async function initializeGit(cwd: string): Promise<void> {
   await git(cwd, ["init", "-b", "main"]);

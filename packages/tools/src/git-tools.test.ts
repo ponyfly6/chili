@@ -2,20 +2,14 @@ import { expect, test } from "bun:test";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChiliEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
-import {
-  createGitBranchTool,
-  createGitCommitTool,
-  createGitDiffTool,
-  createGitStageTool,
-  createGitStatusTool,
-} from "./builtins/git-diff.js";
+import type { ChiliEvent, SessionId, TimestampMs, TurnId } from "@chili/protocol";
+import { createBashTool } from "./builtins/bash.js";
 import { ToolExecutor } from "./executor.js";
 import { runProcess } from "./process.js";
 import { InMemoryToolRegistry } from "./registry.js";
-import type { ApprovalBrokerRequest, ExecuteToolInput } from "./types.js";
+import type { ApprovalBrokerRequest } from "./types.js";
 
-test("git_status separates staged, unstaged, and untracked changes", async () => {
+test("bash exposes Git status and both staged and unstaged diffs", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-git-status-"));
   try {
     await initRepo(workspace);
@@ -29,35 +23,27 @@ test("git_status separates staged, unstaged, and untracked changes", async () =>
     await git(workspace, ["add", "staged.txt"]);
 
     const executor = createExecutor();
-    const result = await executor.execute(toolInput("git_status", {}, workspace));
+    const status = await bash(executor, workspace, "git status --porcelain=v1");
+    expect(status.exitCode).toBe(0);
+    expect(status.stdout.split("\n")).toEqual(expect.arrayContaining([
+      "A  staged.txt", " M tracked.txt", "?? untracked.txt",
+    ]));
 
-    expect(result.status).toBe("completed");
-    if (result.status !== "completed") return;
-    const status = JSON.parse(result.result.output) as GitStatusOutput;
-    expect(status.clean).toBe(false);
-    expect(status.staged).toEqual([expect.objectContaining({ path: "staged.txt", status: "added" })]);
-    expect(status.unstaged).toEqual([expect.objectContaining({ path: "tracked.txt", status: "modified" })]);
-    expect(status.untracked).toEqual([expect.objectContaining({ path: "untracked.txt", status: "untracked" })]);
+    const unstaged = await bash(executor, workspace, "git diff --no-ext-diff -- tracked.txt");
+    expect(unstaged.exitCode).toBe(0);
+    expect(unstaged.stdout).toContain("-one");
+    expect(unstaged.stdout).toContain("+two");
 
-    const unstagedDiff = await executor.execute(toolInput("git_diff", { path: "tracked.txt" }, workspace));
-    expect(unstagedDiff.status).toBe("completed");
-    if (unstagedDiff.status === "completed") {
-      expect(unstagedDiff.result.output).toContain("-one");
-      expect(unstagedDiff.result.output).toContain("+two");
-    }
-
-    const stagedDiff = await executor.execute(toolInput("git_diff", { staged: true, paths: ["staged.txt"] }, workspace));
-    expect(stagedDiff.status).toBe("completed");
-    if (stagedDiff.status === "completed") {
-      expect(stagedDiff.result.output).toContain("staged.txt");
-      expect(stagedDiff.result.metadata?.staged).toBe(true);
-    }
+    const staged = await bash(executor, workspace, "git diff --no-ext-diff --cached -- staged.txt");
+    expect(staged.exitCode).toBe(0);
+    expect(staged.stdout).toContain("staged.txt");
+    expect(staged.stdout).toContain("+staged");
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
 });
 
-test("git_stage and git_commit stage selected paths and create a local commit", async () => {
+test("bash stages selected paths and commits without changing unrelated work or adding a trailer", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-git-commit-"));
   const approvals: ApprovalBrokerRequest[] = [];
   try {
@@ -66,61 +52,80 @@ test("git_stage and git_commit stage selected paths and create a local commit", 
     await git(workspace, ["add", "base.txt"]);
     await git(workspace, ["commit", "--no-gpg-sign", "--no-verify", "-m", "init"]);
 
+    await writeFile(join(workspace, "base.txt"), "unrelated edit\n", "utf8");
     await writeFile(join(workspace, "next.txt"), "next\n", "utf8");
+    await writeFile(join(workspace, "untracked.txt"), "unrelated file\n", "utf8");
     const executor = createExecutor(approvals);
 
-    const staged = await executor.execute(toolInput("git_stage", { paths: ["next.txt"] }, workspace));
-    expect(staged.status).toBe("completed");
-    if (staged.status === "completed") {
-      const output = JSON.parse(staged.result.output) as { staged: GitStatusItem[] };
-      expect(output.staged).toEqual([expect.objectContaining({ path: "next.txt", status: "added" })]);
-    }
+    expect((await bash(executor, workspace, "git add -- next.txt")).exitCode).toBe(0);
+    expect((await git(workspace, ["diff", "--cached", "--name-only"])).stdout.trim()).toBe("next.txt");
 
-    const commit = await executor.execute(toolInput("git_commit", { message: "Add next file" }, workspace));
-    expect(commit.status).toBe("completed");
-    if (commit.status === "completed") {
-      const output = JSON.parse(commit.result.output) as { hash: string; subject: string };
-      expect(output.hash).toMatch(/^[0-9a-f]{40}$/);
-      expect(output.subject).toBe("Add next file");
-    }
-
-    const log = await git(workspace, ["log", "-1", "--pretty=%s"]);
-    expect(log.stdout.trim()).toBe("Add next file");
-    expect(approvals.map((approval) => approval.permission)).toContain("git_stage");
-    expect(approvals.map((approval) => approval.permission)).toContain("git_commit");
+    const commit = await bash(executor, workspace, "git commit -m 'Add next file'");
+    expect(commit.exitCode).toBe(0);
+    expect((await git(workspace, ["log", "-1", "--pretty=%B"])).stdout.trim()).toBe("Add next file");
+    expect((await git(workspace, ["show", "--pretty=", "--name-only", "HEAD"])).stdout.trim()).toBe("next.txt");
+    expect((await git(workspace, ["status", "--porcelain=v1"])).stdout.split("\n")).toEqual(expect.arrayContaining([
+      " M base.txt", "?? untracked.txt",
+    ]));
+    expect(approvals).toEqual(expect.arrayContaining([
+      expect.objectContaining({ permission: "bash", patterns: ["git add -- next.txt"] }),
+      expect.objectContaining({ permission: "bash", patterns: ["git commit -m 'Add next file'"] }),
+    ]));
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
 });
 
-test("git_commit runs hooks by default and fails when a hook rejects the commit", async () => {
+test("bash preserves a rejected commit hook's error and leaves HEAD unchanged", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-git-commit-hook-"));
   try {
     await initRepo(workspace);
     await writeFile(join(workspace, "base.txt"), "base\n", "utf8");
     await git(workspace, ["add", "base.txt"]);
     await git(workspace, ["commit", "--no-gpg-sign", "--no-verify", "-m", "init"]);
+    const before = (await git(workspace, ["rev-parse", "HEAD"])).stdout;
 
     const hookPath = join(workspace, ".git", "hooks", "pre-commit");
     await writeFile(hookPath, "#!/bin/sh\necho pre-commit hook failed >&2\nexit 42\n", "utf8");
     await chmod(hookPath, 0o755);
-
     await writeFile(join(workspace, "next.txt"), "next\n", "utf8");
     await git(workspace, ["add", "next.txt"]);
 
-    const executor = createExecutor();
-    const commit = await executor.execute(toolInput("git_commit", { message: "Add next file" }, workspace));
-
-    expect(commit.status).toBe("failed");
-    if (commit.status === "failed") {
-      expect(commit.error.message).toContain("pre-commit hook failed");
-    }
+    const commit = await bash(createExecutor(), workspace, "git commit -m 'Add next file'");
+    expect(commit.exitCode).not.toBe(0);
+    expect(commit.stderr).toContain("pre-commit hook failed");
+    expect((await git(workspace, ["rev-parse", "HEAD"])).stdout).toBe(before);
+    expect((await git(workspace, ["diff", "--cached", "--name-only"])).stdout.trim()).toBe("next.txt");
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
 });
 
-test("git_branch reports current branch and safely creates and switches branches", async () => {
+test("bash respects configured commit signing instead of silently disabling it", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-git-signing-"));
+  try {
+    await initRepo(workspace);
+    const signerPath = join(workspace, ".git", "reject-signing");
+    await writeFile(signerPath, "#!/bin/sh\necho test signing command invoked >&2\nexit 1\n", "utf8");
+    await chmod(signerPath, 0o755);
+    await git(workspace, ["config", "commit.gpgsign", "true"]);
+    await git(workspace, ["config", "gpg.format", "openpgp"]);
+    await git(workspace, ["config", "gpg.program", signerPath]);
+    await git(workspace, ["config", "user.signingkey", "chili-test"]);
+    await writeFile(join(workspace, "next.txt"), "next\n", "utf8");
+    await git(workspace, ["add", "next.txt"]);
+
+    const commit = await bash(createExecutor(), workspace, "git commit -m 'Signed commit'");
+    expect(commit.exitCode).not.toBe(0);
+    expect(commit.stderr).toContain("test signing command invoked");
+    expect((await git(workspace, ["config", "commit.gpgsign"])).stdout.trim()).toBe("true");
+    expect((await git(workspace, ["diff", "--cached", "--name-only"])).stdout.trim()).toBe("next.txt");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("bash reports, creates, lists, and switches Git branches", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-git-branch-"));
   try {
     await initRepo(workspace);
@@ -129,95 +134,34 @@ test("git_branch reports current branch and safely creates and switches branches
     await git(workspace, ["commit", "--no-gpg-sign", "--no-verify", "-m", "init"]);
 
     const executor = createExecutor();
-    const current = await executor.execute(toolInput("git_branch", {}, workspace));
-    expect(current.status).toBe("completed");
-    if (current.status !== "completed") return;
-    const currentOutput = JSON.parse(current.result.output) as { current?: string; detached: boolean };
-    expect(currentOutput.detached).toBe(false);
-    expect(currentOutput.current).toBeTruthy();
-
-    const created = await executor.execute(toolInput("git_branch", { action: "create", name: "codex/test" }, workspace));
-    expect(created.status).toBe("completed");
-
-    const listed = await executor.execute(toolInput("git_branch", { action: "list" }, workspace));
-    expect(listed.status).toBe("completed");
-    if (listed.status === "completed") {
-      const output = JSON.parse(listed.result.output) as { branches?: string[] };
-      expect(output.branches).toContain("codex/test");
-    }
-
-    const switched = await executor.execute(toolInput("git_branch", { action: "switch", name: "codex/test" }, workspace));
-    expect(switched.status).toBe("completed");
-    if (switched.status === "completed") {
-      const output = JSON.parse(switched.result.output) as { after: { current?: string } };
-      expect(output.after.current).toBe("codex/test");
-    }
+    const current = await bash(executor, workspace, "git branch --show-current");
+    expect(current.exitCode).toBe(0);
+    expect(current.stdout.trim()).toBeTruthy();
+    expect((await bash(executor, workspace, "git branch codex/test")).exitCode).toBe(0);
+    const listed = await bash(executor, workspace, "git branch --format='%(refname:short)'");
+    expect(listed.exitCode).toBe(0);
+    expect(listed.stdout.split("\n")).toContain("codex/test");
+    expect((await bash(executor, workspace, "git switch codex/test")).exitCode).toBe(0);
+    expect((await bash(executor, workspace, "git branch --show-current")).stdout.trim()).toBe("codex/test");
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
 });
 
-test("git tools fail clearly outside a git repository", async () => {
+test("bash preserves Git's nonzero exit status and error outside a repository", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-git-missing-"));
   try {
-    const executor = createExecutor();
-    const result = await executor.execute(toolInput("git_status", {}, workspace));
-
-    expect(result.status).toBe("failed");
-    if (result.status === "failed") {
-      expect(result.error.message).toContain("Not a git repository");
-    }
+    const result = await bash(createExecutor(), workspace, "git status --porcelain=v1");
+    expect(result.exitCode).toBe(128);
+    expect(result.stderr).toContain("not a git repository");
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
 });
-
-test("git tools reject dangerous or unsupported parameters", async () => {
-  const workspace = await mkdtemp(join(tmpdir(), "chili-git-safety-"));
-  try {
-    await initRepo(workspace);
-    const executor = createExecutor();
-
-    const unsafePath = await executor.execute(toolInput("git_diff", { paths: ["../outside.txt"] }, workspace));
-    expect(unsafePath.status).toBe("failed");
-    if (unsafePath.status === "failed") expect(unsafePath.error.message).toContain("workspace");
-
-    const unsafeBranch = await executor.execute(toolInput("git_branch", { action: "create", name: "-force" }, workspace));
-    expect(unsafeBranch.status).toBe("failed");
-    if (unsafeBranch.status === "failed") expect(unsafeBranch.error.message).toContain("safe local branch name");
-
-    const unsupportedAction = await executor.execute(toolInput("git_branch", { action: "reset", name: "main" }, workspace));
-    expect(unsupportedAction.status).toBe("failed");
-    if (unsupportedAction.status === "failed") expect(unsupportedAction.error.message).toContain("action must be");
-
-    const unsupportedFlag = await executor.execute(toolInput("git_stage", { all: true, force: true }, workspace));
-    expect(unsupportedFlag.status).toBe("failed");
-    if (unsupportedFlag.status === "failed") expect(unsupportedFlag.error.message).toContain("unsupported git_stage parameter");
-  } finally {
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
-interface GitStatusItem {
-  path: string;
-  status: string;
-  code: string;
-}
-
-interface GitStatusOutput {
-  clean: boolean;
-  staged: GitStatusItem[];
-  unstaged: GitStatusItem[];
-  untracked: GitStatusItem[];
-}
 
 function createExecutor(approvals: ApprovalBrokerRequest[] = []): ToolExecutor {
   const registry = new InMemoryToolRegistry();
-  registry.register(createGitStatusTool());
-  registry.register(createGitDiffTool());
-  registry.register(createGitStageTool());
-  registry.register(createGitCommitTool());
-  registry.register(createGitBranchTool());
+  registry.register(createBashTool());
 
   return new ToolExecutor({
     registry,
@@ -233,16 +177,17 @@ function createExecutor(approvals: ApprovalBrokerRequest[] = []): ToolExecutor {
   });
 }
 
-function toolInput(toolName: string, input: unknown, cwd: string, callId?: ToolCallId): ExecuteToolInput {
-  const value: ExecuteToolInput = {
+async function bash(executor: ToolExecutor, cwd: string, command: string) {
+  const result = await executor.execute({
     sessionId: "session_git_tools" as SessionId,
     turnId: "turn_git_tools" as TurnId,
-    toolName,
-    input,
+    toolName: "bash",
+    input: { command },
     cwd,
-  };
-  if (callId) value.callId = callId;
-  return value;
+  });
+  expect(result.status).toBe("completed");
+  if (result.status !== "completed") throw new Error(`Bash tool failed: ${JSON.stringify(result)}`);
+  return result.result.structuredData as { stdout: string; stderr: string; exitCode: number };
 }
 
 function createSequentialId(): (prefix: string) => string {
@@ -254,6 +199,8 @@ async function initRepo(cwd: string): Promise<void> {
   await git(cwd, ["init"]);
   await git(cwd, ["config", "user.email", "chili-test@example.com"]);
   await git(cwd, ["config", "user.name", "Chili Test"]);
+  await git(cwd, ["config", "commit.gpgsign", "false"]);
+  await git(cwd, ["config", "core.hooksPath", join(cwd, ".git", "hooks")]);
 }
 
 async function git(cwd: string, args: readonly string[]) {

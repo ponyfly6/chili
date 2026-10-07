@@ -26,6 +26,104 @@ test("read-only shell classification keeps safe git branch and status commands",
   expect(isReadOnlyShellCommand("git diff")).toBe(true);
 });
 
+test("Git read classification supports inspection flags but rejects write and executable options", () => {
+  for (const command of [
+    "git --no-optional-locks status --short",
+    "git --no-pager --no-optional-locks diff --no-ext-diff --no-textconv --stat",
+    "git -P log -5 --oneline",
+    "git --no-pager show HEAD:README.md",
+    "git --no-optional-locks branch --list 'feature/*'",
+    "git diff -- '--output=literal-file-name'",
+  ]) expect(isReadOnlyShellCommand(command)).toBe(true);
+
+  for (const command of [
+    "git diff --output=changes.patch",
+    "git --no-pager log --output changes.txt",
+    "git show --output=changes.txt HEAD",
+    "git diff --ext-diff",
+    "git show --textconv HEAD:README.md",
+    "git grep --open-files-in-pager=sh needle",
+    "git grep -Osh needle",
+    "git -c alias.inspect='!touch marker' inspect",
+    "git -c core.fsmonitor=helper status",
+    "git -C ../other status",
+    "git --git-dir=../other/.git status",
+    "git inspect",
+    "git --no-optional-locks add README.md",
+  ]) expect(isReadOnlyShellCommand(command)).toBe(false);
+});
+
+test("read-only shell classification rejects substitutions and adjacent redirections", () => {
+  for (const command of [
+    "git status>status.txt",
+    "git diff 2>errors.txt",
+    "git status&>status.txt",
+    "git status>>status.txt",
+    "git show $(touch marker)",
+    "git show \"$(touch marker)\"",
+    "git show `touch marker`",
+    "cat <(touch marker)",
+    "git diff $DIFF_OPTIONS",
+    "git diff \"$DIFF_OPTIONS\"",
+    "git diff \"'$DIFF_OPTIONS'\"",
+  ]) expect(isReadOnlyShellCommand(command)).toBe(false);
+
+  for (const command of [
+    "git grep '>'",
+    "git grep \">\"",
+    "git grep '$(literal)'",
+    "git grep '`literal`'",
+    "git grep '\"$literal\"'",
+    "git status | head -n 10",
+  ]) expect(isReadOnlyShellCommand(command)).toBe(true);
+});
+
+test("dangerous Git operations ask even when wrapped or using global options", () => {
+  for (const command of [
+    "git reset --hard HEAD",
+    "git --no-optional-locks reset --hard",
+    "git -C subdir -c core.quotePath=false reset --hard",
+    "git --git-dir=repo/.git --work-tree=repo reset --hard",
+    "git --git-dir repo/.git reset --hard",
+    "env LC_ALL=C git clean -fdx",
+    "git -c clean.requireForce=false clean -d",
+    "git clean -i",
+    "git checkout -- README.md",
+    "git checkout README.md",
+    "git checkout -f main",
+    "git switch --discard-changes main",
+    "git switch -f main",
+    "git restore README.md",
+    "git restore --worktree --staged README.md",
+    "git restore -SW README.md",
+    "git push --force origin main",
+    "git push -f origin main",
+    "git push --mirror origin",
+    "git push --force-with-lease origin main",
+    "git push --force-with-lease=main:abcd origin main",
+    "git push origin +HEAD:main",
+    "git status && git clean -fd",
+    "command /usr/bin/git reset --hard",
+    "bash -c 'git clean -fd'",
+  ]) expect(classifyDangerousShellCommand(command)).toMatchObject({ action: "ask" });
+
+  for (const command of [
+    "git status --short",
+    "git add -- README.md",
+    "git commit -m 'Mention git reset --hard in documentation'",
+    "git reset --soft HEAD~1",
+    "git reset -- --hard",
+    "git clean -ndfx",
+    "git clean --dry-run -f",
+    "git clean -h",
+    "git switch main",
+    "git restore --staged README.md",
+    "git restore -S README.md",
+    "git push origin main",
+    "git push --dry-run --force origin main",
+  ]) expect(classifyDangerousShellCommand(command)).toBeUndefined();
+});
+
 test("read-only shell classification does not discard invocation environment changes", () => {
   for (const command of [
     "LC_ALL=C rg needle .",

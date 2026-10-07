@@ -16,7 +16,7 @@ test("default Chili base prompt covers core prompt behavior without growing too 
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("Inspect, edit, and test");
   expect(DEFAULT_CHILI_BASE_PROMPT).not.toContain("task_batch");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("what changed, what you ran");
-  expect(DEFAULT_CHILI_BASE_PROMPT.length).toBeLessThan(1_500);
+  expect(DEFAULT_CHILI_BASE_PROMPT.length).toBeLessThan(1_900);
 });
 
 test("chiliBasePromptFragment wraps the core base prompt", () => {

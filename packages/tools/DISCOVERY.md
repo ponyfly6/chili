@@ -1,8 +1,8 @@
 # Tool discovery and model exposure
 
-The Host starts root coding sessions with these fourteen tools when available:
+The Host starts root coding sessions with these twelve tools when available:
 `read`, `glob`, `grep`, `edit`, `write`, `apply_patch`, `bash`, `process`,
-`git_status`, `git_diff`, `code_mode`, `tool_search`, `activate_skill`, and
+`code_mode`, `tool_search`, `activate_skill`, and
 `request_user_input`. Headless Hosts without an input queue omit the last tool.
 Agent controls are exposed according to durable Agent state and the caller's
 permissions. All Agents receive code mode by default. Registered tools remain
@@ -54,8 +54,31 @@ The Agent group contains six canonical tools: `agent_spawn`, `agent_list`,
 through code mode without direct loading. Creation and sending return input
 receipts; waiting follows a specific receipt. Use `Promise.all` over individual
 spawn calls for parallel work. See [Agent tools](AGENT_TOOLS.md) for the contracts,
-pause and resume behavior, and permission boundaries. Git tools provide workspace
-isolation and change integration independently of Agent controls.
+pause and resume behavior, and permission boundaries. `git_worktree` and
+`git_apply_patch` provide workspace isolation and change integration independently
+of Agent controls.
+
+Ordinary Git operations use `bash`; `git_status`, `git_diff`, `git_stage`,
+`git_commit`, and `git_branch` are no longer registered or discoverable. Existing
+conversation renderers continue to display historical calls. Git commands use the
+same shell permissions and scheduling as other Bash commands. The macOS sandbox
+continues to protect Git metadata, including a linked worktree's shared gitdir.
+Authorized writes that need that access require an explicit one-time
+`sandboxPermissions: "require_escalated"` request with a justification; there is
+no automatic unsandboxed retry. The base prompt directs the model to commit only
+when the user requests it and to respect repository hooks and signing
+configuration. Chili does not inject commit trailers or disable signing. The
+builtin init prompt permits Bash only for a read-only Git survey and keeps file
+writes limited to `AGENTS.md`. Bash's command classification is a scheduling
+hint, not proof that Git helpers cannot run. The macOS runner enforces no workspace
+writes for classified read-only commands, including their child processes. Only
+after the backend confirms this restriction does Bash publish `readOnly: true`
+for the desktop turn diff. Full-access and opaque backends remain conservative.
+Existing rules for the removed Git tool names no longer authorize or deny these
+operations. Configure `bash` and `bash.unsandboxed` command permission rules for
+the replacement paths. Default-mode elevation always requires a fresh one-time
+approval, even if an old Git-tool session grant existed. Old wildcard Git grants
+are not automatically translated into shell grants.
 
 Loaded definitions are retained for the session; there is no usage-based eviction
 yet. Evaluate definition size, search round trips and tool/argument errors before

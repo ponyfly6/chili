@@ -134,8 +134,6 @@ export function createPermissionRules(
     { permission: "agent_send", pattern: "*", action: "allow", source },
     { permission: "agent_stop", pattern: "*", action: "allow", source },
     { permission: "agent_resume", pattern: "*", action: "allow", source },
-    { permission: "git_status", pattern: "*", action: "allow", source },
-    { permission: "git_diff", pattern: "*", action: "allow", source },
   ];
 }
 

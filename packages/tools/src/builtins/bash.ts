@@ -30,6 +30,8 @@ export interface BashInput {
 export type BashSandboxPermissions = "use_default" | "require_escalated";
 
 export interface BashRunRequest {
+  /** Trusted tool classification: enforcing backends must forbid workspace writes. */
+  readOnly?: boolean;
   executionPolicy?: ToolAccessPolicy;
   resourceDenials?: ToolResourceDenials;
   assertCurrentAuthorization?: () => Promise<void>;
@@ -47,6 +49,8 @@ export interface BashRunRequest {
 
 export interface BashRunResult extends RunProcessResult {
   sandbox?: "macos-seatbelt" | "none";
+  /** True only when this invocation's backend enforced no workspace writes. */
+  readOnly?: boolean;
 }
 
 export interface BashRunner {
@@ -123,11 +127,12 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
     resourcePolicy: "process",
     aliases: ["run_shell_command"],
     searchHint: options.processes
-      ? "Run shell commands or start managed background servers; inspect and stop them with process."
-      : "Run shell commands; read-only commands can be scheduled concurrently.",
+      ? "Run shell and Git commands or start managed background servers; inspect and stop them with process."
+      : "Run shell and Git commands; read-only commands can be scheduled concurrently.",
     description: (allowEscalation
-      ? "Run a non-interactive Bash command without login or interactive profiles in the authoritative workspace. Relative cwd values resolve from that workspace root, and absolute cwd values must remain inside it. Commands that require desktop IPC or other access blocked by the default sandbox may request one-time elevated execution with a justification."
+      ? "Run a non-interactive Bash command without login or interactive profiles in the authoritative workspace. Relative cwd values resolve from that workspace root, and absolute cwd values must remain inside it. The default macOS sandbox protects .git and blocks network access: for authorized Git writes (add, commit, branch changes) or remote operations, request sandbox_permissions=require_escalated with a justification. This is one-time elevated execution, also available for desktop IPC or other sandbox-blocked access; scoped workers and explicit file denies cannot be bypassed."
       : "Run a non-interactive Bash command without login or interactive profiles in the authoritative workspace. Relative cwd values resolve from that workspace root, and absolute cwd values must remain inside it.")
+      + " Use Bash for ordinary Git operations. Use git --no-optional-locks status for inspection and disable external diff/textconv when reading diffs. Preserve repository hooks and signing settings; commit only when requested and do not add attribution automatically."
       + (options.processes
         ? " Set background=true for a dev server or long-running command. Run the program in the foreground, without nohup or a trailing &: Chili keeps it running and returns a processId for the process tool. A running handle does not imply the program is ready or successful. Background commands have no default timeout and survive ordinary replies; explicit Stop, archive, or host shutdown stops them. Existing sandbox restrictions still apply."
         : ""),
@@ -297,6 +302,9 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
         metadata: {
           command: input.command,
           cwd,
+          // Command names cannot rule out configured Git helpers or filters.
+          // Report read-only effects only after the backend confirms enforcement.
+          readOnly: false,
           sandboxPermissions,
           ...(input.justification ? { justification: input.justification } : {}),
         },
@@ -364,6 +372,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       });
       const runRequest: BashRunRequest = {
         ...authority,
+        readOnly: isReadOnlyBashInput(input),
         ...(context.executionPolicy ? { executionPolicy: context.executionPolicy } : {}),
         command: input.command,
         workspaceRoot: resolve(context.cwd),
@@ -398,7 +407,8 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       }
       const sandbox = result.sandbox ?? "none";
       const executionMode = sandbox === "none" ? "unsandboxed" : "sandboxed";
-      await context.metadata({ metadata: { sandbox, sandboxPermissions, executionMode } });
+      const readOnly = runRequest.readOnly === true && sandbox !== "none" && result.readOnly === true;
+      await context.metadata({ metadata: { sandbox, sandboxPermissions, executionMode, readOnly } });
 
       const output = outputSnapshot.truncated
         ? formatTruncatedCommandOutput(outputSnapshot, result, timeoutMs)
@@ -424,6 +434,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
         metadata: {
           command: input.command,
           cwd,
+          readOnly,
           envKeys: input.env ? Object.keys(input.env).sort() : [],
           sandboxPermissions,
           executionMode,
@@ -498,7 +509,8 @@ function resourceDenialVersion(denials?: ToolResourceDenials): string {
 function isReadOnlyBashInput(input: BashInput): boolean {
   // The same command can invoke different executables or startup code under
   // custom BASH_ENV, PATH, HOME, or other tool-specific environment settings.
-  return !input.background && Object.keys(input.env ?? {}).length === 0 && isReadOnlyShellCommand(input.command);
+  return !input.background && input.sandboxPermissions !== "require_escalated"
+    && Object.keys(input.env ?? {}).length === 0 && isReadOnlyShellCommand(input.command);
 }
 
 function formatTruncatedCommandOutput(

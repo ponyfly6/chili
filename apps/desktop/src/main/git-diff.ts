@@ -51,6 +51,12 @@ interface DiffResult<Scope extends DiffScope> {
   truncated: boolean;
 }
 
+interface TurnToolCall {
+  toolName: string;
+  input: unknown;
+  readOnly?: boolean;
+}
+
 interface HeadTreeEntry {
   path: string;
   mode: string;
@@ -262,10 +268,23 @@ async function turnDiff(input: {
   const turnId = input.turnId ?? latestTurnId(sessionEvents);
   if (!turnId) return { scope: "turn", text: "No turn activity yet.", truncated: false };
 
-  const toolCalls = new Map(sessionEvents.flatMap((event) => {
-    if (event.type !== "tool.call_started" || event.payload.turnId !== turnId) return [];
-    return [[event.payload.callId as string, { toolName: event.payload.toolName, input: event.payload.input }] as const];
-  }));
+  const toolCalls = new Map<string, TurnToolCall>();
+  const callTurns = new Map<string, string>();
+  for (const event of sessionEvents) {
+    if (event.type === "tool.call_started") {
+      callTurns.set(event.payload.callId, event.payload.turnId);
+      if (event.payload.turnId === turnId) {
+        toolCalls.set(event.payload.callId, { toolName: event.payload.toolName, input: event.payload.input });
+      }
+    } else if (event.type === "tool.call_updated" && callTurns.get(event.payload.callId) === turnId) {
+      const call = toolCalls.get(event.payload.callId);
+      // Bash reports its own classification after validation. Never trust model input
+      // or infer read-only behavior from the command text in the desktop process.
+      if (call?.toolName === "bash" && event.payload.metadata?.readOnly !== undefined) {
+        call.readOnly = event.payload.metadata.readOnly === true;
+      }
+    }
+  }
   const callIds = new Set(toolCalls.keys());
   if (callIds.size === 0) {
     return { scope: "turn", text: "No file-changing tool activity in this turn.", truncated: false };
@@ -1067,8 +1086,9 @@ function latestTurnId(events: readonly ChiliEvent[]): string | undefined {
   return undefined;
 }
 
-function mayWriteWorkspace(toolCall: { toolName: string; input: unknown }): boolean {
+function mayWriteWorkspace(toolCall: TurnToolCall): boolean {
   if (EXPLICIT_READ_ONLY_TOOLS.has(toolCall.toolName)) return false;
+  if (toolCall.toolName === "bash") return toolCall.readOnly !== true;
   if (toolCall.toolName !== "git_branch") return true;
   if (!isRecord(toolCall.input) || toolCall.input.action === undefined) return false;
   return toolCall.input.action !== "current" && toolCall.input.action !== "list";

@@ -50,11 +50,6 @@ import {
   createEditTool,
   createGitWorktreeTool,
   createGitApplyPatchTool,
-  createGitBranchTool,
-  createGitCommitTool,
-  createGitDiffTool,
-  createGitStageTool,
-  createGitStatusTool,
   createGoalTools,
   createGlobTool,
   createGrepTool,
@@ -1082,11 +1077,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function registerGitTools(registry: InMemoryToolRegistry): void {
-  registry.register(createGitStatusTool());
-  registry.register(createGitDiffTool());
-  registry.register(createGitStageTool());
-  registry.register(createGitCommitTool());
-  registry.register(createGitBranchTool());
   registry.register(createGitWorktreeTool());
   registry.register(createGitApplyPatchTool());
 }

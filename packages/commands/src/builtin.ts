@@ -2,7 +2,7 @@ import { defineCommand } from "./registry.js";
 import { expandPromptTemplate } from "./template.js";
 import type { CommandDefinition } from "./types.js";
 
-const INIT_ALLOWED_TOOLS = ["read", "glob", "grep", "git_status", "git_diff", "edit", "write", "apply_patch", "tool_search"] as const;
+const INIT_ALLOWED_TOOLS = ["read", "glob", "grep", "bash", "edit", "write", "apply_patch", "tool_search"] as const;
 const INIT_WRITE_SCOPE = ["AGENTS.md"] as const;
 
 const INIT_PROMPT = `You are running Chili's /prompt builtin init command for this repository.
@@ -14,7 +14,7 @@ Goal: create or update the repository agent instruction file. The default target
 User focus arguments, if any: $ARGUMENTS
 
 Instructions:
-- Inspect the repository before writing. Use Chili's dedicated read-only repository tools for the survey: read, glob, grep, git_status, and git_diff. Do not use shell commands for repository discovery or file inspection.
+- Inspect the repository before writing. Use read, glob, and grep for file discovery and inspection. Use bash only for read-only Git survey commands such as git --no-optional-locks status, git diff --no-ext-diff --no-textconv, and git log. Do not mutate Git state, invoke repository scripts, or request elevated shell execution. If Git inspection needs helpers blocked by the sandbox, continue with file tools and report uncertainty.
 - Verify facts from local files such as README*, package manifests, workspace configuration, lockfiles, build/test/lint/typecheck config, CI configuration, and existing instruction files including AGENTS.md, CHILI.md, CLAUDE.md, GEMINI.md, .cursor/rules, and .github/copilot-instructions.md.
 - Prefer executable sources over prose when they conflict, for example package scripts, config files, CI jobs, and checked-in tests.
 - Include only repo-specific, actionable guidance. Avoid generic advice that would apply to any repository.

@@ -356,6 +356,97 @@ test("turn diff does not mark explicitly read-only builtin calls as incomplete",
   });
 });
 
+test.each(["git status --short", "git diff --stat", "git log -5 --oneline", "pwd", "cat README.md"])(
+  "turn diff recognizes executor-classified read-only Bash: %s",
+  async (command) => {
+    const workspace = await temporaryDirectory("chili-desktop-diff-bash-read-");
+    const sessionId = "session_bash_read";
+    const events = [
+      event("turn.started", sessionId, { turnId: "turn_bash_read" }, 1),
+      event("tool.call_started", sessionId, {
+        turnId: "turn_bash_read", callId: "call_bash_read", toolName: "bash", input: { command },
+      }, 2),
+    ];
+    const readDiff = () => desktopDiff({
+      scope: "turn", workspace, sessionId,
+      client: { sessionEvents: async () => events } as unknown as RuntimeClient,
+    });
+
+    // The initial event has no executor classification, so coverage is still unknown.
+    expect((await readDiff()).truncated).toBe(true);
+    events.push(event("tool.call_updated", sessionId, {
+      callId: "call_bash_read", status: "running", metadata: { command, readOnly: true },
+    }, 3));
+    events.push(event("tool.call_updated", sessionId, {
+      callId: "call_bash_read", status: "running", metadata: { processId: "process_read", background: true },
+    }, 4));
+
+    // Later metadata without a classification preserves the executor's decision.
+    expect(await readDiff()).toEqual({
+      scope: "turn",
+      text: "No snapshot-backed file changes were recorded for this turn.",
+      truncated: false,
+    });
+  },
+);
+
+test.each([
+  { name: "write classification", command: "git checkout other", metadata: { readOnly: false } },
+  { name: "missing classification", command: "git status", metadata: {} },
+  { name: "non-boolean classification", command: "git status", metadata: { readOnly: "true" } },
+])("turn diff keeps Bash conservative with $name", async ({ command, metadata }) => {
+  const workspace = await temporaryDirectory("chili-desktop-diff-bash-unknown-");
+  const sessionId = "session_bash_unknown";
+  const events = [
+    event("turn.started", sessionId, { turnId: "turn_bash_unknown" }, 1),
+    event("tool.call_started", sessionId, {
+      turnId: "turn_bash_unknown", callId: "call_bash_unknown", toolName: "bash",
+      input: { command, readOnly: true, metadata: { readOnly: true } },
+    }, 2),
+    event("tool.call_updated", sessionId, {
+      callId: "call_bash_unknown", status: "running", metadata,
+    }, 3),
+  ];
+  const result = await desktopDiff({
+    scope: "turn", workspace, sessionId,
+    client: { sessionEvents: async () => events } as unknown as RuntimeClient,
+  });
+
+  expect(result.truncated).toBe(true);
+  expect(result.text).toContain("1 tool call(s) had no snapshot baseline");
+});
+
+test("turn diff scopes Bash classification to the matching session and started call", async () => {
+  const workspace = await temporaryDirectory("chili-desktop-diff-bash-event-scope-");
+  const sessionId = "session_bash_scope";
+  const events = [
+    event("turn.started", sessionId, { turnId: "turn_old" }, 1),
+    event("tool.call_started", sessionId, {
+      turnId: "turn_old", callId: "call_bash_scope", toolName: "bash", input: { command: "pwd" },
+    }, 2),
+    event("tool.call_updated", sessionId, {
+      callId: "call_bash_scope", status: "running", metadata: { readOnly: true },
+    }, 3),
+    event("turn.started", sessionId, { turnId: "turn_bash_scope" }, 4),
+    event("tool.call_started", sessionId, {
+      turnId: "turn_bash_scope", callId: "call_bash_scope", toolName: "bash", input: { command: "git add ." },
+    }, 5),
+    event("tool.call_updated", "other_session", {
+      callId: "call_bash_scope", status: "running", metadata: { readOnly: true },
+    }, 6),
+    event("tool.call_updated", sessionId, {
+      callId: "other_call", status: "running", metadata: { readOnly: true },
+    }, 7),
+  ];
+  const result = await desktopDiff({
+    scope: "turn", workspace, sessionId,
+    client: { sessionEvents: async () => events } as unknown as RuntimeClient,
+  });
+
+  expect(result.truncated).toBe(true);
+  expect(result.text).toContain("1 tool call(s) had no snapshot baseline");
+});
+
 test("turn diff treats a dynamic MCP tool with a read-like name as potentially mutating", async () => {
   const workspace = await temporaryDirectory("chili-desktop-diff-mcp-read-spoof-");
   await writeFile(join(workspace, "spoofed-read.txt"), "secret mutation behind a read-like name\n", "utf8");
@@ -368,6 +459,9 @@ test("turn diff treats a dynamic MCP tool with a read-like name as potentially m
       toolName: "mcp__filesystem__read_file",
       input: { path: "spoofed-read.txt" },
     }, 2),
+    event("tool.call_updated", sessionId, {
+      callId: "call_mcp_read_spoof", status: "running", metadata: { readOnly: true },
+    }, 3),
   ] as ChiliEvent[];
 
   const result = await desktopDiff({

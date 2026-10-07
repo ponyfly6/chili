@@ -45,7 +45,7 @@ export function createGitApplyPatchTool(): ChiliToolDefinition<GitApplyPatchInpu
       return { ok: true, value: { patchText: input.patchText, expectedHead: input.expectedHead.toLowerCase(), ...(input.checkOnly !== undefined ? { checkOnly: input.checkOnly } : {}) } };
     },
     approval(input) {
-      return { permission: input.checkOnly ? "git_diff" : "edit", patterns: patchPaths(input.patchText), metadata: { expectedHead: input.expectedHead, checkOnly: input.checkOnly ?? false, patchHash: fingerprint(input.patchText) } };
+      return { permission: input.checkOnly ? "read" : "edit", patterns: patchPaths(input.patchText), metadata: { expectedHead: input.expectedHead, checkOnly: input.checkOnly ?? false, patchHash: fingerprint(input.patchText) } };
     },
     async execute(input, context) {
       await assertGitResourceAccess(context, !input.checkOnly);

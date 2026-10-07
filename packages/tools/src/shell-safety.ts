@@ -16,7 +16,11 @@ export function isReadOnlyShellCommand(command: string): boolean {
   if (/(^|[;&|]\s*)(rm|mv|cp|touch|mkdir|rmdir|chmod|chown|sudo|tee|python|python3|node|bun|npm|pnpm|yarn|make|sh|bash|zsh|fish|perl|ruby|npx|bunx)\b/.test(normalized)) {
     return false;
   }
-  if (/(^|\s)(>|>>|2>|&>)/.test(normalized)) return false;
+  if (hasCommandSubstitution(normalized)) return false;
+  // Shell expansions can turn otherwise harmless arguments into executable
+  // syntax or write options. Redirections do not require whitespace.
+  if (/[<>$]/.test(unquotedShellText(normalized, false))) return false;
+  if (unquotedShellText(normalized).includes("$")) return false;
 
   const segments = shellSegments(normalized);
   if (segments.length === 0) return false;
@@ -111,6 +115,11 @@ function analyzeShellWords(words: string[], depth: number): DangerousShellComman
     return analyzeRm(normalized.words.slice(1));
   }
 
+  if (command === "git") {
+    const finding = analyzeGitMutation(normalized.words.slice(1));
+    if (finding) return finding;
+  }
+
   if (command === "dd" && normalized.words.some((word) => /^of=\/dev\/(?:disk|rdisk|sd|nvme)/.test(word))) {
     return { action: "deny", reason: "Refusing to write raw disk devices with dd." };
   }
@@ -167,6 +176,59 @@ function analyzeRm(args: string[]): DangerousShellCommandFinding | undefined {
   }
 
   return undefined;
+}
+
+/** Recognition for approval prompts, not a replacement for the shell sandbox. */
+function analyzeGitMutation(args: string[]): DangerousShellCommandFinding | undefined {
+  const invocation = gitCommandArguments(args);
+  const subcommand = invocation[0];
+  const commandArgs = invocation.slice(1);
+  const separator = commandArgs.indexOf("--");
+  const options = separator < 0 ? commandArgs : commandArgs.slice(0, separator);
+  if (options.includes("--help") || options.includes("-h")) return undefined;
+
+  let reason: string | undefined;
+  if (subcommand === "reset" && options.includes("--hard")) {
+    reason = "git reset --hard discards tracked working tree changes.";
+  } else if (subcommand === "clean" && !hasGitFlag(options, "n", "--dry-run")) {
+    // clean.requireForce=false also permits deletion without an explicit -f.
+    reason = "git clean can permanently delete untracked working tree files.";
+  } else if (subcommand === "checkout" && commandArgs.length > 0) {
+    // A bare argument can resolve to either a branch or a file. Classify the
+    // ambiguous path form conservatively without consulting repository state.
+    reason = "git checkout can overwrite working tree files.";
+  } else if (subcommand === "switch" && (hasGitFlag(options, "f", "--force") || options.includes("--discard-changes"))) {
+    reason = "Forced git switch discards working tree changes.";
+  } else if (subcommand === "restore" && (!hasGitFlag(options, "S", "--staged") || hasGitFlag(options, "W", "--worktree"))) {
+    reason = "git restore can discard working tree changes.";
+  } else if (subcommand === "push" && !hasGitFlag(options, "n", "--dry-run") && (
+    hasGitFlag(options, "f", "--force")
+    || options.includes("--mirror")
+    || options.some((arg) => arg === "--force-with-lease" || arg.startsWith("--force-with-lease=") || arg === "--force-if-includes")
+    || commandArgs.some((arg) => arg.startsWith("+"))
+  )) {
+    reason = "Forced git push can overwrite remote history.";
+  }
+  return reason ? { action: "ask", reason } : undefined;
+}
+
+function hasGitFlag(args: readonly string[], short: string, long: string): boolean {
+  return args.some((arg) => arg === long || (/^-[A-Za-z]+$/.test(arg) && arg.slice(1).includes(short)));
+}
+
+/** Skip common global options only to find the command for danger warnings. */
+function gitCommandArguments(args: string[]): string[] {
+  let index = 0;
+  while (index < args.length) {
+    const arg = args[index] ?? "";
+    if (!arg.startsWith("-")) return args.slice(index);
+    if (["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"].includes(arg)) {
+      index += 2;
+    } else {
+      index++;
+    }
+  }
+  return [];
 }
 
 function shellSegments(command: string): string[] {
@@ -392,10 +454,24 @@ function hasUnsafeAwkProgram(program: string): boolean {
 }
 
 function isReadOnlyGit(args: string[]): boolean {
-  const subcommand = args[0] ?? "";
+  let index = 0;
+  while (args[index] === "--no-optional-locks" || args[index] === "--no-pager" || args[index] === "-P") index++;
+  const subcommand = args[index] ?? "";
+  const commandArgs = args.slice(index + 1);
+  // Do not infer read safety across configuration, repository overrides, or
+  // aliases. The two supported global flags only suppress locks and pagers.
+  if (subcommand.startsWith("-")) return false;
+  const separator = commandArgs.indexOf("--");
+  const options = separator < 0 ? commandArgs : commandArgs.slice(0, separator);
+  if (options.some((arg) =>
+    arg === "--output" || arg.startsWith("--output=")
+    || arg === "--ext-diff" || arg === "--textconv"
+    || arg === "--open-files-in-pager" || arg.startsWith("--open-files-in-pager=")
+    || /^-O/.test(arg)
+  )) return false;
   if (subcommand === "status" || subcommand === "diff" || subcommand === "log" || subcommand === "show") return true;
   if (subcommand === "rev-parse" || subcommand === "ls-files" || subcommand === "grep") return true;
-  if (subcommand === "branch") return isReadOnlyGitBranch(args.slice(1));
+  if (subcommand === "branch") return isReadOnlyGitBranch(commandArgs);
   return false;
 }
 
@@ -682,7 +758,7 @@ function hasCommandSubstitution(command: string): boolean {
   return false;
 }
 
-function unquotedShellText(command: string): string {
+function unquotedShellText(command: string, includeDoubleQuoted = true): string {
   let result = "";
   let quote: "'" | "\"" | undefined;
   let escaped = false;
@@ -702,13 +778,22 @@ function unquotedShellText(command: string): string {
       result += " ";
       continue;
     }
+    if (quote === "\"") {
+      if (char === "\"") {
+        quote = undefined;
+        result += " ";
+      } else {
+        result += includeDoubleQuoted ? char : " ";
+      }
+      continue;
+    }
     if (char === "'") {
       quote = "'";
       result += " ";
       continue;
     }
     if (char === "\"") {
-      quote = quote === "\"" ? undefined : "\"";
+      quote = "\"";
       result += " ";
       continue;
     }

@@ -12,7 +12,6 @@ import { createBashTool } from "./bash.js";
 import { createEditTool } from "./edit.js";
 import { createGlobTool } from "./glob.js";
 import { createGrepTool } from "./grep.js";
-import { createGitDiffTool, createGitStageTool, createGitStatusTool } from "./git-diff.js";
 import { createProcessTool } from "./process.js";
 import { createReadFileTool } from "./read-file.js";
 import { createReadImageTool } from "./read-image.js";
@@ -158,21 +157,32 @@ test("managed process machine results retain the owned handle across calls", asy
   }
 });
 
-test("git machine results preserve NUL-delimited paths and discard cut filenames", async () => {
+test("bash preserves Git's raw NUL-delimited paths and reports capture truncation", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "chili-structured-git-"));
   try {
     expect((await runProcess("git", ["init", "-q"], { cwd })).exitCode).toBe(0);
     const filename = "long:name\nwith-newline.txt";
     await writeFile(join(cwd, filename), "content\n");
     const ctx = context(cwd);
-    const full = await createGitStatusTool().execute({}, ctx);
-    expect(full.structuredData).toMatchObject({ head: null, untracked: [{ path: filename, status: "untracked", code: "??" }], truncated: false });
-    const limited = await createGitStatusTool().execute({ maxOutputBytes: 5 }, ctx);
-    expect(limited.structuredData).toMatchObject({ untracked: [], truncated: true });
-    const staged = await createGitStageTool().execute({ paths: [filename] }, ctx);
-    expect(staged.structuredData).toMatchObject({ staged: [{ path: filename, status: "added", code: "A" }], truncated: false });
-    const diff = await createGitDiffTool().execute({ staged: true }, ctx);
-    expect(diff.structuredData).toMatchObject({ diff: expect.stringContaining("+content"), truncated: false });
+    const tool = createBashTool();
+    const statusCommand = "git status --porcelain=v1 -z";
+    const statusOutput = `?? ${filename}\0`;
+    const full = await tool.execute({ command: statusCommand }, ctx);
+    expect(full.structuredData).toMatchObject({ stdout: statusOutput, exitCode: 0, stdoutTruncated: false });
+    const limited = await tool.execute({ command: statusCommand, maxOutputBytes: 5 }, ctx);
+    expect(limited.structuredData).toMatchObject({
+      stdout: statusOutput.slice(0, 5), exitCode: 0, stdoutTruncated: true, stdoutBytes: Buffer.byteLength(statusOutput),
+    });
+    const staged = await tool.execute({ command: "git add -- ." }, ctx);
+    expect(staged.structuredData).toMatchObject({ exitCode: 0 });
+    const names = await tool.execute({ command: "git diff --cached --name-only -z" }, ctx);
+    expect(names.structuredData).toMatchObject({ stdout: `${filename}\0`, exitCode: 0, stdoutTruncated: false });
+    const limitedNames = await tool.execute({ command: "git diff --cached --name-only -z", maxOutputBytes: 5 }, ctx);
+    expect(limitedNames.structuredData).toMatchObject({
+      stdout: filename.slice(0, 5), exitCode: 0, stdoutTruncated: true, stdoutBytes: Buffer.byteLength(`${filename}\0`),
+    });
+    const diff = await tool.execute({ command: "git diff --no-ext-diff --cached" }, ctx);
+    expect(diff.structuredData).toMatchObject({ stdout: expect.stringContaining("+content"), exitCode: 0, stdoutTruncated: false });
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

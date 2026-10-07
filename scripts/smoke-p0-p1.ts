@@ -11,7 +11,6 @@ import {
   createApplyPatchTool,
   createBashTool,
   createEditTool,
-  createGitDiffTool,
   createGlobTool,
   createGrepTool,
   createReadFileTool,
@@ -33,7 +32,6 @@ function registerTools(): InMemoryToolRegistry {
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
   registry.register(createBashTool());
-  registry.register(createGitDiffTool());
   registry.register(createToolSearchTool(registry));
   return registry;
 }

@@ -131,15 +131,24 @@ export function createMacOsSeatbeltBashRunner(options: MacOsSeatbeltBashRunnerOp
       const chiliPath = join(workspaceRoot, ".chili");
       const gitTarget = resolveGitMetadataTarget(gitPath);
       const chiliTarget = canonicalPathOrLogical(chiliPath);
+      // Git objects contain historical and renamed copies of denied files. A
+      // working-tree path denial alone cannot prevent reading those copies.
+      const gitReadRoots = resourceDenials?.readPaths.length
+        ? resolveGitReadMetadataRoots(gitPath, gitTarget)
+        : [];
+      const gitReadTargets = gitReadRoots.length > 0
+        ? await inspectProtectedMetadataTrees(gitReadRoots.map((path) => ({ label: "Git history", path })))
+        : [];
       const protectedSymlinkTargets = await inspectProtectedMetadataTrees([
         { label: ".git", path: gitPath },
         { label: ".git target", path: gitTarget },
+        ...gitReadRoots.map((path) => ({ label: "Git history", path })),
         { label: ".chili", path: chiliPath },
         { label: ".chili target", path: chiliTarget },
       ]);
       // Exact canonical symlink targets preserve compatible metadata layouts while
       // preventing writes through aliases that resolve outside the protected roots.
-      const writablePaths = request.executionPolicy
+      const writablePaths = request.readOnly === true ? [] : request.executionPolicy
         ? resolveWritablePaths(workspaceRoot, request.executionPolicy.writeScope ?? [])
         : undefined;
       if (writablePaths && !writablePaths.includes(workspaceRoot)) {
@@ -148,7 +157,10 @@ export function createMacOsSeatbeltBashRunner(options: MacOsSeatbeltBashRunnerOp
       if (resourceDenials) {
         await assertScopedFilesHaveNoHardLinks([...resourceDenials.readPaths, ...resourceDenials.writePaths]);
       }
-      const profile = buildMacOsSeatbeltProfile(workspaceRoot, protectedSymlinkTargets, writablePaths, resourceDenials);
+      const effectiveDenials = resourceDenials && gitReadRoots.length > 0
+        ? { ...resourceDenials, readPaths: [...resourceDenials.readPaths, ...gitReadRoots, ...gitReadTargets] }
+        : resourceDenials;
+      const profile = buildMacOsSeatbeltProfile(workspaceRoot, protectedSymlinkTargets, writablePaths, effectiveDenials);
       const temporaryRoot = realpathSync.native(await mkdtemp(join(tmpdir(), "chili-seatbelt-")));
       const definitions = [
         `-DWORKSPACE_ROOT=${workspaceRoot}`,
@@ -183,7 +195,7 @@ export function createMacOsSeatbeltBashRunner(options: MacOsSeatbeltBashRunnerOp
           ["-p", profile, ...definitions, "--", "/bin/bash", ...bashArguments(request.command)],
           processOptions,
         );
-        return { ...result, sandbox: "macos-seatbelt" };
+        return { ...result, sandbox: "macos-seatbelt", readOnly: request.readOnly === true };
       } finally {
         await rm(temporaryRoot, { recursive: true, force: true });
       }
@@ -217,6 +229,10 @@ function resourceDenyProfile(workspace: string, denials?: ToolResourceDenials): 
   return [
     "; Explicit resource denies dominate tool choice and profile allowances.",
     ...(readFilters ? [`(deny file-read* ${readFilters})`] : []),
+    // Also cover ordinary nested repositories without scanning the workspace.
+    // Block mutation so renaming .git cannot create a readable metadata alias.
+    // Nested gitdir pointers and copied object stores require separate discovery.
+    ...(readFilters ? [`(deny file-read* file-write* (regex #"^${regexEscape(workspace)}/(.*/)?\\.git(/.*)?$"))`] : []),
     ...(writeFilters ? [`(deny file-write* ${writeFilters})`] : []),
     ...(ancestors.size ? [`(deny file-write-unlink ${[...ancestors].map((path) => `(literal "${seatbeltStringLiteral(path)}")`).join(" ")})`] : []),
   ].join("\n");
@@ -445,6 +461,51 @@ function resolveGitMetadataTarget(gitPath: string): string {
   return target;
 }
 
+function resolveGitReadMetadataRoots(gitPath: string, gitTarget: string): string[] {
+  const roots = new Set([gitPath, gitTarget]);
+  // A workspace can be a subdirectory of a repository. Git discovers its
+  // parent's metadata there, so resource denial must follow the same path.
+  const repositoryGitPath = findEnclosingGitMetadataPath(dirname(gitPath));
+  const repositoryGitTarget = repositoryGitPath ? resolveGitMetadataTarget(repositoryGitPath) : gitTarget;
+  if (repositoryGitPath) roots.add(repositoryGitPath);
+  roots.add(repositoryGitTarget);
+  try {
+    const pointer = readFileSync(join(repositoryGitTarget, "commondir"), "utf8").trim();
+    if (!pointer) throw new Error("Git commondir pointer is empty.");
+    roots.add(canonicalPathOrLogical(resolve(repositoryGitTarget, pointer)));
+  } catch (error) {
+    if (!isNotFound(error)) throw error;
+  }
+  // Alternate object databases require recursive object-store discovery. Until
+  // that layout is supported, do not launch a command with partial protection.
+  for (const root of roots) {
+    try {
+      if (readFileSync(join(root, "objects", "info", "alternates"), "utf8").trim()) {
+        throw new Error("Refusing scoped shell execution: Git alternate object databases cannot be protected by resource read denials.");
+      }
+    } catch (error) {
+      if (!isNotFound(error) && !isNotDirectory(error)) throw error;
+    }
+  }
+  return [...roots];
+}
+
+function findEnclosingGitMetadataPath(workspace: string): string | undefined {
+  let directory = workspace;
+  while (true) {
+    const path = join(directory, ".git");
+    try {
+      statSync(path);
+      return path;
+    } catch (error) {
+      if (!isNotFound(error)) throw error;
+    }
+    const parent = dirname(directory);
+    if (directory === parent) return undefined;
+    directory = parent;
+  }
+}
+
 function canonicalPathOrLogical(path: string): string {
   try {
     return realpathSync.native(path);
@@ -474,4 +535,8 @@ function assertProfileSafePath(path: string): void {
 
 function isNotFound(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+function isNotDirectory(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOTDIR";
 }

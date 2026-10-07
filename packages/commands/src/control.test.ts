@@ -177,7 +177,7 @@ test("filesystem command control preserves builtin prompt metadata", async () =>
     commandId: "prompt.builtin.init",
     commandPath: "/prompt builtin init",
     source: "builtin",
-    allowedTools: ["read", "glob", "grep", "git_status", "git_diff", "edit", "write", "apply_patch", "tool_search"],
+    allowedTools: ["read", "glob", "grep", "bash", "edit", "write", "apply_patch", "tool_search"],
     writeScope: ["AGENTS.md"],
   });
   expect(result.prompt).toContain("testing setup");
