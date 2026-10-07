@@ -331,7 +331,7 @@ bun run scripts/probe-minimax.ts --mock
 
 `bun run test:index` 会输出当前 smoke 脚本和按 workspace 分组的 `*.test.ts` 清单，便于后续 worker 快速选择验证范围。
 
-配置好真实 MiniMax key 后，可以运行 `bun run probe:minimax` 做端到端探针。
+配置好 `MINIMAX_API_KEY` 和所属地区的 `MINIMAX_BASE_URL` 后，可以运行 `bun run probe:minimax` 验证 `MiniMax-M3` 的 Responses 接入。探针关闭推理并限制输出预算；加上 `--mock` 可在本地验证请求和流式响应。
 
 Prompt、memory/project context 和 skills 的维护说明见 [docs/prompt-skills.md](docs/prompt-skills.md)。
 

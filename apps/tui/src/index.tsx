@@ -6,6 +6,7 @@ import type { SessionId } from "@chili/protocol";
 import { basename, resolve } from "node:path";
 import { ChatShellApp, type ChatShellExitInfo, type ChatShellOptions } from "./ChatShellApp.js";
 import { detectSystemTheme } from "./theme/index.js";
+import { shutdownTui } from "./shutdown.js";
 export { runtimeStreamInput } from "./useRuntimeEvents.js";
 
 export type TuiOptions = ChatShellOptions;
@@ -126,15 +127,13 @@ async function main(): Promise<void> {
   const root = createRoot(renderer);
   let exitInfo: ChatShellExitInfo | undefined;
 
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
     let closed = false;
     const close = (info?: ChatShellExitInfo) => {
       if (closed) return;
       closed = true;
       exitInfo = info;
-      root.unmount();
-      renderer.destroy();
-      resolve();
+      void shutdownTui(root, renderer).then(resolve, reject);
     };
 
     root.render(<ChatShellApp client={client} options={options} onExit={close} />);

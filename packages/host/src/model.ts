@@ -19,6 +19,7 @@ import {
   listModelCatalogFromStorage,
   listKnownModels,
   REASONING_LEVELS,
+  readProviderEnvironment,
   resolveBuiltinProviderId,
   resolveProviderModelOptions,
   scopeProviderModelOptions,
@@ -253,6 +254,13 @@ class HostProviderRouter implements ModelRouter {
     const reasoningLevel = reasoningLevelForInput(extended, this.options.defaultReasoningLevel);
     const serviceTier = serviceTierForInput(extended, this.options.defaultServiceTier);
     const providerOptions = this.optionsForProvider(selection, reasoningLevel, serviceTier);
+    if (BUILTIN_PROVIDERS[selection.provider].auth === "api_key"
+      && providerOptions.apiKey === undefined
+      && !readProviderEnvironment(selection.provider, providerOptions.env).apiKey) {
+      const storage = this.options.baseOptions.authStorage ?? new FileAuthStorage();
+      const credential = await storage.get(selection.provider);
+      if (credential?.type === "api_key") providerOptions.apiKey = credential.key;
+    }
     const model = createRegisteredProviderModel(selection.provider, providerOptions);
     yield* new ProviderModelRouterAdapter(model, this.options.profileId).stream(input);
   }

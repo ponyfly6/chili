@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { expect, test } from "bun:test";
 import type { ModelStreamInput } from "@chili/core";
 import type { SessionId, TurnId } from "@chili/protocol";
@@ -123,6 +126,50 @@ test("domestic vendor aliases route to independent connections, including custom
   expect(requests.every((request) => !request.headers.has("x-private-connection"))).toBe(true);
   expect(requests.map((request) => request.body.max_output_tokens ?? request.body.max_tokens ?? request.body.max_completion_tokens)).toEqual([2048, 2048, 2048]);
   expect(identities).toEqual([["alibaba/qwen3.8-max"], ["doubao/ep-host-routing"], ["zhipu/glm-5.3"]]);
+});
+
+test("Host resolves stored API keys per selected provider after explicit and environment credentials", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-host-stored-key-"));
+  const storage = new FileAuthStorage(join(root, "auth.json"));
+  const requests: { model: string; authorization: string | null }[] = [];
+  const fetchImpl = (async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as { model: string };
+    requests.push({ model: body.model, authorization: new Headers(init?.headers).get("authorization") });
+    return responsesResponse(body.model);
+  }) as typeof fetch;
+  try {
+    await storage.set("minimax", { type: "api_key", key: "stored-minimax-fixture" });
+    await storage.set("deepseek", { type: "api_key", key: "stored-deepseek-fixture" });
+    const stored = await createHostModel("minimax/MiniMax-M3", { authStorage: storage, env: {}, fetch: fetchImpl });
+    for await (const _ of stored.stream(input)) { /* consume the real router */ }
+    for await (const _ of stored.stream({ ...input, modelSelection: { provider: "deepseek", model: "deepseek-v4-pro" } })) { /* selected provider */ }
+    const environment = await createHostModel("minimax/MiniMax-M3", {
+      authStorage: storage, env: { MINIMAX_API_KEY: "environment-minimax-fixture" }, fetch: fetchImpl,
+    });
+    for await (const _ of environment.stream(input)) { /* environment wins over storage */ }
+    const explicit = await createHostModel("minimax/MiniMax-M3", {
+      authStorage: storage, apiKey: "explicit-minimax-fixture",
+      env: { MINIMAX_API_KEY: "environment-minimax-fixture" }, fetch: fetchImpl,
+    });
+    for await (const _ of explicit.stream(input)) { /* explicit wins over environment */ }
+    for await (const _ of explicit.stream({ ...input, modelSelection: { provider: "deepseek", model: "deepseek-v4-pro" } })) { /* no cross-provider explicit key */ }
+    expect(requests.map((request) => request.authorization)).toEqual([
+      "Bearer stored-minimax-fixture", "Bearer stored-deepseek-fixture", "Bearer environment-minimax-fixture",
+      "Bearer explicit-minimax-fixture", "Bearer stored-deepseek-fixture",
+    ]);
+    expect(requests.map((request) => request.model)).toEqual([
+      "MiniMax-M3", "deepseek-v4-pro", "MiniMax-M3", "MiniMax-M3", "deepseek-v4-pro",
+    ]);
+    // A missing target credential must not borrow the selected provider's key.
+    const emptyTarget = new FileAuthStorage(join(root, "only-minimax.json"));
+    await emptyTarget.set("minimax", { type: "api_key", key: "only-minimax-fixture" });
+    const isolated = await createHostModel("minimax", { authStorage: emptyTarget, env: {}, fetch: fetchImpl });
+    const consumeForeign = async () => {
+      for await (const _ of isolated.stream({ ...input, modelSelection: { provider: "deepseek", model: "deepseek-v4-pro" } })) {}
+    };
+    await expect(consumeForeign()).rejects.toThrow("DEEPSEEK_API_KEY");
+    expect(requests).toHaveLength(5);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 function responsesResponse(model: string): Response {
