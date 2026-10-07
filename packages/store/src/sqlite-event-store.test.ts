@@ -1206,6 +1206,78 @@ test("stale recovery preserves later idle and archived session outcomes", async 
   }
 });
 
+for (const outcome of ["waiting_for_approval", "idle", "archived"] as const) {
+  test(`stale recovery expires legacy approval waiters in ${outcome} sessions without losing history`, async () => {
+    const store = new SqliteEventStore(":memory:");
+    const sessionId = `session_legacy_${outcome}` as SessionId;
+    const turnId = `turn_legacy_${outcome}` as TurnId;
+    const callId = `call_legacy_${outcome}` as ToolCallId;
+    const approvalId = `approval_legacy_${outcome}` as ApprovalId;
+    const base = { sessionId, time: 2 as TimestampMs };
+    let ids = 0;
+    try {
+      await store.appendMany([
+        sessionEvent("event_legacy_session", sessionId, 1 as TimestampMs),
+        { ...base, id: "event_legacy_turn", type: "turn.started", payload: { turnId } },
+        { ...base, id: "event_legacy_tool", type: "tool.call_started", payload: { turnId, callId, toolName: "bash", input: { command: "bun test" } } },
+        { ...base, id: "event_legacy_wait", type: "tool.call_updated", payload: { callId, status: "waiting_for_approval" } },
+        { ...base, id: "event_legacy_approval", type: "approval.requested", payload: { approvalId, callId, permission: "bash", patterns: ["bun test"] } },
+        { ...base, id: "event_legacy_status", type: "session.status_changed", payload: { sessionId, status: "waiting_for_approval", turnId } },
+      ]);
+      if (outcome === "idle") await store.append({ ...base, id: "event_legacy_idle", type: "session.status_changed", payload: { sessionId, status: "idle", turnId } });
+      if (outcome === "archived") await store.append({ ...base, id: "event_legacy_archive", type: "session.archived", payload: { sessionId } });
+
+      const recovered = await store.reconcileStaleTurns({ staleBefore: 100, now: 101, createId: (prefix) => `${prefix}_legacy_${ids++}` });
+      expect(recovered.filter((event) => event.type === "approval.resolved")).toEqual([
+        expect.objectContaining({ sessionId, payload: { approvalId, decision: "deny", feedback: expect.stringContaining("interrupted") } }),
+      ]);
+      expect(recovered.filter((event) => event.type === "tool.call_finished")).toEqual([
+        expect.objectContaining({ sessionId, payload: { callId, status: "failed", synthetic: true, error: expect.stringContaining("interrupted") } }),
+      ]);
+      if (outcome !== "waiting_for_approval") {
+        expect(recovered.filter((event) => event.type === "turn.completed" || event.type === "session.status_changed")).toEqual([]);
+      }
+      expect(await store.pendingApprovals(sessionId)).toEqual([]);
+      expect(await store.events({ sessionId, type: "approval.requested" })).toHaveLength(1);
+      expect((await store.runtimeSnapshot({ sessionId })).events.filter((event) => event.type === "approval.requested")).toEqual([]);
+      expect(await store.reconcileStaleTurns({ staleBefore: 200, now: 201, createId: () => "must_not_append" })).toEqual([]);
+    } finally { store.close(); }
+  });
+}
+
+test("legacy approval recovery preserves live claims and recent activity", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-legacy-approval-claim-"));
+  const path = join(dir, "events.sqlite");
+  const owner = new SqliteEventStore(path);
+  const recovery = new SqliteEventStore(path);
+  const sessionId = "session_live_legacy_approval" as SessionId;
+  const approvalId = "approval_live_legacy" as ApprovalId;
+  const now = Date.now();
+  try {
+    await owner.appendMany([
+      sessionEvent("event_live_legacy_session", sessionId, 1 as TimestampMs),
+      { id: "event_live_legacy_approval", type: "approval.requested", sessionId, time: 2 as TimestampMs,
+        payload: { approvalId, permission: "bash", patterns: ["pwd"] } },
+    ]);
+    owner.claimSessionRun({ sessionId, claimId: "legacy_owner", sessionAccess: "root", time: now, leaseDurationMs: 60_000 });
+    expect(await recovery.reconcileStaleTurns({ staleBefore: 100, now, createId: () => "must_not_append" })).toEqual([]);
+    expect(await recovery.pendingApprovals(sessionId)).toHaveLength(1);
+    owner.releaseSessionRun({ sessionId, claimId: "legacy_owner" });
+
+    await owner.append({ id: "event_live_legacy_recent", type: "session.status_changed", sessionId, time: 100 as TimestampMs,
+      payload: { sessionId, status: "idle" } });
+    expect(await recovery.reconcileStaleTurns({ staleBefore: 100, now, createId: () => "must_not_append" })).toEqual([]);
+    expect(await recovery.pendingApprovals(sessionId)).toHaveLength(1);
+    expect((await recovery.reconcileStaleTurns({ staleBefore: 101, now, createId: () => "event_legacy_expired" })).map((event) => event.type)).toEqual(["approval.resolved"]);
+    expect(await recovery.pendingApprovals(sessionId)).toEqual([]);
+  } finally {
+    owner.releaseSessionRun({ sessionId, claimId: "legacy_owner" });
+    recovery.close();
+    owner.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("fails closed when scoped session events lack or conflict with envelope identity", async () => {
   const store = new SqliteEventStore(":memory:");
   const sessionId = "session_identity_primary" as SessionId;

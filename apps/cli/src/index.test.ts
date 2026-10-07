@@ -488,7 +488,6 @@ test("one serve shutdown signal aborts an in-flight synchronous prompt and drain
   let harness: CliHarness | undefined;
   let serverCloseCount = 0;
   let harnessCloseCount = 0;
-  let denyPendingCount = 0;
   try {
     await mkdir(repo, { recursive: true });
     harness = await createCliHarness({
@@ -515,9 +514,6 @@ test("one serve shutdown signal aborts an in-flight synchronous prompt and drain
     const closingHarness = harness;
     const shutdown = waitForServeShutdown({
       signalSource: signals,
-      denyPending: () => {
-        denyPendingCount += 1;
-      },
       closeServer: () => {
         serverCloseCount += 1;
         // Bun's server.stop(true) waits for this in-flight handler. Model that
@@ -542,7 +538,6 @@ test("one serve shutdown signal aborts an in-flight synchronous prompt and drain
     expect(await promptResponse.json()).toMatchObject({ status: "cancelled" });
     expect(serverCloseCount).toBe(1);
     expect(harnessCloseCount).toBe(1);
-    expect(denyPendingCount).toBe(1);
     expect(signals.listenerCount("SIGINT")).toBe(0);
     expect(signals.listenerCount("SIGTERM")).toBe(0);
     harness = undefined;
@@ -558,7 +553,6 @@ test("serve shutdown observes both close failures without repeating cleanup", as
   let harnessCloseCount = 0;
   const shutdown = waitForServeShutdown({
     signalSource: signals,
-    denyPending: () => undefined,
     closeServer: async () => {
       serverCloseCount += 1;
       throw new Error("server close failed");
@@ -605,7 +599,6 @@ test("serve shutdown deadline forces a bounded exit and observes late close reje
   try {
     const shutdown = waitForServeShutdown({
       signalSource: signals,
-      denyPending: () => undefined,
       closeServer: () => serverClose.promise,
       closeHarness: () => harnessClose.promise,
       shutdownDeadlineMs: 25,
@@ -659,7 +652,6 @@ test("a repeated serve shutdown signal provides one immediate forced escape", as
   let deadlineCancels = 0;
   const shutdown = waitForServeShutdown({
     signalSource: signals,
-    denyPending: () => undefined,
     closeServer: () => {
       serverCloseCount += 1;
       return serverClose.promise;

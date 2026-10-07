@@ -25,13 +25,18 @@ export type PromptFragmentTrust =
   | "model_summary";
 
 export interface PromptFragment {
+  /** Stable material identity; changes replace this ID within one assembly. */
   id: string;
   layer: PromptLayer;
   source: PromptFragmentSource;
+  /** Ascending material selection order within a role, not instruction authority. */
   priority: number;
+  /** Expected lifetime of the material, not permission to reuse a cached value. */
   lifecycle: PromptFragmentLifecycle;
   trust: PromptFragmentTrust;
   content: string;
+  /** Exact loaded source used for provenance; only content is sent to the model. */
+  sourceContent?: string;
   marker?: { open: string; close: string };
   maxChars?: number;
   metadata?: Record<string, unknown>;
@@ -47,6 +52,7 @@ export interface RenderedPromptFragment {
   lifecycle: PromptFragmentLifecycle;
   trust: PromptFragmentTrust;
   content: string;
+  sourceContent?: string;
   chars: number;
   metadata?: Record<string, unknown>;
 }

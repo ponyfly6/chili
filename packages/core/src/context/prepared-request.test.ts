@@ -25,13 +25,13 @@ async function fixture(model: ModelRouter, contextBudget = {}) {
   const registry = new InMemoryToolRegistry();
   registry.register({
     name: "inspect", description: "Inspect the current session", risk: "read", inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     async execute(_input, context) { return { title: "session", output: context.sessionId }; },
   });
   const runtime = new SingleAgentRuntime({
     store, model, toolRegistry: registry, contextBudget,
     retryPolicy: { maxAttempts: 2, initialDelayMs: 0 },
-    toolExecutor: new ToolExecutor({ registry, events: { publish: (event) => store.append(event) }, approvals: { decide: async () => ({ action: "allow_once" }) } }),
+    toolExecutor: new ToolExecutor({ registry, events: { publish: (event) => store.append(event) }, gate: { review: async () => ({ decision: "allow" }) } }),
   });
   return { cwd, databasePath, store, registry, runtime };
 }
@@ -169,7 +169,7 @@ test("structured program data remains durable while model tool previews are boun
     },
   }, { maxToolResultChars: 120 });
   const data = { rows: Array.from({ length: 300 }, (_, index) => ({ index, value: `row-${index}` })) };
-  f.registry.register({ name: "inspect", description: "program data", risk: "read", inputSchema: { type: "object" }, approval: () => false, async execute() { return { title: "rows", output: "preview ".repeat(500), structuredData: data }; } }, { replace: true });
+  f.registry.register({ name: "inspect", description: "program data", risk: "read", inputSchema: { type: "object" }, resources: () => false, async execute() { return { title: "rows", output: "preview ".repeat(500), structuredData: data }; } }, { replace: true });
   const sessionId = await f.runtime.createSession({ cwd: f.cwd });
   await f.runtime.runTurn({ sessionId, cwd: f.cwd });
   await f.runtime.runTurn({ sessionId, cwd: f.cwd });

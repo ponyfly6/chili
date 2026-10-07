@@ -3,7 +3,6 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChiliEvent, SessionId, TurnId } from "@chili/protocol";
-import { PolicyApprovalBroker } from "../approval.js";
 import { createCodeModeTool } from "../builtins/code-mode.js";
 import { createReadFileTool } from "../builtins/read-file.js";
 import { createWriteFileTool } from "../builtins/write-file.js";
@@ -20,13 +19,17 @@ test("code_mode composes under resource restrictions without granting its childr
     registry.register(createReadFileTool());
     registry.register(createWriteFileTool());
     const events: ChiliEvent[] = [];
+    const reviewedTools: string[] = [];
     const executor = new ToolExecutor({
       registry,
       events: { publish: async (event) => { events.push(event); } },
-      approvals: new PolicyApprovalBroker({ rulesets: [[
-        { permission: "*", pattern: "*", action: "allow" },
-        { permission: "read", pattern: "secret.txt", action: "deny" },
-      ]] }),
+      gate: { review: async (request) => {
+        reviewedTools.push(request.toolName);
+        const filePath = (request.input as { filePath?: string }).filePath;
+        return request.toolName === "read" && filePath?.endsWith("secret.txt")
+          ? { decision: "deny", reason: "This file is outside the requested task." }
+          : { decision: "allow" };
+      } },
       policyResolver: { resolve: () => ({ allowedTools: ["code_mode", "read", "write"], writeScope: [], executeScope: [] }) },
     });
     const result = await executor.execute({
@@ -52,6 +55,7 @@ test("code_mode composes under resource restrictions without granting its childr
     const starts = events.filter((event) => event.type === "tool.call_started");
     expect(starts.filter((event) => event.payload.toolName === "read")).toHaveLength(2);
     expect(starts.filter((event) => event.payload.toolName === "read").every((event) => event.payload.parentCallId === result.callId)).toBe(true);
+    expect(reviewedTools).toEqual(["code_mode", "read", "read"]);
     expect(await readFile(join(cwd, "secret.txt"), "utf8")).toBe("PRIVATE_CONTENT");
   } finally {
     await rm(cwd, { recursive: true, force: true });

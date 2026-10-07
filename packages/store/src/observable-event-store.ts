@@ -38,6 +38,7 @@ export class ObservableEventStore
   private readonly activeParts = new Map<string, Extract<ChiliEvent, { type: "message.part_stream_snapshot" }>>();
   readonly eventReplayBoundary?: NonNullable<EventStore["eventReplayBoundary"]>;
   readonly runtimeSnapshot?: NonNullable<EventStore["runtimeSnapshot"]>;
+  readonly sessionInputForMessage?: NonNullable<EventStore["sessionInputForMessage"]>;
 
   constructor(
     private readonly inner: EventStore,
@@ -72,6 +73,7 @@ export class ObservableEventStore
       if (Buffer.byteLength(JSON.stringify(result), "utf8") > maxBytes) throw new RuntimeSnapshotLimitError();
       return result;
     };
+    if (inner.sessionInputForMessage) this.sessionInputForMessage = (sessionId, messageId) => inner.sessionInputForMessage!(sessionId, messageId);
   }
 
   async append(event: RuntimeEvent, options?: EventAppendOptions): Promise<void> {

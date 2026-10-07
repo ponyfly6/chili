@@ -17,7 +17,7 @@ export interface RemoteSnapshot {
     runStatus: string;
     queuedCount: number;
     deliveryUnknown: boolean;
-    needsDesktop: { approval: boolean; input: boolean };
+    needsDesktop: { input: boolean };
   };
   messages: RemoteMessage[];
   truncated: boolean;
@@ -41,7 +41,7 @@ export function readTaskSnapshot(value: unknown): RemoteSnapshot {
   const result = record(value);
   const session = record(result.session);
   const needsDesktop = record(session.needsDesktop);
-  if (typeof needsDesktop.approval !== "boolean" || typeof needsDesktop.input !== "boolean") invalidResult();
+  if (typeof needsDesktop.input !== "boolean") invalidResult();
   if ("deliveryUnknown" in session && typeof session.deliveryUnknown !== "boolean") invalidResult();
   if (!Array.isArray(result.messages) || result.messages.length > 40) invalidResult();
   const messages = result.messages.map((value): RemoteMessage => {
@@ -62,7 +62,7 @@ export function readTaskSnapshot(value: unknown): RemoteSnapshot {
       runStatus: boundedString(session.runStatus, 64),
       queuedCount: session.queuedCount,
       deliveryUnknown: session.deliveryUnknown === true,
-      needsDesktop: { approval: needsDesktop.approval === true, input: needsDesktop.input === true },
+      needsDesktop: { input: needsDesktop.input === true },
     },
     messages,
     truncated: result.truncated === true,
@@ -94,7 +94,7 @@ export function runStatusLabel(status: string): string {
   const labels: Record<string, string> = {
     idle: "空闲",
     running: "运行中",
-    waiting_for_approval: "等待桌面审批",
+    waiting_for_approval: "旧审批已停止",
     waiting_for_input: "等待桌面回答",
     cancelling: "正在停止",
     completed: "已完成",

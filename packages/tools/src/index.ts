@@ -1,4 +1,3 @@
-export * from "./approval.js";
 export * from "./resource-policy.js";
 export * from "./structured-data.js";
 export * from "./builtins/activate-skill.js";
@@ -17,7 +16,6 @@ export * from "./builtins/read-file.js";
 export * from "./builtins/read-image.js";
 export * from "./builtins/tool-search.js";
 export * from "./builtins/write-file.js";
-export * from "./deferred-approval.js";
 export * from "./errors.js";
 export * from "./executor.js";
 export * from "./dispatch-scope.js";

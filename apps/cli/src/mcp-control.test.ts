@@ -523,7 +523,7 @@ test("project MCP tools resolve and execute only in their canonical workspace", 
   const executor = new ToolExecutor({
     registry,
     events: { publish: async (_event: ChiliEvent) => {} },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     createId: (prefix) => `${prefix}_mcp_scope`,
     now: () => 1 as TimestampMs,
   });

@@ -51,9 +51,6 @@ export class DesktopNotificationGate {
 
 /** Keep untrusted runtime content out of the OS notification surface. */
 export function desktopNotificationForEvent(event: ChiliEvent): DesktopNotificationContent | undefined {
-  if (event.type === "approval.requested") {
-    return { title: "Chili needs approval", body: "A task is waiting for your approval." };
-  }
   if (event.type === "user_input.requested") {
     return { title: "Chili needs your input", body: "A task is waiting for your answer." };
   }

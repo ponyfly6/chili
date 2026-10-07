@@ -3,7 +3,7 @@ import { MAX_PROMPT_BYTES, canSendPrompt, errorMessage, promptByteLength, readSe
 
 const task = { id: "session_1", title: "Existing task", status: "active", updatedAt: 1_700_000_000_000 };
 const snapshot = {
-  session: { ...task, runStatus: "running", queuedCount: 0, needsDesktop: { approval: false, input: false } },
+  session: { ...task, runStatus: "running", queuedCount: 0, needsDesktop: { input: false } },
   messages: [{ id: "message_1", role: "assistant", text: "Recent visible message", createdAt: 1_700_000_000_000 }],
   truncated: false,
 };
@@ -31,17 +31,17 @@ describe("mobile public projection", () => {
   test("accepts the adapter's maximum title and message id budgets", () => {
     const result = readTaskSnapshot({
       ...snapshot,
-      session: { ...snapshot.session, title: "A".repeat(1022), needsDesktop: { approval: true, input: false } },
+      session: { ...snapshot.session, title: "A".repeat(1022), needsDesktop: { input: true } },
       messages: [{ ...snapshot.messages[0], id: "m".repeat(254), text: "<script>not markup</script>" }],
     });
-    expect(result.session.needsDesktop.approval).toBe(true);
+    expect(result.session.needsDesktop.input).toBe(true);
     expect(result.messages[0]?.text).toBe("<script>not markup</script>");
   });
 
-  test("projects the queued delivery uncertainty flag without treating it as a desktop approval", () => {
+  test("projects the queued delivery uncertainty flag without treating it as a desktop input request", () => {
     const uncertain = readTaskSnapshot({ ...snapshot, session: { ...snapshot.session, deliveryUnknown: true } });
     expect(uncertain.session.deliveryUnknown).toBe(true);
-    expect(uncertain.session.needsDesktop).toEqual({ approval: false, input: false });
+    expect(uncertain.session.needsDesktop).toEqual({ input: false });
     expect(readTaskSnapshot(snapshot).session.deliveryUnknown).toBe(false);
     expect(readTaskSnapshot({ ...snapshot, session: { ...snapshot.session, deliveryUnknown: false } }).session.deliveryUnknown).toBe(false);
     for (const invalid of ["false", "true", 0, 1, null, undefined]) {

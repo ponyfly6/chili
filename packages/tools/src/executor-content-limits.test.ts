@@ -27,7 +27,7 @@ test("bounds oversized image content, title, and metadata before returning or pu
     description: "Returns hostile content.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({
       title: "T".repeat(20_000),
       output: "safe summary",
@@ -59,7 +59,7 @@ test("enforces an aggregate byte cap across otherwise valid images", async () =>
     description: "Returns aggregate-heavy content.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({
       title: "aggregate",
       output: "safe summary",
@@ -90,7 +90,7 @@ test("caps each streamed delta and aggregate SSE output for a tool call", async 
     description: "Streams hostile output.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async (_input, context) => {
       for (let index = 0; index < 20; index += 1) {
         await context.streamOutput({ stream: "stdout", delta, bytes: delta.length });
@@ -121,7 +121,7 @@ test("bounds untrusted call input without changing the value executed by the too
     description: "Receives a large input.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async (input: { payload?: string }) => {
       executedBytes = Buffer.byteLength(input.payload ?? "", "utf8");
       return { title: "input", output: "done" };
@@ -154,7 +154,7 @@ test("normalizes hostile call ids once across the complete executor lifecycle", 
       description: "Returns a small result.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       execute: async () => ({ title: "safe", output: "done" }),
     }, events);
 
@@ -193,14 +193,14 @@ test("bounds hostile snapshot provider fields before lifecycle persistence", asy
     description: "Creates a defensive snapshot event.",
     risk: "write",
     inputSchema: { type: "object" },
-    approval: () => ({ permission: "write", patterns: ["README.md"] }),
+    resources: () => ({ permission: "write", patterns: ["README.md"] }),
     execute: async () => ({ title: "snapshot", output: "done" }),
   });
   const events: ChiliEvent[] = [];
   const executor = new ToolExecutor({
     registry,
     events: { publish: async (event) => { events.push(event); } },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     snapshotProvider: {
       create: async () => ({
         id: "snapshot_safe" as SnapshotId,
@@ -233,7 +233,7 @@ test("bounds hostile snapshot provider fields before lifecycle persistence", asy
   const invalidExecutor = new ToolExecutor({
     registry,
     events: { publish: async (event) => { invalidEvents.push(event); } },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     snapshotProvider: {
       create: async () => ({
         id: "__proto__" as SnapshotId,
@@ -254,18 +254,18 @@ test("bounds hostile snapshot provider fields before lifecycle persistence", asy
   }
 });
 
-test("redacts and bounds worst-case approval denial feedback before durable events", async () => {
+test("redacts and bounds worst-case review denial feedback before durable events", async () => {
   const bearerToken = "APPROVAL_SECRET_123456";
   const loopbackUrl = "http://localhost:47832/private?token=APPROVAL_URL_SECRET";
   const feedback = `Denied with Bearer ${bearerToken} at ${loopbackUrl}\n${"\u0000".repeat(5 * 1024 * 1024)}`;
   const registry = new InMemoryToolRegistry();
   let executed = false;
   registry.register({
-    name: "approval_feedback_bound",
-    description: "Requires approval.",
+    name: "review_feedback_bound",
+    description: "Requires review.",
     risk: "write",
     inputSchema: { type: "object" },
-    approval: () => ({ permission: "write", patterns: ["README.md"] }),
+    resources: () => ({ permission: "write", patterns: ["README.md"] }),
     execute: async () => {
       executed = true;
       return { title: "unexpected", output: "unexpected" };
@@ -275,16 +275,16 @@ test("redacts and bounds worst-case approval denial feedback before durable even
   const executor = new ToolExecutor({
     registry,
     events: { publish: async (event) => { events.push(event); } },
-    approvals: { decide: async () => ({ action: "deny", feedback }) },
-    createId: (prefix) => `${prefix}_approval_feedback`,
+    gate: { review: async () => ({ decision: "deny", reason: feedback }) },
+    createId: (prefix) => `${prefix}_review_feedback`,
     now: () => 1 as TimestampMs,
   });
 
-  const result = await executor.execute(toolInput("approval_feedback_bound"));
+  const result = await executor.execute(toolInput("review_feedback_bound"));
   expect(result.status).toBe("failed");
   expect(executed).toBe(false);
   const durable = events.filter((event) =>
-    event.type === "approval.resolved" || event.type === "tool.call_finished"
+    event.type === "tool.call_finished" || (event.type === "tool.call_updated" && event.payload.metadata?.review !== undefined)
   );
   expect(durable).toHaveLength(2);
   const serialized = JSON.stringify(durable);
@@ -310,7 +310,7 @@ test("normalizes an oversized control-character tool name in lifecycle events", 
     description: "Known tool.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "known", output: "done" }),
   }, events);
 
@@ -342,7 +342,7 @@ test("rejects invalid stream and metadata statuses before publishing malformed e
     description: "Publishes an invalid stream name.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async (_input, context) => {
       await context.streamOutput({ stream: invalidStream as never, delta: "ok" });
       return { title: "unexpected", output: "unexpected" };
@@ -358,7 +358,7 @@ test("rejects invalid stream and metadata statuses before publishing malformed e
     description: "Publishes an invalid metadata status.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async (_input, context) => {
       await context.metadata({ status: invalidStream as never, metadata: { ignored: invalidStream } });
       return { title: "unexpected", output: "unexpected" };
@@ -367,7 +367,7 @@ test("rejects invalid stream and metadata statuses before publishing malformed e
   const statusResult = await statusExecutor.execute(toolInput("invalid_metadata_status"));
   expect(statusResult.status).toBe("failed");
   expect(statusEvents.some((event) =>
-    event.type === "tool.call_updated" && event.payload.metadata !== undefined
+    event.type === "tool.call_updated" && event.payload.metadata !== undefined && event.payload.metadata.review === undefined
   )).toBe(false);
 
   const contractsModulePath = "../../../apps/desktop/src/shared/contracts.ts";
@@ -394,7 +394,7 @@ test("normalizes a 5 MiB multibyte tool rejection before returning or publishing
     description: "Rejects with a hostile error.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => { throw source; },
   }, events);
 
@@ -438,7 +438,7 @@ test("redacts Bearer credentials and loopback URLs before tool errors reach desk
     description: "Rejects with recognizable credentials and a local endpoint.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => { throw source; },
   }, events);
 
@@ -482,7 +482,7 @@ test("normalizes 5 MiB abort reasons as bounded cancellations", async () => {
     description: "Aborts with a hostile reason.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => { throw error; },
   }, events);
 
@@ -508,24 +508,24 @@ test("preserves truncation metadata for a 5 MiB AbortController reason", async (
     code: "E_SIGNAL_CANCEL",
   });
   const controller = new AbortController();
-  let approvalStartedResolve: (() => void) | undefined;
-  const approvalStarted = new Promise<void>((resolve) => { approvalStartedResolve = resolve; });
+  let reviewStartedResolve: (() => void) | undefined;
+  const reviewStarted = new Promise<void>((resolve) => { reviewStartedResolve = resolve; });
   const events: ChiliEvent[] = [];
   const registry = new InMemoryToolRegistry();
   registry.register({
     name: "signal_abort",
-    description: "Waits for approval cancellation.",
+    description: "Waits for review cancellation.",
     risk: "write",
     inputSchema: { type: "object" },
-    approval: () => ({ patterns: ["signal-abort"] }),
+    resources: () => ({ patterns: ["signal-abort"] }),
     execute: async () => ({ title: "unexpected", output: "unexpected" }),
   });
   const executor = new ToolExecutor({
     registry,
     events: { publish: async (event) => { events.push(event); } },
-    approvals: {
-      decide: async () => {
-        approvalStartedResolve?.();
+    gate: {
+      review: async () => {
+        reviewStartedResolve?.();
         return new Promise(() => {});
       },
     },
@@ -533,7 +533,7 @@ test("preserves truncation metadata for a 5 MiB AbortController reason", async (
     now: () => 1 as TimestampMs,
   });
   const execution = executor.execute({ ...toolInput("signal_abort"), signal: controller.signal });
-  await approvalStarted;
+  await reviewStarted;
   controller.abort(source);
 
   const result = await execution;
@@ -572,7 +572,7 @@ test("treats a custom execute-phase AbortController reason as a bounded cancella
     description: "Throws the custom signal reason after execution starts.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async (_input, context) => {
       executionStartedResolve?.();
       if (!context.signal.aborted) {
@@ -621,7 +621,7 @@ test("fences pre-aborted and signal-ignoring tools from reporting completion", a
     description: "Must not execute after its signal is already aborted.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => {
       preAbortedToolExecuted = true;
       return { title: "unexpected", output: "unexpected" };
@@ -645,7 +645,7 @@ test("fences pre-aborted and signal-ignoring tools from reporting completion", a
     description: "Returns success even after its signal is aborted.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => {
       executionStartedResolve?.();
       await finishExecution;
@@ -695,7 +695,7 @@ test("signal cancellation wins while contextual tool selection rejects or resolv
       description: "Must not execute after contextual selection is cancelled.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       execute: async () => {
         toolExecuted = true;
         return { title: "unexpected", output: "unexpected" };
@@ -712,7 +712,7 @@ test("signal cancellation wins while contextual tool selection rejects or resolv
     const executor = new ToolExecutor({
       registry,
       events: { publish: async (event) => { events.push(event); } },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
       createId: (prefix) => `${prefix}_context_selection_${phase}`,
       now: () => 1 as TimestampMs,
     });
@@ -771,7 +771,7 @@ test("bounds non-Error rejections and survives throwing error getters", async ()
     description: "Rejects with a string.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => { throw huge; },
   });
   const stringResult = await stringExecutor.execute(toolInput("string_error"));
@@ -791,7 +791,7 @@ test("bounds non-Error rejections and survives throwing error getters", async ()
     description: "Rejects with throwing getters.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => { throw hostile; },
   });
   const getterResult = await getterExecutor.execute(toolInput("getter_error"));
@@ -811,7 +811,7 @@ test("caps safe machine-readable error names and codes independently", async () 
     description: "Rejects with long machine identifiers.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => { throw error; },
   });
 
@@ -831,7 +831,7 @@ test("caps safe machine-readable error names and codes independently", async () 
     description: "Rejects with an unsafe numeric code.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => { throw unsafeNumber; },
   });
   const numericResult = await numericExecutor.execute(toolInput("unsafe_numeric_code"));
@@ -851,7 +851,7 @@ test("preserves prototype-named metadata keys without mutating the output protot
     description: "Returns prototype-named metadata.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "metadata", output: "done", metadata }),
   });
 
@@ -876,7 +876,7 @@ test("caps the actual serialized metadata bytes including JSON escaping and keys
     description: "Returns JSON-expensive metadata.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "metadata", output: "done", metadata }),
   });
 
@@ -894,7 +894,7 @@ test("bounds context metadata updates before event persistence and desktop IPC",
     description: "Publishes hostile progress metadata and completes.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async (_input, context) => {
       await context.metadata({ metadata: { payload: hugeMetadata, useful: "kept" } });
       return { title: "metadata update", output: "done" };
@@ -905,7 +905,7 @@ test("bounds context metadata updates before event persistence and desktop IPC",
   expect(result.status).toBe("completed");
   const update = events.find(
     (event): event is Extract<ChiliEvent, { type: "tool.call_updated" }> =>
-      event.type === "tool.call_updated" && event.payload.metadata !== undefined,
+      event.type === "tool.call_updated" && event.payload.metadata !== undefined && event.payload.metadata.review === undefined,
   );
   expect(update?.payload.metadata).toMatchObject({ useful: "kept" });
   expect(Buffer.byteLength(JSON.stringify(update?.payload.metadata), "utf8")).toBeLessThanOrEqual(512_000);
@@ -958,7 +958,7 @@ test("normalizes only diagnostic tool metadata while preserving aliases and ordi
     description: "Publishes and returns diagnostic metadata.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async (_input, context) => {
       await context.metadata({ metadata: makeMetadata() });
       return {
@@ -975,7 +975,7 @@ test("normalizes only diagnostic tool metadata while preserving aliases and ordi
   if (result.status !== "completed") return;
   const update = events.find(
     (event): event is Extract<ChiliEvent, { type: "tool.call_updated" }> =>
-      event.type === "tool.call_updated" && event.payload.metadata !== undefined,
+      event.type === "tool.call_updated" && event.payload.metadata !== undefined && event.payload.metadata.review === undefined,
   );
   const updateMetadata = update?.payload.metadata;
   const resultMetadata = result.result.metadata;
@@ -1022,7 +1022,7 @@ test("allowlists successful ToolResult fields and drops arbitrary enumerable pay
     description: "Returns an undeclared field.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "safe", output: "done", extraPayload: secret }),
   });
 
@@ -1042,7 +1042,7 @@ test("bounds artifact ids by type, UTF-8 bytes, count, and serialized aggregate 
     description: "Returns hostile artifact ids.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "artifacts", output: "done", artifactIds: artifactIds as never }),
   });
 
@@ -1093,7 +1093,7 @@ test("bounds content by actual serialized JSON bytes for escape-heavy text", asy
     description: "Returns JSON-expensive text content.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({
       title: "escaped",
       output: escapedOutput,
@@ -1155,51 +1155,9 @@ test("bounds content by actual serialized JSON bytes for escape-heavy text", asy
       role: "assistant",
     },
   };
-  const approvalRow = (index: number, metadataChars: number) => ({
-    id: `approval_escape_heavy_${String(index).padStart(4, "0")}`,
-    sessionId: "session_content_limit",
-    permission: "P".repeat(512),
-    patterns: ["X".repeat(2_000)],
-    maxApprovalScope: "persistent",
-    metadata: { note: "M".repeat(metadataChars) },
-    createdAt: index + 1,
-  });
-  const pendingApprovals: ReturnType<typeof approvalRow>[] = [];
-  let pendingApprovalBytes = 2;
-  for (let index = 0; index < 2_000; index += 1) {
-    const row = approvalRow(index, 15_000);
-    const rowBytes = Buffer.byteLength(JSON.stringify(row), "utf8");
-    expect(rowBytes).toBeLessThanOrEqual(64_000);
-    const extraBytes = rowBytes + (pendingApprovals.length > 0 ? 1 : 0);
-    if (pendingApprovalBytes + extraBytes > 1_000_000) break;
-    pendingApprovals.push(row);
-    pendingApprovalBytes += extraBytes;
-  }
-  let low = 0;
-  let high = 15_000;
-  const finalIndex = pendingApprovals.length;
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    const rowBytes = Buffer.byteLength(JSON.stringify(approvalRow(finalIndex, middle)), "utf8");
-    const extraBytes = rowBytes + (pendingApprovals.length > 0 ? 1 : 0);
-    if (pendingApprovalBytes + extraBytes <= 1_000_000) low = middle;
-    else high = middle - 1;
-  }
-  const finalApproval = approvalRow(finalIndex, low);
-  const finalApprovalBytes = Buffer.byteLength(JSON.stringify(finalApproval), "utf8")
-    + (pendingApprovals.length > 0 ? 1 : 0);
-  if (pendingApprovalBytes + finalApprovalBytes <= 1_000_000) {
-    pendingApprovals.push(finalApproval);
-    pendingApprovalBytes += finalApprovalBytes;
-  }
-  expect(pendingApprovalBytes).toBe(Buffer.byteLength(JSON.stringify(pendingApprovals), "utf8"));
-  expect(pendingApprovalBytes).toBeGreaterThan(997_000);
-  expect(pendingApprovalBytes).toBeLessThanOrEqual(1_000_000);
-
   const replayEvents = [messageCreated, messagePartAdded];
   const replayWindow = {
     events: replayEvents,
-    pendingApprovals,
     truncated: true,
     bytes: Buffer.byteLength(JSON.stringify(replayEvents), "utf8"),
     pinnedEventIds: [messagePartAdded.id],
@@ -1256,7 +1214,7 @@ test("hard-caps and persists escape-heavy activate_skill output despite its Infi
     const executor = new ToolExecutor({
       registry,
       events: { publish: async (event) => { events.push(event); } },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
       maxPersistedOutputBytes: 6 * 1024 * 1024,
       createId: (prefix) => `${prefix}_activate_skill_wire_limit`,
       now: () => 1 as TimestampMs,
@@ -1341,7 +1299,7 @@ test("normalizes publisher failures without recursively publishing a terminal ev
       description: "Exercises an event publisher failure boundary.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       execute: async () => {
         if (phase === "terminal-failed") throw new Error("ordinary tool failure");
         return { title: "publisher", output: "done" };
@@ -1365,7 +1323,7 @@ test("normalizes publisher failures without recursively publishing a terminal ev
           }
         },
       },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
       createId: (prefix) => `${prefix}_publisher_${phase}`,
       now: () => 1 as TimestampMs,
     });
@@ -1419,7 +1377,7 @@ function createExecutor(tool: ChiliToolDefinition, events: ChiliEvent[] = []): T
   return new ToolExecutor({
     registry,
     events: { publish: async (event) => { events.push(event); } },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     createId: (prefix) => `${prefix}_content_limit`,
     now: () => 1 as TimestampMs,
   });

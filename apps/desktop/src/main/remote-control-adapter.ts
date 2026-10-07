@@ -41,7 +41,7 @@ export type RemoteDesktopSnapshot = {
     runStatus: RuntimeSessionStatus;
     queuedCount: number;
     deliveryUnknown: boolean;
-    needsDesktop: { approval: boolean; input: boolean };
+    needsDesktop: { input: boolean };
   };
   messages: { id: string; role: "user" | "assistant"; text: string; createdAt: number }[];
   truncated: boolean;
@@ -143,7 +143,6 @@ export function projectRemoteSnapshot(snapshot: DesktopRemoteRootSnapshot): Remo
       queuedCount: Math.max(0, Math.min(64, finiteNumber(snapshot.queuedCount))),
       deliveryUnknown: snapshot.deliveryUnknown,
       needsDesktop: {
-        approval: snapshot.needsDesktop.approval || runtimeSession?.status === "waiting_for_approval",
         input: snapshot.needsDesktop.input,
       },
     },

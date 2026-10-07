@@ -19,8 +19,9 @@ it does not resend an admitted command.
 The interface only lists existing tasks and displays the public bounded snapshot
 projection. The composer sends Queue or Steer, and Stop has its own action lane.
 At most one list read and one snapshot read are in flight, with timer-after-settle
-polling. Read requests do not own the send/stop locks. Approval and input prompts
-only show a request to return to the desktop, with no remote approval controls.
+polling. Read requests do not own the send/stop locks. Input prompts show a request
+to return to the desktop to answer a question. Tool execution uses the selected
+Full Access or Auto-review mode without human approval controls.
 An unknown send outcome clears that submitted draft and tells the user to inspect
 the task before issuing another command; there is no automatic mutation retry.
 Unknown Queue, Steer and Stop outcomes are retained separately from connection

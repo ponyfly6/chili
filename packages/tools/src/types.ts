@@ -1,7 +1,4 @@
 import type {
-  ApprovalDecision,
-  ApprovalId,
-  ApprovalScope,
   RuntimeEvent,
   EventEnvelope,
   SessionId,
@@ -13,7 +10,6 @@ import type {
   ToolResult,
   TurnId,
 } from "@chili/protocol";
-import type { PermissionDecision } from "@chili/policy";
 import type { FileReadStateStore } from "./file-read-state.js";
 import type { ToolDispatchScope } from "./dispatch-scope.js";
 
@@ -47,20 +43,18 @@ export interface ChiliToolDefinition<Input = any, Output extends ToolResult = To
   validate?(input: unknown, context?: ToolRegistryContext): Promise<ValidationResult<Input>> | ValidationResult<Input>;
   /** Resolve trusted resource identities without performing the operation. */
   prepareInput?(input: Input, context: ToolRegistryContext): Promise<Input> | Input;
-  approval?(input: Input): false | ToolApprovalSpec;
+  /** Resource identities for scope enforcement and snapshots; never bypasses execution review. */
+  resources?(input: Input): false | ToolResourceSpec;
   execute(input: Input, context: ChiliToolExecutionContext): Promise<Output>;
 }
 
-export interface ToolApprovalSpec {
+export interface ToolResourceSpec {
   permission?: string;
   patterns: string[];
-  maxApprovalScope?: ApprovalScope;
   metadata?: Record<string, unknown>;
 }
 
-export type ToolApprovalSpecWithDefaults =
-  & Required<Omit<ToolApprovalSpec, "maxApprovalScope">>
-  & Pick<ToolApprovalSpec, "maxApprovalScope">;
+export type ToolResourceSpecWithDefaults = Required<ToolResourceSpec>;
 
 export type ToolBooleanPredicate<Input = any> = boolean | ((input: Input) => boolean | Promise<boolean>);
 
@@ -74,7 +68,7 @@ export interface PersistedToolOutputRegistration {
 
 export interface ChiliToolExecutionContext extends ToolExecutionContext {
   outputArtifactId: ToolCallId;
-  /** Backend-enforced resource constraints; approval is not an isolation boundary. */
+  /** Backend-enforced resource constraints; model review is not an isolation boundary. */
   executionPolicy?: ToolAccessPolicy;
   /** Trusted effective caller grants, denials and scopes for delegated authority. */
   callerToolPolicy?: ToolAccessPolicy;
@@ -152,59 +146,35 @@ export interface ToolEventSink {
   publish(event: RuntimeEvent): Promise<void>;
 }
 
-export interface ApprovalBrokerRequest {
-  approvalId: ApprovalId;
-  sessionId: SessionId;
-  callId: ToolCallId;
-  toolName: string;
-  risk: ChiliToolDefinition["risk"];
-  permission: string;
-  patterns: string[];
-  maxApprovalScope?: ApprovalScope;
-  metadata?: Record<string, unknown>;
-  workspaceRoot?: string;
+/** The host reviews the exact immutable operation prepared by the executor. */
+export interface ToolReviewRequest {
+  readonly sessionId: SessionId;
+  readonly turnId: TurnId;
+  readonly callId: ToolCallId;
+  readonly parentCallId?: ToolCallId;
+  readonly toolName: string;
+  readonly toolDescription: string;
+  readonly risk: ChiliToolDefinition["risk"];
+  readonly input: unknown;
+  readonly cwd: string;
+  readonly resources?: ToolResourceSpecWithDefaults;
 }
 
-export type ApprovalPreflightAction = "allow" | "ask" | "deny";
-
-export interface ApprovalPreflightDecision extends Omit<PermissionDecision, "action"> {
-  action: ApprovalPreflightAction;
-  revision?: string;
+export interface ToolReviewResult {
+  decision: "allow" | "deny";
+  reason?: string;
+  /** Check revocation/configuration changes without calling the model again. */
+  assertCurrent?: () => Promise<void>;
 }
 
-export interface ApprovalPreflightRequest extends Omit<ApprovalBrokerRequest, "approvalId"> {}
-
-/**
- * One ruleset observation shared by checks at a single execution boundary.
- * Capture again after waiting; this is not authority for the lifetime of a call.
- */
-export interface ApprovalPolicySnapshot {
-  preflight(): Promise<ApprovalPreflightDecision>;
-  resourceDenials(): Promise<ToolResourceDenials | undefined>;
-  assertFileResourceAccess(paths: readonly string[], access: "read" | "write"): Promise<void>;
-}
-
-export interface ApprovalResolution {
-  decision: ApprovalDecision;
-  /** The exact policy observation that accepted the decision. */
-  authority: ApprovalPreflightDecision;
-}
-
-export interface ApprovalBroker {
-  /** Optional snapshot API; simple brokers may implement only the legacy hooks. */
-  capturePolicy?(request: ApprovalPreflightRequest): Promise<ApprovalPolicySnapshot>;
-  /** Return the accepted version with its decision instead of rereading it later. */
-  resolve?(request: ApprovalBrokerRequest, signal?: AbortSignal): Promise<ApprovalResolution>;
-  preflight?(request: ApprovalPreflightRequest): Promise<ApprovalPreflightDecision>;
-  decide(request: ApprovalBrokerRequest, signal?: AbortSignal): Promise<ApprovalDecision>;
-  resourceDenials?(request: ApprovalPreflightRequest): Promise<ToolResourceDenials | undefined>;
-  assertFileResourceAccess?(request: ApprovalPreflightRequest, paths: readonly string[], access: "read" | "write"): Promise<void>;
+export interface ToolExecutionGate {
+  review(request: ToolReviewRequest, signal?: AbortSignal): Promise<ToolReviewResult>;
 }
 
 export interface ToolExecutorOptions {
   registry: ToolRegistry;
   events: ToolEventSink;
-  approvals: ApprovalBroker;
+  gate: ToolExecutionGate;
   policyResolver?: ToolAccessPolicyResolver;
   snapshotProvider?: SnapshotProvider;
   snapshotPolicy?: SnapshotPolicy;
@@ -309,7 +279,7 @@ export interface SnapshotProvider {
 
 export type SnapshotPolicy = (input: {
   tool: ChiliToolDefinition;
-  spec: ToolApprovalSpecWithDefaults;
+  spec: ToolResourceSpecWithDefaults;
 }) => boolean;
 
 export type ToolContextFactory = (tool: ChiliToolDefinition, input: ExecuteToolInput, callId: ToolCallId) => ToolExecutionContext;

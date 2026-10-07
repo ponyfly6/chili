@@ -1,7 +1,13 @@
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "@chili/core";
+import { REVIEWER_SYSTEM_INSTRUCTIONS } from "./approval.js";
 
 export class FakeModelRouter implements ModelRouter {
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+    if (input.system.includes(REVIEWER_SYSTEM_INSTRUCTIONS)) {
+      yield { type: "text_delta", text: JSON.stringify({ decision: "allow", reason: "Deterministic fake reviewer fixture." }) };
+      yield { type: "finish", reason: "stop" };
+      return;
+    }
     const discoveryCalls = new Set(input.messages.flatMap((message) => message.parts.flatMap((part) =>
       part.type === "tool_call" && part.toolName === "tool_search" ? [part.callId] : [])));
     const messages = input.messages.map((message) => ({ ...message, parts: message.parts.filter((part) =>
@@ -55,14 +61,12 @@ export class FakeModelRouter implements ModelRouter {
       return;
     }
 
-    if (text.includes("desktop approval fixture")) {
+    if (text.includes("desktop review fixture") || text.includes("desktop approval fixture")) {
       yield {
         type: "tool_call",
         name: "bash",
         input: {
           command: "/usr/bin/true",
-          sandbox_permissions: "require_escalated",
-          justification: "Allow the harmless desktop approval fixture to run once.",
         },
       };
       yield { type: "finish", reason: "tool_use" };

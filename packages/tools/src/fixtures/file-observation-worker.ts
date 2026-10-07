@@ -20,7 +20,7 @@ if (mode === "hold") {
   const executor = new ToolExecutor({
     registry,
     events: { publish: async () => undefined },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
   });
   const base = { cwd: workspace, sessionId: session as SessionId, turnId: "turn" as TurnId };
   const read = await executor.execute({ ...base, toolName: "read", input: { filePath: "a.txt" } });

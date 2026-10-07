@@ -22,7 +22,7 @@ async function workspace(limits = "max_children = 4\nmax_depth = 2\nmax_concurre
   const cwd = await mkdtemp(join(tmpdir(), "chili-unified-agent-"));
   await mkdir(join(cwd,".chili"));
   await writeFile(join(cwd,".chili","config.toml"), `[agents]\n${limits}\n`);
-  return {cwd,chiliHome:join(cwd,"profile"),model:"fake" as const,mcpConnectMode:"manual" as const,staleTurnRecoveryIntervalMs:false as const};
+  return {cwd,chiliHome:join(cwd,"profile"),permissionProfile:"full-access" as const,model:"fake" as const,mcpConnectMode:"manual" as const,staleTurnRecoveryIntervalMs:false as const};
 }
 
 test("Host recovers six Agent controls from durable session identities without Team tools", async () => {

@@ -78,7 +78,7 @@ export function createNewTaskDraft(models: readonly RuntimeModelDescriptor[] = [
     modelKey: selected ? modelKey(selected) : "",
     reasoningLevel: preferredReasoning(selected),
     serviceTier: preferredServiceTier(selected),
-    permissionProfile: "default",
+    permissionProfile: "auto-review",
     delegationPolicy: "proactive",
   };
 }

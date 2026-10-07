@@ -13,7 +13,6 @@ test("scoped read-only Bash rejects environment changes before invoking the runn
   const workspace = await mkdtemp(join(tmpdir(), "chili-bash-readonly-invocation-"));
   const requests: BashRunRequest[] = [];
   const tool = createBashTool({
-    allowEscalation: false,
     runner: {
       supportsExecutionPolicy: true,
       async run(request) {
@@ -34,7 +33,7 @@ test("scoped read-only Bash rejects environment changes before invoking the runn
   const executor = new ToolExecutor({
     registry,
     events: { publish: async () => undefined },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     snapshotProvider: new FileSystemSnapshotProvider(),
     policyResolver: { resolve: () => ({ allowedTools: ["bash"], writeScope: [], executeScope }) },
     createId: (prefix) => `${prefix}_${++nextId}`,
@@ -46,7 +45,7 @@ test("scoped read-only Bash rejects environment changes before invoking the runn
     for (const env of [undefined, {}]) {
       const input = { command: "pwd", cwd: "subdir", ...(env ? { env } : {}) };
       expect(await executor.canRunConcurrently("bash", input)).toBe(true);
-      expect(tool.approval?.(input)).toMatchObject({ metadata: { readOnly: true } });
+      expect(tool.resources?.(input)).toMatchObject({ metadata: { readOnly: true } });
       expect((await executor.execute(executeInput(workspace, input))).status).toBe("completed");
     }
     expect(requests).toHaveLength(2);
@@ -64,7 +63,7 @@ test("scoped read-only Bash rejects environment changes before invoking the runn
     for (const env of environmentOverrides) {
       const input = { command: "pwd", env };
       expect(await executor.canRunConcurrently("bash", input)).toBe(false);
-      expect(tool.approval?.(input)).toMatchObject({ metadata: { readOnly: false } });
+      expect(tool.resources?.(input)).toMatchObject({ metadata: { readOnly: false } });
       const result = await executor.execute(executeInput(workspace, input));
       expect(result.status).toBe("failed");
       if (result.status === "failed") expect(result.error.message).toContain("does not have execute scope");

@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
+import type { RuntimePermissionConfig } from "./runtime.js";
 import {
   parseChiliEvent,
   parseRuntimeModelDescriptor,
+  parseRuntimePermissionConfig,
+  parseRuntimePermissionUpdateOptions,
   parseRuntimeNonNegativeInteger,
   parseRuntimePositiveInteger,
   parseRuntimeStringRecord,
@@ -219,4 +222,36 @@ test("message part events reject malformed nested reasoning and tool result fiel
     output: "",
     executionContext: { exitCode: null },
   })).type).toBe("message.part_added");
+});
+
+
+test("permission config exposes exactly the two live modes and editable review settings", () => {
+  const config: RuntimePermissionConfig = {
+    profile: "auto-review",
+    reviewInstructions: "Review destructive operations.",
+    defaultReviewInstructions: "Review destructive operations.",
+    reviewerModel: { provider: "test", model: "reviewer" },
+    profiles: [
+      { id: "full-access", label: "Full access", description: "", current: false },
+      { id: "auto-review", label: "Auto review", description: "", current: true },
+    ],
+  };
+  expect(parseRuntimePermissionConfig(config)).toEqual(config);
+  expect(() => parseRuntimePermissionConfig({ ...config, profile: "default" })).toThrow();
+  expect(() => parseRuntimePermissionConfig({ ...config, reviewInstructions: undefined })).toThrow();
+  expect(() => parseRuntimePermissionConfig({ ...config, profiles: [{ ...config.profiles[0], id: "default" }] })).toThrow();
+});
+
+test("review settings updates allow reset and reject legacy grants or malformed models", () => {
+  expect(parseRuntimePermissionUpdateOptions({})).toEqual({});
+  expect(parseRuntimePermissionUpdateOptions({ reviewInstructions: "Review irreversible changes.", reviewerModel: null })).toEqual({ reviewInstructions: "Review irreversible changes.", reviewerModel: null });
+  expect(parseRuntimePermissionUpdateOptions({ reviewerModel: { provider: "test", model: "reviewer" } })).toEqual({ reviewerModel: { provider: "test", model: "reviewer" } });
+  for (const value of [
+    { rules: [] }, { allow: ["bash"] }, { reviewInstructions: null },
+    { reviewInstructions: "" }, { reviewInstructions: " \n " }, { reviewInstructions: "a".repeat(32_001) },
+    { reviewerModel: [] }, { reviewerModel: { provider: "test" } },
+    { reviewerModel: { provider: " ", model: "reviewer" } },
+    { reviewerModel: { provider: "test", model: " \n " } },
+    { reviewerModel: { provider: "test", model: "reviewer", rule: "allow" } },
+  ]) expect(() => parseRuntimePermissionUpdateOptions(value)).toThrow();
 });

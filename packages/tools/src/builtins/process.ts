@@ -82,7 +82,7 @@ export function createProcessTool(processes: ManagedProcessManager): ChiliToolDe
     },
     // The only mutation cancels an already-authorized, exactly-owned process.
     // This tool is registered for top-level tasks, not scoped workers.
-    approval: () => false,
+    resources: () => false,
     async execute(input, context) {
       context.signal.throwIfAborted();
       const owner = { sessionId: context.sessionId, workspaceRoot: context.cwd };

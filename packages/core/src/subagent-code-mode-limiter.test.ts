@@ -94,7 +94,6 @@ function context(invokeTool: NonNullable<ChiliToolExecutionContext["invokeTool"]
     cwd: process.cwd(),
     metadata: async () => {},
     streamOutput: async () => {},
-    requestApproval: async () => ({ action: "deny" }),
     registerPersistedOutput: async () => {},
     visibleTools: () => ["agent_spawn", "agent_wait"].map((name) => ({
       name, description: name, risk: "read", codeMode: true, inputSchema: { type: "object" },

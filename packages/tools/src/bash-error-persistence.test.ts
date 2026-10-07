@@ -68,7 +68,6 @@ test("bash bounds and redacts a hostile persisted-output registration error befo
     cwd: workspace,
     metadata: async () => undefined,
     streamOutput: async () => undefined,
-    requestApproval: async () => ({ action: "allow_once" }),
     registerPersistedOutput: async () => {
       throw hostile;
     },

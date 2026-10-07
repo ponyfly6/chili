@@ -136,8 +136,8 @@ function envKeyAllowed(key: string, allowlist: readonly McpEnvAllowlistRule[]): 
 }
 
 function safeFragmentId(value: string): string {
-  const id = value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-  return id.length > 0 ? id : "unknown";
+  // Preserve identity: normalization would merge distinct servers during deduplication.
+  return encodeURIComponent(value);
 }
 
 function isString(value: string | undefined): value is string {

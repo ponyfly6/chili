@@ -12,6 +12,8 @@ import {
 
 export interface SessionSettingsValues extends SessionModelSettingsDraft {
   permissionProfile: RuntimePermissionProfileId;
+  reviewInstructions: string;
+  reviewerModelKey: string;
   delegationPolicy: DelegationPolicy;
 }
 
@@ -106,7 +108,10 @@ function SessionPreferencesForm({ section, config, models, disabled, onSave }: {
   const catalog = models.length ? models : config.model.models;
   const [values, setValues] = useState<SessionSettingsValues>(() => ({
     ...createSessionModelSettingsDraft(catalog, config.model),
-    permissionProfile: config.permission.profile, delegationPolicy: config.delegation.policy,
+    permissionProfile: config.permission.profile,
+    reviewInstructions: config.permission.reviewInstructions,
+    reviewerModelKey: config.permission.reviewerModel ? modelKey(config.permission.reviewerModel) : "",
+    delegationPolicy: config.delegation.policy,
   }));
   const currentLocalModel = config.model.modelSelection;
   const missingLocalModel = currentLocalModel && !catalog.some((model) => modelKey(model) === modelKey(currentLocalModel));
@@ -114,7 +119,9 @@ function SessionPreferencesForm({ section, config, models, disabled, onSave }: {
   const levels = usingLocalModel ? config.model.availableReasoningLevels : availableReasoningLevels(catalog, values.modelKey);
   const tiers = availableServiceTiers(catalog, values.modelKey);
   const validation = validateSessionModelSettingsDraft(values, catalog, config.model);
-  const valid = section === "permissions" || validation.valid;
+  const reviewerModel = config.permission.reviewerModel;
+  const missingReviewerModel = reviewerModel && !catalog.some((model) => modelKey(model) === modelKey(reviewerModel));
+  const valid = section === "permissions" ? values.permissionProfile === "full-access" || values.reviewInstructions.trim().length > 0 : validation.valid;
   const levelLabels: Record<string, string> = { none: "关闭", minimal: "最少", low: "较少", medium: "标准", high: "深入", xhigh: "更深入", max: "最高" };
   return <form onSubmit={(event) => { event.preventDefault(); if (valid && !disabled) onSave(values, section); }}>
     {section === "models" ? <SettingsSection title="当前会话" scope="从下一次回复开始生效">
@@ -130,11 +137,22 @@ function SessionPreferencesForm({ section, config, models, disabled, onSave }: {
         <option value="" disabled={!canSelectProviderDefault(config.model.serviceTier)}>服务商默认</option>{tiers.map((tier) => <option key={tier} value={tier}>{tier}</option>)}
       </select></label>
     </SettingsSection> : <>
-      <SettingsSection title="工作权限" scope="此目录的所有会话">
+      <SettingsSection title="工作权限" scope="个人默认设置">
         <label className="settings-row"><span>权限方式</span><select aria-label="Task permission profile" value={values.permissionProfile} disabled={disabled} onChange={(event) => setValues({ ...values, permissionProfile: event.target.value as RuntimePermissionProfileId })}>
-          {config.permission.profiles.map((profile) => <option key={profile.id} value={profile.id} disabled={Boolean(profile.disabledReason)}>{profile.id === "default" ? "标准" : profile.id === "full-access" ? "完全访问" : profile.label}</option>)}
+          {config.permission.profiles.map((profile) => <option key={profile.id} value={profile.id} disabled={Boolean(profile.disabledReason)}>{profile.id === "full-access" ? "完全访问" : "帮我审批"}</option>)}
         </select></label>
-        <p className="settings-note">{values.permissionProfile === "full-access" ? "可使用所有工具，不再请求确认，也不受系统沙盒限制。" : "根据工具和操作风险请求确认。"} 更改影响此目录的所有会话，重启后恢复默认权限。</p>
+        <p className="settings-note">{values.permissionProfile === "full-access" ? "直接执行工具，不进行自动审查。" : "每次执行工具前，由独立模型根据当前任务和审查说明决定是否执行。"}</p>
+        <p className="settings-note">保存后立即用于此目录的所有会话。其他已打开的目录重新打开后应用。</p>
+        {values.permissionProfile === "auto-review" ? <>
+          <label className="settings-row"><span>审查模型<small>独立判断即将执行的操作。</small></span><select aria-label="审查模型" value={values.reviewerModelKey} disabled={disabled} onChange={(event) => setValues({ ...values, reviewerModelKey: event.target.value })}>
+            <option value="">使用默认模型</option>
+            {missingReviewerModel ? <option value={modelKey(reviewerModel)}>{reviewerModel.model} · {reviewerModel.provider}（本地配置）</option> : null}
+            {catalog.map((model) => <option key={modelKey(model)} value={modelKey(model)} disabled={model.available === false}>{model.displayName ?? model.model} · {model.providerDisplayName ?? model.provider}</option>)}
+          </select></label>
+          <label className="settings-review-instructions"><span>审查说明</span><textarea aria-label="审查说明" value={values.reviewInstructions} maxLength={32_000} rows={10} disabled={disabled} onChange={(event) => setValues({ ...values, reviewInstructions: event.target.value })} /></label>
+          <div className="settings-row"><p className="settings-note">描述你希望放行或阻止的操作。每次审查都会参考这份说明。</p><button type="button" className="secondary" disabled={disabled} onClick={() => setValues({ ...values, reviewInstructions: config.permission.defaultReviewInstructions })}>恢复默认说明</button></div>
+          {!values.reviewInstructions.trim() ? <p className="field-error">请填写审查说明，或恢复默认说明。</p> : null}
+        </> : null}
       </SettingsSection>
       <SettingsSection title="分工协作" scope="当前会话">
         <label className="settings-row"><span>允许其他助手参与<small>复杂需求可以由多个助手分工处理。</small></span><select aria-label="Task delegation" value={values.delegationPolicy} disabled={disabled} onChange={(event) => setValues({ ...values, delegationPolicy: event.target.value as DelegationPolicy })}>
@@ -142,7 +160,7 @@ function SessionPreferencesForm({ section, config, models, disabled, onSave }: {
         </select></label>
       </SettingsSection>
     </>}
-    {!valid ? <p className="settings-note">{usingLocalModel ? "正在使用本地配置的模型。无需重新保存；也可以从列表中选择其他可用模型。" : !catalog.length ? "当前配置没有可切换的模型。已有会话会继续使用默认模型。" : "请选择可用的模型、思考深度与响应速度。"}</p> : null}
+    {section === "models" && !valid ? <p className="settings-note">{usingLocalModel ? "正在使用本地配置的模型。无需重新保存；也可以从列表中选择其他可用模型。" : !catalog.length ? "当前配置没有可切换的模型。已有会话会继续使用默认模型。" : "请选择可用的模型、思考深度与响应速度。"}</p> : null}
     <div className="settings-save"><button className="primary" type="submit" disabled={disabled || !valid}>{disabled ? "暂不可修改" : "保存设置"}</button></div>
   </form>;
 }

@@ -149,7 +149,7 @@ export function RemoteControlPanelContent({ state, draft, error, action, onEdit,
   return <>
     {onClose ? <header className="remote-panel-heading"><div><p className="eyebrow">Private connection · Alpha</p><h2 id="remote-panel-title">Phone control</h2></div><button type="button" data-remote-initial-focus="true" aria-label="Close phone control" onClick={onClose}>×</button></header> : null}
     <div className="remote-panel-scroll">
-      <p className="remote-panel-intro">Continue this workspace’s existing tasks on your phone. Approvals and questions stay on this Mac.</p>
+      <p className="remote-panel-intro">Continue this workspace’s existing tasks on your phone. Questions stay on this Mac.</p>
       {error ? <p role="alert" className="remote-panel-error">{error}</p> : null}
       {setup?.error && setup.error !== error ? <p role="alert" className="remote-panel-error">{setup.error}</p> : null}
       <section className="remote-setup" aria-labelledby="remote-connection-title">

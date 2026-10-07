@@ -168,6 +168,9 @@ async function smokeRuntimeToolSurface(): Promise<void> {
 async function smokeRuntimeCompaction(): Promise<void> {
   await withTempWorkspace("chili-smoke-compact-", async (workspace) => {
     let compactionCalls = 0;
+    let continuedCalls = 0;
+    const summary = "Current goal: keep a compact smoke summary.\nNext steps: continue.";
+    const latestPrompt = "continue with compacted context";
     const harness = createRuntimeHarness(
       workspace,
       {
@@ -176,18 +179,23 @@ async function smokeRuntimeCompaction(): Promise<void> {
             compactionCalls++;
             yield {
               type: "text_delta",
-              text: "<context_summary>\nCurrent goal: keep a compact smoke summary.\nNext steps: continue.\n</context_summary>",
+              text: `<context_summary>\n${summary}\n</context_summary>`,
             };
             yield { type: "finish", reason: "stop" };
             return;
           }
+          continuedCalls++;
+          const continuedText = input.messages.flatMap((message) => message.parts.flatMap((part) =>
+            part.type === "text" ? [part.text] : [])).join("\n");
+          assert.ok(continuedText.includes(latestPrompt), "latest prompt missing after compaction");
+          assert.ok(continuedText.includes(summary), "complete summary missing after compaction");
           yield { type: "text_delta", text: "continued after compaction" };
           yield { type: "finish", reason: "stop" };
         },
       },
       {
-        contextBudget: { maxInputChars: 180, preserveRecentMessages: 1 },
-        contextCompaction: { verifySummary: false, maxSourceChars: 1_000, maxSummaryChars: 500 },
+        contextBudget: { maxInputChars: 8_000, preserveRecentMessages: 1 },
+        contextCompaction: { verifySummary: false, maxSourceChars: 20_000, maxSummaryChars: 500 },
       },
     );
 
@@ -195,16 +203,17 @@ async function smokeRuntimeCompaction(): Promise<void> {
       const sessionId = await harness.runtime.createSession({ cwd: workspace });
       await harness.runtime.appendUserMessage({
         sessionId,
-        text: `older context ${"x".repeat(800)}`,
+        text: `older context ${"x".repeat(12_000)}`,
       });
       await harness.runtime.appendUserMessage({
         sessionId,
-        text: "continue with compacted context",
+        text: latestPrompt,
       });
 
       const result = await harness.runtime.runTurn({ sessionId, cwd: workspace });
       assert.equal(result.status, "completed", result.status === "failed" ? result.error.message : undefined);
       assert.equal(compactionCalls, 1);
+      assert.equal(continuedCalls, 1);
 
       const events = (await harness.store.events({ sessionId, limit: 200 })) as EventLike[];
       assert.ok(events.some((event) => event.type === "turn.compaction_requested"), "missing compaction request");
@@ -232,7 +241,7 @@ function createRuntimeHarness(workspace: string, model: ModelRouter, options: Ru
   const toolExecutor = new ToolExecutor({
     registry,
     events: { publish: (event) => store.append(event) },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     snapshotProvider,
     createId,
     now: () => 1 as never,

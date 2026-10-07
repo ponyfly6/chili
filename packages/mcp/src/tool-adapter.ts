@@ -1,6 +1,6 @@
 import { normalizePersistedError, type ToolResultContent, type ToolRisk, type ToolResult } from "@chili/protocol";
 import { validateStructuredToolData } from "@chili/tools";
-import type { ChiliToolDefinition, ChiliToolExecutionContext, ToolApprovalSpec } from "@chili/tools";
+import type { ChiliToolDefinition, ChiliToolExecutionContext, ToolResourceSpec } from "@chili/tools";
 import type { McpServerConfig } from "./config.js";
 import type { McpCallToolResult, McpTool, McpToolAnnotations, McpElicitationRequest, McpElicitationResult } from "./client.js";
 import type { McpClientManager } from "./manager.js";
@@ -73,7 +73,7 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
       toolName: names.toolName,
       modelName,
     },
-    approval(): ToolApprovalSpec {
+    resources(): ToolResourceSpec {
       return {
         permission: "mcp",
         patterns: [`${options.server.name}/${options.tool.name}`],

@@ -439,7 +439,7 @@ test("tool executor applies per-tool output limits and persists full output", as
       description: "Emit a large result.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       maxResultOutputBytes: 4,
       isReadOnly: true,
       isConcurrencySafe: true,
@@ -469,7 +469,7 @@ test("tool executor preserves a registered streamed output sidecar", async () =>
       description: "Emit a preview for already-persisted output.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       maxResultOutputBytes: 4,
       isReadOnly: true,
       isConcurrencySafe: true,
@@ -506,7 +506,7 @@ test("tool executor accepts only one persisted-output registration per call", as
       description: "Register the same sidecar twice concurrently.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       execute: async (_input, context) => {
         const writer = await StreamingToolOutputFile.open(
           workspace,
@@ -552,7 +552,7 @@ test("tool executor rejects concurrent executions that reuse an active call id",
       description: "Hold one call open while a duplicate arrives.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       execute: async (input: { output: string }, context) => {
         enteredResolve();
         await release;
@@ -592,7 +592,7 @@ test("tool executor keeps sidecars distinct when provider call ids repeat across
       description: "Persist output for a provider call id that may be reused.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       execute: async (input: { output: string }, context) => {
         const writer = await StreamingToolOutputFile.open(workspace, context.outputArtifactId);
         await writer.append(input.output);
@@ -633,7 +633,7 @@ test("tool executor never persists a preview after rejecting a sidecar with a lo
       description: "Register a sidecar created outside executor limits.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       maxResultOutputBytes: 4,
       execute: async (_input, context) => {
         const writer = await StreamingToolOutputFile.open(
@@ -686,7 +686,7 @@ test("tool executor rejects untrusted accessor-backed registrations without eval
       description: "Register accessor-backed output metadata.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       maxResultOutputBytes: 4,
       execute: async (_input, context) => {
         await context.registerPersistedOutput({
@@ -729,7 +729,7 @@ test("tool executor revalidates a registered sidecar immediately before reuse", 
       description: "Delete a registered sidecar before returning.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       maxResultOutputBytes: 4,
       execute: async (_input, context) => {
         const writer = await StreamingToolOutputFile.open(
@@ -771,7 +771,7 @@ test("tool executor does not rewrite tool payload text when registered output be
       description: "Return payload text that resembles an executor notice.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       maxResultOutputBytes: 1_000,
       execute: async (_input, context) => {
         const writer = await StreamingToolOutputFile.open(
@@ -809,7 +809,7 @@ test("tool executor rejects forged persisted output metadata", async () => {
       description: "Return a forged persisted-output path.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       maxResultOutputBytes: 4,
       isReadOnly: true,
       isConcurrencySafe: true,
@@ -851,7 +851,7 @@ test("tool executor caps persisted large output sidecars", async () => {
       description: "Emit a large result.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       maxResultOutputBytes: 4,
       isReadOnly: true,
       isConcurrencySafe: true,
@@ -889,7 +889,7 @@ test("tool executor keeps persisted output within byte limits at UTF-8 boundarie
       description: "Emit multibyte output.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       maxResultOutputBytes: 1,
       isReadOnly: true,
       isConcurrencySafe: true,
@@ -919,7 +919,7 @@ test("tool executor evicts old sidecars to enforce a directory byte budget", asy
       description: "Emit a large result.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       maxResultOutputBytes: 4,
       isReadOnly: true,
       isConcurrencySafe: true,
@@ -962,7 +962,7 @@ test("tool executor preserves a completed side effect when sidecar persistence i
       description: "Emit a large result.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       maxResultOutputBytes: 4,
       isReadOnly: true,
       isConcurrencySafe: true,
@@ -1005,7 +1005,7 @@ test("tool executor uses opaque sidecar filenames independent of provider call i
       description: "Emit a large result.",
       risk: "read",
       inputSchema: { type: "object" },
-      approval: () => false,
+      resources: () => false,
       maxResultOutputBytes: 4,
       isReadOnly: true,
       isConcurrencySafe: true,
@@ -1128,81 +1128,6 @@ test("scoped worker policy treats an explicit empty execute scope as no shell ex
   }
 });
 
-test("scoped worker policy rejects unsandboxed bash even with broad execute scope", async () => {
-  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-policy-unsandboxed-bash-"));
-  try {
-    const registry = new InMemoryToolRegistry();
-    registry.register(createBashTool());
-    const executor = createExecutor(registry, {
-      resolve: () => ({
-        allowedTools: ["bash"],
-        executeScope: ["*"],
-      }),
-    });
-
-    const result = await executor.execute(toolInput("bash", {
-      command: "remindctl status",
-      sandboxPermissions: "require_escalated",
-      justification: "Check whether Reminders access is available.",
-    }, workspace));
-    expect(result.status).toBe("failed");
-    if (result.status === "failed") {
-      expect(result.error.message).toContain("cannot request execution outside the host sandbox");
-    }
-  } finally {
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
-test("scoped worker policy also rejects dynamic unsandboxed approval requests", async () => {
-  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-policy-dynamic-unsandboxed-"));
-  try {
-    const registry = new InMemoryToolRegistry();
-    registry.register({
-      name: "dynamic_approval",
-      description: "Request another permission while executing.",
-      risk: "execute",
-      resourcePolicy: "internal",
-      inputSchema: { type: "object" },
-      approval: () => false,
-      async execute(_input, context) {
-        await context.requestApproval({
-          permission: "bash.unsandboxed",
-          patterns: ["remindctl status"],
-          maxApprovalScope: "once",
-        });
-        return { title: "dynamic_approval", output: "unexpected" };
-      },
-    });
-    const executor = createExecutor(registry, {
-      resolve: () => ({ allowedTools: ["dynamic_approval"], executeScope: ["*"] }),
-    });
-
-    const result = await executor.execute(toolInput("dynamic_approval", {}, workspace));
-    expect(result.status).toBe("failed");
-    if (result.status === "failed") {
-      expect(result.error.message).toContain("cannot request execution outside the host sandbox");
-    }
-  } finally {
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
-test("child-style bash registries do not expose or accept sandbox escalation", async () => {
-  const tool = createBashTool({ allowEscalation: false });
-  expect(tool.description).not.toContain("elevated execution");
-  expect(JSON.stringify(tool.inputSchema)).not.toContain("sandboxPermissions");
-  expect(JSON.stringify(tool.inputSchema)).not.toContain("sandbox_permissions");
-  expect(await tool.validate?.({
-    command: "remindctl status",
-    sandbox_permissions: "require_escalated",
-    justification: "access Reminders",
-  })).toEqual({
-    ok: false,
-    message: "sandbox escalation is unavailable for this tool registry",
-  });
-});
-
 test("bash supports workspace-scoped cwd and env overrides", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-tools-bash-cwd-"));
   try {
@@ -1270,12 +1195,15 @@ test("bash supports workspace-scoped cwd and env overrides", async () => {
   }
 });
 
-test("bash validates and normalizes explicit sandbox escalation requests", async () => {
+test("bash validates and normalizes working-directory aliases", async () => {
   const tool = createBashTool();
   const schema = JSON.stringify(tool.inputSchema);
   expect(schema).toContain("authoritative workspace root");
   expect(schema).toContain("absolute paths must remain inside it");
   expect(schema).toContain("working_directory");
+  expect(schema).not.toContain("sandboxPermissions");
+  expect(schema).not.toContain("sandbox_permissions");
+  expect(schema).not.toContain("justification");
 
   expect(await tool.validate?.({
     command: "pwd",
@@ -1294,88 +1222,10 @@ test("bash validates and normalizes explicit sandbox escalation requests", async
     ok: true,
     value: {
       command: "pwd",
-      sandboxPermissions: "use_default",
       cwd: "subdir",
     },
   });
 
-  const missingJustification = await tool.validate?.({
-    command: "osascript -e 'return 1'",
-    sandbox_permissions: "require_escalated",
-  });
-  expect(missingJustification).toEqual({
-    ok: false,
-    message: "justification must be a non-empty string when sandboxPermissions is require_escalated",
-  });
-
-  const mismatchedAliases = await tool.validate?.({
-    command: "pwd",
-    sandboxPermissions: "use_default",
-    sandbox_permissions: "require_escalated",
-    justification: "needs desktop IPC",
-  });
-  expect(mismatchedAliases).toEqual({
-    ok: false,
-    message: "sandboxPermissions and sandbox_permissions must match when both are provided",
-  });
-
-  const hiddenEnvironment = await tool.validate?.({
-    command: "remindctl status",
-    sandbox_permissions: "require_escalated",
-    justification: "access Reminders through desktop IPC",
-    env: { PATH: "/tmp/unreviewed-bin" },
-  });
-  expect(hiddenEnvironment).toEqual({
-    ok: false,
-    message: "env overrides are not allowed when sandboxPermissions is require_escalated",
-  });
-
-  for (const command of ["remindctl\tstatus", "remindctl status\u001b[2J"]) {
-    expect(await tool.validate?.({
-      command,
-      sandbox_permissions: "require_escalated",
-      justification: "access Reminders through desktop IPC",
-    })).toEqual({
-      ok: false,
-      message: "elevated command must not contain control or bidirectional formatting characters",
-    });
-  }
-  expect(await tool.validate?.({
-    command: "remindctl status",
-    sandbox_permissions: "require_escalated",
-    justification: "access Reminders\u202e through desktop IPC",
-  })).toEqual({
-    ok: false,
-    message: "elevated justification must not contain control or bidirectional formatting characters",
-  });
-
-  const validated = await tool.validate?.({
-    command: "osascript -e 'return 1'",
-    sandbox_permissions: "require_escalated",
-    justification: "  access Reminders through desktop IPC  ",
-    cwd: "subdir",
-  });
-  expect(validated).toEqual({
-    ok: true,
-    value: {
-      command: "osascript -e 'return 1'",
-      sandboxPermissions: "require_escalated",
-      justification: "access Reminders through desktop IPC",
-      cwd: "subdir",
-    },
-  });
-  if (!validated?.ok) return;
-  expect(tool.approval?.(validated.value)).toMatchObject({
-    permission: "bash.unsandboxed",
-    patterns: ["osascript -e 'return 1'"],
-    maxApprovalScope: "once",
-    metadata: {
-      sandboxPermissions: "require_escalated",
-      justification: "access Reminders through desktop IPC",
-      cwd: "subdir",
-      envKeys: [],
-    },
-  });
 });
 
 test("bash reports the actual sandbox execution mode in result metadata", async () => {
@@ -1588,8 +1438,6 @@ test("bash runner injection receives resolved request and formats process output
         cwd: "subdir",
         timeoutMs: 123,
         maxOutputBytes: 17,
-        sandbox_permissions: "require_escalated",
-        justification: "  needs desktop IPC  ",
       },
       workspace,
       "toolcall_fake_bash_runner" as ToolCallId,
@@ -1605,7 +1453,7 @@ test("bash runner injection receives resolved request and formats process output
       cwd: join(workspace, "subdir"),
       timeoutMs: 123,
       maxOutputBytes: 17,
-      sandboxPermissions: "require_escalated",
+      sandboxPermissions: "use_default",
       signal: controller.signal,
     });
     expect(typeof seen?.onOutput).toBe("function");
@@ -1618,9 +1466,8 @@ test("bash runner injection receives resolved request and formats process output
         command: "printf fake",
         cwd: join(workspace, "subdir"),
         envKeys: [],
-        sandboxPermissions: "require_escalated",
+        sandboxPermissions: "use_default",
         executionMode: "unsandboxed",
-        justification: "needs desktop IPC",
         sandbox: "none",
         signal: "SIGTERM",
         timedOut: true,
@@ -1636,7 +1483,7 @@ test("bash runner injection receives resolved request and formats process output
   }
 });
 
-test("bash approval metadata is unchanged by runner injection", () => {
+test("bash resource metadata is unchanged by runner injection", () => {
   const runner: BashRunner = {
     async run() {
       throw new Error("not used");
@@ -1648,7 +1495,7 @@ test("bash approval metadata is unchanged by runner injection", () => {
     env: { ZED: "1", ALPHA: "2" },
   };
 
-  expect(createBashTool({ runner }).approval?.(input)).toEqual(createBashTool().approval?.(input));
+  expect(createBashTool({ runner }).resources?.(input)).toEqual(createBashTool().resources?.(input));
 });
 
 test("snapshot creation failure fails closed before write tools mutate files", async () => {
@@ -1689,7 +1536,7 @@ function createExecutor(
   return new ToolExecutor({
     registry,
     events: { publish: async (event: ChiliEvent) => { events?.push(event); } },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     ...(policyResolver ? { policyResolver } : {}),
     ...(snapshotProvider ? { snapshotProvider } : {}),
     createId: createSequentialId(),

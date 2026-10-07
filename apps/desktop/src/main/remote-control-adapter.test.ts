@@ -497,10 +497,10 @@ describe("remote snapshot whitelist and complete serialization budget", () => {
       } }),
     ];
     const projected = projectRemoteSnapshot({
-      ...rootSnapshot(events), needsDesktop: { approval: true, input: true },
+      ...rootSnapshot(events), needsDesktop: { input: true },
     });
     expect(projected.messages.map((message) => message.text)).toEqual(["hello", "safe answer"]);
-    expect(projected.session.needsDesktop).toEqual({ approval: true, input: true });
+    expect(projected.session.needsDesktop).toEqual({ input: true });
     const json = JSON.stringify(projected);
     expect(json).not.toContain("SECRET");
     expect(json).not.toContain("/repo");
@@ -553,7 +553,7 @@ function summary(id: string): RuntimeSessionSummary {
 
 function rootSnapshot(events: ChiliEvent[]): DesktopRemoteRootSnapshot {
   return { session: summary("root"), events, queuedCount: 0, deliveryUnknown: false,
-    needsDesktop: { approval: false, input: false }, truncated: false };
+    needsDesktop: { input: false }, truncated: false };
 }
 
 function context(operation: RemoteControlServiceRequest["operation"]): RemoteControlInvocationContext {

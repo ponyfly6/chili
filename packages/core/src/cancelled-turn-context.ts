@@ -57,7 +57,31 @@ export async function filterCancelledPromptMessagesForContext(
   );
   if (removableTurnIds.size === 0) return [...messages];
 
-  return messages.filter((message) => !message.turnId || !removableTurnIds.has(message.turnId));
+  const completedCompactions = new Map<string, { turnId: string; boundaryMessageId: string }>();
+  for (const event of await readEvents(store, { sessionId, type: "turn.compaction_completed" })) {
+    const payload = recordPayload(event);
+    const messageId = stringValue(payload.messageId);
+    const turnId = stringValue(payload.turnId);
+    const boundaryMessageId = stringValue(payload.boundaryMessageId);
+    if (messageId && turnId && boundaryMessageId) completedCompactions.set(messageId, { turnId, boundaryMessageId });
+  }
+  const committedContextIds = new Set<string>();
+  const messageIndexes = new Map(messages.map((message, index) => [message.id, index]));
+  for (const [index, message] of messages.entries()) {
+    const completed = completedCompactions.get(message.id);
+    if (!completed || completed.turnId !== message.turnId) continue;
+    const boundaryIndex = messageIndexes.get(completed.boundaryMessageId as Message["id"]);
+    if (boundaryIndex === undefined || boundaryIndex >= index) continue;
+    if (!message.parts.some((part) => part.type === "compaction" && part.boundaryMessageId === completed.boundaryMessageId)) continue;
+    committedContextIds.add(message.id);
+    // The boundary can be the failed turn's own user message. Retain that raw
+    // anchor so compactedMessageView can replace the whole covered prefix.
+    committedContextIds.add(completed.boundaryMessageId);
+  }
+  return messages.filter((message) => {
+    if (!message.turnId || !removableTurnIds.has(message.turnId)) return true;
+    return committedContextIds.has(message.id);
+  });
 }
 
 async function readEvents(

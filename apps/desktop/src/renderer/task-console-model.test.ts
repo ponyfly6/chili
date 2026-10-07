@@ -92,7 +92,7 @@ describe("new task setup", () => {
       modelKey: modelKey(models[0]!),
       reasoningLevel: "high",
       serviceTier: "standard",
-      permissionProfile: "default",
+      permissionProfile: "auto-review",
       delegationPolicy: "proactive",
     });
   });
@@ -114,7 +114,7 @@ describe("new task setup", () => {
       prompt: "Run the deterministic task",
       modelSelection: { provider: "deepseek", model: "deepseek-v4-pro" },
       reasoningLevel: "high",
-      permissionProfile: "default",
+      permissionProfile: "auto-review",
       delegationPolicy: "proactive",
     });
   });
@@ -246,7 +246,7 @@ describe("new task setup", () => {
       prompt: "Use provider-default reasoning",
       modelSelection: { provider: "local", model: "no-reasoning" },
       serviceTier: "standard",
-      permissionProfile: "default",
+      permissionProfile: "auto-review",
       delegationPolicy: "proactive",
     });
   });
@@ -351,7 +351,7 @@ describe("new task setup", () => {
       modelSelection: { provider: "openai-codex", model: "gpt-5.6-sol" },
       reasoningLevel: "high",
       serviceTier: "standard",
-      permissionProfile: "default",
+      permissionProfile: "auto-review",
       delegationPolicy: "proactive",
     });
   });

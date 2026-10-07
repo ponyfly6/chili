@@ -106,6 +106,7 @@ test("observable wrappers preserve optional replay capabilities and byte budgets
     });
     expect(unsupported.eventReplayBoundary).toBeUndefined();
     expect(unsupported.runtimeSnapshot).toBeUndefined();
+    expect(unsupported.sessionInputForMessage).toBeUndefined();
   } finally { base.close(); }
 });
 

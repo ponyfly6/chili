@@ -14,6 +14,7 @@ import {
   parseRuntimeModelConfig as parseProtocolModelConfig,
   parseRuntimeModelDescriptor as parseProtocolModelDescriptor,
   parseRuntimePermissionConfig as parseProtocolPermissionConfig,
+  parseRuntimeReviewInstructions,
   type ChiliEvent,
   type DelegationPolicy,
   type ModelSelection,
@@ -25,6 +26,7 @@ import {
   type RuntimeModelDescriptor,
   type RuntimePermissionConfig,
   type RuntimePermissionProfileId,
+  type RuntimePermissionUpdateOptions,
   type ServiceTier,
 } from "@chili/protocol";
 import type {
@@ -187,7 +189,7 @@ type DesktopOperation =
   | { type: "session.reasoning.set"; sessionId: string; reasoningLevel: ReasoningLevel }
   | { type: "session.service-tier.set"; sessionId: string; serviceTier: ServiceTier }
   | { type: "permissions.get" }
-  | { type: "permissions.set"; profile: RuntimePermissionProfileId }
+  | ({ type: "permissions.set"; profile: RuntimePermissionProfileId } & RuntimePermissionUpdateOptions)
   | { type: "session.delegation.get"; sessionId: string }
   | { type: "session.delegation.set"; sessionId: string; policy: DelegationPolicy }
   | { type: "mcp.status"; sessionId?: string }
@@ -197,12 +199,6 @@ type DesktopOperation =
   | { type: "agent.send"; sessionId: string; agentId: string; text: string; mode?: SendMode }
   | { type: "agent.stop"; sessionId: string; agentId: string }
   | { type: "agent.resume"; sessionId: string; agentId: string }
-  | {
-      type: "approval.resolve";
-      approvalId: string;
-      decision: "allow_once" | "allow_session" | "allow_always" | "deny";
-      feedback?: string;
-    }
   | { type: "user-input.resolve"; inputId: string; answers: Record<string, string[]> }
   | { type: "events.resync.complete"; barrierId: string }
   | { type: "diff.get"; scope: DiffScope; sessionId: string; turnId?: string };
@@ -240,7 +236,6 @@ export interface DesktopResponseMap {
   "agent.send": { agentId: string; inputId: string };
   "agent.stop": { agentId: string };
   "agent.resume": { agentId: string; inputId?: string };
-  "approval.resolve": { resolved: boolean };
   "user-input.resolve": { resolved: boolean };
   "events.resync.complete": { status: "completed" | "retry" };
   "diff.get": { scope: DiffScope; text: string; truncated: boolean };
@@ -354,7 +349,16 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
     };
   }
   if (type === "permissions.set") {
-    return { type, profile: requirePermissionProfile(record.profile, "profile") };
+    return {
+      type,
+      profile: requirePermissionProfile(record.profile, "profile"),
+      ...(record.reviewInstructions !== undefined
+        ? { reviewInstructions: parseRuntimeReviewInstructions(record.reviewInstructions, "reviewInstructions") }
+        : {}),
+      ...(record.reviewerModel !== undefined
+        ? { reviewerModel: record.reviewerModel === null ? null : parseModelSelection(record.reviewerModel, "reviewerModel") }
+        : {}),
+    };
   }
   if (type === "session.delegation.set") {
     return {
@@ -390,19 +394,6 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
   }
   if (type === "agent.stop" || type === "agent.resume") {
     return { type, sessionId: requireIdentifier(record.sessionId, "sessionId"), agentId: requireIdentifier(record.agentId, "agentId") };
-  }
-  if (type === "approval.resolve") {
-    const decision = record.decision;
-    if (decision !== "allow_once" && decision !== "allow_session" && decision !== "allow_always" && decision !== "deny") {
-      throw new TypeError("Unsupported approval decision");
-    }
-    const request: Extract<DesktopRequest, { type: "approval.resolve" }> = {
-      type,
-      approvalId: requireIdentifier(record.approvalId, "approvalId"),
-      decision,
-    };
-    if (record.feedback !== undefined) request.feedback = requireString(record.feedback, "feedback", 8_000, true);
-    return request;
   }
   if (type === "user-input.resolve") {
     const rawAnswers = requireRecord(record.answers, "answers");
@@ -492,7 +483,7 @@ function requireDelegationPolicy(value: unknown, field: string): DelegationPolic
 }
 
 function requirePermissionProfile(value: unknown, field: string): RuntimePermissionProfileId {
-  return requireEnum(value, ["default", "auto-review", "full-access"], field) as RuntimePermissionProfileId;
+  return requireEnum(value, ["auto-review", "full-access"], field) as RuntimePermissionProfileId;
 }
 
 export function parseDesktopEvent(value: unknown): DesktopEvent {
@@ -619,7 +610,7 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
       agentId: requireIdentifier(record.agentId, "agentId"),
       ...(request.type === "agent.send" || record.inputId !== undefined ? { inputId: requireIdentifier(record.inputId, "inputId") } : {}),
     };
-  } else if (request.type === "approval.resolve" || request.type === "user-input.resolve") {
+  } else if (request.type === "user-input.resolve") {
     response = { resolved: requireBoolean(requireRecord(value, "resolve response").resolved, "resolved") };
   } else if (request.type === "events.resync.complete") {
     const status = requireRecord(value, "resync completion response").status;
@@ -1084,13 +1075,12 @@ function requestKeys(type: string): readonly string[] {
   if (type === "session.model.set") return ["type", "sessionId", "modelSelection"];
   if (type === "session.reasoning.set") return ["type", "sessionId", "reasoningLevel"];
   if (type === "session.service-tier.set") return ["type", "sessionId", "serviceTier"];
-  if (type === "permissions.set") return ["type", "profile"];
+  if (type === "permissions.set") return ["type", "profile", "reviewInstructions", "reviewerModel"];
   if (type === "session.delegation.set") return ["type", "sessionId", "policy"];
   if (type === "mcp.status" || type === "mcp.reload") return ["type", "sessionId"];
   if (type === "session.send") return ["type", "sessionId", "text", "mode", "submissionId"];
   if (type === "agent.send") return ["type", "sessionId", "agentId", "text", "mode"];
   if (type === "agent.stop" || type === "agent.resume") return ["type", "sessionId", "agentId"];
-  if (type === "approval.resolve") return ["type", "approvalId", "decision", "feedback"];
   if (type === "user-input.resolve") return ["type", "inputId", "answers"];
   if (type === "events.resync.complete") return ["type", "barrierId"];
   if (type === "diff.get") return ["type", "scope", "sessionId", "turnId"];

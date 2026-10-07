@@ -28,7 +28,7 @@ export function createAgentSpawnTool(controller: AgentToolController): ChiliTool
       if (!/^[a-zA-Z0-9_-]+$/u.test(checked.value.name)) return { ok: false, message: "name must contain only letters, digits, hyphens, or underscores" };
       return checked;
     },
-    approval: () => ({ permission: "agent_spawn", patterns: ["*"] }),
+    resources: () => ({ permission: "agent_spawn", patterns: ["*"] }),
     async execute(input, context) { return result("agent_spawn", await controller.spawnAgent(input, context)); },
   };
 }
@@ -49,7 +49,7 @@ export function createAgentSendTool(controller: AgentToolController): ChiliToolD
       if (checked.value.mode !== undefined && checked.value.mode !== "queue" && checked.value.mode !== "steer") return { ok: false, message: "mode must be queue or steer" };
       return checked;
     },
-    approval: (input) => ({ permission: "agent_send", patterns: [input.agentId] }),
+    resources: (input) => ({ permission: "agent_send", patterns: [input.agentId] }),
     async execute(input, context) { return result("agent_send", await controller.sendAgent(input, context)); },
   };
 }
@@ -81,7 +81,7 @@ export function createAgentWaitTool(controller: AgentToolController): ChiliToolD
       if (timeoutMs !== undefined && (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 60000)) return { ok: false, message: "timeoutMs must be an integer between 0 and 60000" };
       return { ok: true, value: { ...checked.value, ...(timeoutMs === undefined ? {} : { timeoutMs }) } };
     },
-    approval: () => false,
+    resources: () => false,
     async execute(input, context) { return result("agent_wait", await controller.waitAgent(input, context)); },
   };
 }
@@ -93,7 +93,7 @@ export function createAgentStopTool(controller: AgentToolController): ChiliToolD
     resourcePolicy: "internal", risk: "write", codeMode: true, isConcurrencySafe: true,
     inputSchema: targetSchema, outputSchema: targetSchema,
     validate: (input) => strings<AgentTargetToolInput>(input, ["agentId"]),
-    approval: (input) => ({ permission: "agent_stop", patterns: [input.agentId] }),
+    resources: (input) => ({ permission: "agent_stop", patterns: [input.agentId] }),
     async execute(input, context) { return result("agent_stop", await controller.stopAgent(input, context)); },
   };
 }
@@ -106,7 +106,7 @@ export function createAgentResumeTool(controller: AgentToolController): ChiliToo
     inputSchema: targetSchema,
     outputSchema: { ...targetSchema, properties: { agentId: identifier, inputId: identifier } },
     validate: (input) => strings<AgentTargetToolInput>(input, ["agentId"]),
-    approval: (input) => ({ permission: "agent_resume", patterns: [input.agentId] }),
+    resources: (input) => ({ permission: "agent_resume", patterns: [input.agentId] }),
     async execute(input, context) { return result("agent_resume", await controller.resumeAgent(input, context)); },
   };
 }
@@ -125,7 +125,7 @@ export function createAgentListTool(controller: AgentToolController): ChiliToolD
       } } },
     },
     validate: (input) => strings<AgentListToolInput>(input === undefined ? {} : input, []),
-    approval: () => false,
+    resources: () => false,
     async execute(input, context) { return result("agent_list", { agents: await controller.listAgents(input, context) }); },
   };
 }

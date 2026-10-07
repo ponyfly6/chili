@@ -177,7 +177,7 @@ async function execute(cwd: string, input: GitApplyPatchInput, overrides: Partia
     sessionId: "git_patch_session" as SessionId, turnId: "git_patch_turn" as TurnId,
     callId, outputArtifactId: callId, cwd, signal: new AbortController().signal,
     metadata: async () => undefined, streamOutput: async () => undefined,
-    requestApproval: async () => ({ action: "allow_once" }), registerPersistedOutput: async () => undefined,
+    registerPersistedOutput: async () => undefined,
     ...overrides,
   };
   return (await tool.execute(validated.value, context)).structuredData as unknown as PatchResult;

@@ -5,7 +5,6 @@ import { collectCommandNodes, completeCommandsSync, resolveCommand, type Resolve
 import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, RuntimeSessionSummary } from "@chili/sdk";
 import { normalizeSessionTitle, SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import type {
-  ApprovalId,
   DelegationPolicy,
   MessageImageContent,
   RuntimeCommandNode,
@@ -32,7 +31,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { cleanClipboardText, systemClipboard, type ClipboardAccess, type ClipboardImage } from "./clipboard.js";
 import type { RuntimeTuiOptions, RuntimeConnectionState } from "./useRuntimeEvents.js";
-import { acceptedFeedbackMatchesStatus, useChatRuntime, type ChatApprovalGrantScope, type ChatRuntimeState } from "./useChatRuntime.js";
+import { acceptedFeedbackMatchesStatus, useChatRuntime, type ChatRuntimeState } from "./useChatRuntime.js";
 import { shorten } from "./components/helpers.js";
 import {
   DEFAULT_REASONING_LEVEL,
@@ -52,7 +51,6 @@ import {
   type ModelSelection,
   type ReasoningLevel,
 } from "./model-state.js";
-import { ApprovalDock, approvalDockHeight } from "./chat/ApprovalDock.js";
 import { AgentsView, agentsViewModel, type AgentsViewModel } from "./chat/AgentsView.js";
 import { BrandMark } from "./chat/BrandMark.js";
 import { charDisplayWidth } from "./chat/markdown.js";
@@ -508,7 +506,6 @@ export function ChatShellSurface(props: {
     scope: paletteDrilldown ? "contextual" : "global",
     limit: SLASH_COMPLETION_LIMIT,
   });
-  const firstApproval = props.runtime.chatView.pendingApprovals[0];
   const setPrompt = useMemo(() => setPromptText(setPromptParts, pastedTextByMarkerRef), []);
   const historyPromptValueRef = useRef<string | undefined>(undefined);
   const clearPromptAttachments = useCallback(() => {
@@ -1164,14 +1161,6 @@ export function ChatShellSurface(props: {
     ? filteredResumeSessions(resumePicker.sessions, resumePicker.query, cwd, resumePicker.showAll)
     : [];
   const selectorOpen = Boolean(modelPicker || reasoningPicker || permissionsPicker || resumePicker || renamePrompt);
-  const approvalReviewHeight = approvalDockHeight(
-    props.runtime.chatView.pendingApprovals,
-    Math.max(24, dimensions.width - 8),
-    theme,
-  );
-  const approvalReviewBlocked = firstApproval?.permission === "bash.unsandboxed"
-    && approvalReviewHeight > Math.max(6, dimensions.height - 8);
-  const approvalShortcutsEnabled = view === "chat" && Boolean(firstApproval) && props.runtime.chatView.pendingApprovals.length > 0 && !authManualPrompt && !selectorOpen && !themePicker && !paletteOpen && !commandCompletionOpen && !skillCompletionOpen;
   const disabledReason = authManualPrompt
     ? undefined
     : modelPicker
@@ -1190,17 +1179,15 @@ export function ChatShellSurface(props: {
     ? undefined
     : commandInputActive
     ? undefined
-    : props.runtime.chatView.pendingApprovals.length > 0
-      ? "Resolve approval to continue"
-      : props.runtime.chatView.status === "cancelling"
-        ? "Cancelling session..."
-        : props.runtime.chatView.status === "running"
-          ? "Session running - Esc or Ctrl+X to interrupt"
-          : props.runtime.submitBlockedReason
-            ? props.runtime.submitBlockedReason
-            : !props.runtime.canSubmit
-              ? "Waiting for runtime"
-              : undefined;
+    : props.runtime.chatView.status === "cancelling"
+      ? "Cancelling session..."
+      : props.runtime.chatView.status === "running"
+        ? "Session running - Esc or Ctrl+X to interrupt"
+        : props.runtime.submitBlockedReason
+          ? props.runtime.submitBlockedReason
+          : !props.runtime.canSubmit
+            ? "Waiting for runtime"
+            : undefined;
   const promptDisabled = Boolean(disabledReason);
   const clipboard = props.clipboard ?? systemClipboard;
   const registerPromptTextPaste = useCallback((value: string) => {
@@ -1733,30 +1720,6 @@ export function ChatShellSurface(props: {
       if (next !== undefined) setPromptFromHistory(next);
       return;
     }
-    if (approvalShortcutsEnabled && firstApproval && isApproveAlwaysKey(key)) {
-      if (firstApproval.maxApprovalScope === undefined || firstApproval.maxApprovalScope === "persistent") {
-        void props.runtime.approveApproval(firstApproval.id, { scope: "persistent" });
-      }
-      return;
-    }
-    if (approvalShortcutsEnabled && firstApproval && isApproveSessionKey(key)) {
-      if (firstApproval.maxApprovalScope !== "once") {
-        void props.runtime.approveApproval(firstApproval.id, { scope: "session" });
-      }
-      return;
-    }
-    if (approvalShortcutsEnabled && firstApproval && isApproveOnceKey(key)) {
-      if (approvalReviewBlocked) {
-        appendLocalItem("error", "Resize the terminal to review the full command before approval.");
-      } else {
-        void props.runtime.approveApproval(firstApproval.id, { scope: "once" });
-      }
-      return;
-    }
-    if (approvalShortcutsEnabled && firstApproval && isRejectApprovalKey(key)) {
-      void props.runtime.rejectApproval(firstApproval.id);
-      return;
-    }
   });
 
   const gitBranch = useGitBranch(cwd, props.options?.gitBranch);
@@ -1901,7 +1864,6 @@ export function ChatShellSurface(props: {
           hideThinking={hideThinking}
           transcriptActive={view === "transcript"}
           commands={commands}
-          approvalReviewBlocked={approvalReviewBlocked}
           disabledReason={disabledReason}
           theme={theme}
           themePicker={themePicker ? {
@@ -1972,7 +1934,6 @@ function HomeScreen(props: {
   const maxCommandItems = promptMenuItemLimit({
     height: props.height,
     footerHeight,
-    approvalHeight: 0,
     themePickerHeight,
     selectorHeight,
     feedback: Boolean(feedback),
@@ -2065,7 +2026,6 @@ function SessionScreen(props: {
   hideThinking: boolean;
   transcriptActive: boolean;
   commands: readonly TuiCommand[];
-  approvalReviewBlocked: boolean;
   disabledReason?: string | undefined;
   theme: TuiTheme;
   themePicker?: ThemePickerModel | undefined;
@@ -2077,19 +2037,12 @@ function SessionScreen(props: {
 }) {
   const promptWidth = Math.min(96, Math.max(42, props.width - 8));
   const messageWidth = Math.max(24, props.width - 8);
-  const approvalHeight = approvalDockHeight(
-    props.runtime.chatView.pendingApprovals,
-    messageWidth,
-    props.theme,
-    props.approvalReviewBlocked,
-  );
   const feedback = currentFeedback(props.runtime);
   const footerHeight = statusFooterHeight(props.width);
   const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
   const modelPicker = fitModelPickerRows(
     props.modelPicker,
     props.height
-      - approvalHeight
       - themePickerHeight
       - footerHeight
       - PROMPT_INPUT_HEIGHT
@@ -2101,7 +2054,6 @@ function SessionScreen(props: {
   const maxCommandItems = promptMenuItemLimit({
     height: props.height,
     footerHeight,
-    approvalHeight,
     themePickerHeight,
     selectorHeight,
     feedback: Boolean(feedback),
@@ -2119,9 +2071,9 @@ function SessionScreen(props: {
     prompt: props.prompt.startsWith("!") ? props.prompt.slice(1) : props.prompt,
     width: promptWidth,
   });
-  const messagePaneHeight = Math.max(1, props.height - approvalHeight - themePickerHeight - selectorHeight - promptHeight - footerHeight);
+  const messagePaneHeight = Math.max(1, props.height - themePickerHeight - selectorHeight - promptHeight - footerHeight);
   const transcriptChrome = props.height < 16 ? 6 : 3;
-  const transcriptVisibleLimit = Math.max(1, props.height - approvalHeight - themePickerHeight - selectorHeight - promptHeight - footerHeight - transcriptChrome);
+  const transcriptVisibleLimit = Math.max(1, props.height - themePickerHeight - selectorHeight - promptHeight - footerHeight - transcriptChrome);
   return (
     <box
       width="100%"
@@ -2163,14 +2115,6 @@ function SessionScreen(props: {
           />
         )}
       </box>
-      <ApprovalDock
-        approvals={props.runtime.chatView.pendingApprovals}
-        width={messageWidth}
-        reviewBlocked={props.approvalReviewBlocked}
-        onApprove={(approvalId: ApprovalId, scope: ChatApprovalGrantScope) => void props.runtime.approveApproval(approvalId, { scope })}
-        onReject={(approvalId: ApprovalId) => void props.runtime.rejectApproval(approvalId)}
-        theme={props.theme}
-      />
       <box width="100%" alignItems="center" flexDirection="column">
         {props.themePicker ? <ThemePicker model={props.themePicker} theme={props.theme} /> : null}
         {modelPicker ? <ModelPicker model={modelPicker} theme={props.theme} /> : null}
@@ -2359,7 +2303,6 @@ function selectorPickerHeight(
 function promptMenuItemLimit(input: {
   height: number;
   footerHeight: number;
-  approvalHeight: number;
   themePickerHeight: number;
   selectorHeight: number;
   feedback: boolean;
@@ -2368,7 +2311,6 @@ function promptMenuItemLimit(input: {
 }): number {
   if (!input.menuOpen) return PROMPT_MENU_MAX_ITEMS;
   const reserved = input.footerHeight
-    + input.approvalHeight
     + input.themePickerHeight
     + input.selectorHeight
     + PROMPT_INPUT_HEIGHT
@@ -4042,7 +3984,7 @@ function currentFeedback(runtime: ChatRuntimeState): { status: string; message: 
     return runtime.chatFeedback;
   }
   if (runtime.chatView.status === "cancelling") return { status: "pending", message: "cancelling session" };
-  // The approval dock and footer already own this state. Avoid consuming an
+  // The footer already owns this state. Avoid consuming an
   // extra row (and never let a stale neutral acknowledgement replace the dock).
   if (runtime.chatView.status === "waiting_for_approval") return undefined;
   if (runtime.chatView.status === "running") {
@@ -4519,23 +4461,6 @@ function isCopyShortcut(key: KeyEvent): boolean {
 
 function isPasteShortcut(key: KeyEvent): boolean {
   return key.name === "v" && !key.shift && (key.ctrl || Boolean(key.super || key.meta));
-}
-
-function isApproveOnceKey(key: KeyEvent): boolean {
-  return key.name === "a" && !hasModifier(key);
-}
-
-function isApproveSessionKey(key: KeyEvent): boolean {
-  return key.name === "s" && !hasModifier(key);
-}
-
-function isApproveAlwaysKey(key: KeyEvent): boolean {
-  const upperA = key.name === "A" || key.sequence === "A" || (key.name === "a" && key.shift);
-  return upperA && !key.ctrl && !key.meta && !key.super && !key.hyper && !key.option;
-}
-
-function isRejectApprovalKey(key: KeyEvent): boolean {
-  return key.name === "x" && !hasModifier(key);
 }
 
 function isArrowUp(key: KeyEvent): boolean {

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import type { PromptDebugManifest } from "../prompt/debug.js";
 import {
   formatToolResultForModel,
   type Message,
@@ -23,6 +25,8 @@ export interface ContextBudgetOptions {
 }
 
 export interface ContextRequestSurface {
+  /** Provenance identifies optional Memory; it is never sent as model content. */
+  promptDebug?: PromptDebugManifest;
   contextWindowTokens?: number;
   requestMaxOutputTokens?: number;
   system?: readonly string[];
@@ -59,6 +63,8 @@ export interface ContextUsage {
   fixedInputTokens?: number;
   budgetTokens?: number;
   outputReserveTokens?: number;
+  framingSafetyTokens?: number;
+  estimatedRequestTokens?: number;
 }
 
 export interface ContextWindowOverflow {
@@ -176,6 +182,7 @@ export class ContextWindowBuilder {
     const budgeted = toolCompacted.messages;
     const threshold = Math.floor(this.maxInputChars * this.compactionThresholdRatio);
     const truncatedChars = estimateMessages(budgeted);
+    this.selectOptionalMemory(normalizedSurface, surface, budgeted);
     const surfaceBudget = resolveSurfaceBudget(normalizedSurface, this.framingSafetyTokens);
     const truncatedTokens = surfaceBudget ? estimateMessagesTokens(budgeted) : undefined;
     const fixedInputExceedsWindow = surfaceBudget
@@ -208,7 +215,7 @@ export class ContextWindowBuilder {
     const withinTokenBudget = !surfaceBudget || (truncatedTokens ?? 0) <= surfaceBudget.historyBudgetTokens;
 
     if (truncatedChars <= this.maxInputChars && withinTokenBudget) {
-      const boundary = this.chooseBoundary(budgeted, "token_budget", truncatedChars);
+      const boundary = this.chooseBoundary(compactedMessages, "token_budget", truncatedChars);
       const tokenThresholdReached = surfaceBudget
         && (truncatedTokens ?? 0) >= Math.floor(surfaceBudget.historyBudgetTokens * this.compactionThresholdRatio);
       return {
@@ -248,11 +255,14 @@ export class ContextWindowBuilder {
     const pairedSelected = dropToolResultsWithoutPrecedingCalls(selected);
     const budgetOmittedMessages = budgeted.length - pairedSelected.length;
     const omittedMessages = compactedMessagesOmitted + budgetOmittedMessages;
+    const lastOmittedMessage = budgetOmittedMessages > 0 ? budgeted[budgetOmittedMessages - 1] : undefined;
     const boundary = this.chooseBoundary(
-      budgeted,
+      compactedMessages,
       "token_budget",
       truncatedChars,
-      budgetOmittedMessages > 0 ? budgetOmittedMessages - 1 : 0,
+      lastOmittedMessage
+        ? compactedMessages.findIndex((message) => message.id === lastOmittedMessage.id)
+        : 0,
     );
     const result: ContextBuildResult = {
       messages: pairedSelected,
@@ -285,6 +295,42 @@ export class ContextWindowBuilder {
     }
 
     return result;
+  }
+
+  private selectOptionalMemory(
+    selected: NormalizedContextRequestSurface,
+    original: ContextRequestSurface,
+    messages: readonly Message[],
+  ): void {
+    if (!positiveInteger(selected.contextWindowTokens) || !original.promptDebug) return;
+    const fragments = original.promptDebug.fragments.filter((fragment) => fragment.layer === "contextual_user");
+    const consumedFragments = new Set<number>();
+    const originals = original.contextualUser ?? [];
+    const optional = originals.map((content) => {
+      const version = createHash("sha256").update(content).digest("hex");
+      const index = fragments.findIndex((fragment, index) => !consumedFragments.has(index) && fragment.contentVersion === version);
+      if (index < 0) return false;
+      consumedFragments.add(index);
+      const fragment = fragments[index]!;
+      return fragment.source === "memory"
+        && (fragment.metadata?.kind === "user_memory" || fragment.metadata?.kind === "project_memory");
+    });
+    const consumedOriginals = new Set<number>();
+    const selectedOptional = selected.contextualUser.map((content) => {
+      const index = originals.findIndex((candidate, index) => !consumedOriginals.has(index) && candidate === content);
+      if (index < 0) return originals.length === 1 && optional[0] === true;
+      consumedOriginals.add(index);
+      return optional[index] === true;
+    });
+    const historyTokens = estimateMessagesTokens(messages);
+    // Keep higher-priority selected entries first. Optional long-term facts must
+    // not force eviction of the current request or otherwise usable history.
+    for (let index = selected.contextualUser.length - 1; index >= 0; index--) {
+      const budget = resolveSurfaceBudget(selected, this.framingSafetyTokens);
+      if (!budget || budget.fixedInputTokens + budget.outputReserveTokens
+        + budget.framingSafetyTokens + historyTokens <= budget.contextWindowTokens) return;
+      if (selectedOptional[index]) selected.contextualUser.splice(index, 1);
+    }
   }
 
   private normalizeSurface(surface: ContextRequestSurface): NormalizedContextRequestSurface {
@@ -337,6 +383,9 @@ export class ContextWindowBuilder {
       usage.fixedInputTokens = input.surfaceBudget.fixedInputTokens;
       usage.budgetTokens = input.surfaceBudget.historyBudgetTokens;
       usage.outputReserveTokens = input.surfaceBudget.outputReserveTokens;
+      usage.framingSafetyTokens = input.surfaceBudget.framingSafetyTokens;
+      usage.estimatedRequestTokens = (input.contextTokens ?? 0) + input.surfaceBudget.fixedInputTokens
+        + input.surfaceBudget.outputReserveTokens + input.surfaceBudget.framingSafetyTokens;
     }
     return usage;
   }
@@ -763,16 +812,22 @@ export function compactedMessageView(messages: readonly Message[]): Message[] {
   if (!compactionMessage) return [...messages];
 
   const boundaryIndex = messages.findIndex((message) => message.id === compactedAt.boundaryMessageId);
-  if (boundaryIndex >= 0) {
+  if (boundaryIndex >= 0 && boundaryIndex < compactedAt.messageIndex) {
     return [
       compactionMessage,
       ...messages
         .slice(boundaryIndex + 1)
-        .filter((message) => message.id !== compactionMessage.id),
+        // Summaries are appended after the history they replace. An older
+        // summary can therefore occur after the new boundary in storage order,
+        // even though it was part of the new summary's input.
+        .filter((message) => !message.parts.some((part) => part.type === "compaction")),
     ];
   }
 
-  return messages.slice(compactedAt.messageIndex);
+  // A projected history may already begin with its summary and omit the raw
+  // boundary. It is safe to use that history unchanged, but never to discard
+  // unrelated messages merely because a boundary cannot be resolved.
+  return [...messages];
 }
 
 function cloneMessage(message: Message): Message {
@@ -1203,16 +1258,53 @@ function countToolResults(messages: readonly Message[]): number {
   );
 }
 
+/**
+ * Complete, contiguous source groups that can be summarized independently.
+ * A result is the completion fact: persisted call parts can retain their
+ * original pending status after the result was appended in another message.
+ */
+export function compactionGroups(messages: readonly Message[]): Message[][] {
+  const scanned = scanCompactionGroups(messages, messages.length - 1);
+  if (scanned.error) throw new Error(scanned.error);
+  if (scanned.lastCompleteIndex !== messages.length - 1) {
+    throw new Error("Compaction source contains tool calls without results");
+  }
+  return scanned.groups;
+}
+
 /** Never summarize a call while leaving its result (or unfinished effect) behind. */
 function completeToolPairBoundary(messages: readonly Message[], candidate: number): number {
-  const open = new Map<string, number>();
+  return scanCompactionGroups(messages, candidate).lastCompleteIndex;
+}
+
+function scanCompactionGroups(messages: readonly Message[], candidate: number): {
+  groups: Message[][];
+  lastCompleteIndex: number;
+  error?: string;
+} {
+  const open = new Set<string>();
+  const seen = new Set<string>();
+  const groups: Message[][] = [];
   let lastComplete = -1;
-  for (let index = 0; index <= candidate; index++) {
+  for (let index = 0; index <= Math.min(candidate, messages.length - 1); index++) {
     for (const part of messages[index]?.parts ?? []) {
-      if (part.type === "tool_call") open.set(part.callId, index);
-      if (part.type === "tool_result") open.delete(part.callId);
+      if (part.type === "tool_call") {
+        if (seen.has(part.callId)) {
+          return { groups, lastCompleteIndex: lastComplete, error: `Duplicate tool call in compaction source: ${part.callId}` };
+        }
+        seen.add(part.callId);
+        open.add(part.callId);
+      }
+      if (part.type === "tool_result") {
+        if (!open.delete(part.callId)) {
+          return { groups, lastCompleteIndex: lastComplete, error: `Tool result without a preceding unmatched call in compaction source: ${part.callId}` };
+        }
+      }
     }
-    if (open.size === 0) lastComplete = index;
+    if (open.size === 0) {
+      groups.push(messages.slice(lastComplete + 1, index + 1));
+      lastComplete = index;
+    }
   }
-  return lastComplete;
+  return { groups, lastCompleteIndex: lastComplete };
 }

@@ -2231,7 +2231,7 @@ test("SingleAgentRuntime satisfies AgentRunner without starting an already abort
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event: RuntimeEvent) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     retryPolicy: { maxAttempts: 3, initialDelayMs: 0 },
     createId: createSequentialId(),
@@ -2285,7 +2285,7 @@ test("RuntimeService excludes cancelled prompt with no assistant output from sub
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event: RuntimeEvent) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId,
     now: () => ++now as TimestampMs,
@@ -2368,7 +2368,7 @@ test("RuntimeService persists encrypted reasoning output into the next turn cont
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event: RuntimeEvent) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId,
     now: () => ++now as TimestampMs,
@@ -2425,7 +2425,7 @@ test("RuntimeService excludes a failed prompt with only a synthetic error from s
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event: RuntimeEvent) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     retryPolicy: { maxAttempts: 1 },
     createId,

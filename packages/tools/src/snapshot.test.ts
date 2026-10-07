@@ -410,7 +410,7 @@ function fileTools(snapshotProvider?: FileSystemSnapshotProvider): ToolExecutor 
   return new ToolExecutor({
     registry,
     events: { publish: async () => undefined },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     ...(snapshotProvider ? { snapshotProvider } : {}),
   });
 }

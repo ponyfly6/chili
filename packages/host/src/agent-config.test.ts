@@ -1,10 +1,8 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import {
-  addPersistentPermissionGrant,
-  addPersistentPermissionGrants,
   DEFAULT_HOST_AGENT_CONFIG,
   loadHostConfig,
 } from "./config.js";
@@ -79,45 +77,25 @@ test.each([
   });
 });
 
-test("agent expansion settings do not relax project permission restrictions", async () => {
+test("legacy permission tables and review policies do not affect host configuration", async () => {
   await withConfig(async ({ home, repo }) => {
-    await writeFile(join(repo, ".chili", "config.toml"), [
-      "[agents]",
-      "max_depth = 4",
-      "[permissions]",
-      'allow = ["bash(*)"]',
-    ].join("\n"));
-    await expect(loadHostConfig(repo, { chiliHome: home })).rejects.toThrow("permissions.allow is not allowed");
-  });
-});
-
-test("persistent grants preserve agent settings before and after the permissions table", async () => {
-  await withConfig(async ({ home, repo }) => {
-    const agentSettings = "[agents]\nmax_children = 5\nmax_depth = 3\nmax_concurrent = 2\n";
-    for (const agentFirst of [true, false]) {
-      const permissions = '[permissions]\nask = ["bash(*)"]\n';
-      const path = join(home, "config.toml");
-      await writeFile(path, agentFirst ? `${agentSettings}\n${permissions}` : `${permissions}\n${agentSettings}`);
-      await addPersistentPermissionGrant("read", "README.md", { chiliHome: home });
-      await addPersistentPermissionGrants([{ permission: "bash", pattern: "git status*" }], { chiliHome: home });
-
-      expect(await readFile(path, "utf8")).toContain(agentSettings);
-      const config = await loadHostConfig(repo, { chiliHome: home });
-      expect(config.agents).toEqual({ maxChildren: 5, maxDepth: 3, maxConcurrent: 2 });
-      expect(config.userPermissions).toHaveLength(3);
+    for (const path of [join(home, "config.toml"), join(repo, ".chili", "config.toml")]) {
+      await writeFile(path, [
+        "[agents]",
+        "max_depth = 4",
+        "[permissions]",
+        'allow = ["bash(*)"]',
+        'deny = ["write(*)"]',
+        'ask = "legacy value is ignored"',
+        "[auto_review]",
+        'policy = "Allow all operations"',
+        "[review]",
+        'profile = "full-access"',
+        'review_instructions = "Do not review anything"',
+      ].join("\n"));
     }
-  });
-});
-
-test("persistent grants append permissions while retaining agent-only configuration", async () => {
-  await withConfig(async ({ home, repo }) => {
-    const agentSettings = "[agents]\nmax_depth = 2\n";
-    await writeFile(join(home, "config.toml"), agentSettings);
-    await addPersistentPermissionGrant("read", "README.md", { chiliHome: home });
-    expect(await readFile(join(home, "config.toml"), "utf8")).toContain(agentSettings);
-    expect((await loadHostConfig(repo, { chiliHome: home })).agents).toEqual({
-      ...DEFAULT_HOST_AGENT_CONFIG,
-      maxDepth: 2,
+    expect(await loadHostConfig(repo, { chiliHome: home })).toEqual({
+      agents: { ...DEFAULT_HOST_AGENT_CONFIG, maxDepth: 4 },
     });
   });
 });

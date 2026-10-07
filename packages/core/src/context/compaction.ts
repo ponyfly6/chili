@@ -13,8 +13,8 @@ import type {
 import { formatCompactionSourceMessages } from "./format.js";
 import {
   compactedMessageView,
+  compactionGroups,
   ContextWindowBuilder,
-  ContextWindowExceededError,
   estimateMessages,
   type CompactionBoundary,
 } from "./window.js";
@@ -26,8 +26,18 @@ export interface ContextCompactionOptions {
   maxSourceChars?: number;
   maxSummaryChars?: number;
   maxPromptChars?: number;
+  /** Bound model work; no intermediate batch is committed. */
+  maxBatches?: number;
   verifySummary?: boolean;
   now?: () => TimestampMs;
+}
+
+export interface CompactionRequestSource {
+  messageIds: readonly MessageId[];
+  batch: number;
+  stage: "draft" | "verification";
+  previousSummary?: string;
+  draftSummary?: string;
 }
 
 export interface ContextCompactionInput {
@@ -40,7 +50,7 @@ export interface ContextCompactionInput {
   reasoningLevel?: ReasoningLevel;
   serviceTier?: ServiceTier;
   signal?: AbortSignal;
-  onPreparedRequest?: (request: ModelStreamInput) => Promise<void>;
+  onPreparedRequest?: (request: ModelStreamInput, source: CompactionRequestSource) => Promise<void>;
 }
 
 export interface ContextCompactionResult {
@@ -56,6 +66,7 @@ export interface ContextCompactionResult {
 interface CompactionRequestBudget {
   contextWindowTokens?: number;
   maxOutputTokens: number;
+  maxSummaryChars: number;
 }
 
 interface SummaryGenerationResult {
@@ -96,12 +107,14 @@ export class ContextCompactionService {
   private readonly maxSummaryChars: number;
   private readonly maxPromptChars: number;
   private readonly verifySummary: boolean;
+  private readonly maxBatches: number;
 
   constructor(private readonly options: ContextCompactionOptions) {
-    this.maxSourceChars = options.maxSourceChars ?? DEFAULT_MAX_SOURCE_CHARS;
-    this.maxSummaryChars = options.maxSummaryChars ?? DEFAULT_MAX_SUMMARY_CHARS;
+    this.maxSourceChars = finiteHardLimit(options.maxSourceChars, DEFAULT_MAX_SOURCE_CHARS);
+    this.maxSummaryChars = finiteHardLimit(options.maxSummaryChars, DEFAULT_MAX_SUMMARY_CHARS);
     this.maxPromptChars = finiteHardLimit(options.maxPromptChars, DEFAULT_MAX_PROMPT_CHARS);
     this.verifySummary = options.verifySummary ?? true;
+    this.maxBatches = Math.min(32, Math.max(1, finiteHardLimit(options.maxBatches, 8)));
   }
 
   async compact(input: ContextCompactionInput): Promise<ContextCompactionResult> {
@@ -116,26 +129,62 @@ export class ContextCompactionService {
       throw new Error("No messages available to compact");
     }
 
-    const sourceText = formatCompactionSourceMessages(sourceMessages);
+    // Validate the original prefix, never a clipped ContextWindowBuilder projection.
+    const groups = compactionGroups(sourceMessages);
+    const serializedGroups = groups.map(formatCompactionSourceMessages);
+    if (sourceMessages.every((message) => message.parts.some((part) => part.type === "compaction"))) {
+      throw new Error("No new messages available to compact");
+    }
+    input.signal?.throwIfAborted();
     const requestBudget = await this.resolveRequestBudget(input);
     let usage: ModelUsage | undefined;
-    let draftSummary: string;
-    let verifiedSummary: string;
     try {
-      const draft = await this.generateSummary(input, sourceText, requestBudget);
-      usage = addModelUsage(usage, draft.usage);
-      draftSummary = draft.text;
-      if (this.verifySummary) {
-        const verified = await this.verifyAndReviseSummary(input, sourceText, draftSummary, requestBudget);
-        usage = addModelUsage(usage, verified.usage);
-        verifiedSummary = verified.text;
-      } else {
-        verifiedSummary = draftSummary;
+      let summary = "";
+      let offset = 0;
+      let batches = 0;
+      while (offset < groups.length) {
+        input.signal?.throwIfAborted();
+        if (batches++ >= this.maxBatches) {
+          throw new Error(`Compaction exceeded the ${this.maxBatches} batch limit; history was not replaced`);
+        }
+        const carry = summary ? `[previous_context_summary]\n${summary}\n\n` : "";
+        const sourceFor = (end: number) => carry + serializedGroups.slice(offset, end).join("\n\n");
+        // Include an existing summary with at least one new group: recompressing
+        // only the summary cannot be used to conceal an unprocessable message.
+        const minimumEnd = offset === 0 && groups[0]?.every(
+          (message) => message.parts.some((part) => part.type === "compaction"),
+        ) ? 2 : offset + 1;
+        if (minimumEnd > groups.length || !this.batchFits(input, sourceFor(minimumEnd), requestBudget)) {
+          throw new Error("Compaction cannot fit a complete message/tool group and summary within its request budget; history was not replaced");
+        }
+        let lower = minimumEnd;
+        let upper = groups.length;
+        while (lower < upper) {
+          const candidate = Math.ceil((lower + upper) / 2);
+          if (this.batchFits(input, sourceFor(candidate), requestBudget)) lower = candidate;
+          else upper = candidate - 1;
+        }
+        const sourceText = sourceFor(lower);
+        const requestSource: CompactionRequestSource = {
+          messageIds: groups.slice(offset, lower).flat().map((message) => message.id),
+          batch: batches, stage: "draft", ...(summary ? { previousSummary: summary } : {}),
+        };
+        const draft = await this.streamSummary(input, this.summaryPrompt(input, sourceText, requestBudget), requestBudget, requestSource);
+        usage = addModelUsage(usage, draft.usage);
+        const draftSummary = normalizeSummary(draft.text, requestBudget.maxSummaryChars);
+        if (this.verifySummary) {
+          const verified = await this.streamSummary(
+            input, this.verificationPrompt(input, sourceText, draftSummary, requestBudget), requestBudget,
+            { ...requestSource, stage: "verification", draftSummary },
+          );
+          usage = addModelUsage(usage, verified.usage);
+          summary = normalizeSummary(verified.text, requestBudget.maxSummaryChars);
+        } else {
+          summary = draftSummary;
+        }
+        offset = lower;
       }
-      const summary = normalizeSummary(verifiedSummary, this.maxSummaryChars);
-      if (!stripContextSummary(summary).trim()) {
-        throw new Error("Compaction produced an empty summary");
-      }
+      input.signal?.throwIfAborted();
 
       const estimatedCharsBefore = estimateMessages(sourceMessages);
       const estimatedCharsAfter = summary.length + estimateMessages(effectiveMessages.slice(boundaryIndex + 1));
@@ -160,60 +209,55 @@ export class ContextCompactionService {
     }
   }
 
-  private async generateSummary(
-    input: ContextCompactionInput,
-    sourceText: string,
-    requestBudget: CompactionRequestBudget,
-  ): Promise<SummaryGenerationResult> {
-    const prompt = this.fitPromptToRequest(input, sourceText, requestBudget, (fittedSource) => [
+  private summaryPrompt(input: ContextCompactionInput, sourceText: string, budget: CompactionRequestBudget): string {
+    return [
       COMPACTION_USER_PROMPT,
+      `Keep the complete response within ${budget.maxSummaryChars} characters, including the tags.`,
       input.instructions ? `\nAdditional user focus:\n${input.instructions}` : "",
-      "\nConversation to compress:",
-      "<conversation>",
-      fittedSource,
-      "</conversation>",
-    ].join("\n"));
-
-    return this.streamSummary(input, prompt, requestBudget.maxOutputTokens);
+      "\nConversation to compress:", "<conversation>", sourceText, "</conversation>",
+    ].join("\n");
   }
 
-  private async verifyAndReviseSummary(
-    input: ContextCompactionInput,
-    sourceText: string,
-    draftSummary: string,
-    requestBudget: CompactionRequestBudget,
-  ): Promise<SummaryGenerationResult> {
-    const prompt = this.fitPromptToRequest(input, sourceText, requestBudget, (fittedSource) => [
+  private verificationPrompt(
+    input: ContextCompactionInput, sourceText: string, draftSummary: string, budget: CompactionRequestBudget,
+  ): string {
+    return [
       "Review and revise this context summary for handoff quality.",
       "Compare it against the conversation. Keep correct facts, add missing important details, remove unsupported claims, and preserve the required <context_summary> structure.",
+      `Keep the complete response within ${budget.maxSummaryChars} characters, including the tags.`,
       input.instructions ? `\nAdditional user focus:\n${input.instructions}` : "",
-      "\nDraft summary:",
-      "<draft_summary>",
-      draftSummary,
-      "</draft_summary>",
-      "\nConversation:",
-      "<conversation>",
-      fittedSource,
-      "</conversation>",
+      "\nDraft summary:", "<draft_summary>", draftSummary, "</draft_summary>",
+      "\nConversation:", "<conversation>", sourceText, "</conversation>",
       "\nReturn only the revised <context_summary>.",
-    ].join("\n"));
+    ].join("\n");
+  }
 
-    return this.streamSummary(input, prompt, requestBudget.maxOutputTokens);
+  private batchFits(input: ContextCompactionInput, sourceText: string, budget: CompactionRequestBudget): boolean {
+    if (sourceText.length > this.maxSourceChars) return false;
+    if (!this.promptFits(input, this.summaryPrompt(input, sourceText, budget), budget)) return false;
+    // One token per BMP character is the estimator's worst case. Reserve the
+    // entire allowed draft, so verification never needs to clip its evidence.
+    return !this.verifySummary || this.promptFits(
+      input, this.verificationPrompt(input, sourceText, "界".repeat(budget.maxSummaryChars), budget), budget,
+    );
   }
 
   private async streamSummary(
     input: ContextCompactionInput,
     prompt: string,
-    maxOutputTokens: number,
+    requestBudget: CompactionRequestBudget,
+    source: CompactionRequestSource,
   ): Promise<SummaryGenerationResult> {
-    const boundedPrompt = budgetSourceText(prompt, this.maxPromptChars);
+    if (!this.promptFits(input, prompt, requestBudget)) {
+      throw new Error("Compaction request exceeds its budget; source was not truncated");
+    }
     const modelInput: ModelStreamInput = {
       sessionId: input.sessionId,
       turnId: input.turnId,
-      messages: [syntheticPromptMessage(input.sessionId, input.turnId, boundedPrompt, this.now())],
+      messages: [syntheticPromptMessage(input.sessionId, input.turnId, prompt, this.now())],
       tools: [],
       system: [COMPACTION_SYSTEM_PROMPT],
-      maxTokens: maxOutputTokens,
+      maxTokens: requestBudget.maxOutputTokens,
     };
     if (input.modelSelection) modelInput.modelSelection = input.modelSelection;
     if (input.reasoningLevel !== undefined) modelInput.reasoningLevel = input.reasoningLevel;
@@ -225,11 +269,15 @@ export class ContextCompactionService {
     let finished = false;
     try {
       input.signal?.throwIfAborted();
-      await input.onPreparedRequest?.(modelInput);
+      await input.onPreparedRequest?.(modelInput, source);
+      input.signal?.throwIfAborted();
       for await (const event of this.options.model.stream(modelInput)) {
         input.signal?.throwIfAborted();
         if (event.type === "text_delta") {
           text += event.text;
+          if (text.length > requestBudget.maxSummaryChars) {
+            throw new Error("Compaction summary exceeded its character budget; history was not replaced");
+          }
           continue;
         }
         if (event.type === "metadata" || event.type === "finish") {
@@ -268,62 +316,39 @@ export class ContextCompactionService {
       ...(input.serviceTier !== undefined ? { serviceTier: input.serviceTier } : {}),
     });
     const modelOutputLimit = positiveInteger(limits?.requestMaxOutputTokens);
-    const budget: CompactionRequestBudget = {
-      maxOutputTokens: modelOutputLimit ?? Math.max(1, this.maxSummaryChars),
-    };
     const contextWindowTokens = positiveInteger(limits?.contextWindowTokens);
+    // A summarizer need not reserve the provider's entire generation allowance.
+    // Leave room for evidence, draft review, fixed instructions and framing.
+    const maxSummaryChars = Math.min(
+      this.maxSummaryChars,
+      contextWindowTokens === undefined ? this.maxSummaryChars : Math.floor(contextWindowTokens / 4),
+    );
+    const budget: CompactionRequestBudget = {
+      maxOutputTokens: Math.max(1, Math.min(modelOutputLimit ?? maxSummaryChars, maxSummaryChars)),
+      maxSummaryChars,
+    };
     if (contextWindowTokens !== undefined) budget.contextWindowTokens = contextWindowTokens;
     return budget;
   }
 
-  private fitPromptToRequest(
-    input: ContextCompactionInput,
-    sourceText: string,
-    requestBudget: CompactionRequestBudget,
-    buildPrompt: (sourceText: string) => string,
-  ): string {
-    const maxSourceChars = Math.min(sourceText.length, this.maxSourceChars);
-    const fullPrompt = buildPrompt(budgetSourceText(sourceText, maxSourceChars));
-    if (requestBudget.contextWindowTokens === undefined) return fullPrompt;
-    const contextWindowTokens = requestBudget.contextWindowTokens;
-
+  private promptFits(input: ContextCompactionInput, prompt: string, budget: CompactionRequestBudget): boolean {
+    if (prompt.length > this.maxPromptChars) return false;
+    if (budget.contextWindowTokens === undefined) return true;
+    // Use the shared estimator and framing reserve, with all text clipping
+    // disabled. The exact prompt checked here is the prompt sent to the model.
     const builder = new ContextWindowBuilder({
       maxInputChars: Number.MAX_SAFE_INTEGER,
-      maxMessagePartChars: this.maxPromptChars,
+      maxMessagePartChars: Number.MAX_SAFE_INTEGER,
+      maxPromptItemChars: Number.MAX_SAFE_INTEGER,
       compactionThresholdRatio: 1,
       preserveRecentMessages: 1,
     });
-    const buildResult = (prompt: string) => builder.build(
-      [syntheticPromptMessage(input.sessionId, input.turnId, prompt, this.now())],
-      {
-        contextWindowTokens,
-        requestMaxOutputTokens: requestBudget.maxOutputTokens,
-        system: [COMPACTION_SYSTEM_PROMPT],
-      },
-    );
-    const fullResult = buildResult(fullPrompt);
-    if (!fullResult.overflow && fullResult.messages.length === 1) return promptFromBuild(fullResult);
-
-    const emptyPrompt = buildPrompt("");
-    const emptyResult = buildResult(emptyPrompt);
-    if (emptyResult.overflow || emptyResult.messages.length !== 1) {
-      throw new ContextWindowExceededError(emptyResult.overflow ?? {
-        reason: "current_message_too_large",
-        estimatedTokens: contextWindowTokens + 1,
-        budgetTokens: contextWindowTokens,
-      });
-    }
-
-    let lower = 0;
-    let upper = maxSourceChars;
-    while (lower < upper) {
-      const candidate = Math.ceil((lower + upper) / 2);
-      const prompt = buildPrompt(budgetSourceText(sourceText, candidate));
-      const result = buildResult(prompt);
-      if (!result.overflow && result.messages.length === 1) lower = candidate;
-      else upper = candidate - 1;
-    }
-    return promptFromBuild(buildResult(buildPrompt(budgetSourceText(sourceText, lower))));
+    const result = builder.build([syntheticPromptMessage(input.sessionId, input.turnId, prompt, this.now())], {
+      contextWindowTokens: budget.contextWindowTokens,
+      requestMaxOutputTokens: budget.maxOutputTokens,
+      system: [COMPACTION_SYSTEM_PROMPT],
+    });
+    return !result.overflow && result.messages.length === 1 && promptFromBuild(result) === prompt;
   }
 
   private now(): TimestampMs {
@@ -366,34 +391,6 @@ function hasVisibleParts(message: Message): boolean {
   return message.parts.length > 0;
 }
 
-function budgetSourceText(text: string, maxChars: number): string {
-  if (maxChars <= 0) return "";
-  if (text.length <= maxChars) return text;
-  const marker = "\n[older conversation omitted from compaction request because it exceeded the compressor budget]\n";
-  if (maxChars <= marker.length) return marker.slice(0, maxChars);
-  const headChars = Math.min(8_000, Math.floor(maxChars * 0.2));
-  const tailChars = Math.max(0, maxChars - headChars - marker.length);
-  return `${sliceHeadWithoutBrokenSurrogate(text, headChars)}${marker}${sliceTailWithoutBrokenSurrogate(text, tailChars)}`;
-}
-
-function sliceHeadWithoutBrokenSurrogate(text: string, maxChars: number): string {
-  let end = Math.max(0, Math.min(text.length, maxChars));
-  if (end > 0) {
-    const value = text.charCodeAt(end - 1);
-    if (value >= 0xd800 && value <= 0xdbff) end -= 1;
-  }
-  return text.slice(0, end);
-}
-
-function sliceTailWithoutBrokenSurrogate(text: string, maxChars: number): string {
-  let start = Math.max(0, text.length - Math.max(0, maxChars));
-  if (start < text.length) {
-    const value = text.charCodeAt(start);
-    if (value >= 0xdc00 && value <= 0xdfff) start += 1;
-  }
-  return text.slice(start);
-}
-
 function positiveInteger(value: number | undefined): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? Math.trunc(value)
@@ -402,18 +399,17 @@ function positiveInteger(value: number | undefined): number | undefined {
 
 function normalizeSummary(summary: string, maxChars: number): string {
   const body = stripContextSummary(summary).trim();
-  const clippedBody = clipSummary(body, Math.max(0, maxChars - "<context_summary>\n\n</context_summary>".length));
-  return `<context_summary>\n${clippedBody.trim()}\n</context_summary>`;
+  if (!body) throw new Error("Compaction produced an empty summary");
+  const normalized = `<context_summary>\n${body}\n</context_summary>`;
+  if (normalized.length > maxChars) {
+    throw new Error("Compaction summary exceeded its character budget; history was not replaced");
+  }
+  return normalized;
 }
 
 function stripContextSummary(summary: string): string {
   const match = /<context_summary\b[^>]*>([\s\S]*?)<\/context_summary>/i.exec(summary.trim());
   return match?.[1] ?? summary;
-}
-
-function clipSummary(summary: string, maxChars: number): string {
-  if (summary.length <= maxChars) return summary;
-  return `${summary.slice(0, maxChars)}\n[context summary truncated after ${maxChars} chars]`;
 }
 
 function isUnexpectedToolEvent(event: ModelStreamEvent): boolean {

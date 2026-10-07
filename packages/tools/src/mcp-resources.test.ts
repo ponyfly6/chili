@@ -1,13 +1,13 @@
 import { expect, test } from "bun:test";
-import type { ApprovalDecision, ChiliEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { ChiliEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { createMcpResourceReadTool, createMcpResourcesListTool, type McpResourcesController } from "./builtins/mcp-resources.js";
 import { ToolExecutor } from "./executor.js";
 import { InMemoryToolRegistry } from "./registry.js";
-import type { ApprovalBroker, ChiliToolDefinition, ExecuteToolInput } from "./types.js";
+import type { ToolExecutionGate, ToolReviewRequest, ChiliToolDefinition, ExecuteToolInput } from "./types.js";
 
-test("mcp_resources_list is read-only and does not require approval", async () => {
+test("mcp_resources_list is read-only and still enters the execution gate", async () => {
   const events: ChiliEvent[] = [];
-  let approvals = 0;
+  let reviews = 0;
   const controller: McpResourcesController = {
     listResources: () => [{ serverName: "docs", uri: "file://README.md", name: "README", mimeType: "text/markdown" }],
     readResource: () => {
@@ -16,9 +16,9 @@ test("mcp_resources_list is read-only and does not require approval", async () =
   };
   const tool = createMcpResourcesListTool(controller);
   const executor = createExecutor([tool], events, {
-    decide: async () => {
-      approvals += 1;
-      return { action: "deny" };
+    review: async () => {
+      reviews += 1;
+      return { decision: "allow" };
     },
   });
 
@@ -26,16 +26,16 @@ test("mcp_resources_list is read-only and does not require approval", async () =
   const result = await executor.execute(toolInput("mcp_resources_list", { serverName: "docs" }));
 
   expect(result.status).toBe("completed");
-  expect(approvals).toBe(0);
+  expect(reviews).toBe(1);
   expect(events.map((event) => event.type)).not.toContain("approval.requested");
   if (result.status === "completed") {
     expect(result.result.output).toContain("docs: README (file://README.md) [text/markdown]");
   }
 });
 
-test("mcp_resource_read is read-only but asks approval for the target resource", async () => {
+test("mcp_resource_read presents the exact target to the execution gate", async () => {
   const events: ChiliEvent[] = [];
-  const decisions: ApprovalDecision[] = [];
+  const reviews: ToolReviewRequest[] = [];
   const controller: McpResourcesController = {
     listResources: () => [],
     readResource: (input) => ({
@@ -47,11 +47,11 @@ test("mcp_resource_read is read-only but asks approval for the target resource",
   };
   const tool = createMcpResourceReadTool(controller);
   const executor = createExecutor([tool], events, {
-    decide: async (request) => {
-      expect(request.permission).toBe("mcp_resource_read");
-      expect(request.patterns).toEqual(["docs:file://README.md"]);
-      decisions.push({ action: "allow_once" });
-      return { action: "allow_once" };
+    review: async (request) => {
+      expect(request.toolName).toBe("mcp_resource_read");
+      expect(request.input).toEqual({ serverName: "docs", uri: "file://README.md" });
+      reviews.push(request);
+      return { decision: "allow" };
     },
   });
 
@@ -62,9 +62,8 @@ test("mcp_resource_read is read-only but asks approval for the target resource",
   }));
 
   expect(result.status).toBe("completed");
-  expect(decisions).toHaveLength(1);
-  expect(events.map((event) => event.type)).toContain("approval.requested");
-  expect(events.some((event) => event.type === "tool.call_updated" && event.payload.status === "waiting_for_approval")).toBe(true);
+  expect(reviews).toHaveLength(1);
+  expect(events.map((event) => event.type)).not.toContain("approval.requested");
   if (result.status === "completed") {
     expect(result.result.output).toBe("resource text");
     expect(result.result.metadata).toMatchObject({
@@ -78,14 +77,14 @@ test("mcp_resource_read is read-only but asks approval for the target resource",
 function createExecutor(
   tools: readonly ChiliToolDefinition[],
   events: ChiliEvent[],
-  approvals: ApprovalBroker,
+  gate: ToolExecutionGate,
 ): ToolExecutor {
   const registry = new InMemoryToolRegistry();
   for (const tool of tools) registry.register(tool);
   return new ToolExecutor({
     registry,
     events: { publish: async (event) => { events.push(event); } },
-    approvals,
+    gate,
     createId: (prefix) => `${prefix}_test`,
     now: () => 1 as TimestampMs,
   });

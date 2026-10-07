@@ -9,15 +9,15 @@ import { createCodeModeTool } from "./builtins/code-mode.js";
 import { ToolExecutor } from "./executor.js";
 import { InMemoryToolRegistry } from "./registry.js";
 import { MAX_STRUCTURED_TOOL_RESULT_BYTES, validateStructuredToolData } from "./structured-data.js";
-import type { ApprovalBroker, ChiliToolDefinition, ChiliToolExecutionContext, ToolAccessPolicyResolver } from "./types.js";
+import type { ToolExecutionGate, ChiliToolDefinition, ChiliToolExecutionContext, ToolAccessPolicyResolver } from "./types.js";
 
 function tool(name: string, execute: ChiliToolDefinition["execute"], safe = true): ChiliToolDefinition {
   return { name, description: name, risk: "read", codeMode: true,
-    inputSchema: { type: "object" }, isConcurrencySafe: safe, approval: () => false, execute };
+    inputSchema: { type: "object" }, isConcurrencySafe: safe, resources: () => false, execute };
 }
 
 function setup(children: ChiliToolDefinition[], run: (context: ChiliToolExecutionContext) => Promise<void>, options: {
-  approvals?: ApprovalBroker; policyResolver?: ToolAccessPolicyResolver; scope?: ToolDispatchScope; signal?: AbortSignal;
+  gate?: ToolExecutionGate; policyResolver?: ToolAccessPolicyResolver; scope?: ToolDispatchScope; signal?: AbortSignal;
 } = {}) {
   const events: ChiliEvent[] = [];
   const registry = new InMemoryToolRegistry();
@@ -27,7 +27,7 @@ function setup(children: ChiliToolDefinition[], run: (context: ChiliToolExecutio
     return { title: "script", output: "done" };
   }, false), codeMode: false, isOrchestrator: true });
   const executor = new ToolExecutor({ registry, events: { publish: async (event) => { events.push(event); } },
-    approvals: options.approvals ?? { decide: async () => ({ action: "allow_once" }) },
+    gate: options.gate ?? { review: async () => ({ decision: "allow" }) },
     ...(options.policyResolver ? { policyResolver: options.policyResolver } : {}),
   });
   const execute = () => executor.execute({ sessionId: "s" as SessionId, turnId: "t" as TurnId,
@@ -55,16 +55,16 @@ test("nested calls inherit policy, validate schemas, and require an explicit cal
   expect(starts[2]?.payload.parentCallId).toBe(starts[0]?.payload.callId);
 });
 
-test("nested calls recheck worker policy after approval and never broaden it", async () => {
+test("nested calls recheck worker policy after review and never broaden it", async () => {
   let denied = false;
   let executed = false;
   const child = { ...tool("write_child", async () => { executed = true; return { title: "write", output: "done" }; }),
-    approval: () => ({ permission: "write", patterns: ["a"] }) };
+    resources: () => ({ permission: "write", patterns: ["a"] }) };
   const { execute } = setup([child], async (context) => {
     await expect(context.invokeTool!("write_child", {})).rejects.toThrow("not allowed");
   }, {
     policyResolver: { resolve: () => denied ? { deniedTools: ["write_child"] } : undefined },
-    approvals: { decide: async () => { denied = true; return { action: "allow_once" }; } },
+    gate: { review: async (request) => { if (request.toolName === "write_child") denied = true; return { decision: "allow" }; } },
   });
   expect((await execute()).status).toBe("completed");
   expect(executed).toBe(false);
@@ -92,15 +92,16 @@ test("nested calls recheck worker policy after waiting for an execution permit",
   expect(executions).toBe(0);
 });
 
-test("a script's catalog cannot silently change while a child waits for approval", async () => {
+test("a script's catalog cannot silently change while a child waits for review", async () => {
   let executed = false;
   const child = { ...tool("child", async () => { executed = true; return { title: "child", output: "old" }; }),
-    approval: () => ({ permission: "read", patterns: ["*"] }) };
+    resources: () => ({ permission: "read", patterns: ["*"] }) };
   const state = setup([child], async (context) => {
     await expect(context.invokeTool!("child", {})).rejects.toThrow("catalog changed");
-  }, { approvals: { decide: async () => {
+  }, { gate: { review: async (request) => {
+    if (request.toolName !== "child") return { decision: "allow" };
     state.registry.register(tool("child", async () => ({ title: "child", output: "replacement" })), { replace: true });
-    return { action: "allow_once" };
+    return { decision: "allow" };
   } } });
   expect((await state.execute()).status).toBe("completed");
   expect(executed).toBe(false);
@@ -182,7 +183,7 @@ test("program data survives display truncation without leaking into tool events"
     const registry = new InMemoryToolRegistry();
     registry.register({ ...tool("data", async () => ({ title: "data", output: "long output".repeat(100), structuredData: { values: [1, 2, 3] } })), maxResultOutputBytes: 10 });
     const events: ChiliEvent[] = [];
-    const executor = new ToolExecutor({ registry, events: { publish: async (event) => { events.push(event); } }, approvals: { decide: async () => ({ action: "allow_once" }) } });
+    const executor = new ToolExecutor({ registry, events: { publish: async (event) => { events.push(event); } }, gate: { review: async () => ({ decision: "allow" }) } });
     const result = await executor.execute({ sessionId: "s" as SessionId, turnId: "t" as TurnId, cwd, toolName: "data", input: {} });
     expect(result.status).toBe("completed");
     if (result.status === "completed") {
@@ -210,7 +211,7 @@ test("oversized program data fails explicitly after the handler effect without s
     effects++;
     return { title: "large", output: "operation succeeded", structuredData: { output: "x".repeat(5 * 1024 * 1024) } };
   }));
-  const executor = new ToolExecutor({ registry, events: { publish: async () => {} }, approvals: { decide: async () => ({ action: "allow_once" }) } });
+  const executor = new ToolExecutor({ registry, events: { publish: async () => {} }, gate: { review: async () => ({ decision: "allow" }) } });
   const result = await executor.execute({ sessionId: "s" as SessionId, turnId: "t" as TurnId, cwd: process.cwd(), toolName: "large", input: {} });
   expect(result.status).toBe("failed");
   if (result.status === "failed") expect(result.error.message).toContain("4 MiB");
@@ -222,7 +223,7 @@ test("direct execution preserves program data above 1 MiB through the exact 4 Mi
     const structuredData = "x".repeat(bytes - 2);
     const registry = new InMemoryToolRegistry();
     registry.register(tool("large", async () => ({ title: "large", output: "summary", structuredData })));
-    const executor = new ToolExecutor({ registry, events: { publish: async () => {} }, approvals: { decide: async () => ({ action: "allow_once" }) } });
+    const executor = new ToolExecutor({ registry, events: { publish: async () => {} }, gate: { review: async () => ({ decision: "allow" }) } });
     const result = await executor.execute({ sessionId: "s" as SessionId, turnId: "t" as TurnId, cwd: process.cwd(), toolName: "large", input: {} });
     expect(result.status).toBe("completed");
     if (result.status === "completed") expect(result.result.structuredData).toBe(structuredData);
@@ -275,7 +276,7 @@ test("prepared calls reject changes to code mode capabilities and schema trust",
     let current = original;
     const registry = new InMemoryToolRegistry();
     registry.replaceContextualSource("test", () => [current]);
-    const executor = new ToolExecutor({ registry, events: { publish: async () => {} }, approvals: { decide: async () => ({ action: "allow_once" }) } });
+    const executor = new ToolExecutor({ registry, events: { publish: async () => {} }, gate: { review: async () => ({ decision: "allow" }) } });
     const request = { sessionId: "s" as SessionId, turnId: "t" as TurnId, cwd: process.cwd(), toolName: "child", input: {} };
     const prepared = await executor.prepare(request);
     current = { ...original, ...change };
@@ -300,7 +301,7 @@ test("orchestrator and nested tools retain the runtime owner context", async () 
     return { title: "script", output: "done" };
   }, false), isOrchestrator: true, codeMode: false });
   const executor = new ToolExecutor({ registry, executionContext: (operation) => owner.run("runtime-owner", operation),
-    events: { publish: async () => {} }, approvals: { decide: async () => ({ action: "allow_once" }) },
+    events: { publish: async () => {} }, gate: { review: async () => ({ decision: "allow" }) },
   });
   const result = await executor.execute({ sessionId: "s" as SessionId, turnId: "t" as TurnId, cwd: process.cwd(), toolName: "script", input: {} });
   expect(result.status).toBe("completed");
@@ -315,7 +316,7 @@ test("scripts cannot catch an audit storage failure and continue producing effec
   registry.register(createCodeModeTool());
   registry.register(tool("first", async () => ({ title: "first", output: "done" })));
   registry.register(tool("second", async () => { secondRan = true; return { title: "second", output: "done" }; }));
-  const executor = new ToolExecutor({ registry, approvals: { decide: async () => ({ action: "allow_once" }) }, events: {
+  const executor = new ToolExecutor({ registry, gate: { review: async () => ({ decision: "allow" }) }, events: {
     publish: async (event) => {
       if (event.type === "tool.call_started" && event.payload.toolName === "first") firstId = event.payload.callId;
       if (!failedPublish && event.type === "tool.call_finished" && event.payload.callId === firstId) {

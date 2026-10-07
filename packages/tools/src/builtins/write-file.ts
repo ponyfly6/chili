@@ -62,7 +62,7 @@ export function createWriteFileTool(): ChiliToolDefinition<WriteFileInput> {
     async prepareInput(input, context) {
       return { ...input, filePath: await canonicalResourcePattern(context.cwd, input.filePath, true) };
     },
-    approval(input) {
+    resources(input) {
       return {
         permission: "write",
         patterns: [input.filePath],

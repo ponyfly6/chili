@@ -11,7 +11,6 @@
     "@chili/core": "workspace:*",
     "@chili/host": "workspace:*",
     "@chili/mcp": "workspace:*",
-    "@chili/policy": "workspace:*",
     "@chili/protocol": "workspace:*",
     "@chili/providers": "workspace:*",
     "@chili/server": "workspace:*",

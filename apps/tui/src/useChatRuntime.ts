@@ -7,10 +7,8 @@ import {
   type RuntimeSessionSummary,
 } from "@chili/sdk";
 import type {
-  ApprovalId,
   DelegationPolicy,
   MessageImageContent,
-  RuntimeApprovalResolveResult,
   RuntimeDelegationConfig,
   RuntimeMcpAddServerRequest,
   RuntimeMcpAuthRequest,
@@ -88,8 +86,6 @@ export interface ChatRuntimeState extends RuntimeEventsState {
   interruptActiveSession: () => Promise<void>;
   stopAgent: (agentId: string) => Promise<void>;
   resumeAgent: (agentId: string) => Promise<void>;
-  approveApproval: (approvalId: ApprovalId, options?: ChatApproveOptions) => Promise<void>;
-  rejectApproval: (approvalId: ApprovalId) => Promise<void>;
 }
 
 export interface ChatSubmitOptions {
@@ -105,12 +101,6 @@ export interface ChatCommandSubmitOptions {
   modelSelection?: ModelSelection | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
   serviceTier?: ServiceTier | undefined;
-}
-
-export type ChatApprovalGrantScope = "once" | "session" | "persistent";
-
-export interface ChatApproveOptions {
-  scope?: ChatApprovalGrantScope | undefined;
 }
 
 export interface UseChatRuntimeInput {
@@ -1097,14 +1087,6 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     }
   }, [client, ensureSession, options.baseUrl, withAbort]);
 
-  const approveApproval = useCallback(async (approvalId: ApprovalId, approveOptions: ChatApproveOptions = {}) => {
-    await resolveApproval("approve", approvalId, client, withAbort, setChatFeedback, approveOptions);
-  }, [client, withAbort]);
-
-  const rejectApproval = useCallback(async (approvalId: ApprovalId) => {
-    await resolveApproval("reject", approvalId, client, withAbort, setChatFeedback);
-  }, [client, withAbort]);
-
   useEffect(() => () => {
     sessionSelectionEpochRef.current += 1;
     selectedSessionScopeRef.current = {
@@ -1171,9 +1153,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     resumeSession,
     renameSession,
     interruptActiveSession,
-    approveApproval,
-    rejectApproval,
-  }), [activeSessionId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, delegationConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshDelegationConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setRuntimeDelegationPolicy, startNewSession, listSessions, resumeSession, renameSession, submitCommand, submitPrompt, eventRuntime, stopAgent, resumeAgent]);
+  }), [activeSessionId, canSubmit, chatFeedback, chatView, interruptActiveSession, modelCandidates, modelConfig, delegationConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshDelegationConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setRuntimeDelegationPolicy, startNewSession, listSessions, resumeSession, renameSession, submitCommand, submitPrompt, eventRuntime, stopAgent, resumeAgent]);
 }
 
 function upsertMcpServer(current: RuntimeMcpStatusResponse | undefined, server: RuntimeMcpServerDescriptor): RuntimeMcpStatusResponse {
@@ -1194,51 +1174,6 @@ function statusFromMcpServers(servers: readonly RuntimeMcpServerDescriptor[]): R
       errored: servers.filter((server) => server.status === "error").length,
     },
   };
-}
-
-async function resolveApproval(
-  action: "approve" | "reject",
-  approvalId: ApprovalId,
-  client: HttpRuntimeClient,
-  withAbort: <T>(run: (signal: AbortSignal) => Promise<T>) => Promise<T>,
-  setFeedback: (feedback: ChatRuntimeFeedback | undefined) => void,
-  approveOptions: ChatApproveOptions = {},
-): Promise<void> {
-  setFeedback({ status: "pending", message: action === "approve" ? pendingApprovalMessage(approveOptions.scope) : "rejecting request" });
-  try {
-    const result = await withAbort((signal) => {
-      if (action === "approve") {
-        return client.approveApproval({
-          approvalId,
-          signal,
-          scope: approveOptions.scope ?? "once",
-        });
-      }
-      return client.rejectApproval({ approvalId, feedback: "Rejected from TUI", signal });
-    });
-    requireResolvedApproval(result);
-    setFeedback({ status: "success", message: action === "approve" ? resolvedApprovalMessage(approveOptions.scope) : "approval rejected" });
-  } catch (error) {
-    if (!isAbortError(error)) setFeedback({ status: "error", message: toError(error).message });
-  }
-}
-
-function pendingApprovalMessage(scope: ChatApprovalGrantScope | undefined): string {
-  if (scope === "persistent") return "approving request permanently";
-  if (scope === "session") return "approving request for session";
-  return "approving request once";
-}
-
-function resolvedApprovalMessage(scope: ChatApprovalGrantScope | undefined): string {
-  if (scope === "persistent") return "approval allowed always";
-  if (scope === "session") return "approval allowed for session";
-  return "approval allowed once";
-}
-
-function requireResolvedApproval(result: RuntimeApprovalResolveResult): void {
-  if (!result.resolved) {
-    throw new Error("Approval is no longer pending after recheck. Nothing was approved; reconnect or start a fresh prompt.");
-  }
 }
 
 function isAbortError(error: unknown): boolean {

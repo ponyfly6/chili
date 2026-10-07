@@ -52,7 +52,7 @@ export function createElectronTransport(api: ChiliDesktopApi, projectId?: string
     setReasoning: (sessionId, reasoningLevel) => invoke({ type: "session.reasoning.set", sessionId, reasoningLevel }),
     setServiceTier: (sessionId, serviceTier) => invoke({ type: "session.service-tier.set", sessionId, serviceTier }),
     permissionConfig: () => invoke({ type: "permissions.get" }),
-    setPermission: (profile) => invoke({ type: "permissions.set", profile }),
+    setPermission: (profile, options) => invoke({ type: "permissions.set", profile, ...options }),
     setDelegation: (sessionId, policy) => invoke({ type: "session.delegation.set", sessionId, policy }),
     reloadMcp: (sessionId) => invoke({ type: "mcp.reload", ...(sessionId ? { sessionId } : {}) }),
     send: async (sessionId, text, mode) => {
@@ -70,7 +70,6 @@ export function createElectronTransport(api: ChiliDesktopApi, projectId?: string
     sendAgent: (sessionId, agentId, text, mode) => invoke({ type: "agent.send", sessionId, agentId, text, ...(mode === undefined ? {} : { mode }) }),
     stopAgent: (sessionId, agentId) => invoke({ type: "agent.stop", sessionId, agentId }),
     resumeAgent: (sessionId, agentId) => invoke({ type: "agent.resume", sessionId, agentId }),
-    resolveApproval: (approvalId, decision) => invoke({ type: "approval.resolve", approvalId, decision }),
     resolveUserInput: (inputId, answers) => invoke({ type: "user-input.resolve", inputId, answers }),
     completeResync: (barrierId) => invoke({ type: "events.resync.complete", barrierId }),
     diff: (scope, sessionId, turnId) => invokeAfterWorkspaceSelection({

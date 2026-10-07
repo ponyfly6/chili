@@ -3,8 +3,8 @@ import type { RuntimePermissionProfileId } from "@chili/protocol";
 import type { BashRunner } from "@chili/tools";
 import { createCliBashRunner } from "./bash-runner.js";
 
-test("CLI bash runner follows live macOS permission profile changes", async () => {
-  let profile: RuntimePermissionProfileId = "default";
+test("CLI root shell uses the same backend after either execution mode admits a call", async () => {
+  let profile: RuntimePermissionProfileId = "auto-review";
   let sandboxedCalls = 0;
   let unsandboxedCalls = 0;
   const runner = createCliBashRunner({
@@ -14,18 +14,18 @@ test("CLI bash runner follows live macOS permission profile changes", async () =
     unsandboxedRunner: fakeRunner(() => { unsandboxedCalls += 1; }),
   });
 
-  expect((await runner.run(request())).sandbox).toBe("macos-seatbelt");
+  expect((await runner.run(request())).sandbox).toBe("none");
   profile = "full-access";
   expect((await runner.run(request())).sandbox).toBe("none");
-  expect({ sandboxedCalls, unsandboxedCalls }).toEqual({ sandboxedCalls: 1, unsandboxedCalls: 1 });
+  expect({ sandboxedCalls, unsandboxedCalls }).toEqual({ sandboxedCalls: 0, unsandboxedCalls: 2 });
 });
 
-test("CLI bash runner honors an explicitly approved one-command macOS escalation", async () => {
+test("CLI root shell executes a reviewed call without manual escalation", async () => {
   let sandboxedCalls = 0;
   let unsandboxedCalls = 0;
   const runner = createCliBashRunner({
     platform: "darwin",
-    permissionProfile: () => "default",
+    permissionProfile: () => "auto-review",
     sandboxedRunner: fakeRunner(() => { sandboxedCalls += 1; }, "macos-seatbelt"),
     unsandboxedRunner: fakeRunner(() => { unsandboxedCalls += 1; }, "none"),
   });
@@ -34,11 +34,12 @@ test("CLI bash runner honors an explicitly approved one-command macOS escalation
   expect({ sandboxedCalls, unsandboxedCalls }).toEqual({ sandboxedCalls: 0, unsandboxedCalls: 1 });
 });
 
-test("CLI bash runner does not retry outside the sandbox after a sandbox failure", async () => {
+test("CLI scoped shell does not retry outside the sandbox after a sandbox failure", async () => {
   let unsandboxedCalls = 0;
   const runner = createCliBashRunner({
     platform: "darwin",
-    permissionProfile: () => "default",
+    permissionProfile: () => "auto-review",
+    allowHostSandboxEscape: false,
     sandboxedRunner: {
       async run() {
         throw new Error("seatbelt failed");
@@ -56,7 +57,7 @@ test("CLI bash runner keeps both execution modes on the unsandboxed backend on u
   let unsandboxedCalls = 0;
   const runner = createCliBashRunner({
     platform: "linux",
-    permissionProfile: () => "default",
+    permissionProfile: () => "auto-review",
     sandboxedRunner: fakeRunner(() => { sandboxedCalls += 1; }, "macos-seatbelt"),
     unsandboxedRunner: fakeRunner(() => { unsandboxedCalls += 1; }),
   });
@@ -88,7 +89,7 @@ test("scoped worker runner fails closed when the host has no shell sandbox", asy
   let unsandboxedCalls = 0;
   const runner = createCliBashRunner({
     platform: "linux",
-    permissionProfile: () => "default",
+    permissionProfile: () => "auto-review",
     allowHostSandboxEscape: false,
     unsandboxedRunner: fakeRunner(() => { unsandboxedCalls += 1; }),
   });

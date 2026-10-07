@@ -38,7 +38,7 @@ test("background status appears in the project list without entering the active 
     f.manager.observeEvent(a.projectId!, statusEvent("session-a", "running"));
     f.manager.observeEvent(a.projectId!, statusEvent("session-a", "waiting_for_approval"));
     expect(f.manager.state().projectId).toBe(b.projectId);
-    expect(f.manager.state().projects?.find((project) => project.id === a.projectId)).toMatchObject({ runningCount: 1, attentionCount: 1 });
+    expect(f.manager.state().projects?.find((project) => project.id === a.projectId)).toMatchObject({ runningCount: 1, attentionCount: 0 });
     expect(f.events.filter((event) => event.type === "runtime.event")).toHaveLength(0);
     f.manager.observeEvent(b.projectId!, statusEvent("session-b", "running"));
     expect(f.events.filter((event) => event.type === "runtime.event")).toMatchObject([{ projectId: b.projectId }]);
@@ -163,7 +163,7 @@ test("a failed settings write keeps the existing project selected without a phan
   } finally { await f.close(); }
 });
 
-test("resolving one background input keeps other inputs and approvals visible", async () => {
+test("resolving one background input keeps other inputs visible without requesting legacy approval", async () => {
   const f = await fixture();
   try {
     const a = await f.manager.add(f.a);
@@ -177,7 +177,7 @@ test("resolving one background input keeps other inputs and approvals visible", 
     expect(count()).toBe(1);
     f.manager.observeEvent(a.projectId!, statusEvent("session-a", "waiting_for_approval"));
     f.manager.observeEvent(a.projectId!, input("user_input.cancelled", "two"));
-    expect(count()).toBe(1);
+    expect(count()).toBe(0);
     f.manager.observeEvent(a.projectId!, statusEvent("session-a", "idle"));
     expect(count()).toBe(0);
   } finally { await f.close(); }

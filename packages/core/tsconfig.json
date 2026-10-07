@@ -16,9 +16,6 @@
       "path": "../protocol"
     },
     {
-      "path": "../policy"
-    },
-    {
       "path": "../store"
     },
     {

@@ -17,7 +17,7 @@ import { InMemoryToolRegistry } from "./registry.js";
 function executor(): ToolExecutor {
   const registry = new InMemoryToolRegistry();
   for (const tool of [createReadFileTool(), createWriteFileTool(), createEditTool(), createApplyPatchTool()]) registry.register(tool);
-  return new ToolExecutor({ registry, events: { publish: async () => undefined }, approvals: { decide: async () => ({ action: "allow_once" }) } });
+  return new ToolExecutor({ registry, events: { publish: async () => undefined }, gate: { review: async () => ({ decision: "allow" }) } });
 }
 
 function call(execution: ToolExecutor, cwd: string, session: string, toolName: string, input: unknown) {

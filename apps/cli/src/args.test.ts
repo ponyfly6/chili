@@ -1,6 +1,13 @@
 import { expect, test } from "bun:test";
 import { parseArgs, usage } from "./args.js";
 
+test("--yes selects Full Access explicitly and help describes automated review", () => {
+  expect(parseArgs(["--yes", "hello"]).yes).toBe(true);
+  expect(parseArgs(["-y", "hello"]).yes).toBe(true);
+  expect(parseArgs(["hello"]).yes).toBe(false);
+  expect(usage()).toContain("Full Access: execute tools without automatic review");
+});
+
 test("parses an explicit profile directory for every CLI entry point", () => {
   expect(parseArgs(["skills", "list", "--chili-home", "/tmp/profile"]))
     .toMatchObject({ command: "skills-list", chiliHome: "/tmp/profile" });

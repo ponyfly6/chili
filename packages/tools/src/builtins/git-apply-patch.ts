@@ -44,7 +44,7 @@ export function createGitApplyPatchTool(): ChiliToolDefinition<GitApplyPatchInpu
       try { patchPaths(input.patchText); } catch (error) { return { ok: false, message: (error as Error).message }; }
       return { ok: true, value: { patchText: input.patchText, expectedHead: input.expectedHead.toLowerCase(), ...(input.checkOnly !== undefined ? { checkOnly: input.checkOnly } : {}) } };
     },
-    approval(input) {
+    resources(input) {
       return { permission: input.checkOnly ? "read" : "edit", patterns: patchPaths(input.patchText), metadata: { expectedHead: input.expectedHead, checkOnly: input.checkOnly ?? false, patchHash: fingerprint(input.patchText) } };
     },
     async execute(input, context) {

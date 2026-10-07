@@ -40,6 +40,30 @@ test("binds every task operation to its project even after another transport act
   expect(calls.map((request) => request.projectId)).toEqual(["project-a", "project-b", "project-a", "project-b"]);
 });
 
+test("forwards review settings and reviewer reset with the selected permission mode", async () => {
+  const calls: DesktopRequest[] = [];
+  const api = {
+    invoke: async (request: DesktopRequest) => { calls.push(request); return {}; },
+    subscribe: () => () => undefined,
+  } as ChiliDesktopApi;
+  const transport = createElectronTransport(api, "project-a");
+  await transport.setPermission("auto-review", {
+    reviewInstructions: "Allow task-scoped changes.",
+    reviewerModel: { provider: "local", model: "reviewer" },
+  });
+  await transport.setPermission("auto-review", { reviewerModel: null });
+  await transport.setPermission("full-access");
+  expect(calls).toEqual([
+    {
+      type: "permissions.set", projectId: "project-a", profile: "auto-review",
+      reviewInstructions: "Allow task-scoped changes.",
+      reviewerModel: { provider: "local", model: "reviewer" },
+    },
+    { type: "permissions.set", projectId: "project-a", profile: "auto-review", reviewerModel: null },
+    { type: "permissions.set", projectId: "project-a", profile: "full-access" },
+  ]);
+});
+
 test("projection reads wait until workspace selection fully settles", async () => {
   const selection = deferred<DesktopState>();
   const calls: DesktopRequest[] = [];

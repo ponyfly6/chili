@@ -2,9 +2,7 @@ import { expect, test } from "bun:test";
 import { access, link, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ApprovalDecision, SessionId, SnapshotId, TimestampMs, TurnId } from "@chili/protocol";
-import type { PermissionRule } from "@chili/policy";
-import { PolicyApprovalBroker, PolicyApprovalState } from "./approval.js";
+import type { SessionId, SnapshotId, TimestampMs, TurnId } from "@chili/protocol";
 import { createReadFileTool } from "./builtins/read-file.js";
 import { createWriteFileTool } from "./builtins/write-file.js";
 import { createBashTool } from "./builtins/bash.js";
@@ -12,7 +10,7 @@ import { createMacOsSeatbeltBashRunner } from "./macos-seatbelt.js";
 import { ToolExecutor } from "./executor.js";
 import { InMemoryToolRegistry } from "./registry.js";
 import { FileReadStateStore } from "./file-read-state.js";
-import type { ChiliToolDefinition, ExecuteToolInput, ToolExecutorOptions } from "./types.js";
+import type { ChiliToolDefinition, ExecuteToolInput, ToolExecutorOptions, ToolReviewResult } from "./types.js";
 
 async function workspaceTest(run: (cwd: string) => Promise<void>): Promise<void> {
   const cwd = await mkdtemp(join(tmpdir(), "chili-foundation-contract-"));
@@ -28,7 +26,7 @@ function fixture(definition: ChiliToolDefinition, options: Partial<ToolExecutorO
   registry.register(definition);
   const executor = new ToolExecutor({
     registry, events: { publish: async () => undefined },
-    approvals: new PolicyApprovalBroker({ rulesets: [[{ permission: "*", pattern: "*", action: "allow" }]] }),
+    gate: { review: async () => ({ decision: "allow" }) },
     ...options,
   });
   return { registry, executor };
@@ -38,48 +36,47 @@ function effectTool(execute: ChiliToolDefinition["execute"]): ChiliToolDefinitio
   return { name: "effect", description: "Controlled test side effect", risk: "write", inputSchema: { type: "object" }, execute };
 }
 
-test("file deny covers relative, dot, absolute and symlink spellings before the real read", async () => workspaceTest(async (cwd) => {
+test("review receives the same canonical file for relative, absolute and symlink spellings", async () => workspaceTest(async (cwd) => {
   await writeFile(join(cwd, "blocked.txt"), "never expose this");
-  await symlink("blocked.txt", join(cwd, "alias.txt"));
-  await symlink("blocked.txt", join(cwd, "alias*"));
-  await symlink("blocked.txt", join(cwd, "alias?"));
-  await symlink("blocked.txt", join(cwd, "alias[0]"));
-  for (const deniedPath of ["blocked.txt", "./blocked.txt", join(cwd, "blocked.txt"), "alias.txt", "alias*", "alias?", "alias[0]"]) {
-    const { executor } = fixture(createReadFileTool(), { approvals: new PolicyApprovalBroker({ rulesets: [[
-      { permission: "read", pattern: "*", action: "allow" },
-      { permission: `read(${deniedPath})`, pattern: "*", action: "deny" },
-    ]] }) });
-    for (const filePath of ["blocked.txt", "./blocked.txt", join(cwd, "blocked.txt"), "alias.txt", "alias*", "alias?", "alias[0]"]) {
-      expect((await executor.execute(input(cwd, "read", { filePath }))).status).toBe("failed");
-    }
+  for (const alias of ["alias.txt", "alias*", "alias?", "alias[0]"]) await symlink("blocked.txt", join(cwd, alias));
+  const reviewed: unknown[] = [];
+  const { executor } = fixture(createReadFileTool(), { gate: { review: async (request) => {
+    reviewed.push(request.input);
+    expect(request.resources?.patterns).toEqual(["blocked.txt"]);
+    return { decision: "deny", reason: "Private file" };
+  } } });
+  for (const filePath of ["blocked.txt", "./blocked.txt", join(cwd, "blocked.txt"), "alias.txt", "alias*", "alias?", "alias[0]"]) {
+    const result = await executor.execute(input(cwd, "read", { filePath }));
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") expect(result.error.message).toContain("Private file");
   }
+  expect(reviewed).toEqual(Array.from({ length: 7 }, () => ({ filePath: "blocked.txt" })));
   await link(join(cwd, "blocked.txt"), join(cwd, "hardlink.txt"));
-  const { executor } = fixture(createReadFileTool());
   const result = await executor.execute(input(cwd, "read", { filePath: "hardlink.txt" }));
   expect(result.status).toBe("failed");
   if (result.status === "failed") expect(result.error.message).toContain("multi-link");
+  expect(reviewed).toHaveLength(7);
 }));
 
-test("interactive file grants bind the workspace and literal stars cannot become reusable wildcards", async () => workspaceTest(async (cwd) => {
-  let asks = 0;
-  const approvals = new PolicyApprovalBroker({
-    rulesets: [[{ permission: "read", pattern: "*", action: "ask" }]],
-    ask: async () => { asks++; return { action: "allow_session" }; },
-  });
-  const { executor } = fixture(createReadFileTool(), { approvals });
+test("every file call is reviewed in its workspace and literal stars remain exact inputs", async () => workspaceTest(async (cwd) => {
+  const reviewed: { cwd: string; input: unknown }[] = [];
+  const { executor } = fixture(createReadFileTool(), { gate: { review: async (request) => {
+    reviewed.push({ cwd: request.cwd, input: request.input });
+    return { decision: "allow" };
+  } } });
   await writeFile(join(cwd, "same.txt"), "a");
   expect((await executor.execute(input(cwd, "read", { filePath: "same.txt" }))).status).toBe("completed");
   expect((await executor.execute(input(cwd, "read", { filePath: "./same.txt" }))).status).toBe("completed");
-  expect(asks).toBe(1);
+  expect(reviewed).toHaveLength(2);
   await workspaceTest(async (other) => {
     await writeFile(join(other, "same.txt"), "b");
     expect((await executor.execute(input(other, "read", { filePath: "same.txt" }))).status).toBe("completed");
-    expect(asks).toBe(2);
+    expect(reviewed[2]).toEqual({ cwd: other, input: { filePath: "same.txt" } });
   });
   await writeFile(join(cwd, "literal*"), "star");
-  const rejected = await executor.execute(input(cwd, "read", { filePath: "literal*" }));
-  expect(rejected.status).toBe("failed");
-  if (rejected.status === "failed") expect(rejected.error.message).toContain("scope");
+  const result = await executor.execute(input(cwd, "read", { filePath: "literal*" }));
+  expect(result.status).toBe("completed");
+  expect(reviewed[3]).toEqual({ cwd, input: { filePath: "literal*" } });
 }));
 
 test("async JSON Schema extensions fail before handlers and never create an unhandled validation promise", async () => workspaceTest(async (cwd) => {
@@ -114,24 +111,18 @@ test("execute scope compares the whole command and never approves a compound pre
   expect(commands).toEqual(["pwd"]);
 }));
 
-test("unproven tools cannot bypass scoped capabilities or a root filesystem deny", async () => workspaceTest(async (cwd) => {
+test("unproven tools cannot bypass scoped capabilities", async () => workspaceTest(async (cwd) => {
   let effects = 0;
   const tool = { ...effectTool(async () => { effects++; return { title: "opaque", output: "opaque" }; }), risk: "read" as const, isReadOnly: true };
   const scoped = fixture(tool, { policyResolver: { resolve: () => ({ allowedTools: ["effect"], writeScope: [], executeScope: [] }) } });
   expect((await scoped.executor.execute(input(cwd, "effect", {}))).status).toBe("failed");
-  const root = fixture(tool, { approvals: new PolicyApprovalBroker({ rulesets: [[
-    { permission: "*", pattern: "*", action: "allow" }, { permission: "read", pattern: "secret", action: "deny" },
-  ]] }) });
-  expect((await root.executor.execute(input(cwd, "effect", {}))).status).toBe("failed");
   expect(effects).toBe(0);
 }));
 
-test("an unenforcing shell backend cannot receive an invocation when file resources are denied", async () => workspaceTest(async (cwd) => {
+test("an unenforcing shell backend cannot receive a scoped invocation", async () => workspaceTest(async (cwd) => {
   let effects = 0;
   const { executor } = fixture(createBashTool({ runner: { run: async () => { effects++; throw new Error("must not run"); } } }), {
-    approvals: new PolicyApprovalBroker({ rulesets: [[
-      { permission: "*", pattern: "*", action: "allow" }, { permission: "read", pattern: "secret", action: "deny" },
-    ]] }),
+    policyResolver: { resolve: () => ({ allowedTools: ["bash"], executeScope: ["cat secret"], writeScope: [] }) },
   });
   expect((await executor.execute(input(cwd, "bash", { command: "cat secret" }))).status).toBe("failed");
   expect(effects).toBe(0);
@@ -139,31 +130,15 @@ test("an unenforcing shell backend cannot receive an invocation when file resour
 
 const macOsTest = process.platform === "darwin" ? test : test.skip;
 
-macOsTest("real shell backend enforces file denies through the ordinary executor", async () => workspaceTest(async (cwd) => {
-  await writeFile(join(cwd, "secret"), "FAKE_PRIVATE_MARKER");
-  await writeFile(join(cwd, "protected"), "original");
-  const { executor } = fixture(createBashTool({ runner: createMacOsSeatbeltBashRunner() }), {
-    approvals: new PolicyApprovalBroker({ rulesets: [[
-      { permission: "*", pattern: "*", action: "allow" },
-      { permission: "read", pattern: "secret", action: "deny" },
-      { permission: "edit", pattern: "protected", action: "deny" },
-    ]] }),
-  });
-  const result = await executor.execute(input(cwd, "bash", { command: "cat secret; printf changed > protected" }));
-  if (result.status !== "completed") throw result.error;
-  expect(result.result.output).not.toContain("FAKE_PRIVATE_MARKER");
-  expect(await readFile(join(cwd, "protected"), "utf8")).toBe("original");
-}));
-
-test("file policy revoked during version validation is checked again at commit", async () => workspaceTest(async (cwd) => {
-  const rules: PermissionRule[] = [{ permission: "*", pattern: "*", action: "allow" }];
+test("a review permit invalidated during version validation is checked again at commit", async () => workspaceTest(async (cwd) => {
+  let valid = true;
   class RevokingReads extends FileReadStateStore {
     override forSession(sessionId: string): FileReadStateStore {
       const scoped = super.forSession(sessionId);
       const assertFresh = scoped.assertFresh.bind(scoped);
       scoped.assertFresh = async (workspace, path) => {
         const version = await assertFresh(workspace, path);
-        rules.push({ permission: "write", pattern: "file.txt", action: "deny" });
+        valid = false;
         return version;
       };
       return scoped;
@@ -172,7 +147,9 @@ test("file policy revoked during version validation is checked again at commit",
   const fileReads = new RevokingReads();
   await writeFile(join(cwd, "file.txt"), "before");
   await fileReads.forSession("s").recordTextRead(cwd, join(cwd, "file.txt"), "before");
-  const { executor } = fixture(createWriteFileTool(), { fileReadState: fileReads, approvals: new PolicyApprovalBroker({ rulesets: [rules] }) });
+  const { executor } = fixture(createWriteFileTool(), { fileReadState: fileReads, gate: { review: async () => ({
+    decision: "allow", assertCurrent: async () => { if (!valid) throw new Error("Review configuration changed"); },
+  }) } });
   expect((await executor.execute(input(cwd, "write", { filePath: "file.txt", content: "after" }))).status).toBe("failed");
   expect(await readFile(join(cwd, "file.txt"), "utf8")).toBe("before");
 }));
@@ -225,49 +202,50 @@ test("preparation fixes validated scheduling arguments and rejects a replaced ca
   expect(executed).toBe(1);
 }));
 
-test("policy changes while waiting invalidate approval before remembering a grant", async () => workspaceTest(async (cwd) => {
-  let rules: PermissionRule[] = [];
+test("configuration changes while a review is pending invalidate its decision", async () => workspaceTest(async (cwd) => {
+  let revision = 1;
   let effects = 0;
-  let approve!: (value: ApprovalDecision) => void;
+  let approve!: (value: ToolReviewResult) => void;
   let started!: () => void;
   const waiting = new Promise<void>((resolve) => { started = resolve; });
-  const approvals = new PolicyApprovalBroker({
-    rulesetsForRequest: () => [rules],
-    ask: () => { started(); return new Promise((resolve) => { approve = resolve; }); },
+  const { executor } = fixture(effectTool(async () => { effects++; return { title: "effect", output: "effect" }; }), {
+    gate: { review: async () => {
+      const reviewedRevision = revision;
+      started();
+      const result = await new Promise<ToolReviewResult>((resolve) => { approve = resolve; });
+      return { ...result, assertCurrent: async () => {
+        if (reviewedRevision !== revision) throw new Error("Review configuration changed");
+      } };
+    } },
   });
-  const { executor } = fixture(effectTool(async () => { effects++; return { title: "effect", output: "effect" }; }), { approvals });
   const pending = executor.execute(input(cwd, "effect", {}));
   await waiting;
-  rules = [{ permission: "effect", pattern: "*", action: "deny" }];
-  approve({ action: "allow_session" });
+  revision++;
+  approve({ decision: "allow" });
   expect((await pending).status).toBe("failed");
   expect(effects).toBe(0);
-  rules = [];
-  expect((await approvals.preflight({ sessionId: "s" as SessionId, callId: "c" as import("@chili/protocol").ToolCallId, toolName: "effect", risk: "write", permission: "effect", patterns: ["*"] })).action).toBe("ask");
 }));
 
-test("revoking policy or a session grant while snapshotting prevents the effect", async () => workspaceTest(async (cwd) => {
-  for (const grant of [false, true]) {
-    let rules: PermissionRule[] = grant ? [] : [{ permission: "effect", pattern: "*", action: "allow" }];
-    let effects = 0;
-    const state = new PolicyApprovalState();
-    if (grant) state.addSessionGrant({ sessionId: "s" as SessionId, permission: "effect", patterns: ["*"], source: "test" });
-    const { executor } = fixture(effectTool(async () => { effects++; return { title: "effect", output: "effect" }; }), {
-      approvals: new PolicyApprovalBroker({ state, rulesetsForRequest: () => [rules], ask: async () => ({ action: "deny" }) }),
-      snapshotProvider: {
-        create: async () => {
-          rules = []; state.revokeSessionGrants("s" as SessionId);
-          return { id: "snap" as SnapshotId, cwd, paths: [], createdAt: 1 as TimestampMs };
-        },
-        revert: async () => { throw new Error("unused"); },
+test("invalidating a review permit while snapshotting prevents the effect", async () => workspaceTest(async (cwd) => {
+  let valid = true;
+  let effects = 0;
+  const { executor } = fixture(effectTool(async () => { effects++; return { title: "effect", output: "effect" }; }), {
+    gate: { review: async () => ({ decision: "allow", assertCurrent: async () => {
+      if (!valid) throw new Error("Review configuration changed");
+    } }) },
+    snapshotProvider: {
+      create: async () => {
+        valid = false;
+        return { id: "snap" as SnapshotId, cwd, paths: [], createdAt: 1 as TimestampMs };
       },
-    });
-    expect((await executor.execute(input(cwd, "effect", {}))).status).toBe("failed");
-    expect(effects).toBe(0);
-  }
+      revert: async () => { throw new Error("unused"); },
+    },
+  });
+  expect((await executor.execute(input(cwd, "effect", {}))).status).toBe("failed");
+  expect(effects).toBe(0);
 }));
 
-test("latest worker policy is checked after approval and after snapshotting", async () => workspaceTest(async (cwd) => {
+test("latest worker policy is checked after review and after snapshotting", async () => workspaceTest(async (cwd) => {
   let deniedTools: string[] = [];
   let calls = 0;
   const { executor } = fixture(effectTool(async () => { calls++; return { title: "ok", output: "ok" }; }), {
@@ -281,33 +259,16 @@ test("latest worker policy is checked after approval and after snapshotting", as
   expect(calls).toBe(0);
 }));
 
-test("lifecycle event publication cannot replace revoked approval authority", async () => workspaceTest(async (cwd) => {
-  for (const at of ["approval.resolved", "tool.call_updated"] as const) {
-    const state = new PolicyApprovalState();
-    let effects = 0;
-    let rules: PermissionRule[] = at === "tool.call_updated" ? [{ permission: "effect", pattern: "*", action: "allow" }] : [];
-    const { executor } = fixture(effectTool(async () => { effects++; return { title: "effect", output: "effect" }; }), {
-      approvals: new PolicyApprovalBroker({ state, rulesetsForRequest: () => [rules], ask: async () => ({ action: "allow_session" }) }),
-      events: { publish: async (event) => {
-        if (at === "approval.resolved" && event.type === at) state.revokeSessionGrants("s" as SessionId);
-        if (at === "tool.call_updated" && event.type === at && event.payload.status === "running") {
-          rules = [{ permission: "effect", pattern: "*", action: "deny" }];
-        }
-      } },
-    });
-    expect((await executor.execute(input(cwd, "effect", {}))).status).toBe("failed");
-    expect(effects).toBe(0);
-  }
-}));
-
-test("an awaited grant observer cannot revoke then resurrect the approved operation", async () => workspaceTest(async (cwd) => {
-  const state = new PolicyApprovalState();
+test("lifecycle event publication cannot revive an invalidated review permit", async () => workspaceTest(async (cwd) => {
+  let valid = true;
   let effects = 0;
   const { executor } = fixture(effectTool(async () => { effects++; return { title: "effect", output: "effect" }; }), {
-    approvals: new PolicyApprovalBroker({ state,
-      ask: async () => ({ action: "allow_session" }),
-      onSessionGrant: async () => state.revokeSessionGrants("s" as SessionId),
-    }),
+    gate: { review: async () => ({ decision: "allow", assertCurrent: async () => {
+      if (!valid) throw new Error("Review configuration changed");
+    } }) },
+    events: { publish: async (event) => {
+      if (event.type === "tool.call_updated" && event.payload.status === "running") valid = false;
+    } },
   });
   expect((await executor.execute(input(cwd, "effect", {}))).status).toBe("failed");
   expect(effects).toBe(0);

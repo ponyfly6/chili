@@ -1995,8 +1995,6 @@ test("client can cancel chat commands without serializing AbortSignal", async ()
     signal: controller.signal,
   });
   await client.interruptSession({ sessionId, reason: "stop", signal: controller.signal });
-  await client.approveApproval({ approvalId: "approval_sdk_abort" as ApprovalId, signal: controller.signal });
-  await client.rejectApproval({ approvalId: "approval_sdk_abort" as ApprovalId, feedback: "no", signal: controller.signal });
 
   expect(records).toEqual([
     {
@@ -2016,16 +2014,6 @@ test("client can cancel chat commands without serializing AbortSignal", async ()
     {
       url: "http://runtime.test/api/sessions/session_sdk_abort/interrupt",
       body: { reason: "stop" },
-      signalled: true,
-    },
-    {
-      url: "http://runtime.test/api/approvals/approval_sdk_abort/resolve",
-      body: { decision: "allow_once" },
-      signalled: true,
-    },
-    {
-      url: "http://runtime.test/api/approvals/approval_sdk_abort/resolve",
-      body: { decision: "deny", feedback: "no" },
       signalled: true,
     },
   ]);
@@ -2209,46 +2197,6 @@ test("client sends model control requests and prompt overrides", async () => {
   ]);
 });
 
-test("client approval command wrappers map product actions onto resolve calls", async () => {
-  const approvalId = "approval_sdk_wrapper" as ApprovalId;
-  const records: { url: string; body: unknown }[] = [];
-  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-    records.push({
-      url: String(input),
-      body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
-    });
-    return new Response(JSON.stringify({ resolved: true }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
-  }) as unknown as typeof fetch;
-  const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: fetchImpl });
-
-  await client.approveApproval({ approvalId });
-  await client.approveApproval({ approvalId, scope: "session" });
-  await client.approveApproval({ approvalId, scope: "persistent", feedback: "trusted" });
-  await client.rejectApproval({ approvalId, feedback: "needs review" });
-  expect(() => client.approveApproval({ approvalId, scope: "forever" as never })).toThrow("approval scope must be one of once, session, persistent");
-
-  expect(records).toEqual([
-    {
-      url: "http://runtime.test/api/approvals/approval_sdk_wrapper/resolve",
-      body: { decision: "allow_once" },
-    },
-    {
-      url: "http://runtime.test/api/approvals/approval_sdk_wrapper/resolve",
-      body: { decision: "allow_session" },
-    },
-    {
-      url: "http://runtime.test/api/approvals/approval_sdk_wrapper/resolve",
-      body: { decision: "allow_always", feedback: "trusted" },
-    },
-    {
-      url: "http://runtime.test/api/approvals/approval_sdk_wrapper/resolve",
-      body: { decision: "deny", feedback: "needs review" },
-    },
-  ]);
-});
 
 function toolApprovalEvents(input: {
   time: number;

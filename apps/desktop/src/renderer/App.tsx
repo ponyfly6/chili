@@ -26,7 +26,6 @@ import type {
 import type {
   ChatMessagePart,
   ChatTranscriptItem,
-  RuntimeApprovalView,
   RuntimeSessionSummary,
 } from "@chili/sdk";
 import type {
@@ -854,7 +853,20 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         if (mutations.reasoningLevel) await transport.setReasoning(selectedId, mutations.reasoningLevel);
         if (mutations.serviceTier) await transport.setServiceTier(selectedId, mutations.serviceTier);
       } else {
-        if (values.permissionProfile !== sessionConfig.permission.profile) await transport.setPermission(values.permissionProfile);
+        const permission = sessionConfig.permission;
+        const currentReviewerKey = permission.reviewerModel ? modelKey(permission.reviewerModel) : "";
+        if (values.permissionProfile !== permission.profile
+          || values.reviewInstructions !== permission.reviewInstructions
+          || values.reviewerModelKey !== currentReviewerKey) {
+          const catalog = models.length > 0 ? models : sessionConfig.model.models;
+          const reviewer = modelFromKey(catalog, values.reviewerModelKey)
+            ?? (values.reviewerModelKey === currentReviewerKey ? permission.reviewerModel : undefined);
+          if (values.reviewerModelKey && !reviewer) throw new TypeError("请选择可用的审查模型。");
+          await transport.setPermission(values.permissionProfile, {
+            reviewInstructions: values.reviewInstructions.trim() ? values.reviewInstructions : permission.reviewInstructions,
+            reviewerModel: reviewer ? { provider: reviewer.provider, model: reviewer.model } : null,
+          });
+        }
         if (values.delegationPolicy !== sessionConfig.delegation.policy) await transport.setDelegation(selectedId, values.delegationPolicy);
       }
       setSettingsOpen(false);
@@ -914,17 +926,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     if (!selectedId || selectedReadOnly) return;
     await runAction(async () => {
       await transport.stop(selectedId);
-    });
-  };
-
-  const resolveApproval = async (
-    approvalId: string,
-    decision: "allow_once" | "allow_session" | "allow_always" | "deny",
-  ) => {
-    if (selectedReadOnly) return Promise.resolve();
-    return runAction(async () => {
-      await transport.resolveApproval(approvalId, decision);
-      await reloadSelected();
     });
   };
 
@@ -1188,14 +1189,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             </details>
           ) : null}
 
-          {presentation && presentation.pendingApprovals.length > 0 ? (
-            <div className="blocking-dock">
-              {presentation.pendingApprovals.map((approval) => (
-                <ApprovalCard key={approval.id} approval={approval} disabled={runtimeActionsDisabled} resolve={resolveApproval} />
-              ))}
-            </div>
-          ) : null}
-
           {presentation && presentation.pendingInputs.length > 0 ? (
             <div className="blocking-dock">
               {presentation.pendingInputs.map((input) => (
@@ -1449,7 +1442,7 @@ function NewTaskDialog({
                     <option key={profile.id} value={profile.id} disabled={Boolean(profile.disabledReason)}>{profile.label} · {profile.description}</option>
                   ))}
                 </select>
-                <small className="scope-warning"><Icon name="shield" />Applies to every task until the local runtime restarts; restart returns to Default.</small>
+                <small className="scope-warning"><Icon name="shield" />Saved as your default and applied to every task in this workspace.</small>
               </label>
               <label className="field-label">
                 <span>Delegation</span>
@@ -1955,30 +1948,6 @@ function inlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
   }
   if (cursor < text.length) nodes.push(text.slice(cursor));
   return nodes;
-}
-
-function ApprovalCard({
-  approval,
-  disabled,
-  resolve: resolveRequest,
-}: {
-  approval: RuntimeApprovalView;
-  disabled: boolean;
-  resolve: (id: string, decision: "allow_once" | "allow_session" | "allow_always" | "deny") => Promise<void>;
-}) {
-  const allowSession = approval.maxApprovalScope === "session" || approval.maxApprovalScope === "persistent";
-  const allowAlways = approval.maxApprovalScope === "persistent";
-  return (
-    <section className="request-card approval-card">
-      <div><p className="eyebrow">Approval required · {shortId(approval.sessionId ?? "")}</p><h3>{approval.permission}</h3><p>{approval.patterns.join(", ") || "This action needs permission."}</p></div>
-      <div className="request-actions">
-        <button className="danger" disabled={disabled} onClick={() => void resolveRequest(approval.id, "deny")}>Deny</button>
-        <button className="secondary" disabled={disabled} onClick={() => void resolveRequest(approval.id, "allow_once")}>Allow once</button>
-        {allowSession ? <button className="secondary" disabled={disabled} onClick={() => void resolveRequest(approval.id, "allow_session")}>Allow session</button> : null}
-        {allowAlways ? <button className="primary" disabled={disabled} onClick={() => void resolveRequest(approval.id, "allow_always")}>Always allow</button> : null}
-      </div>
-    </section>
-  );
 }
 
 function UserInputCard({

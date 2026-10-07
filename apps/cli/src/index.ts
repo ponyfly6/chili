@@ -21,7 +21,6 @@ import type {
 import { startRuntimeHttpServer } from "@chili/server";
 import { loadSkillSettings, loadSkills, updateSkillDisabledSetting, type Skill } from "@chili/skills";
 import { inspectSqliteEventStore } from "@chili/store";
-import { DeferredApprovalQueue } from "@chili/tools";
 import { parseArgs, usage } from "./args.js";
 import { applyCliEnvironmentDefaults, cliEnvironmentDefaults } from "./environment-defaults.js";
 import { createCliHarness } from "./harness.js";
@@ -59,7 +58,6 @@ async function main(): Promise<void> {
     return;
   }
 
-  const approvalQueue = args.command === "serve" ? new DeferredApprovalQueue() : undefined;
   const mcpConnectMode: "eager" | "background" | "manual" = args.command === "mcp"
     ? "eager"
     : args.command === "serve"
@@ -71,7 +69,6 @@ async function main(): Promise<void> {
     yes: args.yes,
     quiet: args.command === "sessions" || args.command === "prompt-debug" || args.command === "mcp" || args.json,
     mcpConnectMode,
-    ...(approvalQueue ? { approvalQueue } : {}),
   };
   const envDefaults = cliEnvironmentDefaults(process.env);
   const modelDefaults = applyCliEnvironmentDefaults({
@@ -108,10 +105,9 @@ async function main(): Promise<void> {
       return;
     }
     if (args.command === "serve") {
-      if (!approvalQueue) throw new Error("approval queue was not initialized");
       lifecycleOwnsHarness = false;
       signalLifecycle.dispose();
-      await serve({ harness, approvalQueue, host: args.host, port: args.port });
+      await serve({ harness, host: args.host, port: args.port });
       return;
     }
 
@@ -268,7 +264,6 @@ async function printPromptDebug(
 
 async function serve(input: {
   harness: Awaited<ReturnType<typeof createCliHarness>>;
-  approvalQueue: DeferredApprovalQueue;
   host: string;
   port: number;
 }): Promise<void> {
@@ -277,7 +272,6 @@ async function serve(input: {
     service: input.harness.service,
     store: input.harness.events,
     agents: input.harness.agents,
-    approvals: input.approvalQueue,
     permissions: input.harness.permissions,
     commands: input.harness.commands,
     ...(mcp ? { mcp } : {}),
@@ -289,7 +283,6 @@ async function serve(input: {
 
   await waitForServeShutdown({
     signalSource: process,
-    denyPending: () => input.approvalQueue.denyAll("Runtime server stopped."),
     closeServer: () => server.close(),
     closeHarness: () => input.harness.close(),
     forceExit: ({ exitCode }) => process.exit(exitCode),
@@ -481,7 +474,6 @@ export function createCliShutdownLifecycle(input: {
 
 export function waitForServeShutdown(input: {
   signalSource: ServeShutdownSignalSource;
-  denyPending(): void;
   closeServer(): Promise<void>;
   closeHarness(): Promise<void>;
   forceExit(input: ServeShutdownForceExit): void;
@@ -531,12 +523,6 @@ export function waitForServeShutdown(input: {
       stopping = true;
 
       const errors: unknown[] = [];
-      try {
-        input.denyPending();
-      } catch (error) {
-        errors.push(error);
-      }
-
       // Calling closeServer synchronously closes HTTP admission. Calling
       // closeHarness immediately afterwards closes runtime admission and aborts
       // in-flight prompts, allowing Bun's force-stop drain to finish.

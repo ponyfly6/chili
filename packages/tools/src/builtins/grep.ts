@@ -150,7 +150,7 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
       if (maxOutputBytes !== undefined) value.maxOutputBytes = maxOutputBytes;
       return { ok: true, value };
     },
-    approval(input) {
+    resources(input) {
       return {
         permission: "grep",
         patterns: input.paths ?? splitSearchPathList(input.path) ?? ["*"],

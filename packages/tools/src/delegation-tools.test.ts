@@ -86,7 +86,7 @@ function createExecutor(controller: DelegationToolController): ToolExecutor {
   return new ToolExecutor({
     registry,
     events: { publish: async (_event: ChiliEvent) => undefined },
-    approvals: { decide: async () => ({ action: "deny" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     createId: (prefix) => `${prefix}_delegation_test`,
     now: () => 1 as TimestampMs,
   });

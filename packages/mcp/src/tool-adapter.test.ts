@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { PERSISTED_ERROR_LIMITS } from "@chili/protocol";
+import { InMemoryToolRegistry, ToolExecutor, type ToolReviewRequest } from "@chili/tools";
 import type { McpServerConfig } from "./config.js";
 import { createMcpChiliTool, createMcpChiliTools, inferConcurrencySafe, inferRisk, sanitizeMcpToolDescription } from "./tool-adapter.js";
 
@@ -15,7 +16,7 @@ const server: McpServerConfig = {
   raw: {},
 };
 
-test("adapts MCP tool approval to Chili mcp permission and raw server/tool pattern", () => {
+test("describes MCP resource identity for review and scope enforcement", () => {
   const tool = createMcpChiliTool({
     server,
     tool: {
@@ -39,7 +40,7 @@ test("adapts MCP tool approval to Chili mcp permission and raw server/tool patte
     rawServerName: "GitHub Enterprise",
     rawToolName: "issues.search",
   });
-  expect(tool.approval?.({})).toMatchObject({
+  expect(tool.resources?.({})).toMatchObject({
     permission: "mcp",
     patterns: ["GitHub Enterprise/issues.search"],
     metadata: {
@@ -48,6 +49,58 @@ test("adapts MCP tool approval to Chili mcp permission and raw server/tool patte
       modelName: "mcp__github_enterprise__issues_search",
     },
   });
+});
+
+test("reviews the complete MCP payload before dispatching exactly those arguments", async () => {
+  let reviewed: ToolReviewRequest | undefined;
+  let dispatched: unknown;
+  const tool = createMcpChiliTool({
+    server,
+    tool: { name: "issues.create", inputSchema: { type: "object" } },
+    manager: {
+      callTool: async (_server, _tool, input) => {
+        dispatched = input;
+        return { content: [{ type: "text", text: "created" }] };
+      },
+    },
+  });
+  const registry = new InMemoryToolRegistry();
+  registry.register(tool);
+  const executor = new ToolExecutor({
+    registry,
+    events: { publish: async () => {} },
+    gate: { review: async (request) => { reviewed = request; return { decision: "allow" }; } },
+  });
+  const input = { repository: "project", title: "Issue", body: "Complete outgoing body", labels: ["bug"] };
+  const result = await executor.execute({
+    sessionId: "session_mcp" as never, turnId: "turn_mcp" as never,
+    cwd: process.cwd(), toolName: tool.name, input,
+  });
+  expect(result.status).toBe("completed");
+  expect(reviewed?.input).toEqual(input);
+  expect(reviewed?.resources?.metadata).toMatchObject({ server: server.name, tool: "issues.create" });
+  expect(Object.isFrozen(reviewed?.input)).toBe(true);
+  expect(dispatched).toBe(reviewed?.input);
+});
+
+test("a denied MCP review makes no remote call", async () => {
+  let dispatched = false;
+  const tool = createMcpChiliTool({
+    server, tool: { name: "send", inputSchema: { type: "object" } },
+    manager: { callTool: async () => { dispatched = true; return { content: [] }; } },
+  });
+  const registry = new InMemoryToolRegistry();
+  registry.register(tool);
+  const executor = new ToolExecutor({
+    registry, events: { publish: async () => {} },
+    gate: { review: async () => ({ decision: "deny", reason: "Recipient is outside the task." }) },
+  });
+  const result = await executor.execute({
+    sessionId: "session_mcp" as never, turnId: "turn_mcp" as never,
+    cwd: process.cwd(), toolName: tool.name, input: { recipient: "unknown" },
+  });
+  expect(result.status).toBe("failed");
+  expect(dispatched).toBe(false);
 });
 
 test("infers MCP tool risk and concurrency from annotations", () => {
@@ -108,7 +161,6 @@ test("preserves MCP image content for model tool results", async () => {
     registerPersistedOutput: async () => {},
     metadata: async () => {},
     streamOutput: async () => {},
-    requestApproval: async () => ({ action: "allow_once" }),
   });
 
   expect(result.output).toContain("[image image/png");
@@ -332,7 +384,6 @@ function executionContext() {
     registerPersistedOutput: async () => {},
     metadata: async () => {},
     streamOutput: async () => {},
-    requestApproval: async () => ({ action: "allow_once" as const }),
   };
 }
 

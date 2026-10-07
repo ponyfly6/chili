@@ -28,7 +28,6 @@ import { ObservableEventStore, SqliteEventStore, UnknownEventCursorError } from 
 import { HttpRuntimeClient, type RuntimeSessionEventWindow } from "@chili/sdk";
 import type {
   AgentPath,
-  ApprovalDecisionAction,
   ChiliEvent,
   RuntimeEvent,
   DelegationPolicy,
@@ -45,6 +44,7 @@ import type {
   RuntimeModelDescriptor,
   RuntimePermissionConfig,
   RuntimePermissionProfileId,
+  RuntimePermissionUpdateOptions,
   RuntimeCommandCatalog,
   RuntimeCommandInvocation,
   RuntimeSessionRef,
@@ -2070,38 +2070,6 @@ test("rejects unknown SSE cursors but keeps a known tip cursor live without tran
   }
 });
 
-test("resolves approvals through the runtime HTTP handler", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const calls: unknown[] = [];
-  const approvals = {
-    resolved: false,
-    maxApprovalScope() {
-      return "persistent" as const;
-    },
-    resolve(input: { decision: ApprovalDecisionAction; feedback?: string }) {
-      calls.push(input);
-      this.resolved = input.decision === "allow_session";
-      return this.resolved;
-    },
-  };
-  const handler = createRuntimeHttpHandler({ service, store, approvals });
-
-  const response = await handler(
-    new Request("http://chili.test/approvals/approval_http/resolve", {
-      method: "POST",
-      body: JSON.stringify({ decision: "allow_session", feedback: "" }),
-      headers: { "content-type": "application/json" },
-    }),
-  );
-
-  expect(response.status).toBe(200);
-  expect(await response.json()).toEqual({ resolved: true });
-  expect(approvals.resolved).toBe(true);
-  expect(calls).toEqual([{ approvalId: "approval_http", decision: "allow_session", feedback: "" }]);
-});
-
 test("lists and resolves pending user input through the runtime HTTP handler", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -2227,108 +2195,80 @@ test("validates user input HTTP filters and answer bodies before resolving", asy
   expect(unknownFilter.status).toBe(400);
 });
 
-test("approval resolvers without scope introspection can only resolve one-shot decisions", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
+test("gets and updates both permission modes and custom review settings", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
   const service = new FakeRuntimeService(store);
-  const calls: unknown[] = [];
-  const handler = createRuntimeHttpHandler({
-    service,
-    store,
-    approvals: {
-      resolve(input: unknown) {
-        calls.push(input);
-        return true;
-      },
-    },
-  });
-
-  const response = await handler(
-    new Request("http://chili.test/approvals/approval_http/resolve", {
-      method: "POST",
-      body: JSON.stringify({ decision: "allow_always" }),
-      headers: { "content-type": "application/json" },
-    }),
-  );
-
-  expect(response.status).toBe(400);
-  expect(await response.json()).toEqual({
-    error: { message: "Approval decision allow_always exceeds the maximum approval scope once." },
-  });
-  expect(calls).toEqual([]);
-});
-
-test("rejects approval decisions above the pending request scope", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const calls: unknown[] = [];
-  const handler = createRuntimeHttpHandler({
-    service,
-    store,
-    approvals: {
-      maxApprovalScope: () => "once" as const,
-      resolve(input: unknown) {
-        calls.push(input);
-        return true;
-      },
-    },
-  });
-
-  const response = await handler(
-    new Request("http://chili.test/approvals/approval_http/resolve", {
-      method: "POST",
-      body: JSON.stringify({ decision: "allow_session" }),
-      headers: { "content-type": "application/json" },
-    }),
-  );
-
-  expect(response.status).toBe(400);
-  expect(await response.json()).toEqual({
-    error: { message: "Approval decision allow_session exceeds the maximum approval scope once." },
-  });
-  expect(calls).toEqual([]);
-});
-
-test("gets and sets permission profiles through the runtime HTTP handler", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  let profile: RuntimePermissionProfileId = "default";
+  let config = permissionConfig("auto-review");
   const permissions = {
-    get() {
-      return permissionConfig(profile);
-    },
-    set(nextProfile: RuntimePermissionProfileId) {
-      profile = nextProfile;
-      return permissionConfig(profile);
+    get: () => config,
+    async set(profile: RuntimePermissionProfileId, options: RuntimePermissionUpdateOptions = {}) {
+      config = { ...config, profile, profiles: permissionConfig(profile).profiles };
+      if (options.reviewInstructions !== undefined) config.reviewInstructions = options.reviewInstructions;
+      if (options.reviewerModel === null) delete config.reviewerModel;
+      else if (options.reviewerModel !== undefined) config.reviewerModel = options.reviewerModel;
+      return config;
     },
   };
   const handler = createRuntimeHttpHandler({ service, store, permissions });
+  const initial = await handler(new Request("http://chili.test/permissions"));
+  expect(initial.status).toBe(200);
+  expect(await initial.json()).toEqual(permissionConfig("auto-review"));
 
-  const getResponse = await handler(new Request("http://chili.test/permissions"));
-  expect(getResponse.status).toBe(200);
-  expect(await getResponse.json()).toMatchObject({ profile: "default" });
-
-  const setResponse = await handler(
-    new Request("http://chili.test/permissions", {
+  for (const profile of ["full-access", "auto-review"] as const) {
+    const response = await handler(new Request("http://chili.test/permissions", {
       method: "POST",
-      body: JSON.stringify({ profile: "full-access" }),
+      body: JSON.stringify({ profile, reviewInstructions: "Review irreversible changes.", reviewerModel: { provider: "test", model: "reviewer" } }),
       headers: { "content-type": "application/json" },
-    }),
-  );
-  expect(setResponse.status).toBe(200);
-  expect(await setResponse.json()).toMatchObject({ profile: "full-access" });
-  expect(String(profile)).toBe("full-access");
+    }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ profile, reviewInstructions: "Review irreversible changes.", reviewerModel: { provider: "test", model: "reviewer" } });
+  }
 
-  const badResponse = await handler(
-    new Request("http://chili.test/permissions", {
-      method: "POST",
-      body: JSON.stringify({ profile: "unsafe" }),
-      headers: { "content-type": "application/json" },
-    }),
-  );
-  expect(badResponse.status).toBe(400);
+  const reset = await handler(new Request("http://chili.test/permissions", {
+    method: "POST", body: JSON.stringify({ profile: "auto-review", reviewerModel: null }),
+    headers: { "content-type": "application/json" },
+  }));
+  expect(reset.status).toBe(200);
+  expect(await reset.json()).not.toHaveProperty("reviewerModel");
+});
+
+test("permission updates reject old modes, grants, and malformed review settings", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const service = new FakeRuntimeService(store);
+  const calls: unknown[] = [];
+  const handler = createRuntimeHttpHandler({ service, store, permissions: {
+    get: () => permissionConfig("auto-review"),
+    set(profile, options) { calls.push({ profile, options }); return permissionConfig(profile); },
+  } });
+  for (const body of [
+    { profile: "default" }, { profile: "unsafe" }, {},
+    { profile: "auto-review", reviewInstructions: 123 },
+    { profile: "auto-review", reviewInstructions: "" },
+    { profile: "auto-review", reviewInstructions: " \n " },
+    { profile: "auto-review", reviewInstructions: "a".repeat(32_001) },
+    { profile: "auto-review", reviewerModel: [] },
+    { profile: "auto-review", reviewerModel: { provider: "test" } },
+    { profile: "auto-review", reviewerModel: { provider: "test", model: "reviewer", extra: true } },
+    { profile: "full-access", rules: [{ action: "allow" }] },
+    { profile: "auto-review", reviewInstructions: null },
+  ]) {
+    const response = await handler(new Request("http://chili.test/permissions", {
+      method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" },
+    }));
+    expect(response.status).toBe(400);
+  }
+  expect(calls).toEqual([]);
+});
+
+test("manual approval mutation endpoint is retired", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+  for (const decision of ["allow_once", "allow_session", "allow_always", "deny"]) {
+    const response = await handler(new Request("http://chili.test/approvals/approval_old/resolve", {
+      method: "POST", body: JSON.stringify({ decision }), headers: { "content-type": "application/json" },
+    }));
+    expect(response.status).toBe(404);
+  }
 });
 
 test("serves prompt commands and submits expanded command prompts", async () => {
@@ -2969,72 +2909,6 @@ test("returns not implemented for MCP routes without runtime control", async () 
 
   expect(response.status).toBe(501);
   expect(await response.json()).toEqual({ error: { message: "No MCP control service is configured" } });
-});
-
-test("rejects malformed approval resolve payloads before the runtime resolver", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const calls: unknown[] = [];
-  const handler = createRuntimeHttpHandler({
-    service,
-    store,
-    approvals: {
-      resolve(input: unknown) {
-        calls.push(input);
-        return true;
-      },
-    },
-  });
-
-  const cases = [
-    { body: {}, message: "decision is required" },
-    { body: { decision: "allow_forever" }, message: "decision must be one of allow_once, allow_session, allow_always, deny" },
-    { body: { decision: "allow_once", feedback: 123 }, message: "feedback must be a string" },
-    { body: { decision: "allow_once", scope: "session" }, message: "Unexpected field: scope" },
-  ];
-
-  for (const testCase of cases) {
-    const response = await handler(
-      new Request("http://chili.test/approvals/approval_http/resolve", {
-        method: "POST",
-        body: JSON.stringify(testCase.body),
-        headers: { "content-type": "application/json" },
-      }),
-    );
-
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: { message: testCase.message } });
-  }
-
-  expect(calls).toEqual([]);
-});
-
-test("returns conflict when approval is not pending in the runtime queue", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const approvals = {
-    resolve() {
-      return false;
-    },
-  };
-  const handler = createRuntimeHttpHandler({ service, store, approvals });
-
-  const response = await handler(
-    new Request("http://chili.test/approvals/approval_orphan/resolve", {
-      method: "POST",
-      body: JSON.stringify({ decision: "allow_once" }),
-      headers: { "content-type": "application/json" },
-    }),
-  );
-
-  expect(response.status).toBe(409);
-  expect(await response.json()).toEqual({
-    error: {
-      message: "Approval is not pending in this runtime. It may have been handled already or orphaned by a server restart.",
-    },
-  });
 });
 
 test("serves model control routes and prompt model overrides", async () => {
@@ -3790,9 +3664,10 @@ function sseOutputEvent(sessionId: SessionId, index: number, callId: string): Ru
 function permissionConfig(profile: RuntimePermissionProfileId): RuntimePermissionConfig {
   return {
     profile,
+    reviewInstructions: "Review dangerous operations.",
+    defaultReviewInstructions: "Review dangerous operations.",
     profiles: [
-      { id: "default", label: "Default", description: "Default permissions", current: profile === "default" },
-      { id: "auto-review", label: "Auto-review", description: "Auto-review permissions", current: profile === "auto-review", disabledReason: "disabled" },
+      { id: "auto-review", label: "Auto-review", description: "Auto-review permissions", current: profile === "auto-review" },
       { id: "full-access", label: "Full Access", description: "Full access permissions", current: profile === "full-access" },
     ],
   };

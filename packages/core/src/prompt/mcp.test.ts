@@ -1,3 +1,4 @@
+import { assemblePromptFragments } from "./assembler.js";
 import { expect, test } from "bun:test";
 import {
   filterMcpEnvironment,
@@ -15,7 +16,7 @@ test("mcp server instructions are mcp sourced and cannot claim system trust", ()
   });
 
   expect(fragment).toMatchObject({
-    id: "mcp.server.docs-server.instructions",
+    id: "mcp.server.Docs%20Server.instructions",
     layer: "contextual_user",
     source: "mcp",
     trust: "tool",
@@ -65,4 +66,13 @@ test("extension supplied mcp server definitions cannot carry trust claims", () =
     name: "plugin-server",
     command: "node",
   });
+});
+
+test("distinct MCP server names never collapse into one prompt material", () => {
+  const fragments = ["Docs Server", "docs-server", "docs server"].map((serverName) =>
+    mcpServerInstructionsPromptFragment({ serverName, instructions: `Rules for ${serverName}` })!,
+  );
+  const assembly = assemblePromptFragments(fragments);
+  expect(new Set(assembly.fragments.map((fragment) => fragment.id)).size).toBe(3);
+  for (const fragment of fragments) expect(assembly.contextualUser.some((text) => text.includes(fragment.content))).toBe(true);
 });

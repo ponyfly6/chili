@@ -757,3 +757,32 @@ test("Agent wait timeout preserves the concrete input receipt", async () => {
   const client = new HttpRuntimeClient({ baseUrl: "http://chili.test", fetch: (async () => Response.json({ input, timedOut: true })) as unknown as typeof fetch });
   expect(await client.waitAgent({ sessionId: "root" as SessionId, agentId: "child", inputId: "receipt", timeoutMs: 0 })).toEqual({ input, timedOut: true });
 });
+
+
+test("permission client sends review settings and preserves cancellation outside the JSON body", async () => {
+  const calls: { body: unknown; signal: AbortSignal | null | undefined }[] = [];
+  const controller = new AbortController();
+  const config = {
+    profile: "auto-review", reviewInstructions: "Default review.", defaultReviewInstructions: "Default review.",
+    profiles: [
+      { id: "full-access", label: "Full access", description: "", current: false },
+      { id: "auto-review", label: "Auto review", description: "", current: true },
+    ],
+  };
+  const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test", fetch: (async (_input, init) => {
+    const body = JSON.parse(String(init?.body));
+    calls.push({ body, signal: init?.signal });
+    return Response.json({ ...config, ...body, ...(body.reviewerModel === null ? { reviewerModel: undefined } : {}) });
+  }) as typeof fetch });
+  expect(await client.setPermissionProfile({ profile: "auto-review", reviewInstructions: "My review.", reviewerModel: { provider: "test", model: "reviewer" }, signal: controller.signal })).toMatchObject({
+    profile: "auto-review", reviewInstructions: "My review.", reviewerModel: { provider: "test", model: "reviewer" },
+  });
+  expect(await client.setPermissionProfile({ profile: "full-access", reviewerModel: null })).not.toHaveProperty("reviewerModel");
+  expect(calls).toEqual([
+    { body: { profile: "auto-review", reviewInstructions: "My review.", reviewerModel: { provider: "test", model: "reviewer" } }, signal: controller.signal },
+    { body: { profile: "full-access", reviewerModel: null }, signal: undefined },
+  ]);
+  expect("approveApproval" in client).toBe(false);
+  expect("rejectApproval" in client).toBe(false);
+  expect("resolveApproval" in client).toBe(false);
+});

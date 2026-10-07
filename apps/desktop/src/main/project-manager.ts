@@ -19,7 +19,6 @@ interface ProjectEntry {
   tasks: DesktopProject["recentTasks"];
   tasksLoaded: boolean;
   running: Set<string>;
-  attention: Set<string>;
   inputs: Map<string, string>;
   refresh?: ReturnType<typeof setTimeout>;
   refreshing: boolean;
@@ -66,7 +65,7 @@ export class DesktopProjectManager {
       ...(active ? { projectId: active.saved.id, workspace: active.saved.path } : {}),
       projects: [...this.entries.values()].map((entry) => ({
         id: entry.saved.id, path: entry.saved.path, phase: entry.runtime?.sidecar.state().sidecar.phase ?? "idle",
-        runningCount: entry.running.size, attentionCount: new Set([...entry.attention, ...entry.inputs.values()]).size,
+        runningCount: entry.running.size, attentionCount: new Set(entry.inputs.values()).size,
         tasksLoaded: entry.tasksLoaded, recentTasks: entry.tasks,
       })),
     };
@@ -106,7 +105,7 @@ export class DesktopProjectManager {
     const entry = this.entries.get(id);
     if (!entry || this.closing) return;
     if (entry.runtime?.sidecar.state().sidecar.phase === "healthy") this.scheduleTasks(id);
-    else { entry.running.clear(); entry.attention.clear(); entry.inputs.clear(); }
+    else { entry.running.clear(); entry.inputs.clear(); }
     this.publishState();
   }
 
@@ -123,8 +122,6 @@ export class DesktopProjectManager {
       const sessionId = String(event.sessionId);
       if (["running", "waiting_for_approval", "cancelling"].includes(event.payload.status)) entry.running.add(sessionId);
       else entry.running.delete(sessionId);
-      if (event.payload.status === "waiting_for_approval") entry.attention.add(sessionId);
-      else entry.attention.delete(sessionId);
       this.publishState();
     }
     if (event.sessionId && event.type === "user_input.requested") {
@@ -219,7 +216,7 @@ export class DesktopProjectManager {
 
   private assertOpen(): void { if (this.closing) throw new Error("Desktop is closing"); }
   private entry(saved: SavedDesktopProject): ProjectEntry {
-    return { saved, tasks: [], tasksLoaded: false, running: new Set(), attention: new Set(), inputs: new Map(), refreshing: false, refreshAgain: false };
+    return { saved, tasks: [], tasksLoaded: false, running: new Set(), inputs: new Map(), refreshing: false, refreshAgain: false };
   }
   private publishState(): void { if (!this.closing) this.options.publish({ type: "state.changed", state: this.state() }); }
 

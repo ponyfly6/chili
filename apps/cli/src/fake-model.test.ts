@@ -30,8 +30,8 @@ test("desktop input fixture emits one deterministic single-select request", asyn
   ]);
 });
 
-test("desktop approval fixture emits one harmless once-only escalated bash request", async () => {
-  const events = await streamEvents("desktop approval fixture");
+test("desktop review fixture emits a harmless call for automatic review", async () => {
+  const events = await streamEvents("desktop review fixture");
 
   expect(events).toEqual([
     {
@@ -39,8 +39,6 @@ test("desktop approval fixture emits one harmless once-only escalated bash reque
       name: "bash",
       input: {
         command: "/usr/bin/true",
-        sandbox_permissions: "require_escalated",
-        justification: "Allow the harmless desktop approval fixture to run once.",
       },
     },
     { type: "finish", reason: "tool_use" },
@@ -48,7 +46,7 @@ test("desktop approval fixture emits one harmless once-only escalated bash reque
 });
 
 test("desktop fixtures use the existing generic completion after a tool result", async () => {
-  for (const text of ["desktop input fixture", "desktop approval fixture"]) {
+  for (const text of ["desktop input fixture", "desktop review fixture"]) {
     const events = await streamEvents(text, true);
     expect(events).toEqual([
       { type: "text_delta", text: "I read the file and the tool loop works." },

@@ -69,7 +69,7 @@ export interface DesktopRemoteRootSnapshot {
   events: ChiliEvent[];
   queuedCount: number;
   deliveryUnknown: boolean;
-  needsDesktop: { approval: boolean; input: boolean };
+  needsDesktop: { input: boolean };
   truncated: boolean;
 }
 
@@ -286,12 +286,8 @@ export class DesktopControlService {
         if (lease.client.sessionEventWindow) {
           return lease.client.sessionEventWindow({ sessionId, limit: 5_000, signal });
         }
-        if (!lease.client.listPendingApprovals) throw new Error("Runtime does not support safe remote snapshots");
-        const [events, approvals] = await Promise.all([
-          lease.client.sessionEvents({ sessionId, limit: 5_000, signal }),
-          lease.client.listPendingApprovals({ sessionId, signal }),
-        ]);
-        return { events, pendingApprovals: approvals, truncated: false, approvalsTruncated: false };
+        const events = await lease.client.sessionEvents({ sessionId, limit: 5_000, signal });
+        return { events, truncated: false };
       })(),
       lease.client.listUserInputs({ sessionId, signal }),
       lease.client.inputQueue({ sessionId, signal }),
@@ -303,8 +299,6 @@ export class DesktopControlService {
       queuedCount: queue.pendingCount,
       deliveryUnknown: this.remoteDeliveryUnknown.has(String(sessionId)),
       needsDesktop: {
-        approval: eventWindow.pendingApprovals.length > 0
-          || ("approvalsTruncated" in eventWindow && eventWindow.approvalsTruncated === true),
         input: inputs.length > 0,
       },
       truncated: eventWindow.truncated,
@@ -594,7 +588,12 @@ export class DesktopControlService {
     if (request.type === "permissions.set") {
       return this.withWorkspaceActor(async () => {
         const lease = this.captureClientLease();
-        const config = await lease.client.setPermissionProfile({ profile: request.profile, signal: lease.signal });
+        const config = await lease.client.setPermissionProfile({
+          profile: request.profile,
+          ...(request.reviewInstructions !== undefined ? { reviewInstructions: request.reviewInstructions } : {}),
+          ...(request.reviewerModel !== undefined ? { reviewerModel: request.reviewerModel } : {}),
+          signal: lease.signal,
+        });
         this.assertClientLease(lease);
         return config;
       });
@@ -652,17 +651,6 @@ export class DesktopControlService {
     if (request.type === "session.stop") {
       const lease = this.captureClientLease();
       return this.withSessionActor(request.sessionId, () => this.stop(request.sessionId, lease), "stop");
-    }
-    if (request.type === "approval.resolve") {
-      const lease = this.captureClientLease();
-      const result = await lease.client.resolveApproval({
-        approvalId: request.approvalId as never,
-        decision: request.decision,
-        ...(request.feedback !== undefined ? { feedback: request.feedback } : {}),
-        signal: lease.signal,
-      });
-      this.assertClientLease(lease);
-      return result;
     }
     if (request.type === "user-input.resolve") {
       const lease = this.captureClientLease();

@@ -52,14 +52,14 @@ test("normalizes a hostile tool Error before return, SQLite persistence, and des
     description: "Throws a hostile error.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => { throw source; },
   });
   let nextId = 0;
   const executor = new ToolExecutor({
     registry,
     events: { publish: (event) => store.append(event) },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     createId: (prefix) => `${prefix}_tool_error_sinks_${++nextId}`,
     now: () => 1 as TimestampMs,
   });
@@ -154,7 +154,7 @@ test("keeps a 5 MiB tool Error bounded through executor, runtime, SQLite events,
     description: "Reject with a very large process error.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => { throw source; },
   });
   const model: ModelRouter = {
@@ -172,7 +172,7 @@ test("keeps a 5 MiB tool Error bounded through executor, runtime, SQLite events,
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
       createId,
       now: () => 1 as TimestampMs,
     }),
@@ -297,7 +297,7 @@ test("bounds successful provider diagnostics before run results, SQLite, session
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
       createId,
       now: () => 1 as TimestampMs,
     }),
@@ -632,7 +632,7 @@ test("does not persist completed compaction after a signal-ignoring compactor re
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
       createId,
       now: () => 1 as TimestampMs,
     }),
@@ -679,7 +679,7 @@ function createRuntime(
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
       createId,
       now: () => 1 as TimestampMs,
     }),

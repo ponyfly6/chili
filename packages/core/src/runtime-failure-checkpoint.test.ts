@@ -39,7 +39,7 @@ test("persists a projected failure checkpoint from prior progress without anothe
     description: "Inspect a file.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({
       title: "inspected",
       output: "TOOL OUTPUT SECRET",
@@ -76,7 +76,7 @@ test("persists a projected failure checkpoint from prior progress without anothe
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     retryPolicy: { maxAttempts: 1, initialDelayMs: 0 },
     createId,

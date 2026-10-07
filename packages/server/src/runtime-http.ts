@@ -7,6 +7,7 @@ import {
   parseRuntimeArray,
   parseRuntimeIdentifier,
   parseRuntimeModelSelection,
+  parseRuntimePermissionUpdateOptions,
   parseRuntimeRecord,
   parseRuntimeString,
   parseRuntimeStringArray,
@@ -20,7 +21,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { RuntimeSessionNotFoundError } from "@chili/core";
-import type { ChiliEvent, EventEnvelope, ApprovalDecisionAction, DelegationPolicy, RuntimeInterruptResult, RuntimeDelegationConfig, RuntimeModelConfig, RuntimeModelDescriptor, RuntimeMcpAddServerRequest, RuntimeMcpControlService, RuntimeMcpScopeInput, RuntimeMcpAuthRequest, RuntimeMcpListResponse, RuntimeMcpServerDescriptor, RuntimeMcpStatusResponse, RuntimeMcpTransport, MessageImageContent, RuntimePermissionConfig, RuntimePermissionProfileId, RuntimeApprovalResolveResult, RuntimePromptAccepted, RuntimePromptResult, RuntimeSessionRef, RuntimeTurnResult, RuntimeSkillMention, ModelSelection, ReasoningLevel, ServiceTier, SessionId, PendingUserInputRequest, UserInputAnswers, UserInputId } from "@chili/protocol";
+import type { ChiliEvent, EventEnvelope, DelegationPolicy, RuntimeInterruptResult, RuntimeDelegationConfig, RuntimeModelConfig, RuntimeModelDescriptor, RuntimeMcpAddServerRequest, RuntimeMcpControlService, RuntimeMcpScopeInput, RuntimeMcpAuthRequest, RuntimeMcpListResponse, RuntimeMcpServerDescriptor, RuntimeMcpStatusResponse, RuntimeMcpTransport, MessageImageContent, RuntimePermissionConfig, RuntimePermissionProfileId, RuntimePermissionUpdateOptions, RuntimePromptAccepted, RuntimePromptResult, RuntimeSessionRef, RuntimeTurnResult, RuntimeSkillMention, ModelSelection, ReasoningLevel, ServiceTier, SessionId, PendingUserInputRequest, UserInputAnswers, UserInputId } from "@chili/protocol";
 import type { AgentControlService, RuntimeBackgroundErrorHandler, SubmitPromptInput, SubmitPromptResult } from "@chili/core";
 import { SessionInputConflictError } from "@chili/store";
 import { eventStream, type EventStreamOptions } from "./event-stream.js";
@@ -84,7 +85,6 @@ export interface RuntimeHttpHandlerOptions {
   store: EventStore & EventPublisher;
   authToken?: string;
   agents?: Pick<AgentControlService, "forSession">;
-  approvals?: ApprovalResolver;
   userInputs?: UserInputController;
   permissions?: PermissionProfileControl;
   commands?: PromptCommandControl;
@@ -106,15 +106,6 @@ export interface RuntimeHttpHandlerOptions {
   onBackgroundError?: (error: unknown) => void;
 }
 
-export interface ApprovalResolver {
-  resolve(input: {
-    approvalId: import("@chili/protocol").ApprovalId;
-    decision: ApprovalDecisionAction;
-    feedback?: string;
-  }): boolean | Promise<boolean>;
-  maxApprovalScope?(approvalId: import("@chili/protocol").ApprovalId): import("@chili/protocol").ApprovalScope | undefined | Promise<import("@chili/protocol").ApprovalScope | undefined>;
-}
-
 export interface UserInputController {
   list(input?: { sessionId?: SessionId }): readonly PendingUserInputRequest[] | Promise<readonly PendingUserInputRequest[]>;
   resolve(input: {
@@ -125,7 +116,7 @@ export interface UserInputController {
 
 export interface PermissionProfileControl {
   get(): RuntimePermissionConfig | Promise<RuntimePermissionConfig>;
-  set(profile: RuntimePermissionProfileId): RuntimePermissionConfig | Promise<RuntimePermissionConfig>;
+  set(profile: RuntimePermissionProfileId, options?: RuntimePermissionUpdateOptions): RuntimePermissionConfig | Promise<RuntimePermissionConfig>;
 }
 
 export interface StartRuntimeHttpServerOptions extends RuntimeHttpHandlerOptions {
@@ -189,9 +180,10 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "setPermissions") {
         if (!options.permissions) return jsonError(501, "No permission profile controller is configured");
-        const body = await readJson<PermissionsBody>(request, ["profile"]);
-        if (!isRuntimePermissionProfileId(body.profile)) throw badRequest("profile must be default, auto-review, or full-access");
-        return json(await options.permissions.set(body.profile));
+        const body = await readJson<PermissionsBody>(request, ["profile", "reviewInstructions", "reviewerModel"]);
+        if (!isRuntimePermissionProfileId(body.profile)) throw badRequest("profile must be full-access or auto-review");
+        const { profile, ...settings } = body;
+        return json(await options.permissions.set(profile, parseRuntimePermissionUpdateOptions(settings, "body")));
       }
 
       if (route.name === "commands") {
@@ -635,26 +627,6 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         return json({ resolved: true });
       }
 
-      if (route.name === "resolveApproval") {
-        if (!options.approvals) return jsonError(501, "No approval resolver is configured");
-        const resolveInput = parseResolveApprovalBody(route.approvalId, await readJson<unknown>(request));
-        // A resolver that cannot report the pending request's scope must not be
-        // allowed to create reusable grants. Treat the extension boundary as
-        // one-shot by default and fail closed before resolve() can persist state.
-        const maxApprovalScope = options.approvals.maxApprovalScope
-          ? await options.approvals.maxApprovalScope(route.approvalId)
-          : "once";
-        if (!approvalDecisionWithinScope(resolveInput.decision, maxApprovalScope)) {
-          return jsonError(400, `Approval decision ${resolveInput.decision} exceeds the maximum approval scope ${maxApprovalScope}.`);
-        }
-        const resolved = await options.approvals.resolve(resolveInput);
-        if (!resolved) {
-          return jsonError(409, "Approval is not pending in this runtime. It may have been handled already or orphaned by a server restart.");
-        }
-        const result: RuntimeApprovalResolveResult = { resolved };
-        return json(result);
-      }
-
       if (route.name === "events") {
         rejectUnknownQueryParameters(url, ["sessionId", "afterEventId", "fromStart"]);
         const streamOptions: EventStreamOptions = {
@@ -877,7 +849,6 @@ type Route =
   | { name: "listUserInputs" }
   | { name: "listPendingApprovals" }
   | { name: "resolveUserInput"; inputId: string }
-  | { name: "resolveApproval"; approvalId: import("@chili/protocol").ApprovalId }
   | { name: "notFound" };
 
 interface CreateSessionBody {
@@ -934,6 +905,8 @@ interface DelegationBody {
 
 interface PermissionsBody {
   profile?: unknown;
+  reviewInstructions?: unknown;
+  reviewerModel?: unknown;
 }
 
 interface ResolveUserInputBody {
@@ -1040,14 +1013,6 @@ function routeRequest(method: string, pathname: string): Route {
     if (method === "POST" && action === "auth") return { name: "mcpAuth", server };
     if (method === "POST" && action === "logout") return { name: "mcpLogout", server };
     return { name: "notFound" };
-  }
-
-  const approvalRoute = /^\/approvals\/([^/]+)\/resolve$/.exec(path);
-  if (method === "POST" && approvalRoute) {
-    return {
-      name: "resolveApproval",
-      approvalId: decodeURIComponent(approvalRoute[1] ?? "") as import("@chili/protocol").ApprovalId,
-    };
   }
 
   const userInputRoute = /^\/user-inputs\/([^/]+)\/resolve$/.exec(path);
@@ -1220,32 +1185,6 @@ function parsePromptImages(value: unknown): MessageImageContent[] {
   return images;
 }
 
-function parseResolveApprovalBody(approvalId: import("@chili/protocol").ApprovalId, body: unknown): {
-  approvalId: import("@chili/protocol").ApprovalId;
-  decision: ApprovalDecisionAction;
-  feedback?: string;
-} {
-  if (!isRecord(body)) throw badRequest("JSON object body is required");
-  const unknownKeys = Object.keys(body).filter((key) => key !== "decision" && key !== "feedback");
-  if (unknownKeys.length > 0) throw badRequest(`Unexpected field: ${unknownKeys[0]}`);
-  if (body.decision === undefined) throw badRequest("decision is required");
-  if (!isApprovalDecisionAction(body.decision)) throw badRequest("decision must be one of allow_once, allow_session, allow_always, deny");
-
-  const input: {
-    approvalId: import("@chili/protocol").ApprovalId;
-    decision: ApprovalDecisionAction;
-    feedback?: string;
-  } = {
-    approvalId,
-    decision: body.decision,
-  };
-  if (body.feedback !== undefined) {
-    if (typeof body.feedback !== "string") throw badRequest("feedback must be a string");
-    input.feedback = body.feedback;
-  }
-  return input;
-}
-
 function parseResolveUserInputBody(body: unknown): UserInputAnswers {
   if (!isRecord(body) || Array.isArray(body)) throw badRequest("JSON object body is required");
   const typed = body as ResolveUserInputBody & Record<string, unknown>;
@@ -1257,19 +1196,6 @@ function parseResolveUserInputBody(body: unknown): UserInputAnswers {
   } catch (error) {
     throw badRequest(error instanceof Error ? error.message : String(error));
   }
-}
-
-function isApprovalDecisionAction(value: unknown): value is ApprovalDecisionAction {
-  return value === "allow_once" || value === "allow_session" || value === "allow_always" || value === "deny";
-}
-
-function approvalDecisionWithinScope(
-  decision: ApprovalDecisionAction,
-  maxApprovalScope: import("@chili/protocol").ApprovalScope | undefined,
-): boolean {
-  if (decision === "deny" || decision === "allow_once") return true;
-  if (decision === "allow_session") return maxApprovalScope !== "once";
-  return maxApprovalScope === undefined || maxApprovalScope === "persistent";
 }
 
 function rejectLegacySystemField(body: unknown): void {

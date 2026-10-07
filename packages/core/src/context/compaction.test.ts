@@ -797,7 +797,7 @@ test("runtime sends the bounded request surface to the model", async () => {
     description: "d".repeat(400),
     risk: "read",
     inputSchema: { type: "object", properties: { query: { type: "string" } } },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "lookup", output: "done" }),
   });
   registry.register({
@@ -805,7 +805,7 @@ test("runtime sends the bounded request surface to the model", async () => {
     description: "oversized",
     risk: "read",
     inputSchema: { type: "object", description: "s".repeat(2_000) },
-    approval: () => false,
+    resources: () => false,
     execute: async () => {
       hiddenExecutions++;
       return { title: "oversized", output: "done" };
@@ -826,7 +826,7 @@ test("runtime sends the bounded request surface to the model", async () => {
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
@@ -879,7 +879,7 @@ test("runtime fails before model streaming when fixed input exhausts the model w
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
@@ -969,7 +969,7 @@ test("conversation and compaction formatting preserve controlled tool execution 
 test("compaction fits draft and verification requests to the selected model limits", async () => {
   const sessionId = "session_compaction_limits" as SessionId;
   const turnId = "turn_compaction_limits" as TurnId;
-  const source = textMessage("msg_compaction_limits", sessionId, "user", `old context ${"x".repeat(80_000)}`);
+  const source = textMessage("msg_compaction_limits", sessionId, "user", `old context ${"x".repeat(8_000)}`);
   const modelInputs: ModelStreamInput[] = [];
   let limitSelection: unknown;
   const model: ModelRouter = {
@@ -1032,7 +1032,7 @@ test("compaction fits draft and verification requests to the selected model limi
   expect(modelInputs.every((input) => input.maxTokens === 1_024)).toBe(true);
   expect(modelInputs.every((input) => {
     const text = input.messages[0]?.parts.find((part) => part.type === "text");
-    return text?.type === "text" && text.text.length < 80_000;
+    return text?.type === "text" && text.text.includes(formatCompactionSourceMessages([source]));
   })).toBe(true);
   expect(result.usage).toEqual({
     inputTokens: 190,
@@ -1042,7 +1042,7 @@ test("compaction fits draft and verification requests to the selected model limi
   });
 });
 
-test("compaction hard-limits every synthesized model prompt", async () => {
+test("compaction rejects oversized fixed instructions instead of clipping the prompt", async () => {
   const sessionId = "session_compaction_prompt_limit" as SessionId;
   const source = textMessage(
     "msg_compaction_prompt_limit",
@@ -1067,7 +1067,7 @@ test("compaction hard-limits every synthesized model prompt", async () => {
     maxSummaryChars: 100,
   });
 
-  await compactor.compact({
+  await expect(compactor.compact({
     sessionId,
     turnId: "turn_compaction_prompt_limit" as TurnId,
     messages: [source],
@@ -1078,14 +1078,9 @@ test("compaction hard-limits every synthesized model prompt", async () => {
       budgetChars: 1_000,
     },
     instructions: "focus".repeat(1_000),
-  });
+  })).rejects.toThrow("complete message/tool group");
 
-  expect(modelInputs).toHaveLength(2);
-  for (const input of modelInputs) {
-    const part = input.messages[0]?.parts[0];
-    expect(part?.type).toBe("text");
-    if (part?.type === "text") expect(part.text.length).toBeLessThanOrEqual(400);
-  }
+  expect(modelInputs).toHaveLength(0);
 });
 
 test("compaction budgets the exact prompt that it sends", async () => {
@@ -1100,7 +1095,7 @@ test("compaction budgets the exact prompt that it sends", async () => {
   const compactor = new ContextCompactionService({
     model: {
       resolveRequestLimits() {
-        return { contextWindowTokens: 25_000, requestMaxOutputTokens: 1_000 };
+        return { contextWindowTokens: 100_000, requestMaxOutputTokens: 1_000 };
       },
       async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
         modelInputs.push(input);
@@ -1126,7 +1121,7 @@ test("compaction budgets the exact prompt that it sends", async () => {
 
   const sent = modelInputs[0]?.messages[0]?.parts[0];
   expect(sent?.type).toBe("text");
-  if (sent?.type === "text") expect(sent.text.length).toBeLessThan(100_000);
+  if (sent?.type === "text") expect(sent.text).toContain("x".repeat(119_000));
 });
 
 test("compaction preserves usage when an empty model summary fails validation", async () => {
@@ -1255,7 +1250,7 @@ test("runtime auto-compacts before the main model request and sends the summary 
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
@@ -1376,7 +1371,7 @@ async function expectReactiveCompactionRecovery(firstError: () => Error): Promis
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,

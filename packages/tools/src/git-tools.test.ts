@@ -7,7 +7,7 @@ import { createBashTool } from "./builtins/bash.js";
 import { ToolExecutor } from "./executor.js";
 import { runProcess } from "./process.js";
 import { InMemoryToolRegistry } from "./registry.js";
-import type { ApprovalBrokerRequest } from "./types.js";
+import type { ToolReviewRequest } from "./types.js";
 
 test("bash exposes Git status and both staged and unstaged diffs", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-git-status-"));
@@ -45,7 +45,7 @@ test("bash exposes Git status and both staged and unstaged diffs", async () => {
 
 test("bash stages selected paths and commits without changing unrelated work or adding a trailer", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-git-commit-"));
-  const approvals: ApprovalBrokerRequest[] = [];
+  const reviews: ToolReviewRequest[] = [];
   try {
     await initRepo(workspace);
     await writeFile(join(workspace, "base.txt"), "base\n", "utf8");
@@ -55,7 +55,7 @@ test("bash stages selected paths and commits without changing unrelated work or 
     await writeFile(join(workspace, "base.txt"), "unrelated edit\n", "utf8");
     await writeFile(join(workspace, "next.txt"), "next\n", "utf8");
     await writeFile(join(workspace, "untracked.txt"), "unrelated file\n", "utf8");
-    const executor = createExecutor(approvals);
+    const executor = createExecutor(reviews);
 
     expect((await bash(executor, workspace, "git add -- next.txt")).exitCode).toBe(0);
     expect((await git(workspace, ["diff", "--cached", "--name-only"])).stdout.trim()).toBe("next.txt");
@@ -67,9 +67,9 @@ test("bash stages selected paths and commits without changing unrelated work or 
     expect((await git(workspace, ["status", "--porcelain=v1"])).stdout.split("\n")).toEqual(expect.arrayContaining([
       " M base.txt", "?? untracked.txt",
     ]));
-    expect(approvals).toEqual(expect.arrayContaining([
-      expect.objectContaining({ permission: "bash", patterns: ["git add -- next.txt"] }),
-      expect.objectContaining({ permission: "bash", patterns: ["git commit -m 'Add next file'"] }),
+    expect(reviews).toEqual(expect.arrayContaining([
+      expect.objectContaining({ toolName: "bash", input: expect.objectContaining({ command: "git add -- next.txt" }) }),
+      expect.objectContaining({ toolName: "bash", input: expect.objectContaining({ command: "git commit -m 'Add next file'" }) }),
     ]));
   } finally {
     await rm(workspace, { recursive: true, force: true });
@@ -159,17 +159,17 @@ test("bash preserves Git's nonzero exit status and error outside a repository", 
   }
 });
 
-function createExecutor(approvals: ApprovalBrokerRequest[] = []): ToolExecutor {
+function createExecutor(reviews: ToolReviewRequest[] = []): ToolExecutor {
   const registry = new InMemoryToolRegistry();
   registry.register(createBashTool());
 
   return new ToolExecutor({
     registry,
     events: { publish: async (_event: ChiliEvent) => undefined },
-    approvals: {
-      decide: async (request) => {
-        approvals.push(request);
-        return { action: "allow_once" };
+    gate: {
+      review: async (request) => {
+        reviews.push(request);
+        return { decision: "allow" };
       },
     },
     createId: createSequentialId(),

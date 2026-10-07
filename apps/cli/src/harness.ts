@@ -3,7 +3,6 @@ import {
   type ChiliHost,
   type ChiliHostOptions,
 } from "@chili/host";
-import { createCliApprovalAsk } from "./approval.js";
 import { CliPrinter } from "./printing-store.js";
 
 export {
@@ -14,7 +13,7 @@ export {
 
 export type CliHarness = ChiliHost;
 
-export interface CliHarnessOptions extends Omit<ChiliHostOptions, "permissionProfile" | "askApproval" | "onEvent"> {
+export interface CliHarnessOptions extends Omit<ChiliHostOptions, "permissionProfile" | "onEvent"> {
   yes?: boolean;
   quiet?: boolean;
 }
@@ -25,8 +24,7 @@ export function createCliHarness(options: CliHarnessOptions): Promise<CliHarness
   const printer = quiet ? undefined : new CliPrinter();
   return createChiliHost({
     ...shared,
-    permissionProfile: yes ? "full-access" : "default",
-    askApproval: createCliApprovalAsk(),
+    ...(yes ? { permissionProfile: "full-access" as const } : {}),
     ...(printer ? { onEvent: (event) => printer.event(event) } : {}),
   });
 }

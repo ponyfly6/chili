@@ -1,5 +1,4 @@
-import type { ApprovalId, MessageId, SessionId, TurnId } from "./ids.js";
-import type { ApprovalDecisionAction } from "./tool.js";
+import type { MessageId, SessionId, TurnId } from "./ids.js";
 
 export const SESSION_TITLE_MAX_CHARS = 120;
 
@@ -98,7 +97,7 @@ export interface RuntimeModelConfig {
   serviceTier?: ServiceTier;
 }
 
-export const RUNTIME_PERMISSION_PROFILE_IDS = ["default", "auto-review", "full-access"] as const;
+export const RUNTIME_PERMISSION_PROFILE_IDS = ["full-access", "auto-review"] as const;
 
 export type RuntimePermissionProfileId = (typeof RUNTIME_PERMISSION_PROFILE_IDS)[number];
 
@@ -113,6 +112,15 @@ export interface RuntimePermissionProfileDescriptor {
 export interface RuntimePermissionConfig {
   profile: RuntimePermissionProfileId;
   profiles: RuntimePermissionProfileDescriptor[];
+  reviewInstructions: string;
+  defaultReviewInstructions: string;
+  reviewerModel?: ModelSelection;
+}
+
+export interface RuntimePermissionUpdateOptions {
+  reviewInstructions?: string;
+  /** null resets the reviewer to the host-selected default model. */
+  reviewerModel?: ModelSelection | null;
 }
 
 export type RuntimeCommandSource = "project" | "user" | "mcp" | "builtin";
@@ -296,7 +304,6 @@ export type RuntimeCommand =
   | RuntimeCreateSessionCommand
   | RuntimeSubmitPromptCommand
   | RuntimeInterruptCommand
-  | RuntimeResolveApprovalCommand
   | RuntimeArchiveSessionCommand;
 
 export interface RuntimeCreateSessionCommand {
@@ -320,13 +327,6 @@ export interface RuntimeInterruptCommand {
   type: "session.interrupt";
   sessionId: SessionId;
   reason?: string;
-}
-
-export interface RuntimeResolveApprovalCommand {
-  type: "approval.resolve";
-  approvalId: ApprovalId;
-  decision: ApprovalDecisionAction;
-  feedback?: string;
 }
 
 export interface RuntimeArchiveSessionCommand {
@@ -374,10 +374,6 @@ export interface RuntimePromptAccepted {
 
 export interface RuntimeInterruptResult {
   interrupted: boolean;
-}
-
-export interface RuntimeApprovalResolveResult {
-  resolved: boolean;
 }
 
 export type RuntimePromptResult =

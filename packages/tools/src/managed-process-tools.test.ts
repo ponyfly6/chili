@@ -8,24 +8,20 @@ import { createProcessTool } from "./builtins/process.js";
 import { ToolExecutor } from "./executor.js";
 import { ManagedProcessManager } from "./managed-process.js";
 import { InMemoryToolRegistry } from "./registry.js";
-import type { ApprovalBrokerRequest, ExecuteToolInput, ExecuteToolResult, ToolAccessPolicy } from "./types.js";
+import type { ToolReviewRequest, ExecuteToolInput, ExecuteToolResult, ToolAccessPolicy } from "./types.js";
 
-test("managed Bash approval uses the original command and denial never starts a process", async () => {
-  const fixture = await createFixture({ denyApproval: true });
+test("managed Bash review uses the original command and denial never starts a process", async () => {
+  const fixture = await createFixture({ denyReview: true });
   try {
     const command = "bun run dev -- --port 4312";
     const result = await fixture.execute("bash", {
       command, background: true, env: { CHILI_TEST_MODE: "development" },
     });
     expect(result.status).toBe("failed");
-    expect(fixture.approvals).toHaveLength(1);
-    expect(fixture.approvals[0]).toMatchObject({
-      permission: "bash",
-      patterns: [command],
-      metadata: {
-        command, background: true, readOnly: false,
-        envKeys: ["CHILI_TEST_MODE"], sandboxPermissions: "use_default",
-      },
+    expect(fixture.reviews).toHaveLength(1);
+    expect(fixture.reviews[0]).toMatchObject({
+      toolName: "bash",
+      input: { command, background: true, env: { CHILI_TEST_MODE: "development" } },
     });
     expect(fixture.runner.requests).toHaveLength(0);
     expect(fixture.manager.list(fixture.owner)).toEqual([]);
@@ -66,7 +62,7 @@ test("background execution and environment overrides require a worker execute sc
       expect(result.status).toBe("failed");
       if (result.status === "failed") expect(result.error.message).toContain("does not have execute scope");
     }
-    expect(fixture.approvals).toHaveLength(0);
+    expect(fixture.reviews).toHaveLength(0);
     expect(fixture.runner.requests).toHaveLength(0);
     expect(fixture.manager.list(fixture.owner)).toEqual([]);
   } finally {
@@ -81,7 +77,7 @@ test("registries without a process manager reject background Bash during validat
     const result = await fixture.execute("bash", { command: "pwd", background: true });
     expect(result.status).toBe("failed");
     if (result.status === "failed") expect(result.error.message).toContain("unavailable in this tool registry");
-    expect(fixture.approvals).toHaveLength(0);
+    expect(fixture.reviews).toHaveLength(0);
     expect(fixture.runner.requests).toHaveLength(0);
   } finally {
     await fixture.cleanup();
@@ -136,7 +132,7 @@ test("managed Bash preserves execution parameters and later logs belong to new c
     expect(fixture.events.slice(launchFinished + 1).filter((event) => (
       event.type === "tool.output_delta" || event.type === "tool.call_updated"
     ) && event.payload.callId === launch.callId)).toEqual([]);
-    expect(fixture.approvals).toHaveLength(1);
+    expect(fixture.reviews).toHaveLength(3);
   } finally {
     await fixture.cleanup();
   }
@@ -196,7 +192,7 @@ test("process stop stays non-read-only and cannot bypass a scoped worker policy"
     const stopped = await fixture.execute("process", { action: "stop", processId });
     expect(stopped.status === "completed" && stopped.result.metadata).toMatchObject({ processStatus: "stopped" });
     expect(fixture.runner.requests[0]!.signal.aborted).toBe(true);
-    expect(fixture.approvals).toHaveLength(1);
+    expect(fixture.reviews).toHaveLength(3);
   } finally {
     await fixture.cleanup();
   }
@@ -248,7 +244,7 @@ test("cancelling the initial Bash call stops a process before its handle is deli
 });
 
 interface FixtureOptions {
-  denyApproval?: boolean;
+  denyReview?: boolean;
   managedBash?: boolean;
   policy?: ToolAccessPolicy;
   publish?: (event: ChiliEvent) => void | Promise<void>;
@@ -269,7 +265,7 @@ async function createFixture(options: FixtureOptions = {}) {
   }));
   registry.register(createProcessTool(manager));
   const events: ChiliEvent[] = [];
-  const approvals: ApprovalBrokerRequest[] = [];
+  const reviews: ToolReviewRequest[] = [];
   let nextId = 0;
   const executor = new ToolExecutor({
     registry,
@@ -277,15 +273,15 @@ async function createFixture(options: FixtureOptions = {}) {
       await options.publish?.(event);
       events.push(event);
     } },
-    approvals: { async decide(request) {
-      approvals.push(request);
-      return options.denyApproval ? { action: "deny", feedback: "Execution was denied" } : { action: "allow_once" };
+    gate: { async review(request) {
+      reviews.push(request);
+      return options.denyReview ? { decision: "deny", reason: "Execution was denied" } : { decision: "allow" };
     } },
     ...(options.policy ? { policyResolver: { resolve: () => options.policy } } : {}),
     createId: (prefix) => `${prefix}_${++nextId}`,
   });
   return {
-    workspace, otherWorkspace, owner, manager, runner, registry, executor, events, approvals,
+    workspace, otherWorkspace, owner, manager, runner, registry, executor, events, reviews,
     execute(toolName: string, input: unknown, overrides: Partial<ExecuteToolInput> = {}) {
       return executor.execute({
         sessionId: owner.sessionId,

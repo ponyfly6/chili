@@ -69,7 +69,7 @@ export function createGlobTool(): ChiliToolDefinition<GlobInput> {
       if (limit !== undefined) value.limit = limit;
       return { ok: true, value };
     },
-    approval(input) {
+    resources(input) {
       return {
         permission: "glob",
         patterns: [input.path ? `${input.path}/${input.pattern}` : input.pattern],

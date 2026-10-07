@@ -30,7 +30,7 @@ function harness(options: {
     codeMode: true,
     isConcurrencySafe: true,
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     async execute(input) {
       executed.push(input);
       await options.inspect?.();
@@ -43,7 +43,7 @@ function harness(options: {
     risk: "read",
     isOrchestrator: true,
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: (_input, context) => options.compose(context),
   });
   const model: ModelRouter = {
@@ -59,7 +59,7 @@ function harness(options: {
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     ...(options.doomLoopGuard ? { doomLoopGuard: options.doomLoopGuard } : {}),
     ...(options.maxConcurrentToolCalls ? { maxConcurrentToolCalls: options.maxConcurrentToolCalls } : {}),

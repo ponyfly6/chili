@@ -14,6 +14,7 @@ import type {
   ModelSelection,
   ReasoningLevel,
   RuntimePermissionProfileId,
+  RuntimePermissionUpdateOptions,
   ServiceTier,
 } from "@chili/protocol";
 
@@ -38,7 +39,7 @@ export interface ControlTransport {
   setReasoning(sessionId: string, reasoningLevel: ReasoningLevel): Promise<DesktopResponseMap["session.reasoning.set"]>;
   setServiceTier(sessionId: string, serviceTier: ServiceTier): Promise<DesktopResponseMap["session.service-tier.set"]>;
   permissionConfig(): Promise<DesktopResponseMap["permissions.get"]>;
-  setPermission(profile: RuntimePermissionProfileId): Promise<DesktopResponseMap["permissions.set"]>;
+  setPermission(profile: RuntimePermissionProfileId, options?: RuntimePermissionUpdateOptions): Promise<DesktopResponseMap["permissions.set"]>;
   setDelegation(sessionId: string, policy: DelegationPolicy): Promise<DesktopResponseMap["session.delegation.set"]>;
   reloadMcp(sessionId?: string): Promise<DesktopResponseMap["mcp.reload"]>;
   send(sessionId: string, text: string, mode: SendMode): Promise<DesktopResponseMap["session.send"]>;
@@ -46,10 +47,6 @@ export interface ControlTransport {
   sendAgent(sessionId: string, agentId: string, text: string, mode?: SendMode): Promise<DesktopResponseMap["agent.send"]>;
   stopAgent(sessionId: string, agentId: string): Promise<DesktopResponseMap["agent.stop"]>;
   resumeAgent(sessionId: string, agentId: string): Promise<DesktopResponseMap["agent.resume"]>;
-  resolveApproval(
-    approvalId: string,
-    decision: "allow_once" | "allow_session" | "allow_always" | "deny",
-  ): Promise<DesktopResponseMap["approval.resolve"]>;
   resolveUserInput(inputId: string, answers: Record<string, string[]>): Promise<DesktopResponseMap["user-input.resolve"]>;
   completeResync(barrierId: string): Promise<DesktopResponseMap["events.resync.complete"]>;
   diff(scope: DiffScope, sessionId: string, turnId?: string): Promise<DesktopResponseMap["diff.get"]>;
