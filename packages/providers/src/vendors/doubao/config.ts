@@ -7,7 +7,7 @@ export const DOUBAO_DEFINITION = {
   auth: "api_key",
   defaultRequestMaxTokens: 65536,
   unknownModelRequestMaxTokens: 4096,
-  reasoning: "toggle-effort",
+  reasoning: "responses",
   serviceTier: false,
 } satisfies ProviderDefinition;
 

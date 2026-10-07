@@ -51,16 +51,14 @@ test("switching to official APIs uses their own endpoint and credentials and kee
       OPENAI_BASE_URL: "https://openai.invalid/v1",
     },
     apiKey: "minimax-fake-key",
-    baseUrl: "https://minimax.invalid/anthropic",
+    baseUrl: "https://minimax.invalid/v1",
     headers: { "x-private-connection": "minimax-only" },
     maxTokens: 2048,
     fetch: (async (url, init) => {
       const request = { url: String(url), headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) as Record<string, unknown> };
       requests.push(request);
       if (request.url.endsWith("/responses")) {
-        return new Response(`event: response.completed\ndata: ${JSON.stringify({
-          type: "response.completed", response: { id: "resp_vendor", status: "completed", model: request.body.model, output: [] },
-        })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+        return responsesResponse(String(request.body.model));
       }
       return Response.json({ id: "msg_vendor", model: request.body.model, type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" });
     }) as typeof fetch,
@@ -75,8 +73,8 @@ test("switching to official APIs uses their own endpoint and credentials and kee
     for await (const _ of router.stream({ ...input, ...(modelSelection ? { modelSelection } : {}) })) { /* consume */ }
   }
   expect(requests.map((request) => request.url)).toEqual([
-    "https://minimax.invalid/anthropic/v1/messages", "https://anthropic.invalid/v1/messages",
-    "https://openai.invalid/v1/responses", "https://minimax.invalid/anthropic/v1/messages",
+    "https://minimax.invalid/v1/responses", "https://anthropic.invalid/v1/messages",
+    "https://openai.invalid/v1/responses", "https://minimax.invalid/v1/responses",
   ]);
   expect(requests.map((request) => request.headers.get("x-api-key"))).toEqual([null, "anthropic-fake-key", null, null]);
   expect(requests.map((request) => request.headers.get("authorization"))).toEqual(["Bearer minimax-fake-key", null, "Bearer openai-fake-key", "Bearer minimax-fake-key"]);
@@ -97,6 +95,7 @@ test("domestic vendor aliases route to independent connections, including custom
     fetch: (async (url, init) => {
       const request = { url: String(url), headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) as Record<string, unknown> };
       requests.push(request);
+      if (request.url.endsWith("/responses")) return responsesResponse(String(request.body.model));
       return Response.json({ id: "chatcmpl_vendors", model: request.body.model, choices: [{ index: 0, message: { content: "ok" }, finish_reason: "stop" }] });
     }) as typeof fetch,
   });
@@ -105,21 +104,37 @@ test("domestic vendor aliases route to independent connections, including custom
     { provider: "ark", model: "ep-host-routing" },
     { provider: "bigmodel", model: "glm-5.3" },
   ];
-  const identities: string[] = [];
+  const identities: string[][] = [];
   for (const modelSelection of selections) {
+    const selectedIdentities = new Set<string>();
     for await (const event of router.stream({ ...input, modelSelection })) {
-      if (event.type === "metadata" && event.provider && event.model) identities.push(`${event.provider}/${event.model}`);
+      if (event.type === "metadata" && event.provider && event.model) selectedIdentities.add(`${event.provider}/${event.model}`);
     }
+    identities.push([...selectedIdentities]);
   }
   expect(requests.map((request) => request.url)).toEqual([
-    "https://alibaba.invalid/compatible-mode/v1/chat/completions",
-    "https://doubao.invalid/api/v3/chat/completions",
+    "https://alibaba.invalid/compatible-mode/v1/responses",
+    "https://doubao.invalid/api/v3/responses",
     "https://zhipu.invalid/api/paas/v4/chat/completions",
   ]);
   expect(requests.map((request) => request.headers.get("authorization"))).toEqual([
     "Bearer alibaba-fake-key", "Bearer doubao-fake-key", "Bearer zhipu-fake-key",
   ]);
   expect(requests.every((request) => !request.headers.has("x-private-connection"))).toBe(true);
-  expect(requests.map((request) => request.body.max_tokens ?? request.body.max_completion_tokens)).toEqual([2048, 2048, 2048]);
-  expect(identities).toEqual(["alibaba/qwen3.8-max", "doubao/ep-host-routing", "zhipu/glm-5.3"]);
+  expect(requests.map((request) => request.body.max_output_tokens ?? request.body.max_tokens ?? request.body.max_completion_tokens)).toEqual([2048, 2048, 2048]);
+  expect(identities).toEqual([["alibaba/qwen3.8-max"], ["doubao/ep-host-routing"], ["zhipu/glm-5.3"]]);
 });
+
+function responsesResponse(model: string): Response {
+  const item = { id: "msg_vendor", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "ok" }] };
+  const events = [
+    { type: "response.created", response: { id: "resp_vendor", model } },
+    { type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } },
+    { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "ok" },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id: "resp_vendor", status: "completed", model, output: [item] } },
+  ];
+  return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+    headers: { "content-type": "text/event-stream" },
+  });
+}

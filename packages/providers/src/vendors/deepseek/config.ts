@@ -2,7 +2,7 @@ import type { ProviderDefinition, ProviderEnvironmentSpec } from "../../provider
 
 export const DEEPSEEK_DEFINITION = {
   displayName: "DeepSeek", aliases: [], modelPrefixes: ["deepseek-"], auth: "api_key",
-  defaultRequestMaxTokens: 128 * 1024, reasoning: "toggle-effort", serviceTier: false,
+  defaultRequestMaxTokens: 128 * 1024, unknownModelRequestMaxTokens: 4096, reasoning: "toggle-effort", serviceTier: false,
 } satisfies ProviderDefinition;
 
 export const DEEPSEEK_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {

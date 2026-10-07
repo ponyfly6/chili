@@ -64,7 +64,7 @@ afterEach(() => {
   restoreEnv("ANTHROPIC_MODEL", savedEnv.ANTHROPIC_MODEL);
 });
 
-test("CLI DeepSeek env resolution uses official V4 OpenAI-compatible endpoint and model", async () => {
+test("CLI DeepSeek env resolution uses official V4 Responses endpoint and model", async () => {
   process.env.DEEPSEEK_API_KEY = "env-key";
   process.env.DEEPSEEK_BASE_URL = "https://api.deepseek.com";
   process.env.DEEPSEEK_MODEL = "deepseek-v4-flash";
@@ -74,28 +74,18 @@ test("CLI DeepSeek env resolution uses official V4 OpenAI-compatible endpoint an
   const fetchImpl = (async (input, init) => {
     url = String(input);
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    return new Response(
-      JSON.stringify({
-        id: "chatcmpl_cli",
-        model: "deepseek-v4-flash",
-        choices: [{ index: 0, finish_reason: "stop", message: { content: "ok" } }],
-      }),
-      {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      },
-    );
+    return responsesResponse(String(body.model));
   }) as typeof fetch;
 
   const model = await createCliModel("deepseek", { fetch: fetchImpl });
   const limits = await model.resolveRequestLimits?.({});
   const events = await collect(model.stream(emptyInput()));
 
-  expect(url).toBe("https://api.deepseek.com/chat/completions");
+  expect(url).toBe("https://api.deepseek.com/responses");
   expect(body).toMatchObject({
     model: "deepseek-v4-flash",
-    max_tokens: 131072,
-    thinking: { type: "enabled" },
+    max_output_tokens: 131072,
+    reasoning: { effort: "high" },
   });
   expect(limits).toEqual({ contextWindowTokens: 1048576, requestMaxOutputTokens: 131072 });
   expect(events).toContainEqual(expect.objectContaining({
@@ -107,7 +97,7 @@ test("CLI DeepSeek env resolution uses official V4 OpenAI-compatible endpoint an
   }));
 });
 
-test("CLI Kimi env resolution uses latest Moonshot OpenAI-compatible endpoint and model", async () => {
+test("CLI Kimi env resolution uses latest Moonshot Responses endpoint and model", async () => {
   process.env.MOONSHOT_API_KEY = "env-key";
   process.env.MOONSHOT_BASE_URL = "https://api.moonshot.cn/v1";
   delete process.env.MOONSHOT_MODEL;
@@ -117,26 +107,16 @@ test("CLI Kimi env resolution uses latest Moonshot OpenAI-compatible endpoint an
   const fetchImpl = (async (input, init) => {
     url = String(input);
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    return new Response(
-      JSON.stringify({
-        id: "chatcmpl_kimi_cli",
-        model: "kimi-k3",
-        choices: [{ index: 0, finish_reason: "stop", message: { content: "ok" } }],
-      }),
-      {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      },
-    );
+    return responsesResponse(String(body.model));
   }) as typeof fetch;
 
   const model = await createCliModel("kimi", { fetch: fetchImpl });
   const events = await collect(model.stream(emptyInput()));
 
-  expect(url).toBe("https://api.moonshot.cn/v1/chat/completions");
+  expect(url).toBe("https://api.moonshot.cn/v1/responses");
   expect(body).toMatchObject({
     model: "kimi-k3",
-    max_completion_tokens: 131072,
+    max_output_tokens: 131072,
   });
   expect(body).not.toHaveProperty("thinking");
   expect(events).toContainEqual(expect.objectContaining({
@@ -240,25 +220,18 @@ test("CLI grok alias routes to xAI Grok 4.7 with documented reasoning parameters
   const fetchImpl = (async (input, init) => {
     url = String(input);
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    return new Response(
-      JSON.stringify({
-        id: "chatcmpl_grok_cli",
-        model: "grok-4.7",
-        choices: [{ index: 0, finish_reason: "stop", message: { content: "ok" } }],
-      }),
-      { status: 200, headers: { "content-type": "application/json" } },
-    );
+    return responsesResponse(String(body.model));
   }) as typeof fetch;
 
   const model = await createCliModel("grok:xhigh", { fetch: fetchImpl });
   const limits = await model.resolveRequestLimits?.({});
   const events = await collect(model.stream(emptyInput()));
 
-  expect(url).toBe("https://api.x.ai/v1/chat/completions");
+  expect(url).toBe("https://api.x.ai/v1/responses");
   expect(body).toMatchObject({
     model: "grok-4.7",
-    max_completion_tokens: 128000,
-    reasoning_effort: "xhigh",
+    max_output_tokens: 128000,
+    reasoning: { effort: "xhigh" },
   });
   expect(body).not.toHaveProperty("thinking");
   expect(limits).toEqual({ contextWindowTokens: 500000, requestMaxOutputTokens: 128000 });
@@ -270,7 +243,7 @@ test("CLI grok alias routes to xAI Grok 4.7 with documented reasoning parameters
   }));
 });
 
-test("CLI MiniMax env resolution prefers Anthropic-compatible base URL over generic MiniMax base URL", async () => {
+test("CLI MiniMax env resolution uses Responses base URL and ignores the removed Anthropic base URL", async () => {
   process.env.MINIMAX_API_KEY = "env-key";
   process.env.MINIMAX_BASE_URL = "https://api.minimaxi.com/v1";
   process.env.MINIMAX_ANTHROPIC_BASE_URL = "https://api.minimaxi.com/anthropic";
@@ -283,21 +256,19 @@ test("CLI MiniMax env resolution prefers Anthropic-compatible base URL over gene
   const fetchImpl = (async (input, init) => {
     url = String(input);
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    return new Response(JSON.stringify({ content: [], stop_reason: "end_turn" }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    return responsesResponse(String(body.model));
   }) as typeof fetch;
 
   const model = await createCliModel("minimax", { fetch: fetchImpl });
   await collect(model.stream(emptyInput()));
 
-  expect(url).toBe("https://api.minimaxi.com/anthropic/v1/messages");
+  expect(url).toBe("https://api.minimaxi.com/v1/responses");
   expect(body).toMatchObject({
     model: "MiniMax-M3",
-    max_tokens: 131072,
-    thinking: { type: "adaptive" },
+    max_output_tokens: 131072,
+    reasoning: { effort: "high" },
   });
+  expect(body).not.toHaveProperty("thinking");
 });
 
 test("CLI runtime model selection resolves explicit provider aliases to concrete defaults", () => {
@@ -686,14 +657,7 @@ test("CLI binds explicit credentials and headers to their initial provider", asy
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     requests.push({ url, headers: new Headers(init?.headers), body });
     if (url.startsWith("https://deepseek-private.test/")) {
-      return new Response(
-        JSON.stringify({
-          id: "chatcmpl_scoped",
-          model: body.model,
-          choices: [{ index: 0, finish_reason: "stop", message: { content: "ok" } }],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
+      return responsesResponse(String(body.model));
     }
     return codexResponse(String(body.model));
   }) as typeof fetch;
@@ -711,7 +675,7 @@ test("CLI binds explicit credentials and headers to their initial provider", asy
   } as ModelStreamInput & { modelSelection: { provider: string; model: string } }));
 
   expect(requests).toHaveLength(2);
-  expect(requests[0]?.url).toBe("https://deepseek-private.test/v1/chat/completions");
+  expect(requests[0]?.url).toBe("https://deepseek-private.test/v1/responses");
   expect(requests[0]?.headers.get("authorization")).toBe("Bearer deepseek-private-key");
   expect(requests[0]?.headers.get("x-provider-secret")).toBe("deepseek-private-header");
   expect(requests[1]?.url).toBe("https://gateway.test/v1/responses");
@@ -798,17 +762,7 @@ test("CLI DeepSeek reasoning off disables thinking", async () => {
   let body: Record<string, unknown> = {};
   const fetchImpl = (async (_input, init) => {
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    return new Response(
-      JSON.stringify({
-        id: "chatcmpl_cli",
-        model: "deepseek-v4-pro",
-        choices: [{ index: 0, finish_reason: "stop", message: { content: "ok" } }],
-      }),
-      {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      },
-    );
+    return responsesResponse(String(body.model));
   }) as typeof fetch;
 
   const model = await createCliModel({ provider: "deepseek", reasoningLevel: "off" }, { fetch: fetchImpl });
@@ -816,7 +770,7 @@ test("CLI DeepSeek reasoning off disables thinking", async () => {
 
   expect(body).toMatchObject({
     model: "deepseek-v4-pro",
-    thinking: { type: "disabled" },
+    reasoning: { effort: "none" },
   });
   expect(body).not.toHaveProperty("reasoning_effort");
 });
@@ -829,17 +783,7 @@ test("CLI Kimi K3 clamps reasoning off to low without sending a thinking switch"
   let body: Record<string, unknown> = {};
   const fetchImpl = (async (_input, init) => {
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    return new Response(
-      JSON.stringify({
-        id: "chatcmpl_kimi_cli",
-        model: "kimi-k3",
-        choices: [{ index: 0, finish_reason: "stop", message: { content: "ok" } }],
-      }),
-      {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      },
-    );
+    return responsesResponse(String(body.model));
   }) as typeof fetch;
 
   const model = await createCliModel({ provider: "kimi", reasoningLevel: "off" }, { fetch: fetchImpl });
@@ -847,10 +791,43 @@ test("CLI Kimi K3 clamps reasoning off to low without sending a thinking switch"
 
   expect(body).toMatchObject({
     model: "kimi-k3",
-    max_completion_tokens: 131072,
-    reasoning_effort: "low",
+    max_output_tokens: 131072,
+    reasoning: { effort: "low" },
   });
   expect(body).not.toHaveProperty("thinking");
+});
+
+test("CLI Kimi model switches select Responses for K3 and retain Chat Completions for K2.7", async () => {
+  const requests: { url: string; headers: Headers; body: Record<string, unknown> }[] = [];
+  const model = await createCliModel({ provider: "kimi", model: "kimi-k3" }, {
+    env: {},
+    apiKey: "kimi-switch-key",
+    baseUrl: "https://kimi-switch.invalid/v1",
+    fetch: (async (url, init) => {
+      const request = { url: String(url), headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) as Record<string, unknown> };
+      requests.push(request);
+      if (request.url.endsWith("/responses")) return responsesResponse(String(request.body.model));
+      return Response.json({ id: "chatcmpl_k27", model: request.body.model, choices: [{ index: 0, message: { content: "ok" }, finish_reason: "stop" }] });
+    }) as typeof fetch,
+  });
+
+  await collect(model.stream(emptyInput()));
+  await collect(model.stream({
+    ...emptyInput(),
+    modelSelection: { provider: "kimi", model: "kimi-k2.7-code" },
+  } as ModelStreamInput & { modelSelection: { provider: string; model: string } }));
+  await collect(model.stream(emptyInput()));
+
+  expect(requests.map((request) => request.url)).toEqual([
+    "https://kimi-switch.invalid/v1/responses",
+    "https://kimi-switch.invalid/v1/chat/completions",
+    "https://kimi-switch.invalid/v1/responses",
+  ]);
+  expect(requests.map((request) => request.body.model)).toEqual(["kimi-k3", "kimi-k2.7-code", "kimi-k3"]);
+  expect(requests.map((request) => request.headers.get("authorization"))).toEqual(Array(3).fill("Bearer kimi-switch-key"));
+  expect(requests[0]?.body).toHaveProperty("input");
+  expect(requests[1]?.body).toHaveProperty("messages");
+  expect(requests[1]?.body).not.toHaveProperty("input");
 });
 
 async function collect(stream: AsyncIterable<unknown>): Promise<unknown[]> {
@@ -891,6 +868,17 @@ function streamText(text: string): ReadableStream<Uint8Array> {
       controller.close();
     },
   });
+}
+
+function responsesResponse(model: string): Response {
+  const item = { id: "msg_cli", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "ok" }] };
+  return new Response(streamText([
+    data({ type: "response.created", response: { id: "resp_cli", model } }),
+    data({ type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } }),
+    data({ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "ok" }),
+    data({ type: "response.output_item.done", output_index: 0, item }),
+    data({ type: "response.completed", response: { id: "resp_cli", model, status: "completed", output: [item] } }),
+  ].join("")), { headers: { "content-type": "text/event-stream" } });
 }
 
 function codexResponse(model: string): Response {

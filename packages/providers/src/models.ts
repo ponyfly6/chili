@@ -82,7 +82,15 @@ function cloneModelDescriptor(model: ModelDescriptor): ModelDescriptor {
             },
           }
         : {}),
-      ...(model.compatibility.responses ? { responses: { ...model.compatibility.responses } } : {}),
+      ...(model.compatibility.responses
+        ? {
+            responses: {
+              ...model.compatibility.responses,
+              ...(model.compatibility.responses.reasoningEffortMap
+                ? { reasoningEffortMap: { ...model.compatibility.responses.reasoningEffortMap } } : {}),
+            },
+          }
+        : {}),
     };
   }
   if (model.inputCapabilities) clone.inputCapabilities = [...model.inputCapabilities];

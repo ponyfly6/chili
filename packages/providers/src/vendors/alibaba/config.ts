@@ -7,7 +7,7 @@ export const ALIBABA_DEFINITION = {
   auth: "api_key",
   defaultRequestMaxTokens: 131072,
   unknownModelRequestMaxTokens: 4096,
-  reasoning: "toggle-effort",
+  reasoning: "responses",
   serviceTier: false,
 } satisfies ProviderDefinition;
 

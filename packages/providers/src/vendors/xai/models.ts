@@ -5,12 +5,17 @@ export const XAI_GROK_46_MODEL = "grok-4.6";
 export const XAI_GROK_47_MODEL = "grok-4.7";
 export const XAI_OPENAI_BASE_URL = "https://api.x.ai/v1";
 
+export const XAI_REASONING_EFFORT_MAP = {
+  off: "low", minimal: "low", low: "low", medium: "medium", high: "high",
+  xhigh: "xhigh", max: "xhigh", ultra: "xhigh",
+} as const;
+
 export const XAI_MODELS = [
   ...[XAI_GROK_47_MODEL, XAI_GROK_46_MODEL].map((model): ModelDescriptor => ({
     provider: XAI_PROVIDER_ID,
     model,
     displayName: model === XAI_GROK_47_MODEL ? "Grok 4.7" : "Grok 4.6",
-    apiFamily: "openai-completions",
+    apiFamily: "openai-responses",
     baseUrl: XAI_OPENAI_BASE_URL,
     ...(model === XAI_GROK_47_MODEL ? { default: true } : {}),
     inputCapabilities: ["text", "image"],
@@ -25,27 +30,6 @@ export const XAI_MODELS = [
       usage: true,
       responseId: true,
     },
-    compatibility: {
-      chatCompletions: {
-        supportsStore: false,
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: true,
-        reasoningEffortMap: {
-          off: "low",
-          minimal: "low",
-          low: "low",
-          medium: "medium",
-          high: "high",
-          xhigh: "xhigh",
-          max: "xhigh",
-          ultra: "xhigh",
-        },
-        supportsUsageInStreaming: true,
-        maxTokensField: "max_completion_tokens",
-        requiresReasoningContentOnAssistantMessages: false,
-        reasoningParameterStyle: "xai",
-        toolCallDeltaMode: "standard",
-      },
-    },
+    compatibility: { responses: { reasoningEffortMap: XAI_REASONING_EFFORT_MAP } },
   })),
 ] satisfies readonly ModelDescriptor[];

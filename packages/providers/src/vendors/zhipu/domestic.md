@@ -4,7 +4,9 @@
 
 配置 `ZHIPU_API_KEY`（或 `BIGMODEL_API_KEY`），选择 provider `zhipu`。默认模型为 `glm-5.3`；也收录 `glm-5.3-flash` 和 `glm-5.3-flashx`。`ZHIPU_MODEL` / `BIGMODEL_MODEL` 可覆盖模型。旧 `glm` 别名和 `glm-*` 自动识别仍指向 `zai`，国内接入应明确选择 `zhipu` 或 `bigmodel`。
 
-默认使用按量 API 地址 `https://open.bigmodel.cn/api/paas/v4`。使用 GLM Coding Plan 时，将 `ZHIPU_BASE_URL`（或 `BIGMODEL_BASE_URL`）设为 `https://open.bigmodel.cn/api/coding/paas/v4`，并配置对应套餐的密钥。团队套餐密钥与其他平台密钥不通用。这里使用 Chat Completions 协议；不要填 Responses 或 Anthropic 地址，也不会自动切换到按量 API。[官方接入说明](https://docs.bigmodel.cn/cn/coding-plan/tool/others)
+默认使用按量 Chat Completions 地址 `https://open.bigmodel.cn/api/paas/v4`。符合 Responses 使用条件的账号，推荐将 `ZHIPU_BASE_URL`（或 `BIGMODEL_BASE_URL`）设为 `https://open.bigmodel.cn/api/v1`，Chili 自动使用 Responses。完整的 `/api/v1/responses` 地址也支持。使用套餐的 Chat Completions 协议时，可明确选择 `https://open.bigmodel.cn/api/coding/paas/v4`。请配置对应产品的密钥；团队套餐密钥与其他平台密钥不通用，请求失败不会自动切换计费地址。[官方接入说明](https://docs.bigmodel.cn/cn/coding-plan/tool/others)、[Responses 说明](https://docs.bigmodel.cn/cn/guide/develop/responses/introduction)
+
+官方 GLM-5.3 文档说明：曾订阅 Coding Plan（含已过期）的账号，目前调用普通模型 API 只支持 Chat Completions。密钥本身无法提供这项账户历史，因此未明确选地址时保留通用按量接口；这不表示智谱不支持 Responses。[账号限制](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3)
 
 GLM-5.3 为文本模型；Flash / FlashX 在 Chili 中开放文本和图片输入。官方另有视频、文件能力，但 Chili 当前消息协议未开放这些输入。三款采用 1M 上下文与 128K 输出限制，推理始终开启；Chili 的关闭选项映射为 `low`，中间强度归一为 `low` / `high` / `max`。FlashX 当前不在 Coding Plan 套餐内。[GLM-5.3](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3)、[Flash / FlashX](https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash)
 

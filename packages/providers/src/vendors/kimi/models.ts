@@ -11,7 +11,7 @@ export const KIMI_MODELS = [
     provider: KIMI_PROVIDER_ID,
     model: KIMI_K3_MODEL,
     displayName: "Kimi K3",
-    apiFamily: "openai-completions",
+    apiFamily: "openai-responses",
     baseUrl: KIMI_OPENAI_BASE_URL,
     default: true,
     inputCapabilities: ["text", "image"],
@@ -28,10 +28,8 @@ export const KIMI_MODELS = [
       responseId: true,
     },
     compatibility: {
-      chatCompletions: {
-        supportsStore: false,
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: true,
+      responses: {
+        sendSessionIdHeader: false,
         reasoningEffortMap: {
           off: "low",
           minimal: "low",
@@ -42,11 +40,6 @@ export const KIMI_MODELS = [
           max: "max",
           ultra: "max",
         },
-        supportsUsageInStreaming: true,
-        maxTokensField: "max_completion_tokens",
-        requiresReasoningContentOnAssistantMessages: true,
-        reasoningParameterStyle: "moonshot-k3",
-        toolCallDeltaMode: "standard",
       },
     },
   },

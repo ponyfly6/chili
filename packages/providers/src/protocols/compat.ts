@@ -42,6 +42,7 @@ export interface ChatCompletionsCompatibility {
 
 export interface ResponsesCompatibility {
   sendSessionIdHeader: boolean;
+  reasoningEffortMap?: Partial<Record<string, string>>;
 }
 
 export interface ModelCompatibilityOverrides {
@@ -104,6 +105,7 @@ export function resolveResponsesCompatibility(
 ): ResponsesCompatibility {
   return {
     sendSessionIdHeader: overrides.sendSessionIdHeader ?? true,
+    ...(overrides.reasoningEffortMap ? { reasoningEffortMap: { ...overrides.reasoningEffortMap } } : {}),
   };
 }
 

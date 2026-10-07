@@ -13,7 +13,7 @@ export const DEEPSEEK_MODELS = [
     provider: DEEPSEEK_PROVIDER_ID,
     model: DEEPSEEK_V4_PRO_MODEL,
     displayName: "DeepSeek V4 Pro (0813)",
-    apiFamily: "openai-completions",
+    apiFamily: "openai-responses",
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     default: true,
     inputCapabilities: ["text"],
@@ -30,10 +30,8 @@ export const DEEPSEEK_MODELS = [
       responseId: true,
     },
     compatibility: {
-      chatCompletions: {
-        supportsStore: false,
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: true,
+      responses: {
+        sendSessionIdHeader: false,
         reasoningEffortMap: {
           off: "low",
           minimal: "low",
@@ -44,11 +42,6 @@ export const DEEPSEEK_MODELS = [
           max: "max",
           ultra: "max",
         },
-        supportsUsageInStreaming: true,
-        maxTokensField: "max_tokens",
-        requiresReasoningContentOnAssistantMessages: true,
-        reasoningParameterStyle: "deepseek",
-        toolCallDeltaMode: "standard",
       },
     },
   },
@@ -56,7 +49,7 @@ export const DEEPSEEK_MODELS = [
     provider: DEEPSEEK_PROVIDER_ID,
     model,
     displayName: model === DEEPSEEK_FLASH_MODEL ? "DeepSeek V4.1 Flash" : "DeepSeek V4.1 Flash (legacy alias)",
-    apiFamily: "openai-completions",
+    apiFamily: "openai-responses",
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     inputCapabilities: ["text", "image"],
     contextWindowTokens: 1048576,
@@ -72,10 +65,8 @@ export const DEEPSEEK_MODELS = [
       responseId: true,
     },
     compatibility: {
-      chatCompletions: {
-        supportsStore: false,
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: true,
+      responses: {
+        sendSessionIdHeader: false,
         reasoningEffortMap: {
           off: "low",
           minimal: "low",
@@ -86,11 +77,6 @@ export const DEEPSEEK_MODELS = [
           max: "max",
           ultra: "max",
         },
-        supportsUsageInStreaming: true,
-        maxTokensField: "max_tokens",
-        requiresReasoningContentOnAssistantMessages: true,
-        reasoningParameterStyle: "deepseek",
-        toolCallDeltaMode: "standard",
       },
     },
   })),

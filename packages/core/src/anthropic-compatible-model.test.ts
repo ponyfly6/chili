@@ -19,7 +19,7 @@ test("MiniMax M3 router defaults to 131072 output tokens and supports image inpu
   let body: Record<string, unknown> = {};
   const fetchImpl = (async (_url, init) => {
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    return new Response(JSON.stringify({ content: [], stop_reason: "stop" }), { status: 200 });
+    return miniMaxResponse();
   }) as typeof fetch;
   const sessionId = "session_image" as SessionId;
   const messageId = "message_image" as MessageId;
@@ -54,15 +54,15 @@ test("MiniMax M3 router defaults to 131072 output tokens and supports image inpu
   }
 
   expect(body.model).toBe(MINIMAX_M3_MODEL);
-  expect(body.max_tokens).toBe(131072);
-  expect(body.stream).toBe(false);
-  expect(body.thinking).toEqual({ type: "adaptive" });
+  expect(body.max_output_tokens).toBe(131072);
+  expect(body.stream).toBe(true);
+  expect(body.reasoning).toEqual({ effort: "high" });
   expect(body).not.toHaveProperty("service_tier");
-  expect(body.messages).toEqual([{
+  expect(body.input).toEqual([{
     role: "user",
     content: [{
-      type: "image",
-      source: { type: "base64", media_type: "image/png", data: "aW1hZ2U=" },
+      type: "input_image",
+      image_url: "data:image/png;base64,aW1hZ2U=",
     }],
   }]);
 });
@@ -71,7 +71,7 @@ test("MiniMax M3 request controls override router defaults", async () => {
   const bodies: Record<string, unknown>[] = [];
   const fetchImpl = (async (_url, init) => {
     bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
-    return new Response(JSON.stringify({ content: [], stop_reason: "stop" }), { status: 200 });
+    return miniMaxResponse();
   }) as typeof fetch;
   const adaptiveFast = createMiniMaxM3Router({
     apiKey: "test-key",
@@ -112,9 +112,9 @@ test("MiniMax M3 request controls override router defaults", async () => {
     // drain stream
   }
 
-  expect(bodies[0]?.thinking).toEqual({ type: "disabled" });
+  expect(bodies[0]?.reasoning).toEqual({ effort: "none" });
   expect(bodies[0]).not.toHaveProperty("service_tier");
-  expect(bodies[1]?.thinking).toEqual({ type: "adaptive" });
+  expect(bodies[1]?.reasoning).toEqual({ effort: "high" });
   expect(bodies[1]?.service_tier).toBe("priority");
 });
 
@@ -126,7 +126,7 @@ test("MiniMax M3 env precedence matches the provider and supports MINIMAX_BASE_U
       headers: { authorization: new Headers(init?.headers).get("authorization") ?? "" },
       body: JSON.parse(String(init?.body)) as Record<string, unknown>,
     });
-    return new Response(JSON.stringify({ content: [], stop_reason: "stop" }), { status: 200 });
+    return miniMaxResponse();
   }) as typeof fetch;
   const preferred = createMiniMaxM3Router({
     env: {
@@ -136,7 +136,7 @@ test("MiniMax M3 env precedence matches the provider and supports MINIMAX_BASE_U
       ANTHROPIC_MODEL: "anthropic-model",
       MINIMAX_ANTHROPIC_BASE_URL: "https://preferred.test/anthropic",
       ANTHROPIC_BASE_URL: "https://anthropic.test/anthropic",
-      MINIMAX_BASE_URL: "https://fallback.test/v1",
+      MINIMAX_BASE_URL: "https://preferred.test/v1",
     },
     fetch: fetchImpl,
   });
@@ -163,12 +163,12 @@ test("MiniMax M3 env precedence matches the provider and supports MINIMAX_BASE_U
   }
 
   expect(requests[0]).toMatchObject({
-    url: "https://preferred.test/anthropic/v1/messages",
+    url: "https://preferred.test/v1/responses",
     headers: { authorization: "Bearer minimax-key" },
     body: { model: "minimax-model" },
   });
   expect(requests[1]).toMatchObject({
-    url: "https://fallback-only.test/v1/messages",
+    url: "https://fallback-only.test/v1/responses",
     headers: { authorization: "Bearer fallback-key" },
     body: { model: MINIMAX_M3_MODEL },
   });
@@ -181,6 +181,12 @@ test("legacy MiniMax router does not take another vendor's credentials", () => {
     ANTHROPIC_MODEL: "claude-custom",
   } })).toThrow("requires an API key");
 });
+
+function miniMaxResponse(): Response {
+  return new Response(`data: ${JSON.stringify({ type: "response.completed", response: {
+    id: "response_minimax", status: "completed", output: [],
+  } })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+}
 
 test("passes AbortSignal through to the provider fetch", async () => {
   const controller = new AbortController();

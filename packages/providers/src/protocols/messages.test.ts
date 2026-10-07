@@ -3,8 +3,6 @@ import type { Message, MessageId, PartId, SessionId, TimestampMs, ToolCallId } f
 import {
   AnthropicCompatibleModel,
   buildAnthropicRequestBody,
-  createMiniMaxM3Model,
-  MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M3_MODEL,
   normalizeAnthropicToolCallId,
   ProviderBackpressureCoordinator,
@@ -268,11 +266,14 @@ test("converts pasted user images into Anthropic image blocks", () => {
   ]);
 });
 
-test("MiniMax M3 includes image tool results as multimodal context", async () => {
+test("Messages includes image tool results as multimodal context", async () => {
   const callId = "toolcall_image" as ToolCallId;
   let fetchCalled = false;
   let body: Record<string, unknown> | undefined;
-  const model = createMiniMaxM3Model({
+  const model = new AnthropicCompatibleModel({
+    provider: "minimax",
+    baseUrl: "https://messages.test/anthropic",
+    inputCapabilities: ["text", "image"],
     apiKey: "test-key",
     model: MINIMAX_M3_MODEL,
     fetch: (async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
@@ -406,10 +407,12 @@ test("passes AbortSignal through to fetch and requests streaming", async () => {
     });
   }) as typeof fetch;
 
-  const model = createMiniMaxM3Model({
+  const model = new AnthropicCompatibleModel({
+    provider: "minimax",
+    model: MINIMAX_M3_MODEL,
+    reasoning: true,
     apiKey: "test-key",
-    baseUrl: MINIMAX_ANTHROPIC_BASE_URL,
-    env: {},
+    baseUrl: "https://messages.test/anthropic",
     fetch: fetchImpl,
     maxTokens: 64,
   });
@@ -423,7 +426,7 @@ test("passes AbortSignal through to fetch and requests streaming", async () => {
     }),
   );
 
-  expect(url).toBe(`${MINIMAX_ANTHROPIC_BASE_URL}/v1/messages`);
+  expect(url).toBe("https://messages.test/anthropic/v1/messages");
   expect(signal).toBeInstanceOf(AbortSignal);
   expect(body?.model).toBe(MINIMAX_M3_MODEL);
   expect(body?.max_tokens).toBe(64);

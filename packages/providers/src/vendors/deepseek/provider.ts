@@ -1,5 +1,5 @@
 import { DEEPSEEK_DEFINITION, DEEPSEEK_ENVIRONMENT } from "./config.js";
-import type { ChiliModelProvider, ModelDescriptor, ReasoningLevel } from "../../types.js";
+import type { ChiliModel, ChiliModelProvider, ModelDescriptor, ReasoningLevel } from "../../types.js";
 import { type EnvironmentSource, readEnvironmentSpec } from "../../env.js";
 import { findDefaultKnownModel, findKnownModel, listKnownModels } from "../../models.js";
 import {
@@ -8,6 +8,8 @@ import {
   DEEPSEEK_V4_PRO_MODEL,
 } from "./models.js";
 import { OpenAICompletionsModel, type OpenAICompletionsModelOptions } from "../../protocols/chat-completions.js";
+import { createApiKeyResponsesModel } from "../../protocols/api-key-responses.js";
+import { buildDeepSeekResponsesRequestBody, resolveDeepSeekResponsesRequestOptions } from "./request.js";
 
 export {
   DEEPSEEK_FLASH_MODEL,
@@ -31,8 +33,6 @@ export interface DeepSeekModelOptions {
   env?: EnvironmentSource;
 }
 
-const DEFAULT_DEEPSEEK_REASONING_EFFORT: ReasoningLevel = "high";
-
 export class DeepSeekOpenAIProvider implements ChiliModelProvider {
   readonly id = DEEPSEEK_PROVIDER_ID;
   readonly name = "DeepSeek";
@@ -54,24 +54,18 @@ export class DeepSeekOpenAIProvider implements ChiliModelProvider {
       });
     }
 
-    const fallback = findDefaultKnownModel(this.id);
     const descriptor: ModelDescriptor = {
       provider: this.id,
       model: defaultModel,
       displayName: defaultModel,
-      apiFamily: fallback?.apiFamily ?? "openai-completions",
+      apiFamily: "openai-completions",
       baseUrl: this.defaultBaseUrl(),
       default: true,
     };
-    if (fallback?.capabilities) descriptor.capabilities = fallback.capabilities;
-    if (fallback?.compatibility) descriptor.compatibility = fallback.compatibility;
-    if (fallback?.inputCapabilities) descriptor.inputCapabilities = fallback.inputCapabilities;
-    if (fallback?.contextWindowTokens !== undefined) descriptor.contextWindowTokens = fallback.contextWindowTokens;
-    if (fallback?.maxOutputTokens !== undefined) descriptor.maxOutputTokens = fallback.maxOutputTokens;
     return [descriptor, ...models.map(withoutDefaultFlag)];
   }
 
-  getModel(model?: string): OpenAICompletionsModel {
+  getModel(model?: string): ChiliModel {
     return createDeepSeekV4Model({ ...this.options, ...(model ? { model } : {}) });
   }
 
@@ -97,31 +91,73 @@ export function createDeepSeekProvider(options: DeepSeekModelOptions = {}): Deep
   return new DeepSeekOpenAIProvider(options);
 }
 
-export function createDeepSeekRouter(options: DeepSeekModelOptions = {}): OpenAICompletionsModel {
+export function createDeepSeekRouter(options: DeepSeekModelOptions = {}): ChiliModel {
   return createDeepSeekV4Model(options);
 }
 
-export function createDeepSeekV4Model(options: DeepSeekModelOptions = {}): OpenAICompletionsModel {
+export function createDeepSeekV4Model(options: DeepSeekModelOptions = {}): ChiliModel {
   const env = readEnvironmentSpec(DEEPSEEK_ENVIRONMENT, options.env);
   const model = options.model ?? env.model ?? DEEPSEEK_V4_PRO_MODEL;
-  const descriptor = findKnownModel(DEEPSEEK_PROVIDER_ID, model) ?? findDefaultKnownModel(DEEPSEEK_PROVIDER_ID);
+  const descriptor = findKnownModel(DEEPSEEK_PROVIDER_ID, model);
+  const apiKey = options.apiKey ?? env.apiKey ?? "";
+  if (!apiKey.trim()) throw new Error("DeepSeek provider requires DEEPSEEK_API_KEY");
+  const baseUrl = options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? DEEPSEEK_OPENAI_BASE_URL;
+  if (descriptor?.apiFamily === "openai-responses") {
+    return createApiKeyResponsesModel({
+      provider: DEEPSEEK_PROVIDER_ID,
+      providerLabel: "DeepSeek",
+      model,
+      apiKey,
+      endpoint: resolveDeepSeekResponsesUrl(baseUrl),
+      ...(options.fetch ? { fetch: options.fetch } : {}),
+      ...(options.headers ? { headers: options.headers } : {}),
+      resolveRequestOptions: (input) => resolveDeepSeekResponsesRequestOptions(input, { ...options, model }),
+      buildRequestBody: buildDeepSeekResponsesRequestBody,
+    });
+  }
+  if (new URL(baseUrl).pathname.replace(/\/+$/, "").endsWith("/responses")) {
+    throw new Error(`DeepSeek Responses is not verified for model "${model}"; use a base URL or Chat Completions endpoint for this custom model`);
+  }
   const modelOptions: OpenAICompletionsModelOptions = {
     provider: DEEPSEEK_PROVIDER_ID,
     model,
-    baseUrl: resolveDeepSeekCompletionsUrl(options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? DEEPSEEK_OPENAI_BASE_URL),
-    apiKey: options.apiKey ?? env.apiKey ?? "",
-    reasoning: options.reasoning ?? true,
-    maxTokens: options.maxTokens ?? DEEPSEEK_DEFINITION.defaultRequestMaxTokens,
+    baseUrl: resolveDeepSeekCompletionsUrl(baseUrl),
+    apiKey,
+    maxTokens: options.maxTokens ?? DEEPSEEK_DEFINITION.unknownModelRequestMaxTokens,
+    inputCapabilities: descriptor?.inputCapabilities ?? ["text"],
+    compatibility: descriptor?.compatibility?.chatCompletions ?? {
+      supportsStore: false,
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: false,
+      reasoningEffortMap: {},
+      supportsUsageInStreaming: true,
+      maxTokensField: "max_tokens",
+      requiresReasoningContentOnAssistantMessages: false,
+      reasoningParameterStyle: "native",
+      toolCallDeltaMode: "standard",
+    },
   };
-  if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
-  if (descriptor?.compatibility?.chatCompletions) modelOptions.compatibility = descriptor.compatibility.chatCompletions;
-  if (modelOptions.reasoning) {
-    modelOptions.reasoningEffort = options.reasoningEffort ?? DEFAULT_DEEPSEEK_REASONING_EFFORT;
+  if (descriptor?.capabilities?.reasoning) {
+    modelOptions.reasoning = options.reasoning ?? true;
+    if (modelOptions.reasoning) modelOptions.reasoningEffort = options.reasoningEffort ?? "high";
   }
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
   if (options.fetch !== undefined) modelOptions.fetch = options.fetch;
   if (options.headers !== undefined) modelOptions.headers = options.headers;
   return new OpenAICompletionsModel(modelOptions);
+}
+
+export function resolveDeepSeekResponsesUrl(baseUrl: string): string {
+  const url = new URL(baseUrl);
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("DeepSeek requires an absolute HTTP(S) Responses endpoint");
+  }
+  const path = url.pathname.replace(/\/+$/, "");
+  if (path.endsWith("/chat/completions") || path.endsWith("/messages")) {
+    throw new Error("DeepSeek models use Responses; replace the Chat Completions or Messages endpoint with a Responses base URL");
+  }
+  url.pathname = path.endsWith("/responses") ? path : `${path}/responses`;
+  return url.toString();
 }
 
 export function resolveDeepSeekCompletionsUrl(baseUrl: string): string {

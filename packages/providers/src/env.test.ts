@@ -50,7 +50,7 @@ test("provider environment specs expose the supported variable names and precede
   });
   expect(MINIMAX_ENVIRONMENT).toEqual({
     apiKey: ["MINIMAX_API_KEY"],
-    baseUrl: ["MINIMAX_ANTHROPIC_BASE_URL", "MINIMAX_BASE_URL"],
+    baseUrl: ["MINIMAX_BASE_URL"],
     model: ["MINIMAX_MODEL"],
   });
   expect(XAI_ENVIRONMENT).toEqual({
@@ -134,12 +134,22 @@ test("MiniMax environment resolution uses MiniMax variables without consuming An
   expect(readMiniMaxEnvironment(env)).toEqual({
     apiKey: "minimax-key",
     apiKeyEnv: "MINIMAX_API_KEY",
-    baseUrl: "https://minimax-anthropic.test",
-    baseUrlEnv: "MINIMAX_ANTHROPIC_BASE_URL",
+    baseUrl: "https://minimax-generic.test/v1",
+    baseUrlEnv: "MINIMAX_BASE_URL",
     model: MINIMAX_M3_MODEL,
     modelEnv: "MINIMAX_MODEL",
   });
   expect(readProviderEnvironment(MINIMAX_PROVIDER_ID, env)).toEqual(readMiniMaxEnvironment(env));
+  expect(findConfiguredEnvironmentNames(MINIMAX_PROVIDER_ID, env)).toEqual([
+    "MINIMAX_API_KEY",
+    "MINIMAX_BASE_URL",
+    "MINIMAX_MODEL",
+  ]);
+  expect(snapshotProviderEnvironment(MINIMAX_PROVIDER_ID, env)).toEqual({
+    MINIMAX_API_KEY: "minimax-key",
+    MINIMAX_BASE_URL: "https://minimax-generic.test/v1",
+    MINIMAX_MODEL: MINIMAX_M3_MODEL,
+  });
 
   expect(readMiniMaxEnvironment({
     ANTHROPIC_API_KEY: "anthropic-key",
@@ -159,6 +169,14 @@ test("MiniMax ignores an Anthropic-only connection in reads, discovery, and snap
     ANTHROPIC_MODEL: "claude-custom",
   };
   expect(readMiniMaxEnvironment(env)).toEqual({});
+  expect(findConfiguredEnvironmentNames(MINIMAX_PROVIDER_ID, env)).toEqual([]);
+  expect(snapshotProviderEnvironment(MINIMAX_PROVIDER_ID, env)).toEqual({});
+});
+
+test("MiniMax ignores its retired Anthropic endpoint variable in reads, discovery, and snapshots", () => {
+  const env = { MINIMAX_ANTHROPIC_BASE_URL: "https://minimax-anthropic.test" };
+  expect(readMiniMaxEnvironment(env)).toEqual({});
+  expect(readProviderEnvironment(MINIMAX_PROVIDER_ID, env)).toEqual({});
   expect(findConfiguredEnvironmentNames(MINIMAX_PROVIDER_ID, env)).toEqual([]);
   expect(snapshotProviderEnvironment(MINIMAX_PROVIDER_ID, env)).toEqual({});
 });

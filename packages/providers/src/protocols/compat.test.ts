@@ -22,9 +22,9 @@ test("resolves compatibility from model descriptors", () => {
 
   expect(descriptor).toBeDefined();
   expect(resolveModelCompatibility(descriptor!)).toEqual({
-    apiFamily: "anthropic-messages",
+    apiFamily: "openai-responses",
     compatibility: {
-      supportsEagerToolInputStreaming: true,
+      sendSessionIdHeader: false,
     },
   });
 });

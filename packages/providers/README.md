@@ -15,8 +15,8 @@ Shared protocol implementations live in `protocols/`, request execution in
 `provider-registry.ts` connects every definition to a statically imported typed
 factory. Vendor configuration does not import the registry. Missing factories
 fail compilation. This remains a static built-in catalog, with no remote model
-updates or dynamic plugin loading. Public named exports from `@chili/providers`
-remain available; source file paths are internal.
+updates or dynamic plugin loading. Source file paths are internal. MiniMax now exports `MiniMaxProvider` and
+`MINIMAX_BASE_URL`; migrate callers of the previous protocol-specific names.
 
 | Vendor module | Provider IDs | Maintenance notes |
 | --- | --- | --- |
@@ -61,8 +61,12 @@ account scope. Changing a key or gateway drops incompatible opaque output from
 that request without modifying stored conversation text or tool history. The new
 official `openai` connection rejects legacy unscoped ciphertext; existing
 ChatGPT/`codex-api` modes still accept it for history compatibility. Source
-metadata stores no raw key, account ID or endpoint. Anthropic and Doubao use
-their own protocol-specific continuation handling; see their vendor notes.
+metadata stores no raw key, account ID or endpoint. The same scope check applies
+to the newly connected Responses vendors, including plain reasoning items.
+Doubao also binds continuation state to the actual requested model.
+Ordinary visible reasoning text in pre-migration Chat histories may be serialized
+as plain reasoning by vendors that require it; this does not recreate encrypted
+state or signatures. Anthropic retains Messages-specific continuation handling.
 
 To maintain one vendor, begin with its README, update only that vendor's
 metadata/configuration/adapter when possible, and run its tests. Every model
@@ -80,7 +84,11 @@ submitting. All routine verification uses fake transports.
 MiniMax now reads only `MINIMAX_*` variables. Migrate previous
 `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL` MiniMax settings to
 those names; `ANTHROPIC_*` belongs exclusively to the official Anthropic vendor.
-The deprecated Core MiniMax factory follows the same isolation rule.
+The deprecated Core MiniMax factory follows the same isolation rule and now
+uses Responses. Replace `MINIMAX_ANTHROPIC_BASE_URL` with `MINIMAX_BASE_URL`;
+use `https://api.minimax.cn/v1` for domestic accounts or
+`https://api.minimax.io/v1` for international accounts. No legacy variable fallback
+is retained.
 
 `provider-registry.test.ts` exercises all registered factories with fake
 transports, environment snapshots and credential-source validation. Host and CLI
@@ -171,14 +179,38 @@ legacy migration. `runtime/request-lifecycle.test.ts` verifies each protocol's t
 cancellation/deadline, sibling rate limiting and replay mapping. These tests do
 not contact real providers or establish model task-solving quality.
 
-The deprecated core `AnthropicCompatibleModelRouter` and MiniMax router factories
-are compatibility wrappers around this implementation. They retain their
-constructor options, provider-specific MiniMax environment precedence and non-streaming request
-default, and use the same provider-ID replay, request identity callback, deadline,
-cancellation and backpressure. Tool results now use the common typed streaming
-events even for a JSON response, preserving the provider call ID. Legacy rejected
-iterator error shape is retained; public error fields follow the common provider
-sanitization boundary rather than the old duplicated parser.
+The deprecated core `AnthropicCompatibleModelRouter` remains an explicit Messages
+wrapper with its non-streaming default. The MiniMax convenience factories now
+wrap the same Responses implementation as Host. Both share request identity,
+deadline, cancellation and backpressure; legacy rejected-iterator errors retain
+the common provider sanitization boundary.
+
+## Responses routing
+
+Responses is the default for supported models: the three OpenAI connections,
+MiniMax, known DeepSeek models, Kimi K3, Alibaba Qwen, Doubao and xAI. Kimi K2.7
+continues to use Chat Completions. Unknown model behavior is vendor-specific and
+conservative; see each README. Anthropic uses native Messages. Domestic 智谱 and
+international Z.ai select Responses when configured with a supported official
+`/api/v1` base or complete `/responses` URL; their default pay-as-you-go endpoints
+remain unchanged because account/plan restrictions differ. An HTTP error never
+triggers an automatic protocol fallback.
+
+`protocols/api-key-responses.ts` composes shared streaming transport, credentials,
+request lifecycle and replay scoping. Vendor request builders own parameter names,
+reasoning controls, input items and endpoint rules. OpenAI-only fields are not
+sent to other vendors. Function call IDs are preserved for non-OpenAI vendors.
+No server-side conversation ID is required: Chili resends local history, with
+`store:false` where supported. Built-in server tools and full vendor API feature
+parity are outside the coding-agent function-tool contract.
+
+Streaming treats `response.output_item.done` as a complete output item and also
+accepts complete items supplied only in terminal `response.output`. A vendor
+sequence that changes an already completed item's ciphertext in a later terminal
+event has not been verified; replacing previously committed continuation items
+for that sequence is not implemented. Normal delta/done/terminal repetition is
+deduplicated. Tests use documented shapes and fake transports, not live paid API
+calls or account entitlement checks.
 
 ## Model catalog verification (2026-10-07)
 

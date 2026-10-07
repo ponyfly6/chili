@@ -2,7 +2,7 @@ import type { ProviderDefinition, ProviderEnvironmentSpec } from "../../provider
 
 export const XAI_DEFINITION = {
   displayName: "xAI", aliases: ["x.ai", "grok"], modelPrefixes: ["grok-"], auth: "api_key",
-  defaultRequestMaxTokens: 128_000, reasoning: "effort", serviceTier: false,
+  defaultRequestMaxTokens: 128_000, unknownModelRequestMaxTokens: 4096, reasoning: "effort", serviceTier: false,
 } satisfies ProviderDefinition;
 
 export const XAI_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {

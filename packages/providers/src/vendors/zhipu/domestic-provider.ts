@@ -4,6 +4,7 @@ import { OpenAICompletionsModel, type OpenAICompletionsModelOptions } from "../.
 import type { ChiliModel, ChiliModelProvider, ModelDescriptor, ReasoningLevel } from "../../types.js";
 import { ZHIPU_DEFINITION, ZHIPU_ENVIRONMENT } from "./domestic-config.js";
 import { ZHIPU_GLM_53_MODEL, ZHIPU_OPENAI_BASE_URL, ZHIPU_PROVIDER_ID } from "./domestic-models.js";
+import { createGlmResponsesModel, isGlmResponsesEndpoint } from "./responses.js";
 
 export interface ZhipuModelOptions {
   apiKey?: string;
@@ -31,6 +32,10 @@ export class ZhipuProvider implements ChiliModelProvider {
     const models = listKnownModels(this.id).map((model): ModelDescriptor => {
       const descriptor = { ...model };
       delete descriptor.default;
+      if (baseUrl !== undefined && isGlmResponsesEndpoint(baseUrl)) {
+        descriptor.baseUrl = baseUrl;
+        descriptor.apiFamily = "openai-responses";
+      }
       if (model.model === selectedModel) {
         descriptor.default = true;
         if (baseUrl !== undefined) descriptor.baseUrl = baseUrl;
@@ -42,7 +47,7 @@ export class ZhipuProvider implements ChiliModelProvider {
         provider: this.id,
         model: selectedModel,
         displayName: selectedModel,
-        apiFamily: "openai-completions",
+        apiFamily: isGlmResponsesEndpoint(baseUrl ?? ZHIPU_OPENAI_BASE_URL) ? "openai-responses" : "openai-completions",
         baseUrl: baseUrl ?? ZHIPU_OPENAI_BASE_URL,
         default: true,
       });
@@ -69,14 +74,22 @@ export function createZhipuModel(options: ZhipuModelOptions = {}): ChiliModel {
   if (!apiKey) throw new Error("智谱 BigModel provider requires ZHIPU_API_KEY or BIGMODEL_API_KEY");
   const model = options.model ?? environment.model ?? ZHIPU_GLM_53_MODEL;
   const descriptor = findKnownModel(ZHIPU_PROVIDER_ID, model);
+  const baseUrl = options.baseUrl ?? environment.baseUrl ?? descriptor?.baseUrl ?? ZHIPU_OPENAI_BASE_URL;
+  const maxTokens = options.maxTokens ?? (descriptor
+    ? Math.min(ZHIPU_DEFINITION.defaultRequestMaxTokens, descriptor.maxOutputTokens ?? Infinity)
+    : ZHIPU_DEFINITION.unknownModelRequestMaxTokens);
+  if (isGlmResponsesEndpoint(baseUrl)) {
+    return createGlmResponsesModel({
+      ...options, provider: ZHIPU_PROVIDER_ID, model, apiKey, baseUrl, maxTokens,
+      ...(descriptor === undefined ? {} : { descriptor }),
+    });
+  }
   const modelOptions: OpenAICompletionsModelOptions = {
     provider: ZHIPU_PROVIDER_ID,
     model,
     apiKey,
-    baseUrl: options.baseUrl ?? environment.baseUrl ?? descriptor?.baseUrl ?? ZHIPU_OPENAI_BASE_URL,
-    maxTokens: options.maxTokens ?? (descriptor
-      ? Math.min(ZHIPU_DEFINITION.defaultRequestMaxTokens, descriptor.maxOutputTokens ?? Infinity)
-      : ZHIPU_DEFINITION.unknownModelRequestMaxTokens),
+    baseUrl,
+    maxTokens,
     inputCapabilities: descriptor?.inputCapabilities ?? ["text"],
     compatibility: descriptor?.compatibility?.chatCompletions ?? {
       supportsStore: false,

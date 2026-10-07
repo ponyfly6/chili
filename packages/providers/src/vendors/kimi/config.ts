@@ -2,7 +2,7 @@ import type { ProviderDefinition, ProviderEnvironmentSpec } from "../../provider
 
 export const KIMI_DEFINITION = {
   displayName: "Kimi", aliases: ["moonshot"], modelPrefixes: ["kimi-", "moonshot-"], auth: "api_key",
-  defaultRequestMaxTokens: 128 * 1024, reasoning: "effort", serviceTier: false,
+  defaultRequestMaxTokens: 128 * 1024, unknownModelRequestMaxTokens: 8192, reasoning: "effort", serviceTier: false,
 } satisfies ProviderDefinition;
 
 export const KIMI_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {

@@ -1,4 +1,4 @@
-import type { ChatCompletionsCompatibility } from "../../protocols/compat.js";
+import type { ResponsesCompatibility } from "../../protocols/compat.js";
 import type { ModelDescriptor } from "../../types.js";
 
 export const DOUBAO_PROVIDER_ID = "doubao";
@@ -9,19 +9,12 @@ export const DOUBAO_SEED_21_TURBO_MODEL = "doubao-seed-2-1-turbo-260628";
 export const DOUBAO_SEED_EVOLVING_MODEL = "doubao-seed-evolving";
 
 export const DOUBAO_SEED_COMPATIBILITY = {
-  supportsStore: false,
-  supportsDeveloperRole: false,
-  supportsReasoningEffort: true,
+  sendSessionIdHeader: false,
   reasoningEffortMap: {
-    minimal: "low", low: "low", medium: "medium", high: "high",
+    off: "off", minimal: "low", low: "low", medium: "medium", high: "high",
     xhigh: "high", max: "high", ultra: "high",
   },
-  supportsUsageInStreaming: true,
-  maxTokensField: "max_tokens",
-  requiresReasoningContentOnAssistantMessages: true,
-  reasoningParameterStyle: "doubao",
-  toolCallDeltaMode: "standard",
-} satisfies ChatCompletionsCompatibility;
+} satisfies ResponsesCompatibility;
 
 /** Verified against Ark's official model/API pages on 2026-10-07; see README. */
 export const DOUBAO_MODELS = [
@@ -34,7 +27,7 @@ export const DOUBAO_MODELS = [
     provider: DOUBAO_PROVIDER_ID,
     model,
     displayName,
-    apiFamily: "openai-completions",
+    apiFamily: "openai-responses",
     baseUrl: DOUBAO_OPENAI_BASE_URL,
     ...(model === DOUBAO_SEED_21_PRO_MODEL ? { default: true } : {}),
     inputCapabilities: ["text", "image"],
@@ -45,7 +38,7 @@ export const DOUBAO_MODELS = [
       streaming: true, reasoning: true, toolCalls: true, toolCallDeltas: true,
       usage: true, responseId: true,
     },
-    compatibility: { chatCompletions: DOUBAO_SEED_COMPATIBILITY },
+    compatibility: { responses: DOUBAO_SEED_COMPATIBILITY },
     cost: { currency: "CNY", input, output, cacheRead, cacheWrite: 0,
       notes: "Standard online non-audio rates; flex/batch rates differ. Cache storage is charged separately at CNY 0.017/M tokens/hour; cacheWrite does not include storage." },
   })),

@@ -5,10 +5,12 @@ import { type EnvironmentSource, readEnvironmentSpec } from "../../env.js";
 import { findDefaultKnownModel, findKnownModel, listKnownModels } from "../../models.js";
 import {
   ZAI_GLM_53_MODEL,
+  ZAI_GLM_53_1M_MODEL,
   ZAI_OPENAI_BASE_URL,
   ZAI_PROVIDER_ID,
 } from "./models.js";
 import { OpenAICompletionsModel, type OpenAICompletionsModelOptions } from "../../protocols/chat-completions.js";
+import { createGlmResponsesModel, isGlmResponsesEndpoint } from "./responses.js";
 
 export { ZAI_GLM_53_MODEL, ZAI_GLM_53_FLASH_MODEL, ZAI_GLM_53_FLASHX_MODEL, ZAI_OPENAI_BASE_URL, ZAI_PROVIDER_ID } from "./models.js";
 
@@ -33,13 +35,20 @@ export class ZaiOpenAIProvider implements ChiliModelProvider {
   constructor(private readonly options: ZaiModelOptions = {}) {}
 
   models(): readonly ModelDescriptor[] {
-    const models = listKnownModels(this.id);
     const defaultModel = this.defaultModel();
+    const baseUrl = this.defaultBaseUrl();
+    const responses = isGlmResponsesEndpoint(baseUrl);
+    if (responses) assertZaiResponsesModel(defaultModel);
+    const models = listKnownModels(this.id).filter((model) => !responses || model.model !== ZAI_GLM_53_1M_MODEL);
     if (models.some((model) => model.model === defaultModel)) {
       return models.map((model) => {
         const descriptor: ModelDescriptor = { ...model };
+        if (responses) {
+          descriptor.baseUrl = baseUrl;
+          descriptor.apiFamily = "openai-responses";
+        }
         if (model.model === defaultModel) {
-          descriptor.baseUrl = this.defaultBaseUrl();
+          descriptor.baseUrl = baseUrl;
           descriptor.default = true;
         } else {
           delete descriptor.default;
@@ -48,12 +57,12 @@ export class ZaiOpenAIProvider implements ChiliModelProvider {
       });
     }
 
-    const fallback = findDefaultKnownModel(this.id);
+    const fallback = isGlmResponsesEndpoint(this.defaultBaseUrl()) ? undefined : findDefaultKnownModel(this.id);
     const descriptor: ModelDescriptor = {
       provider: this.id,
       model: defaultModel,
       displayName: defaultModel,
-      apiFamily: fallback?.apiFamily ?? "openai-completions",
+      apiFamily: isGlmResponsesEndpoint(this.defaultBaseUrl()) ? "openai-responses" : fallback?.apiFamily ?? "openai-completions",
       baseUrl: this.defaultBaseUrl(),
       default: true,
     };
@@ -62,7 +71,10 @@ export class ZaiOpenAIProvider implements ChiliModelProvider {
     if (fallback?.inputCapabilities) descriptor.inputCapabilities = fallback.inputCapabilities;
     if (fallback?.contextWindowTokens !== undefined) descriptor.contextWindowTokens = fallback.contextWindowTokens;
     if (fallback?.maxOutputTokens !== undefined) descriptor.maxOutputTokens = fallback.maxOutputTokens;
-    return [descriptor, ...models.map(withoutDefaultFlag)];
+    return [descriptor, ...models.map((model) => ({
+      ...withoutDefaultFlag(model),
+      ...(responses ? { baseUrl, apiFamily: "openai-responses" } : {}),
+    }))];
   }
 
   getModel(model?: string): ChiliModel {
@@ -103,6 +115,15 @@ export function createZaiModel(options: ZaiModelOptions = {}): ChiliModel {
   const descriptor = findKnownModel(ZAI_PROVIDER_ID, model) ?? findDefaultKnownModel(ZAI_PROVIDER_ID);
   const baseUrl = options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? ZAI_OPENAI_BASE_URL;
   const maxTokens = options.maxTokens ?? ZAI_DEFINITION.defaultRequestMaxTokens;
+  if (isGlmResponsesEndpoint(baseUrl)) {
+    assertZaiResponsesModel(model);
+    const exactDescriptor = findKnownModel(ZAI_PROVIDER_ID, model);
+    return createGlmResponsesModel({
+      ...options, provider: ZAI_PROVIDER_ID, model, apiKey, baseUrl,
+      maxTokens: options.maxTokens ?? (exactDescriptor ? maxTokens : 4096),
+      ...(exactDescriptor === undefined ? {} : { descriptor: exactDescriptor }),
+    });
+  }
   if (isAnthropicEndpoint(baseUrl)) {
     const modelOptions: AnthropicCompatibleModelOptions = {
       provider: ZAI_PROVIDER_ID,
@@ -138,4 +159,10 @@ export function createZaiModel(options: ZaiModelOptions = {}): ChiliModel {
 
 function isAnthropicEndpoint(baseUrl: string): boolean {
   return baseUrl.replace(/\/+$/, "").endsWith("/anthropic") || baseUrl.replace(/\/+$/, "").endsWith("/v1/messages");
+}
+
+function assertZaiResponsesModel(model: string): void {
+  if (model === ZAI_GLM_53_1M_MODEL) {
+    throw new Error("glm-5.3[1m] is a Messages-only alias; use glm-5.3 with the Responses endpoint (1M context is already included)");
+  }
 }

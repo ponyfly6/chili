@@ -89,7 +89,10 @@ export function resolveProviderModelOptions(
   if (!definition.serviceTier) delete options.serviceTier;
   else if (controls.serviceTier !== undefined) options.serviceTier = controls.serviceTier;
   const requested = controls.reasoningLevel;
-  const mapped = requested && requested !== "off" ? descriptor?.compatibility?.chatCompletions?.reasoningEffortMap?.[requested] : undefined;
+  const effortMap = descriptor?.apiFamily === "openai-responses"
+    ? descriptor.compatibility?.responses?.reasoningEffortMap
+    : descriptor?.compatibility?.chatCompletions?.reasoningEffortMap;
+  const mapped = requested && requested !== "off" ? effortMap?.[requested] : undefined;
   const level = requested ? clampModelReasoningLevel(
     descriptor ?? model,
     mapped && (REASONING_LEVELS as readonly string[]).includes(mapped) ? mapped as ReasoningLevel : requested,

@@ -54,7 +54,7 @@ type CodexResponseInputItem =
     }
   | (Record<string, unknown> & {
       type: "reasoning";
-      encrypted_content: string;
+      encrypted_content?: string | null;
     });
 
 interface CodexStreamPayload {
@@ -66,6 +66,7 @@ interface CodexStreamPayload {
     usage?: CodexUsage;
     model?: string;
     error?: CodexErrorPayload;
+    output?: CodexOutputItem[];
   };
   error?: CodexErrorPayload | string;
   item?: CodexOutputItem;
@@ -100,10 +101,17 @@ interface CodexOutputItem extends Record<string, unknown> {
   name?: string;
   arguments?: string;
   status?: string;
-  content?: Array<{ type?: string; text?: string; refusal?: string; status?: string }>;
+  content?: CodexContentPart | CodexContentPart[];
   summary?: Array<{ text?: string; status?: string }>;
   phase?: string | null;
-  encrypted_content?: string;
+  encrypted_content?: string | null;
+}
+
+interface CodexContentPart {
+  type?: string;
+  text?: string;
+  refusal?: string;
+  status?: string;
 }
 
 interface CodexUsage {
@@ -135,6 +143,15 @@ export interface ResponsesModelRuntimeOptions {
   requireAssistantPhase?: boolean;
   /** Migration-only compatibility for history written before connection scoping. */
   allowUnscopedReasoningReplay?: boolean;
+  /** Opt in when a vendor only guarantees continuation on the same model. */
+  scopeReasoningToModel?: boolean;
+  /** Some compatible APIs return reasoning_text in the final summary field. */
+  reasoningTextField?: "content" | "summary";
+  /** Public reasoning content is required for stateless continuation by some APIs. */
+  replayPlainReasoning?: boolean;
+  normalizeToolCallId?: (id: string) => string;
+  /** Legacy adapters keep their prior labels while other APIs supply their own. */
+  protocolLabel?: string;
   resolveCredentials: (signal?: AbortSignal) => Promise<ResponsesCredentials>;
   resolveRequestOptions: (input: ModelStreamInput) => ResponsesRequestBuildOptions;
   buildRequestBody: (input: ModelStreamInput, options: ResponsesRequestBuildOptions) => Record<string, unknown>;
@@ -183,6 +200,10 @@ export class ResponsesModel implements ChiliModel {
     yield* runModelRequest(input, (bounded) => this.streamRequest(bounded));
   }
 
+  private protocolMessage(detail: string): string {
+    return `${this.options.protocolLabel ?? "OpenAI Codex"} ${detail}`;
+  }
+
   private async *streamRequest(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
     const requestOptions = this.options.resolveRequestOptions(input);
     assertImageInputSupported(input, {
@@ -214,6 +235,7 @@ export class ResponsesModel implements ChiliModel {
         credentials.accountId
           ? ["oauth-account", credentials.accountId]
           : ["api-authorization", new Headers(headers).get("authorization") ?? credentials.access],
+        ...(this.options.scopeReasoningToModel ? [["model", requestOptions.model]] : []),
       ])),
     };
     const replayInput = scopeResponsesReplay(input, source, this.options.allowUnscopedReasoningReplay ?? false);
@@ -246,14 +268,14 @@ export class ResponsesModel implements ChiliModel {
       );
     }
     if (!response.body) {
-      throw codexProtocolError(this.provider, "OpenAI Codex response did not include a body", response);
+      throw codexProtocolError(this.provider, this.protocolMessage("response did not include a body"), response);
     }
     if (!isEventStreamResponse(response)) {
       const payload = parseJson<CodexStreamPayload>(await response.text(), undefined);
       if (payload?.error || payload?.type === "error" || payload?.type === "response.failed") {
-        throw formatCodexStreamError(payload, this.provider, "OpenAI Codex response failed", response);
+        throw formatCodexStreamError(payload, this.provider, this.protocolMessage("response failed"), response);
       }
-      throw codexProtocolError(this.provider, "OpenAI Codex response was not an event stream", response);
+      throw codexProtocolError(this.provider, this.protocolMessage("response was not an event stream"), response);
     }
     yield* this.streamSseResponse(response.body, response, source, input.signal, requestOptions.model);
   }
@@ -283,6 +305,11 @@ export class ResponsesModel implements ChiliModel {
     const endedReasoningSections = new Set<number>();
     const incompleteReasoningSections = new Set<number>();
     const provider = this.provider;
+    const protocolMessage = (detail: string) => this.protocolMessage(detail);
+    const requireAssistantPhase = this.options.requireAssistantPhase ?? true;
+    const replayPlainReasoning = this.options.replayPlainReasoning ?? false;
+    const normalizeToolCallId = this.options.normalizeToolCallId ?? normalizeResponsesId;
+    const completedReasoningItems = new Set<string>();
     let activeToolKey: string | undefined;
 
     const finishTextBlock = function* (payload: CodexStreamPayload, text?: string, contentStatus?: string): Generator<ModelStreamEvent> {
@@ -292,7 +319,7 @@ export class ResponsesModel implements ChiliModel {
       if (endedTextBlocks.has(index)) return;
       const phase = payload.output_index === undefined ? undefined : messagePhases.get(payload.output_index);
       if (payload.output_index === undefined || !messagePhases.has(payload.output_index)) {
-        throw codexProtocolError(provider, "OpenAI Codex stream completed text for an undeclared message output", response);
+        throw codexProtocolError(provider, protocolMessage("stream completed text for an undeclared message output"), response);
       }
       if (hasIncompleteContentStatus(payload, contentStatus)) incompleteTextBlocks.add(index);
       const suffix = completedContentSuffix(textBlockTexts.get(index) ?? "", text, provider, response);
@@ -306,10 +333,10 @@ export class ResponsesModel implements ChiliModel {
       yield { type: "text_end", index, ...(phase === undefined ? {} : { phase }) };
     };
 
-    const finishReasoningSection = function* (payload: CodexStreamPayload, text?: string, contentStatus?: string): Generator<ModelStreamEvent> {
-      const knownIndex = reasoningSectionIndexes.get(reasoningSectionKey(payload));
+    const finishReasoningSection = function* (payload: CodexStreamPayload, text?: string, contentStatus?: string, field: "content" | "summary" = "summary"): Generator<ModelStreamEvent> {
+      const knownIndex = reasoningSectionIndexes.get(reasoningSectionKey(payload, field));
       if (knownIndex === undefined && text === undefined) return;
-      const index = knownIndex ?? reasoningSectionEventIndex(payload, reasoningSectionIndexes);
+      const index = knownIndex ?? reasoningSectionEventIndex(payload, reasoningSectionIndexes, field);
       if (endedReasoningSections.has(index)) return;
       if (hasIncompleteContentStatus(payload, contentStatus)) incompleteReasoningSections.add(index);
       const suffix = completedContentSuffix(reasoningSectionTexts.get(index) ?? "", text, provider, response);
@@ -326,21 +353,105 @@ export class ResponsesModel implements ChiliModel {
       yield { type: "reasoning_end", index };
     };
 
+    const finishOutputItem = function* (payload: CodexStreamPayload & { item: CodexOutputItem }): Generator<ModelStreamEvent> {
+      if (payload.item.type === "reasoning") {
+        const key = reasoningItemKey(payload);
+        if (completedReasoningItems.has(key)) return;
+        for (const [contentIndex, content] of contentParts(payload.item.content).entries()) {
+          if (content.type !== "reasoning_text" || typeof content.text !== "string") continue;
+          yield* finishReasoningSection({
+            ...payload,
+            ...(payload.item.id === undefined ? {} : { item_id: payload.item.id }),
+            content_index: contentIndex,
+          }, content.text, content.status, "content");
+        }
+        for (const [summaryIndex, summary] of (payload.item.summary ?? []).entries()) {
+          if (typeof summary.text !== "string") continue;
+          yield* finishReasoningSection({
+            ...payload,
+            ...(payload.item.id === undefined ? {} : { item_id: payload.item.id }),
+            summary_index: summaryIndex,
+          }, summary.text, summary.status);
+        }
+        for (const [index, section] of openReasoningSections) {
+          if (
+            (payload.output_index !== undefined && section.outputIndex === payload.output_index)
+            || (payload.item.id !== undefined && section.itemId === payload.item.id)
+          ) {
+            if (hasIncompleteContentStatus(payload)) incompleteReasoningSections.add(index);
+            if (incompleteReasoningSections.has(index)) continue;
+            openReasoningSections.delete(index);
+            reasoningSectionTexts.delete(index);
+            endedReasoningSections.add(index);
+            yield { type: "reasoning_end", index };
+          }
+        }
+      }
+      if (
+        payload.item.type === "reasoning"
+        && !hasIncompleteContentStatus(payload)
+        && !Array.from(reasoningSectionIndexes).some(([key, index]) => key.startsWith(`${reasoningItemKey(payload)}\0`) && incompleteReasoningSections.has(index))
+        && (typeof payload.item.encrypted_content === "string" || (replayPlainReasoning && hasPlainReasoning(payload.item)))
+      ) {
+        completedReasoningItems.add(reasoningItemKey(payload));
+        yield {
+          type: "reasoning_item",
+          output: {
+            apiFamily: "openai-responses",
+            source: { ...source },
+            ...(payload.output_index === undefined ? {} : { outputIndex: payload.output_index }),
+            item: payload.item,
+          },
+        };
+      }
+      if (payload.item.type === "message") {
+        recordCodexAssistantPhase(messagePhases, payload.output_index, payload.item.phase, provider, response, requireAssistantPhase);
+        for (const [contentIndex, content] of contentParts(payload.item.content).entries()) {
+          const text = content.type === "refusal" ? content.refusal : content.type === "output_text" ? content.text : undefined;
+          if (typeof text !== "string") continue;
+          yield* finishTextBlock({ ...payload, content_index: contentIndex }, text, content.status);
+        }
+        for (const [index, outputIndex] of openTextBlocks) {
+          if (outputIndex !== payload.output_index) continue;
+          if (hasIncompleteContentStatus(payload)) incompleteTextBlocks.add(index);
+          if (incompleteTextBlocks.has(index)) continue;
+          openTextBlocks.delete(index);
+          textBlockTexts.delete(index);
+          endedTextBlocks.add(index);
+          const phase = messagePhases.get(outputIndex);
+          yield { type: "text_end", index, ...(phase === undefined ? {} : { phase }) };
+        }
+      }
+      if (payload.item.type === "function_call") {
+        sawToolCall = true;
+        const state = findToolState(toolCalls, payload, activeToolKey, normalizeToolCallId) ?? createToolState(payload.item, payload.output_index, normalizeToolCallId);
+        toolCalls.set(toolStateKey(state), state);
+        if (payload.item.name) state.name = payload.item.name;
+        if (payload.item.arguments !== undefined) state.partialJson = payload.item.arguments;
+        if (!state.started && state.name) yield startToolEvent(state);
+        if (!state.ended) {
+          throwIfStreamAborted(signal);
+          state.ended = true;
+          yield finishToolEvent(state);
+        }
+      }
+    };
+
     for await (const event of readSseEvents(body, signal)) {
       if (event.data === "[DONE]") break;
       const payload = parseJson<CodexStreamPayload>(event.data, undefined);
 
       if (event.event === "error" || payload?.type === "error") {
-        throw formatCodexStreamError(payload, this.provider, "OpenAI Codex stream error", response);
+        throw formatCodexStreamError(payload, this.provider, this.protocolMessage("stream error"), response);
       }
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
         if (!event.data.trim()) continue;
-        throw providerStreamProtocolError(this.provider, "OpenAI Codex stream contained invalid JSON", response, "invalid_stream");
+        throw providerStreamProtocolError(this.provider, this.protocolMessage("stream contained invalid JSON"), response, "invalid_stream");
       }
       if (!payload?.type) continue;
 
       if (payload.type === "response.failed") {
-        throw formatCodexStreamError(payload, this.provider, "OpenAI Codex response failed", response);
+        throw formatCodexStreamError(payload, this.provider, this.protocolMessage("response failed"), response);
       }
 
       if (payload.type === "response.created") {
@@ -355,7 +466,7 @@ export class ResponsesModel implements ChiliModel {
         }
         if (payload.item.type === "function_call") {
           sawToolCall = true;
-          const state = createToolState(payload.item, payload.output_index);
+          const state = createToolState(payload.item, payload.output_index, normalizeToolCallId);
           const key = toolStateKey(state);
           toolCalls.set(key, state);
           activeToolKey = key;
@@ -364,8 +475,9 @@ export class ResponsesModel implements ChiliModel {
         continue;
       }
 
-      if (payload.type === "response.reasoning_summary_text.delta" && payload.delta) {
-        const index = reasoningSectionEventIndex(payload, reasoningSectionIndexes);
+      if ((payload.type === "response.reasoning_summary_text.delta" || payload.type === "response.reasoning_text.delta") && payload.delta) {
+        const field = payload.type === "response.reasoning_text.delta" ? this.options.reasoningTextField ?? "content" : "summary";
+        const index = reasoningSectionEventIndex(payload, reasoningSectionIndexes, field);
         reasoningSectionTexts.set(index, (reasoningSectionTexts.get(index) ?? "") + payload.delta);
         openReasoningSections.set(index, {
           ...(payload.item_id === undefined ? {} : { itemId: payload.item_id }),
@@ -379,8 +491,9 @@ export class ResponsesModel implements ChiliModel {
         continue;
       }
 
-      if (payload.type === "response.reasoning_summary_text.done" || payload.type === "response.reasoning_summary_part.done") {
-        yield* finishReasoningSection(payload, payload.text ?? payload.part?.text);
+      if (payload.type === "response.reasoning_summary_text.done" || payload.type === "response.reasoning_summary_part.done" || payload.type === "response.reasoning_text.done") {
+        const field = payload.type === "response.reasoning_text.done" ? this.options.reasoningTextField ?? "content" : "summary";
+        yield* finishReasoningSection(payload, payload.text ?? payload.part?.text, undefined, field);
         continue;
       }
 
@@ -390,7 +503,7 @@ export class ResponsesModel implements ChiliModel {
         if (outputIndex === undefined || !messagePhases.has(outputIndex)) {
           throw codexProtocolError(
             this.provider,
-            "OpenAI Codex stream has text delta for an undeclared message output",
+            this.protocolMessage("stream has text delta for an undeclared message output"),
             response,
           );
         }
@@ -407,7 +520,7 @@ export class ResponsesModel implements ChiliModel {
       }
 
       if (payload.type === "response.function_call_arguments.delta" && payload.delta) {
-        const state = findToolState(toolCalls, payload, activeToolKey);
+        const state = findToolState(toolCalls, payload, activeToolKey, normalizeToolCallId);
         if (!state) continue;
         state.partialJson += payload.delta;
         const parsed = parseJson<unknown>(state.partialJson, undefined);
@@ -416,7 +529,7 @@ export class ResponsesModel implements ChiliModel {
       }
 
       if (payload.type === "response.function_call_arguments.done" && payload.arguments !== undefined) {
-        const state = findToolState(toolCalls, payload, activeToolKey);
+        const state = findToolState(toolCalls, payload, activeToolKey, normalizeToolCallId);
         if (!state) continue;
         const delta = payload.arguments.startsWith(state.partialJson)
           ? payload.arguments.slice(state.partialJson.length)
@@ -427,79 +540,14 @@ export class ResponsesModel implements ChiliModel {
       }
 
       if (payload.type === "response.output_item.done" && payload.item) {
-        if (payload.item.type === "reasoning") {
-          for (const [summaryIndex, summary] of (payload.item.summary ?? []).entries()) {
-            if (typeof summary.text !== "string") continue;
-            yield* finishReasoningSection({
-              ...payload,
-              ...(payload.item.id === undefined ? {} : { item_id: payload.item.id }),
-              summary_index: summaryIndex,
-            }, summary.text, summary.status);
-          }
-          for (const [index, section] of openReasoningSections) {
-            if (
-              (payload.output_index !== undefined && section.outputIndex === payload.output_index)
-              || (payload.item.id !== undefined && section.itemId === payload.item.id)
-            ) {
-              if (hasIncompleteContentStatus(payload)) incompleteReasoningSections.add(index);
-              if (incompleteReasoningSections.has(index)) continue;
-              openReasoningSections.delete(index);
-              reasoningSectionTexts.delete(index);
-              endedReasoningSections.add(index);
-              yield { type: "reasoning_end", index };
-            }
-          }
-        }
-        if (
-          payload.item.type === "reasoning"
-          && typeof payload.item.encrypted_content === "string"
-        ) {
-          yield {
-            type: "reasoning_item",
-            output: {
-              apiFamily: "openai-responses",
-              source: { ...source },
-              ...(payload.output_index === undefined ? {} : { outputIndex: payload.output_index }),
-              item: payload.item,
-            },
-          };
-        }
-        if (payload.item.type === "message") {
-          recordCodexAssistantPhase(messagePhases, payload.output_index, payload.item.phase, this.provider, response, this.options.requireAssistantPhase ?? true);
-          for (const [contentIndex, content] of (payload.item.content ?? []).entries()) {
-            const text = content.type === "refusal" ? content.refusal : content.type === "output_text" ? content.text : undefined;
-            if (typeof text !== "string") continue;
-            yield* finishTextBlock({ ...payload, content_index: contentIndex }, text, content.status);
-          }
-          for (const [index, outputIndex] of openTextBlocks) {
-            if (outputIndex !== payload.output_index) continue;
-            if (hasIncompleteContentStatus(payload)) incompleteTextBlocks.add(index);
-            if (incompleteTextBlocks.has(index)) continue;
-            openTextBlocks.delete(index);
-            textBlockTexts.delete(index);
-            endedTextBlocks.add(index);
-            const phase = messagePhases.get(outputIndex);
-            yield { type: "text_end", index, ...(phase === undefined ? {} : { phase }) };
-          }
-        }
-        if (payload.item.type === "function_call") {
-          const state = findToolState(toolCalls, payload, activeToolKey) ?? createToolState(payload.item, payload.output_index);
-          if (payload.item.name) state.name = payload.item.name;
-          if (payload.item.arguments !== undefined) state.partialJson = payload.item.arguments;
-          if (!state.started && state.name) yield startToolEvent(state);
-          if (!state.ended) {
-            throwIfStreamAborted(signal);
-            state.ended = true;
-            yield finishToolEvent(state);
-          }
-        }
+        yield* finishOutputItem({ ...payload, item: payload.item });
         continue;
       }
 
       if (payload.type === "response.completed" || payload.type === "response.done" || payload.type === "response.incomplete") {
         const status = payload.response?.status;
         if (payload.response?.error || status === "failed" || status === "cancelled") {
-          throw formatCodexStreamError(payload, this.provider, "OpenAI Codex response did not complete successfully", response);
+          throw formatCodexStreamError(payload, this.provider, this.protocolMessage("response did not complete successfully"), response);
         }
         if (
           (status !== undefined && status !== "completed" && status !== "incomplete")
@@ -507,7 +555,10 @@ export class ResponsesModel implements ChiliModel {
           || (payload.type === "response.completed" && status === "incomplete")
           || (payload.type === "response.incomplete" && status === "completed")
         ) {
-          throw providerStreamProtocolError(this.provider, "OpenAI Codex stream has an invalid terminal status", response, "invalid_stream");
+          throw providerStreamProtocolError(this.provider, this.protocolMessage("stream has an invalid terminal status"), response, "invalid_stream");
+        }
+        for (const [outputIndex, item] of (payload.response?.output ?? []).entries()) {
+          yield* finishOutputItem({ type: "response.output_item.done", output_index: outputIndex, item });
         }
         finished = true;
         responseId = payload.response?.id ?? responseId;
@@ -523,7 +574,7 @@ export class ResponsesModel implements ChiliModel {
 
     throwIfStreamAborted(signal);
     if (!finished) {
-      throw providerStreamProtocolError(this.provider, "OpenAI Codex stream ended before a terminal response event", response, "incomplete_stream");
+      throw providerStreamProtocolError(this.provider, this.protocolMessage("stream ended before a terminal response event"), response, "incomplete_stream");
     }
     for (const state of toolCalls.values()) {
       throwIfStreamAborted(signal);
@@ -542,15 +593,15 @@ function scopeResponsesReplay(
   let changed = false;
   const messages = input.messages.map((message) => {
     let messageChanged = false;
-    const parts = message.parts.map((part) => {
-      if (part.type !== "reasoning" || part.modelOutput?.apiFamily !== "openai-responses") return part;
+    const parts = message.parts.flatMap((part): MessagePart[] => {
+      if (part.type !== "reasoning" || part.modelOutput?.apiFamily !== "openai-responses") return [part];
       const previous = part.modelOutput.source;
-      if (previous === undefined ? allowUnscoped : previous.provider === source.provider && previous.connection === source.connection) return part;
+      if (previous === undefined ? allowUnscoped : previous.provider === source.provider && previous.connection === source.connection) return [part];
       messageChanged = true;
-      // Keep ordinary conversation content; only the incompatible opaque state
-      // is removed from this request, leaving the stored history untouched.
-      const { modelOutput: _modelOutput, ...withoutOpaqueState } = part;
-      return withoutOpaqueState;
+      // Do not turn a rejected continuation item into legacy reasoning text that
+      // a vendor might reconstruct as a new item. Other visible parts and tools
+      // stay intact, and the stored history is never changed.
+      return [];
     });
     if (!messageChanged) return message;
     changed = true;
@@ -559,7 +610,7 @@ function scopeResponsesReplay(
   return changed ? { ...input, messages } : input;
 }
 
-export function toResponsesInput(messages: readonly Message[], includeImageContent = true, requireAssistantPhase = true): CodexResponseInputItem[] {
+export function toResponsesInput(messages: readonly Message[], includeImageContent = true, requireAssistantPhase: boolean | "omit" = true, normalizeToolCallId: (id: string) => string = normalizeResponsesId): CodexResponseInputItem[] {
   const output: CodexResponseInputItem[] = [];
   for (const message of messages) {
     if (message.role === "system") continue;
@@ -573,7 +624,7 @@ export function toResponsesInput(messages: readonly Message[], includeImageConte
           if (!part.text) continue;
           output.push({
             role: "assistant",
-            ...(requireAssistantPhase ? { phase: requireCodexHistoryPhase(part.phase) } : part.phase === undefined ? {} : { phase: requireCodexHistoryPhase(part.phase) }),
+            ...(requireAssistantPhase === "omit" ? {} : requireAssistantPhase ? { phase: requireCodexHistoryPhase(part.phase) } : part.phase === undefined ? {} : { phase: requireCodexHistoryPhase(part.phase) }),
             content: [{ type: "output_text", text: part.text }],
           });
           continue;
@@ -581,7 +632,7 @@ export function toResponsesInput(messages: readonly Message[], includeImageConte
         if (part.type === "tool_call") {
           output.push({
             type: "function_call",
-            call_id: normalizeResponsesId(String(part.providerCallId ?? part.callId)),
+            call_id: normalizeToolCallId(String(part.providerCallId ?? part.callId)),
             name: part.toolName,
             arguments: stringifyToolInput(part.input),
           });
@@ -596,7 +647,7 @@ export function toResponsesInput(messages: readonly Message[], includeImageConte
       if (part.type !== "tool_result") continue;
       output.push({
         type: "function_call_output",
-        call_id: normalizeResponsesId(String(part.providerCallId ?? part.callId)),
+        call_id: normalizeToolCallId(String(part.providerCallId ?? part.callId)),
         output: formatToolResultForModel(part),
       });
       const imageContent = toolResultImageContent(part, includeImageContent);
@@ -609,11 +660,12 @@ export function toResponsesInput(messages: readonly Message[], includeImageConte
 function isReplayableResponsesReasoningItem(
   output: Extract<MessagePart, { type: "reasoning" }>["modelOutput"],
 ): output is NonNullable<Extract<MessagePart, { type: "reasoning" }>["modelOutput"]> & {
-  item: Record<string, unknown> & { type: "reasoning"; encrypted_content: string };
+  item: Record<string, unknown> & { type: "reasoning"; encrypted_content?: string | null };
 } {
   return output?.apiFamily === "openai-responses"
     && output.item.type === "reasoning"
-    && typeof output.item.encrypted_content === "string";
+    && output.item.status !== "incomplete"
+    && (typeof output.item.encrypted_content === "string" || (output.source !== undefined && hasPlainReasoning(output.item)));
 }
 
 function userMessageContent(parts: readonly MessagePart[], includeImageContent = true): CodexResponseMessageContent[] {
@@ -661,9 +713,23 @@ export function toResponsesTools(tools: readonly ModelTool[]): Array<Record<stri
   }));
 }
 
-function reasoningSectionKey(payload: CodexStreamPayload): string {
-  const itemKey = payload.output_index === undefined ? payload.item_id ?? "output:0" : `output:${payload.output_index}`;
-  return `${itemKey}\0${payload.summary_index ?? 0}`;
+function reasoningItemKey(payload: CodexStreamPayload): string {
+  return payload.output_index === undefined ? payload.item_id ?? payload.item?.id ?? "output:0" : `output:${payload.output_index}`;
+}
+
+function reasoningSectionKey(payload: CodexStreamPayload, field: "content" | "summary" = "summary"): string {
+  const index = field === "content" ? payload.content_index ?? 0 : payload.summary_index ?? payload.content_index ?? 0;
+  return `${reasoningItemKey(payload)}\0${field}\0${index}`;
+}
+
+function contentParts(content: CodexContentPart | CodexContentPart[] | undefined): CodexContentPart[] {
+  return content === undefined ? [] : Array.isArray(content) ? content : [content];
+}
+
+function hasPlainReasoning(item: Record<string, unknown>): boolean {
+  const content = Array.isArray(item.content) ? item.content : item.content === undefined ? [] : [item.content];
+  const summary = Array.isArray(item.summary) ? item.summary : [];
+  return [...content, ...summary].some((part) => isRecord(part) && typeof part.text === "string");
 }
 
 function hasIncompleteContentStatus(payload: CodexStreamPayload, contentStatus?: string): boolean {
@@ -686,8 +752,8 @@ function completedContentSuffix(
   return completed.slice(streamed.length);
 }
 
-function reasoningSectionEventIndex(payload: CodexStreamPayload, indexes: Map<string, number>): number {
-  return contentEventIndex(reasoningSectionKey(payload), indexes);
+function reasoningSectionEventIndex(payload: CodexStreamPayload, indexes: Map<string, number>, field: "content" | "summary" = "summary"): number {
+  return contentEventIndex(reasoningSectionKey(payload, field), indexes);
 }
 
 function textBlockKey(payload: CodexStreamPayload): string {
@@ -764,12 +830,12 @@ function requireCodexHistoryPhase(phase: AssistantMessagePhase | undefined): Ass
   return phase;
 }
 
-function createToolState(item: CodexOutputItem, index: number | undefined): ToolStreamState {
+function createToolState(item: CodexOutputItem, index: number | undefined, normalizeToolCallId: (id: string) => string): ToolStreamState {
   const state: ToolStreamState = {
-    toolCallId: normalizeResponsesId(item.call_id ?? item.id ?? `call_${index ?? 0}`),
+    toolCallId: normalizeToolCallId(item.call_id ?? item.id ?? `call_${index ?? 0}`),
     name: item.name ?? "",
     partialJson: item.arguments ?? "",
-    started: Boolean(item.name),
+    started: false,
     ended: false,
   };
   if (item.id) state.itemId = item.id;
@@ -785,18 +851,25 @@ function findToolState(
   tools: Map<string, ToolStreamState>,
   payload: CodexStreamPayload,
   activeKey: string | undefined,
+  normalizeToolCallId: (id: string) => string,
 ): ToolStreamState | undefined {
   if (payload.item_id && tools.has(payload.item_id)) return tools.get(payload.item_id);
   if (payload.item?.id && tools.has(payload.item.id)) return tools.get(payload.item.id);
   if (payload.item?.call_id) {
-    const byCallId = Array.from(tools.values()).find((tool) => tool.toolCallId === normalizeResponsesId(payload.item?.call_id ?? ""));
+    const byCallId = Array.from(tools.values()).find((tool) => tool.toolCallId === normalizeToolCallId(payload.item?.call_id ?? ""));
     if (byCallId) return byCallId;
   }
+  if (payload.output_index !== undefined) {
+    const byIndex = Array.from(tools.values()).find((tool) => tool.index === payload.output_index);
+    if (byIndex) return byIndex;
+  }
+  if (payload.item_id || payload.item?.id || payload.item?.call_id || payload.output_index !== undefined) return undefined;
   if (activeKey) return tools.get(activeKey);
   return Array.from(tools.values()).at(-1);
 }
 
 function startToolEvent(tool: ToolStreamState): ModelStreamEvent {
+  tool.started = true;
   const event: ModelStreamEvent = {
     type: "tool_call_start",
     toolCallId: tool.toolCallId,
@@ -1020,6 +1093,11 @@ function nonEmptyCode(value: unknown): string | undefined {
 function nonEmptyString(value: unknown): string | undefined {
   const trimmed = typeof value === "string" ? value.trim() : "";
   return trimmed ? trimmed : undefined;
+}
+
+/** Provider-assigned tool call IDs are opaque unless an API explicitly constrains them. */
+export function preserveResponsesId(id: string): string {
+  return id;
 }
 
 export function normalizeResponsesId(id: string): string {

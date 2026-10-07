@@ -1,4 +1,4 @@
-import type { ChatCompletionsCompatibility } from "../../protocols/compat.js";
+import type { ResponsesCompatibility } from "../../protocols/compat.js";
 import type { ModelDescriptor } from "../../types.js";
 
 export const ALIBABA_PROVIDER_ID = "alibaba";
@@ -8,19 +8,12 @@ export const QWEN_38_MAX_0902_MODEL = "qwen3.8-max-0902";
 export const QWEN_38_FLASH_MODEL = "qwen3.8-flash";
 
 export const ALIBABA_QWEN_COMPATIBILITY = {
-  supportsStore: false,
-  supportsDeveloperRole: false,
-  supportsReasoningEffort: true,
+  sendSessionIdHeader: false,
   reasoningEffortMap: {
-    minimal: "low", low: "low", medium: "medium", high: "xhigh",
+    off: "off", minimal: "low", low: "low", medium: "medium", high: "xhigh",
     xhigh: "xhigh", max: "xhigh", ultra: "xhigh",
   },
-  supportsUsageInStreaming: true,
-  maxTokensField: "max_completion_tokens",
-  requiresReasoningContentOnAssistantMessages: true,
-  reasoningParameterStyle: "qwen",
-  toolCallDeltaMode: "standard",
-} satisfies ChatCompletionsCompatibility;
+} satisfies ResponsesCompatibility;
 
 /** Verified against Alibaba's official model/API pages on 2026-10-07; see README. */
 export const ALIBABA_MODELS = [
@@ -32,18 +25,19 @@ export const ALIBABA_MODELS = [
     provider: ALIBABA_PROVIDER_ID,
     model,
     displayName,
-    apiFamily: "openai-completions",
+    apiFamily: "openai-responses",
     baseUrl: ALIBABA_OPENAI_BASE_URL,
     ...(model === QWEN_38_MAX_MODEL ? { default: true } : {}),
     inputCapabilities: ["text", "image"],
-    contextWindowTokens: 1_000_000,
+    // Responses accepts approximately 80% of the underlying 1M model window.
+    contextWindowTokens: 800_000,
     maxOutputTokens: 131072,
     reasoningLevels: ["off", "low", "medium", "xhigh"],
     capabilities: {
       streaming: true, reasoning: true, toolCalls: true, toolCallDeltas: true,
       usage: true, responseId: true,
     },
-    compatibility: { chatCompletions: ALIBABA_QWEN_COMPATIBILITY },
+    compatibility: { responses: ALIBABA_QWEN_COMPATIBILITY },
     cost: model === QWEN_38_FLASH_MODEL
       ? { currency: "CNY", input: 0.8, output: 2.7, cacheRead: 0.1, cacheWrite: 1.25,
           notes: "Beijing standard online rates; cacheRead is implicit caching, cacheWrite is explicit cache creation. Regional, batch and plan pricing differ." }
