@@ -65,6 +65,8 @@ import {
 import { messagesForContext } from "./cancelled-turn-context.js";
 import {
   PromptAssembler,
+  assembleRenderedPromptFragments,
+  renderPromptFragment,
   type PromptAssembly,
   type PromptDebugManifest,
   type PromptFragment,
@@ -1610,9 +1612,9 @@ export class RuntimeService {
   }
 
   private withFinalResponsePrompt(prompt: PromptAssembly): PromptAssembly {
-    return new PromptAssembler()
-      .addMany(prompt.fragments)
-      .add({
+    return assembleRenderedPromptFragments([
+      ...prompt.fragments,
+      renderPromptFragment({
         id: "runtime.final_response_after_max_turns",
         layer: "base",
         source: "runtime",
@@ -1620,8 +1622,8 @@ export class RuntimeService {
         lifecycle: "turn",
         trust: "system",
         content: FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM,
-      })
-      .assemble();
+      }),
+    ]);
   }
 
   private contextBuilder(): ContextWindowBuilder {

@@ -33,17 +33,19 @@ export async function loadDocument(
   const trimmed = (parsedRule?.body ?? content).trim();
   if (!trimmed) return;
 
-  const clipped = clipDocument(trimmed, input.maxChars);
+  const limit = memoryDocumentCharLimit(input.maxChars);
+  const clipped = clipMemoryDocument(trimmed, limit);
   const document: ChiliMemoryDocument = {
     kind: input.kind,
     scope: input.scope,
     label: input.label,
     path: input.path,
     content: clipped.content,
+    sourceContent: content,
     truncated: clipped.truncated,
     contentVersion: createHash("sha256").update(content).digest("hex"),
   };
-  if (clipped.truncated) document.truncatedAfter = input.maxChars;
+  if (clipped.truncated) document.truncatedAfter = limit;
   if (parsedRule?.metadata !== undefined) document.ruleMetadata = parsedRule.metadata;
   documents.push(document);
 }
@@ -84,10 +86,18 @@ export function renderChiliMemoryDocument(document: ChiliMemoryDocument): string
   return lines.join("\n").trimEnd();
 }
 
-function clipDocument(content: string, maxChars: number): { content: string; truncated: boolean } {
+export function memoryDocumentCharLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_MAX_DOCUMENT_CHARS;
+  return Math.max(0, Math.trunc(value));
+}
+
+export function clipMemoryDocument(content: string, maxChars: number): { content: string; truncated: boolean } {
   if (content.length <= maxChars) return { content, truncated: false };
+  let end = Math.min(content.length, maxChars);
+  const last = content.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
   return {
-    content: content.slice(0, maxChars).trimEnd(),
+    content: content.slice(0, end).trimEnd(),
     truncated: true,
   };
 }

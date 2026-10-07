@@ -32,7 +32,10 @@ export interface ChiliMemoryDocument {
   scope: ChiliMemoryDocumentScope;
   label: string;
   path: string;
+  /** Model preview. Source content is retained separately before display limits. */
   content: string;
+  /** Exact loaded file text or persisted Memory entry, for source provenance. */
+  sourceContent?: string;
   truncated: boolean;
   truncatedAfter?: number;
   ruleMetadata?: ChiliProjectRuleMetadata;

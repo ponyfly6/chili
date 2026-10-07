@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import type { PromptFragment } from "../prompt/index.js";
-import { DEFAULT_MAX_DOCUMENT_CHARS, MEMORY_MECHANICS_PROMPT } from "./constants.js";
-import { loadDocument, memoryDocumentDebugMetadata, renderChiliMemoryDocument } from "./documents.js";
+import { MEMORY_MECHANICS_PROMPT } from "./constants.js";
+import { clipMemoryDocument, loadDocument, memoryDocumentCharLimit, memoryDocumentDebugMetadata, renderChiliMemoryDocument } from "./documents.js";
 import { searchChiliMemoryEntries } from "./entries.js";
 import { resolveChiliMemoryPaths } from "./project-instructions.js";
 import type { ChiliMemoryDocument, ChiliMemoryLoadOptions, ChiliMemorySnapshot } from "./types.js";
@@ -11,7 +11,7 @@ export async function loadChiliMemoryContext(options: ChiliMemoryLoadOptions): P
   const paths = await resolveChiliMemoryPaths(options);
   const documents: ChiliMemoryDocument[] = [];
   const missingPaths: string[] = [];
-  const maxChars = options.maxDocumentChars ?? DEFAULT_MAX_DOCUMENT_CHARS;
+  const maxChars = memoryDocumentCharLimit(options.maxDocumentChars);
 
   const omittedDocuments: { path: string; reason: string }[] = [];
   const memoryScopes = options.memoryScopes ?? ["user", "project"];
@@ -19,15 +19,16 @@ export async function loadChiliMemoryContext(options: ChiliMemoryLoadOptions): P
     if (!memoryScopes.includes(scope)) omittedDocuments.push({ path: `${paths.databasePath}#${scope}`, reason: "memory_read_not_authorized" });
   }
   for (const entry of await searchChiliMemoryEntries(options)) {
-    const truncated = entry.text.length > maxChars;
+    const preview = clipMemoryDocument(entry.text, maxChars);
     documents.push({
       kind: entry.scope === "user" ? "user_memory" : "project_memory",
       scope: entry.scope,
       label: `${entry.scope === "user" ? "User" : "Project"} memory (${entry.id})`,
       path: entry.path,
-      content: entry.text.slice(0, maxChars),
-      truncated,
-      ...(truncated ? { truncatedAfter: maxChars } : {}),
+      content: preview.content,
+      sourceContent: entry.text,
+      truncated: preview.truncated,
+      ...(preview.truncated ? { truncatedAfter: maxChars } : {}),
       contentVersion: createHash("sha256").update(`${entry.id}:${entry.revision}:${entry.text}`).digest("hex"),
       memoryId: entry.id,
       memoryRevision: entry.revision,
@@ -84,10 +85,13 @@ export function chiliMemoryPromptFragments(snapshot: ChiliMemorySnapshot): Promp
       id: document.memoryId ? `chili.context.${document.kind}.${document.memoryId}` : `chili.context.${document.kind}.${index}`,
       layer: "contextual_user",
       source,
-      priority: 100 + index,
+      // Select current repository rules before potentially stale background
+      // Memory when the shared contextual-user prompt budget is constrained.
+      priority: source === "project" ? 100 : 200,
       lifecycle: "session",
       trust,
       content: renderChiliMemoryDocument(document),
+      sourceContent: document.sourceContent ?? document.content,
       metadata: memoryDocumentDebugMetadata(document),
     });
   });
