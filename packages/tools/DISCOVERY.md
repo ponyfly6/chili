@@ -16,7 +16,7 @@ There are three views of one registry:
 - The authorized catalog is filtered by the current session/worker policy. Tool
   discovery and code mode use this catalog, not the list of model definitions.
 - The model surface contains eager tools, tools explicitly loaded in the session,
-  and control tools required by durable Goal and Agent state.
+  and control tools required by durable Agent state.
 - The script catalog contains authorized tools that opt in with `codeMode: true`.
   Orchestrators and direct-only tools remain excluded.
 
@@ -42,7 +42,7 @@ name/description directory. Use `tool_search` to obtain complete parameter schem
 All actual calls still go through the existing Executor, current authorization,
 catalog validation, effect scheduler and event recording.
 
-Searching an Agent or Goal tool loads its related control group. The Host
+Searching an Agent tool loads its related control group. The Host
 also reconstructs required groups from persisted domain projections for sessions
 created before discovery existed or work created through the API. Existing
 Agents retain controls for later inputs, inspection and resume. These groups are

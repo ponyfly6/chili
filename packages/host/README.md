@@ -149,7 +149,7 @@ Callers that need retries must keep that ID. Omitting it creates a new submissio
 
 Modes are `start` (require an idle queue), `queue` (FIFO), and `steer` (priority at
 the next turn boundary, interrupting the current turn without stopping managed
-processes). `RuntimeService` arbitrates these inputs with the existing Goal loop.
+processes). `RuntimeService` dispatches these inputs through the session queue.
 Synchronous `submitPrompt()` accepts only `start`; HTTP synchronous routes reject
 queue/steer before admission. Root and child Sessions use the same durable input
 queue. Agent creation commits its child Session and first input together.
@@ -165,8 +165,6 @@ resources. Every Stop advances the control revision, even if already paused, so
 a stale Resume cannot override it. Pending inputs stay saved until explicit
 Resume. A deliberate new `start` may clear pause only when no older pending or
 claimed input exists. Queue/steer and duplicate retries never implicitly unpause.
-HTTP Goal creation/resume also explicitly restores dispatch; model Goal tools
-cannot clear a user Stop. Budget-limited Goals require a budget update first.
 
 On startup and maintenance, recovery leaves live leases alone. Expired claimed
 inputs become interrupted, unknown unfinished tool results become synthetic

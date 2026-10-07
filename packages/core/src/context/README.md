@@ -70,8 +70,7 @@ images, history and output reservations remain inside the shared context budget.
 Compaction cannot end between a tool call and its result, and cannot summarize a
 still-pending call. A missing finish event, cancellation or output-limit finish
 cannot create a replacement summary. Failed compaction preserves the previous
-history. Goal state and current rules remain separate persisted inputs; source
-message IDs retain the original user facts and unfinished work for inspection.
+history. Current rules remain separate prompt inputs; source message IDs retain the original user facts and unfinished work for inspection.
 The summary's semantic completeness is still model-dependent: passing fake
 transport tests does not establish that a real model always preserves every
 requirement over repeated compression.
