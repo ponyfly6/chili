@@ -48,7 +48,6 @@ import {
   createDelegationSetTool,
   createDelegationStatusTool,
   createEditTool,
-  createGitWorktreeTool,
   createGitApplyPatchTool,
   createGoalTools,
   createGlobTool,
@@ -1077,7 +1076,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function registerGitTools(registry: InMemoryToolRegistry): void {
-  registry.register(createGitWorktreeTool());
   registry.register(createGitApplyPatchTool());
 }
 

@@ -10,7 +10,6 @@ import { createGlobTool } from "./builtins/glob.js";
 import { createGrepTool } from "./builtins/grep.js";
 import { createReadImageTool } from "./builtins/read-image.js";
 import { createBashTool } from "./builtins/bash.js";
-import { createGitWorktreeTool } from "./builtins/git-worktree.js";
 import { createGitApplyPatchTool } from "./builtins/git-apply-patch.js";
 import { ToolExecutor } from "./executor.js";
 import { InMemoryToolRegistry } from "./registry.js";
@@ -21,7 +20,7 @@ const secret = "PRIVATE_MARKER_c065751adf";
 
 function harness(rules: () => readonly PermissionRule[], events: ChiliEvent[] = [], policy?: ToolAccessPolicy, ask?: () => Promise<{ action: "allow_session" }>): ToolExecutor {
   const registry = new InMemoryToolRegistry();
-  for (const tool of [createGlobTool(), createGrepTool(), createReadImageTool(), createBashTool(), createGitWorktreeTool(), createGitApplyPatchTool()]) registry.register(tool);
+  for (const tool of [createGlobTool(), createGrepTool(), createReadImageTool(), createBashTool(), createGitApplyPatchTool()]) registry.register(tool);
   const approvals = new PolicyApprovalBroker({ rulesetsForRequest: () => [rules()], ...(ask ? { ask } : {}) });
   return new ToolExecutor({
     registry, approvals, events: { publish: async (event) => { events.push(event); } },
@@ -188,11 +187,12 @@ test("discovery loads resource rules per batch rather than once per candidate", 
   });
 });
 
-test("managed Git tools recheck write revocation immediately before dispatching each process", async () => {
+test("git_apply_patch rechecks write revocation immediately before dispatching each process", async () => {
   await withWorkspace(async (cwd) => {
     await initializeGit(cwd);
     await git(cwd, ["add", "."]);
     await git(cwd, ["commit", "-m", "baseline"]);
+    const input = await gitPatchInput(cwd);
     let active: PermissionRule[] = [{ permission: "*", pattern: "*", action: "allow" }];
     let started = 0;
     const stop = observeProcessGuardianLifecycle((event) => {
@@ -201,16 +201,16 @@ test("managed Git tools recheck write revocation immediately before dispatching 
       active = rules("write(blocked.txt)");
     });
     try {
-      const result = await call(harness(() => active), cwd, "git_worktree", { action: "create", name: "revoked" });
+      const result = await call(harness(() => active), cwd, "git_apply_patch", input);
       expect(result.status).toBe("failed");
       expect(started).toBe(1);
       expect(await readFile(join(cwd, "blocked.txt"), "utf8")).toContain(secret);
     } finally { stop(); }
-    await expect(access(join(cwd, ".chili", "worktrees", "revoked"))).rejects.toThrow();
+    expect(await readFile(join(cwd, "visible.txt"), "utf8")).toBe("public needle\n");
   });
 });
 
-test("managed Git read commands refuse repository filters even without resource scopes", async () => {
+test("git_apply_patch checks refuse repository filters even without resource scopes", async () => {
   await withWorkspace(async (cwd) => {
     await initializeGit(cwd);
     await git(cwd, ["add", "."]);
@@ -223,21 +223,19 @@ test("managed Git read commands refuse repository filters even without resource 
     await git(cwd, ["diff", "--no-ext-diff", "--no-textconv"]);
     expect(await readFile(join(cwd, "filter-ran.txt"), "utf8")).toBe("filter");
     await rm(join(cwd, "filter-ran.txt"));
-    const calls = await managedGitReadCalls(cwd);
+    const input = { ...await gitPatchInput(cwd), checkOnly: true };
     for (const executor of [
       harness(() => [{ permission: "*", pattern: "*", action: "allow" }]),
       harness(() => rules("write(filter-ran.txt)")),
-      harness(() => [{ permission: "*", pattern: "*", action: "allow" }], [], { writeScope: [], executeScope: [], allowedTools: ["git_worktree", "git_apply_patch"] }),
+      harness(() => [{ permission: "*", pattern: "*", action: "allow" }], [], { writeScope: [], executeScope: [], allowedTools: ["git_apply_patch"] }),
     ]) {
-      for (const [tool, input] of calls) {
-        expect((await call(executor, cwd, tool, input)).status).toBe("failed");
-        await expect(access(join(cwd, "filter-ran.txt"))).rejects.toThrow();
-      }
+      expect((await call(executor, cwd, "git_apply_patch", input)).status).toBe("failed");
+      await expect(access(join(cwd, "filter-ran.txt"))).rejects.toThrow();
     }
   });
 });
 
-test("managed Git read commands disable filesystem-monitor helpers", async () => {
+test("git_apply_patch checks disable filesystem-monitor helpers", async () => {
   await withWorkspace(async (cwd) => {
     await initializeGit(cwd);
     await git(cwd, ["add", "."]);
@@ -249,20 +247,20 @@ test("managed Git read commands disable filesystem-monitor helpers", async () =>
     expect(await readFile(join(cwd, "monitor-ran.txt"), "utf8")).toBe("monitor");
     await rm(join(cwd, "monitor-ran.txt"));
     const executor = harness(() => [{ permission: "*", pattern: "*", action: "allow" }]);
-    for (const [tool, input] of await managedGitReadCalls(cwd)) {
-      expect((await call(executor, cwd, tool, input)).status).toBe("completed");
-      await expect(access(join(cwd, "monitor-ran.txt"))).rejects.toThrow();
-    }
+    const input = { ...await gitPatchInput(cwd), checkOnly: true };
+    expect((await call(executor, cwd, "git_apply_patch", input)).status).toBe("completed");
+    await expect(access(join(cwd, "monitor-ran.txt"))).rejects.toThrow();
   });
 });
 
-test("managed Git read dispatch detects filters added while the command is being prepared", async () => {
+test("git_apply_patch checks detect filters added while the command is being prepared", async () => {
   await withWorkspace(async (cwd) => {
     await initializeGit(cwd);
     await git(cwd, ["add", "."]);
     await git(cwd, ["commit", "-m", "baseline"]);
     await writeFile(join(cwd, ".gitattributes"), "visible.txt filter=probe\n");
     await writeFile(join(cwd, "visible.txt"), "changed\n");
+    const input = { ...await gitPatchInput(cwd), checkOnly: true };
     const configPath = join(cwd, ".git", "config");
     const originalConfig = await readFile(configPath, "utf8");
     let started = 0;
@@ -272,20 +270,17 @@ test("managed Git read dispatch detects filters added while the command is being
       writeFileSync(configPath, `${originalConfig}\n[filter "probe"]\n\tclean = printf filter > filter-ran.txt; cat\n`);
     });
     try {
-      const result = await call(harness(() => [{ permission: "*", pattern: "*", action: "allow" }]), cwd, "git_worktree", { action: "list" });
+      const result = await call(harness(() => [{ permission: "*", pattern: "*", action: "allow" }]), cwd, "git_apply_patch", input);
       expect(result.status).toBe("failed");
       await expect(access(join(cwd, "filter-ran.txt"))).rejects.toThrow();
     } finally { stop(); }
   });
 });
 
-async function managedGitReadCalls(cwd: string) {
+async function gitPatchInput(cwd: string) {
   const expectedHead = (await git(cwd, ["rev-parse", "HEAD"])).trim();
   const patchText = "diff --git a/visible.txt b/visible.txt\n--- a/visible.txt\n+++ b/visible.txt\n@@ -1 +1 @@\n-public needle\n+updated needle\n";
-  return [
-    ["git_worktree", { action: "list" }],
-    ["git_apply_patch", { expectedHead, patchText, checkOnly: true }],
-  ] as const;
+  return { expectedHead, patchText };
 }
 
 async function initializeGit(cwd: string): Promise<void> {

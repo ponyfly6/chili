@@ -91,8 +91,8 @@ test("root and nested Agents compose the same tools in Code Mode at one executio
     }
     const rootResults=(await host.store.messages(root)).flatMap((message)=>message.parts).filter((part)=>part.type==="tool_result");
     const scriptCatalog: string[] = JSON.parse(rootResults[0]!.output).catalog;
-    expect(scriptCatalog).toEqual(expect.arrayContaining(["write", "bash", "git_worktree", "git_apply_patch"]));
-    for (const removed of ["git_status", "git_diff", "git_stage", "git_commit", "git_branch"]) {
+    expect(scriptCatalog).toEqual(expect.arrayContaining(["write", "bash", "git_apply_patch"]));
+    for (const removed of ["git_status", "git_diff", "git_stage", "git_commit", "git_branch", "git_worktree"]) {
       expect(scriptCatalog).not.toContain(removed);
     }
     expect(JSON.stringify(rootResults)).not.toContain('team_create');

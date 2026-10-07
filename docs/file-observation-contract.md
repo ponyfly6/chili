@@ -122,14 +122,14 @@ nested `.git` directories are blocked as well. Unsupported alternate object
 stores fail closed; undiscovered nested gitdir pointers or independently copied
 object stores are outside this path-based protection.
 
-The retained `git_worktree` and `git_apply_patch` tools conservatively reject any
+The retained `git_apply_patch` tool conservatively rejects any
 file read/write deny or scoped write/process policy, including an explicit empty
-scope. Their fixed Git subprocesses disable hooks and `core.fsmonitor`, inspect
+scope. Its fixed Git subprocesses disable hooks and `core.fsmonitor`, inspect
 effective filter configuration at dispatch, and reject configured
 `filter.*.clean`, `.process`, or `.smudge` commands. Each subprocess rechecks
 current authorization immediately before its guardian receives execution
 permission; final checks prevent buffered results escaping after revocation.
-These narrow tools retain workspace ownership and patch integration checks;
+This narrow tool retains patch integration checks;
 filter-dependent operations require an authorized Bash command.
 
 These paths are covered by

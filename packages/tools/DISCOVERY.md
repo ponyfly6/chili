@@ -54,13 +54,13 @@ The Agent group contains six canonical tools: `agent_spawn`, `agent_list`,
 through code mode without direct loading. Creation and sending return input
 receipts; waiting follows a specific receipt. Use `Promise.all` over individual
 spawn calls for parallel work. See [Agent tools](AGENT_TOOLS.md) for the contracts,
-pause and resume behavior, and permission boundaries. `git_worktree` and
-`git_apply_patch` provide workspace isolation and change integration independently
-of Agent controls.
+pause and resume behavior, and permission boundaries. `git_apply_patch` provides
+change integration independently of Agent controls.
 
-Ordinary Git operations use `bash`; `git_status`, `git_diff`, `git_stage`,
-`git_commit`, and `git_branch` are no longer registered or discoverable. Existing
-conversation renderers continue to display historical calls. Git commands use the
+Git operations, including worktree management, use `bash`; `git_status`,
+`git_diff`, `git_stage`, `git_commit`, `git_branch`, and `git_worktree` are no longer
+registered or discoverable. Existing conversation renderers continue to display
+historical calls. Git commands use the
 same shell permissions and scheduling as other Bash commands. The macOS sandbox
 continues to protect Git metadata, including a linked worktree's shared gitdir.
 Authorized writes that need that access require an explicit one-time

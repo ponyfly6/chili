@@ -30,7 +30,7 @@ An insert trigger also fills the sequence for older processes that continue writ
 
 Agents use the same creation, messaging, waiting, stopping, and resuming operations. They decide how to split work and request review through ordinary inputs. There is no Team controller, business Task state machine, or automatic verification/merge workflow.
 
-`git_worktree` and `git_apply_patch` are independent tools. Agents can isolate work, review changes, run checks, and explicitly integrate patches under their tool permissions.
+Agents use `bash` for Git operations, including worktree management, and `git_apply_patch` for explicit patch integration. They can isolate work, review changes, run checks, and integrate patches under their tool permissions.
 
 ## Shell classification matches execution
 
