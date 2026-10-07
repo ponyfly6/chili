@@ -1,3 +1,4 @@
+import { BUILTIN_PROVIDERS } from "./provider-definition.js";
 import type { ChiliModelProvider, ModelDescriptor, ReasoningLevel } from "./types.js";
 import { type EnvironmentSource, readXaiEnvironment } from "./env.js";
 import {
@@ -25,7 +26,6 @@ export interface XaiModelOptions {
   env?: EnvironmentSource;
 }
 
-const DEFAULT_XAI_MAX_COMPLETION_TOKENS = 128_000;
 const DEFAULT_XAI_REASONING_EFFORT: ReasoningLevel = "high";
 
 export class XaiOpenAIProvider implements ChiliModelProvider {
@@ -98,7 +98,7 @@ export function createXaiModel(options: XaiModelOptions = {}): OpenAICompletions
     model,
     baseUrl: options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? XAI_OPENAI_BASE_URL,
     apiKey,
-    maxTokens: options.maxTokens ?? DEFAULT_XAI_MAX_COMPLETION_TOKENS,
+    maxTokens: options.maxTokens ?? BUILTIN_PROVIDERS.xai.defaultRequestMaxTokens,
     reasoning: options.reasoning ?? true,
   };
   if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;

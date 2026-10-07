@@ -1,5 +1,55 @@
 # Provider execution contract
 
+## Registration and configuration
+
+`provider-definition.ts` owns built-in provider IDs, aliases, display names,
+model-prefix inference, connection labels and default request output allowances.
+Model capabilities, model defaults and wire compatibility remain in `models.ts`
+and `compat.ts`. An output allowance is a request default, not a claim about a
+custom model's context window.
+
+`provider-registry.ts` connects every definition to one statically imported,
+typed factory. Missing factories fail compilation; Host no longer guesses export
+names or accepts structurally unknown provider modules. This is an internal
+registration table, without dynamic plugin loading.
+
+Host owns user selection (including CLI aliases/suffixes and the fake model),
+profile binding and per-request overrides. It delegates provider construction
+and reasoning/service-tier translation to `resolveProviderModelOptions` and
+`createRegisteredProviderModel`. Resolution reads a snapshot of only the selected
+provider's environment variables. Explicit connection/model options take
+precedence over that snapshot, followed by the existing adapter/catalog defaults.
+The adapters retain their public standalone factories and consume the same
+snapshot when translating their protocol options. No second live environment
+read can change the connection partway through constructing an attempt.
+
+Environment credentials remain environment credentials: they are not converted
+into explicit `apiKey` options that bypass provenance checks. In particular,
+legacy ChatGPT OAuth tokens are still rejected by the `codex-api` adapter.
+ChatGPT's OAuth-only endpoint rules, profile storage and just-before-dispatch
+credential validation remain unchanged. Configuration resolution does not cache
+OAuth tokens. Switching providers discards the previous provider's explicit
+key, endpoint and custom headers; shared request controls remain available.
+
+The Host bridge consumes the exported provider request/event types directly.
+There is no event-name allowlist to silently discard a newly added provider
+event; compatibility with Core's stream contract is checked by TypeScript.
+Provider events still carry text/reasoning block completion and opaque protocol
+continuation data, independently of user-visible reasoning persistence.
+
+To add a built-in provider, register its definition and typed factory, its
+environment names in `env.ts`, and its model descriptors/compatibility in
+`models.ts`. Reuse an existing protocol adapter where appropriate. Host needs no
+new factory, provider-name switch or environment parser. Public legacy factory
+aliases remain available to existing callers.
+
+`provider-registry.test.ts` exercises all registered factories with fake
+transports, environment snapshots and credential-source validation. Host and CLI
+tests cover model selection, protocol differences, request identity, deadlines
+and connection isolation across per-turn model switches.
+
+## Requests
+
 The Responses, Chat Completions and Anthropic adapters share a total request
 deadline and cancellation boundary. The default deadline is five minutes and
 `ModelStreamInput.requestTimeoutMs` can override it. It includes authentication,

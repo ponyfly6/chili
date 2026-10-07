@@ -5,57 +5,35 @@ import type {
   ModelStreamEvent,
   ModelStreamInput,
 } from "@chili/core";
-import type { ModelSelection, PreparedModelIdentity, RuntimeModelDescriptor, ServiceTier } from "@chili/protocol";
-import * as providersModule from "@chili/providers";
+import type { ModelSelection, RuntimeModelDescriptor, ServiceTier } from "@chili/protocol";
 import {
-  assertCodexApiModel,
-  assertOpenAICodexModel,
-  canonicalizeCodexApiModel,
-  canonicalizeOpenAICodexModel,
-  CODEX_API_DEFAULT_MODEL,
-  CODEX_API_PROVIDER_ID,
-  DEEPSEEK_OPENAI_BASE_URL,
-  DEEPSEEK_PROVIDER_ID,
+  BUILTIN_PROVIDERS,
+  assertProviderConnectionOptions,
+  canonicalizeProviderModel,
+  createRegisteredProviderModel,
   FileAuthStorage,
-  DEEPSEEK_V4_PRO_MODEL,
-  clampModelReasoningLevel,
   findKnownModel,
   getModelSelectionAvailableReasoningLevels,
-  KIMI_K3_MODEL,
-  KIMI_OPENAI_BASE_URL,
-  KIMI_PROVIDER_ID,
+  inferBuiltinProviderId,
+  isBuiltinProviderId,
   listModelCatalogFromStorage,
   listKnownModels,
-  MINIMAX_ANTHROPIC_BASE_URL,
-  MINIMAX_M3_MODEL,
-  MINIMAX_PROVIDER_ID,
-  OPENAI_CODEX_DEFAULT_MODEL,
-  OPENAI_CODEX_PROVIDER_ID,
-  readDeepSeekEnvironment,
-  readCodexApiEnvironment,
-  readKimiEnvironment,
-  readMiniMaxEnvironment,
-  readXaiEnvironment,
-  readZaiEnvironment,
-  XAI_GROK_46_MODEL,
-  XAI_OPENAI_BASE_URL,
-  XAI_PROVIDER_ID,
-  ZAI_GLM_53_MODEL,
-  ZAI_OPENAI_BASE_URL,
-  ZAI_PROVIDER_ID,
+  REASONING_LEVELS,
+  resolveBuiltinProviderId,
+  resolveProviderModelOptions,
+  scopeProviderModelOptions,
+  type BuiltinProviderId,
+  type ChiliModel,
+  type ModelStreamInput as ProviderModelStreamInput,
+  type ProviderModelOptions,
+  type ReasoningLevel,
+  type ResolvedProviderModelOptions,
 } from "@chili/providers";
 import { FakeModelRouter } from "./fake-model.js";
 
 export type HostModelName = string;
-export type HostProviderName =
-  | "minimax"
-  | "deepseek"
-  | "kimi"
-  | "zai"
-  | "xai"
-  | "openai-codex"
-  | "codex-api";
-export type HostReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export type HostProviderName = BuiltinProviderId;
+export type HostReasoningLevel = ReasoningLevel;
 
 export interface HostModelSelection {
   provider?: string;
@@ -64,78 +42,8 @@ export interface HostModelSelection {
   serviceTier?: ServiceTier;
 }
 
-interface ProviderRouterOptions {
-  apiKey?: string;
-  baseUrl?: string;
-  model?: string;
-  maxTokens?: number;
-  temperature?: number;
-  fetch?: typeof fetch;
-  headers?: Record<string, string>;
-  authStorage?: FileAuthStorage;
-  reasoning?: boolean;
-  reasoningEffort?: HostReasoningLevel;
-  reasoningMode?: "pro";
-  reasoningContext?: "auto" | "all_turns" | "current_turn";
-  reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
-  serviceTier?: ServiceTier;
-}
-
-type HostModelOptions = ProviderRouterOptions & HostModelSelection & { profileId?: string };
-
-type ProviderRouterFactory = (options?: ProviderRouterOptions) => ProviderModelOrProvider | Promise<ProviderModelOrProvider>;
-
-interface ProviderModel {
-  stream(input: ProviderModelStreamInput): AsyncIterable<ProviderModelStreamEvent>;
-}
-
-interface ProviderModelProvider {
-  getModel(model?: string): ProviderModel;
-}
-
-interface ProviderModelStreamInput {
-  messages: ModelStreamInput["messages"];
-  tools?: ModelStreamInput["tools"];
-  system?: readonly string[];
-  developer?: readonly string[];
-  contextualUser?: readonly string[];
-  serviceTier?: ServiceTier;
-  maxTokens?: number;
-  temperature?: number;
-  signal?: AbortSignal;
-  requestTimeoutMs?: number;
-  onRequestIdentity?: (identity: PreparedModelIdentity) => Promise<void>;
-  metadata?: Record<string, unknown>;
-}
-
-type ProviderModelOrProvider = ProviderModel | ProviderModelProvider;
-
-type ProviderModelStreamEvent =
-  | ModelStreamEvent
-  | { type: "metadata"; [key: string]: unknown }
-  | { type: "reasoning_delta"; [key: string]: unknown }
-  | { type: "reasoning_item"; [key: string]: unknown }
-  | { type: "tool_call_start"; [key: string]: unknown }
-  | { type: "tool_call_delta"; [key: string]: unknown }
-  | { type: "tool_call_end"; name: string; input: unknown; [key: string]: unknown };
-
-const STATIC_PROVIDERS_MODULE = providersModule as unknown as Record<string, unknown>;
-const DEFAULT_DEEPSEEK_MAX_TOKENS = 128 * 1024;
-const DEFAULT_KIMI_MAX_TOKENS = 128 * 1024;
-const DEFAULT_ZAI_MAX_TOKENS = 128 * 1024;
-const DEFAULT_MINIMAX_MAX_TOKENS = 128 * 1024;
-const DEFAULT_XAI_MAX_TOKENS = 128_000;
-const DEFAULT_CODEX_MAX_TOKENS = 128_000;
+type HostModelOptions = ProviderModelOptions & HostModelSelection & { profileId?: string };
 const DEFAULT_PROVIDER: HostProviderName = "minimax";
-const PROVIDER_DISPLAY_NAMES: Record<HostProviderName, string> = {
-  minimax: "MiniMax",
-  deepseek: "DeepSeek",
-  kimi: "Kimi",
-  zai: "Z.ai",
-  xai: "xAI",
-  "openai-codex": "ChatGPT",
-  "codex-api": "Api",
-};
 
 export async function createHostModel(selection?: HostModelName | HostModelSelection, options: HostModelOptions = {}): Promise<ModelRouter> {
   const config = normalizeCreateHostModelInput(selection, options);
@@ -143,9 +51,7 @@ export async function createHostModel(selection?: HostModelName | HostModelSelec
   const baseOptions = providerBaseOptions(config);
 
   if (defaultSelection.kind === "fake") return new FakeModelRouter();
-  if (defaultSelection.provider === OPENAI_CODEX_PROVIDER_ID) {
-    assertOpenAICodexHostOptions(baseOptions);
-  }
+  assertProviderConnectionOptions(defaultSelection.provider, baseOptions);
 
   const routerOptions: HostProviderRouterOptions = {
     defaultSelection,
@@ -160,157 +66,10 @@ export async function createHostModel(selection?: HostModelName | HostModelSelec
 export function resolveHostRuntimeModelSelection(selection: HostModelSelection): ModelSelection | undefined {
   const resolved = resolveHostModelSelection(selection.provider, selection.model);
   if (resolved.kind === "fake") return undefined;
-  const providerOptions = readOptionsForProvider(resolved.provider, resolved.model ? { model: resolved.model } : {});
+  const providerOptions = resolveProviderModelOptions(resolved.provider, resolved.model ? { model: resolved.model } : {});
   const model = providerOptions.model;
   if (!model) return undefined;
   return { provider: resolved.provider, model };
-}
-
-function resolveMiniMaxFactory(providers: Record<string, unknown>): ProviderRouterFactory {
-  const defaultExport = providers.default;
-  const defaultObject = isRecord(defaultExport) ? defaultExport : {};
-  const candidates = [
-    providers.createMiniMaxRouter,
-    providers.createMiniMaxProvider,
-    providers.createMiniMaxProviderRouter,
-    defaultObject.createMiniMaxRouter,
-    typeof defaultExport === "function" ? defaultExport : undefined,
-  ];
-  const factory = candidates.find((candidate) => typeof candidate === "function");
-  if (!factory) {
-    throw new Error(
-      "@chili/providers must export createMiniMaxRouter(options) or another compatible MiniMax router factory",
-    );
-  }
-  return factory as ProviderRouterFactory;
-}
-
-function resolveDeepSeekFactory(providers: Record<string, unknown>): ProviderRouterFactory {
-  const defaultExport = providers.default;
-  const defaultObject = isRecord(defaultExport) ? defaultExport : {};
-  const candidates = [
-    providers.createDeepSeekRouter,
-    providers.createDeepSeekV4Model,
-    providers.createDeepSeekProvider,
-    defaultObject.createDeepSeekRouter,
-    defaultObject.createDeepSeekV4Model,
-    defaultObject.createDeepSeekProvider,
-    typeof defaultExport === "function" ? defaultExport : undefined,
-  ];
-  const factory = candidates.find((candidate) => typeof candidate === "function");
-  if (!factory) {
-    throw new Error("@chili/providers must export createDeepSeekRouter(options) or another compatible DeepSeek factory");
-  }
-  return factory as ProviderRouterFactory;
-}
-
-function resolveKimiFactory(providers: Record<string, unknown>): ProviderRouterFactory {
-  const defaultExport = providers.default;
-  const defaultObject = isRecord(defaultExport) ? defaultExport : {};
-  const candidates = [
-    providers.createKimiRouter,
-    providers.createKimiModel,
-    providers.createKimiProvider,
-    providers.createMoonshotRouter,
-    providers.createMoonshotProvider,
-    defaultObject.createKimiRouter,
-    defaultObject.createKimiModel,
-    defaultObject.createKimiProvider,
-    defaultObject.createMoonshotRouter,
-    defaultObject.createMoonshotProvider,
-    typeof defaultExport === "function" ? defaultExport : undefined,
-  ];
-  const factory = candidates.find((candidate) => typeof candidate === "function");
-  if (!factory) {
-    throw new Error("@chili/providers must export createKimiRouter(options) or another compatible Kimi factory");
-  }
-  return factory as ProviderRouterFactory;
-}
-
-function resolveZaiFactory(providers: Record<string, unknown>): ProviderRouterFactory {
-  const defaultExport = providers.default;
-  const defaultObject = isRecord(defaultExport) ? defaultExport : {};
-  const candidates = [
-    providers.createZaiRouter,
-    providers.createZaiModel,
-    providers.createZaiProvider,
-    defaultObject.createZaiRouter,
-    defaultObject.createZaiModel,
-    defaultObject.createZaiProvider,
-    typeof defaultExport === "function" ? defaultExport : undefined,
-  ];
-  const factory = candidates.find((candidate) => typeof candidate === "function");
-  if (!factory) {
-    throw new Error("@chili/providers must export createZaiRouter(options) or another compatible Z.ai factory");
-  }
-  return factory as ProviderRouterFactory;
-}
-
-function resolveXaiFactory(providers: Record<string, unknown>): ProviderRouterFactory {
-  const defaultExport = providers.default;
-  const defaultObject = isRecord(defaultExport) ? defaultExport : {};
-  const candidates = [
-    providers.createXaiRouter,
-    providers.createXaiModel,
-    providers.createXaiProvider,
-    defaultObject.createXaiRouter,
-    defaultObject.createXaiModel,
-    defaultObject.createXaiProvider,
-    typeof defaultExport === "function" ? defaultExport : undefined,
-  ];
-  const factory = candidates.find((candidate) => typeof candidate === "function");
-  if (!factory) {
-    throw new Error("@chili/providers must export createXaiRouter(options) or another compatible xAI factory");
-  }
-  return factory as ProviderRouterFactory;
-}
-
-function resolveOpenAICodexFactory(providers: Record<string, unknown>): ProviderRouterFactory {
-  const defaultExport = providers.default;
-  const defaultObject = isRecord(defaultExport) ? defaultExport : {};
-  const candidates = [
-    providers.createOpenAICodexRouter,
-    providers.createOpenAICodexModel,
-    providers.createOpenAICodexProvider,
-    defaultObject.createOpenAICodexRouter,
-    defaultObject.createOpenAICodexModel,
-    defaultObject.createOpenAICodexProvider,
-    typeof defaultExport === "function" ? defaultExport : undefined,
-  ];
-  const factory = candidates.find((candidate) => typeof candidate === "function");
-  if (!factory) {
-    throw new Error("@chili/providers must export createOpenAICodexRouter(options) or another compatible OpenAI Codex factory");
-  }
-  return factory as ProviderRouterFactory;
-}
-
-function resolveCodexApiFactory(providers: Record<string, unknown>): ProviderRouterFactory {
-  const defaultExport = providers.default;
-  const defaultObject = isRecord(defaultExport) ? defaultExport : {};
-  const candidates = [
-    providers.createCodexApiRouter,
-    providers.createCodexApiModel,
-    providers.createCodexApiProvider,
-    defaultObject.createCodexApiRouter,
-    defaultObject.createCodexApiModel,
-    defaultObject.createCodexApiProvider,
-    typeof defaultExport === "function" ? defaultExport : undefined,
-  ];
-  const factory = candidates.find((candidate) => typeof candidate === "function");
-  if (!factory) {
-    throw new Error("@chili/providers must export createCodexApiRouter(options) or another compatible Codex API factory");
-  }
-  return factory as ProviderRouterFactory;
-}
-
-function modelFromFactoryResult(
-  modelOrProvider: ProviderModelOrProvider,
-  modelName: string | undefined,
-  providerName: string,
-): ProviderModel {
-  if (isProviderModelProvider(modelOrProvider)) return modelOrProvider.getModel(modelName);
-  if (isProviderModel(modelOrProvider)) return modelOrProvider;
-  throw new Error(`@chili/providers ${providerName} factory did not return a model or provider-compatible object`);
 }
 
 function normalizeCreateHostModelInput(
@@ -337,8 +96,9 @@ function normalizeCreateHostModelInput(
   return merged;
 }
 
-function providerBaseOptions(input: HostModelOptions): ProviderRouterOptions {
-  const options: ProviderRouterOptions = {};
+function providerBaseOptions(input: HostModelOptions): ProviderModelOptions {
+  const options: ProviderModelOptions = {};
+  if (input.env !== undefined) options.env = input.env;
   if (input.apiKey !== undefined) options.apiKey = input.apiKey;
   if (input.baseUrl !== undefined) options.baseUrl = input.baseUrl;
   if (input.maxTokens !== undefined) options.maxTokens = input.maxTokens;
@@ -376,24 +136,21 @@ function resolveHostModelSelection(providerInput: string | undefined, modelInput
     if (split && split.provider !== provider) {
       throw new Error(`--model ${model} conflicts with --provider ${provider}`);
     }
-    const resolvedModel = canonicalizeHostProviderModel(provider, split?.model ?? model);
-    assertHostProviderModel(provider, resolvedModel);
+    const resolvedModel = canonicalizeProviderModel(provider, split?.model ?? model);
     return { kind: "provider", provider, model: resolvedModel };
   }
 
   if (split) {
-    const resolvedModel = canonicalizeHostProviderModel(split.provider, split.model);
-    assertHostProviderModel(split.provider, resolvedModel);
+    const resolvedModel = canonicalizeProviderModel(split.provider, split.model);
     return { kind: "provider", provider: split.provider, model: resolvedModel };
   }
 
   const exact = findKnownModelByBareId(model);
   if (exact) return { kind: "provider", provider: exact.provider, model: exact.model };
 
-  const heuristicProvider = inferProviderFromBareModel(model);
+  const heuristicProvider = inferBuiltinProviderId(model);
   if (heuristicProvider) {
-    const resolvedModel = canonicalizeHostProviderModel(heuristicProvider, model);
-    assertHostProviderModel(heuristicProvider, resolvedModel);
+    const resolvedModel = canonicalizeProviderModel(heuristicProvider, model);
     return { kind: "provider", provider: heuristicProvider, model: resolvedModel };
   }
 
@@ -402,39 +159,22 @@ function resolveHostModelSelection(providerInput: string | undefined, modelInput
 
 function normalizeProviderName(value: string | undefined): HostProviderName | undefined {
   if (!value) return undefined;
-  const normalized = value.trim().toLowerCase();
-  if (normalized === "minimax") return "minimax";
-  if (normalized === "deepseek") return "deepseek";
-  if (normalized === "kimi" || normalized === "moonshot") return "kimi";
-  if (normalized === "zai" || normalized === "z.ai" || normalized === "glm") return "zai";
-  if (normalized === "xai" || normalized === "x.ai" || normalized === "grok") return "xai";
-  if (normalized === "codex" || normalized === "openai-codex") return "openai-codex";
-  if (normalized === "codex-api") return "codex-api";
-  throw new Error(`Unknown provider: ${value}`);
+  const provider = resolveBuiltinProviderId(value);
+  if (!provider) throw new Error(`Unknown provider: ${value}`);
+  return provider;
 }
 
 function normalizeSpecialModelAlias(value: string): ResolvedHostModelSelection | undefined {
   const normalized = value.trim().toLowerCase();
   if (normalized === "fake") return { kind: "fake" };
-  const provider = normalizeProviderAlias(normalized);
+  const provider = resolveBuiltinProviderId(normalized);
   return provider ? { kind: "provider", provider } : undefined;
-}
-
-function normalizeProviderAlias(value: string): HostProviderName | undefined {
-  if (value === "minimax") return "minimax";
-  if (value === "deepseek") return "deepseek";
-  if (value === "kimi" || value === "moonshot") return "kimi";
-  if (value === "zai" || value === "z.ai" || value === "glm") return "zai";
-  if (value === "xai" || value === "x.ai" || value === "grok") return "xai";
-  if (value === "codex" || value === "openai-codex") return "openai-codex";
-  if (value === "codex-api") return "codex-api";
-  return undefined;
 }
 
 function splitProviderModelReference(value: string): { provider: HostProviderName; model: string } | undefined {
   const slashIndex = value.indexOf("/");
   if (slashIndex === -1) return undefined;
-  const provider = normalizeProviderAlias(value.slice(0, slashIndex).trim().toLowerCase());
+  const provider = resolveBuiltinProviderId(value.slice(0, slashIndex).trim().toLowerCase());
   const model = value.slice(slashIndex + 1).trim();
   if (!provider || !model) return undefined;
   return { provider, model };
@@ -443,41 +183,9 @@ function splitProviderModelReference(value: string): { provider: HostProviderNam
 function findKnownModelByBareId(model: string): { provider: HostProviderName; model: string } | undefined {
   const normalized = model.toLowerCase();
   const matches = listKnownModels()
-    .filter((descriptor) => isHostProviderName(descriptor.provider) && descriptor.model.toLowerCase() === normalized)
+    .filter((descriptor) => isBuiltinProviderId(descriptor.provider) && descriptor.model.toLowerCase() === normalized)
     .map((descriptor) => ({ provider: descriptor.provider as HostProviderName, model: descriptor.model }));
   return matches.length === 1 ? matches[0] : undefined;
-}
-
-function inferProviderFromBareModel(model: string): HostProviderName | undefined {
-  const normalized = model.toLowerCase();
-  if (normalized.startsWith("gpt-")) return "openai-codex";
-  if (normalized.startsWith("deepseek-")) return "deepseek";
-  if (normalized.startsWith("kimi-") || normalized.startsWith("moonshot-")) return "kimi";
-  if (normalized.startsWith("glm-")) return "zai";
-  if (normalized.startsWith("grok-")) return "xai";
-  if (normalized.startsWith("minimax-")) return "minimax";
-  return undefined;
-}
-
-function isHostProviderName(provider: string): provider is HostProviderName {
-  return provider === MINIMAX_PROVIDER_ID
-    || provider === DEEPSEEK_PROVIDER_ID
-    || provider === KIMI_PROVIDER_ID
-    || provider === ZAI_PROVIDER_ID
-    || provider === XAI_PROVIDER_ID
-    || provider === OPENAI_CODEX_PROVIDER_ID
-    || provider === CODEX_API_PROVIDER_ID;
-}
-
-function assertHostProviderModel(provider: HostProviderName, model: string | undefined): void {
-  if (provider === OPENAI_CODEX_PROVIDER_ID && model) assertOpenAICodexModel(model);
-  if (provider === CODEX_API_PROVIDER_ID && model) assertCodexApiModel(model);
-}
-
-function canonicalizeHostProviderModel(provider: HostProviderName, model: string): string {
-  if (provider === OPENAI_CODEX_PROVIDER_ID) return canonicalizeOpenAICodexModel(model);
-  if (provider === CODEX_API_PROVIDER_ID) return canonicalizeCodexApiModel(model);
-  return model;
 }
 
 function splitReasoningSuffix(value: string): { model: string; reasoningLevel?: HostReasoningLevel } {
@@ -492,37 +200,29 @@ function splitReasoningSuffix(value: string): { model: string; reasoningLevel?: 
 }
 
 function isReasoningLevel(value: string): value is HostReasoningLevel {
-  return value === "off"
-    || value === "minimal"
-    || value === "low"
-    || value === "medium"
-    || value === "high"
-    || value === "xhigh"
-    || value === "max"
-    || value === "ultra";
+  return (REASONING_LEVELS as readonly string[]).includes(value);
 }
 
 interface HostProviderRouterOptions {
   defaultSelection: Extract<ResolvedHostModelSelection, { kind: "provider" }>;
   defaultReasoningLevel?: HostReasoningLevel;
   defaultServiceTier?: ServiceTier;
-  baseOptions: ProviderRouterOptions;
+  baseOptions: ProviderModelOptions;
   profileId?: string;
 }
 
 class HostProviderRouter implements ModelRouter {
-  private readonly factories = new Map<HostProviderName, Promise<ProviderRouterFactory>>();
-
   constructor(private readonly options: HostProviderRouterOptions) {}
 
   async listModels(): Promise<readonly RuntimeModelDescriptor[]> {
     const catalog = await listModelCatalogFromStorage(
       undefined,
       this.options.baseOptions.authStorage ?? new FileAuthStorage(),
+      this.options.baseOptions.env ? { env: this.options.baseOptions.env } : {},
     );
-    return catalog.filter((model) => isHostProviderName(model.provider)).map((model) => {
+    return catalog.filter((model) => isBuiltinProviderId(model.provider)).map((model) => {
       const endpoint = safeEndpointOrigin(model.endpoint);
-      const connectionLabel = connectionLabelForProvider(model.provider);
+      const connectionLabel = isBuiltinProviderId(model.provider) ? BUILTIN_PROVIDERS[model.provider].connectionLabel : undefined;
       return {
         provider: model.provider,
         model: model.model,
@@ -553,13 +253,7 @@ class HostProviderRouter implements ModelRouter {
     const reasoningLevel = reasoningLevelForInput(extended, this.options.defaultReasoningLevel);
     const serviceTier = serviceTierForInput(extended, this.options.defaultServiceTier);
     const providerOptions = this.optionsForProvider(selection, reasoningLevel, serviceTier);
-    const factory = await this.factoryFor(selection.provider);
-    const modelOrProvider = await factory(providerOptions);
-    const model = modelFromFactoryResult(
-      modelOrProvider,
-      providerOptions.model,
-      PROVIDER_DISPLAY_NAMES[selection.provider],
-    );
+    const model = createRegisteredProviderModel(selection.provider, providerOptions);
     yield* new ProviderModelRouterAdapter(model, this.options.profileId).stream(input);
   }
 
@@ -585,44 +279,14 @@ class HostProviderRouter implements ModelRouter {
     selection: Extract<ResolvedHostModelSelection, { kind: "provider" }>,
     reasoningLevel: HostReasoningLevel | undefined,
     serviceTier: ServiceTier | undefined,
-  ): ProviderRouterOptions {
-    const input: ProviderRouterOptions = {
-      ...providerScopedBaseOptions(
-        this.options.baseOptions,
-        this.options.defaultSelection.provider,
-        selection.provider,
-      ),
+  ): ResolvedProviderModelOptions {
+    return resolveProviderModelOptions(selection.provider, {
+      ...scopeProviderModelOptions(this.options.baseOptions, this.options.defaultSelection.provider, selection.provider),
       ...(selection.model ? { model: selection.model } : {}),
-    };
-    if (serviceTier !== undefined && (
-      selection.provider === OPENAI_CODEX_PROVIDER_ID
-      || selection.provider === CODEX_API_PROVIDER_ID
-      || selection.provider === MINIMAX_PROVIDER_ID
-    )) {
-      input.serviceTier = serviceTier;
-    }
-    const withEnv = readOptionsForProvider(selection.provider, input);
-    const selectedModel = withEnv.model ?? selection.model;
-    const descriptor = selectedModel ? findKnownModel(selection.provider, selectedModel) : undefined;
-    const mappedReasoningLevel = reasoningLevel && reasoningLevel !== "off"
-      ? descriptor?.compatibility?.chatCompletions?.reasoningEffortMap?.[reasoningLevel]
-      : undefined;
-    const levelForModel = mappedReasoningLevel && isReasoningLevel(mappedReasoningLevel)
-      ? mappedReasoningLevel
-      : reasoningLevel;
-    const effectiveReasoningLevel = levelForModel
-      ? clampModelReasoningLevel(descriptor ?? selectedModel, levelForModel)
-      : undefined;
-    applyReasoningOptions(withEnv, selection.provider, effectiveReasoningLevel);
-    return withEnv;
-  }
-
-  private async factoryFor(provider: HostProviderName): Promise<ProviderRouterFactory> {
-    const existing = this.factories.get(provider);
-    if (existing) return existing;
-    const promise = loadFactoryForProvider(provider);
-    this.factories.set(provider, promise);
-    return promise;
+    }, {
+      ...(reasoningLevel !== undefined ? { reasoningLevel } : {}),
+      ...(serviceTier !== undefined ? { serviceTier } : {}),
+    });
   }
 }
 
@@ -679,185 +343,9 @@ function stringProperty(record: Record<string, unknown>, key: string): string | 
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-async function loadFactoryForProvider(provider: HostProviderName): Promise<ProviderRouterFactory> {
-  if (provider === "deepseek") return resolveDeepSeekFactory(STATIC_PROVIDERS_MODULE);
-  if (provider === "kimi") return resolveKimiFactory(STATIC_PROVIDERS_MODULE);
-  if (provider === "zai") return resolveZaiFactory(STATIC_PROVIDERS_MODULE);
-  if (provider === "xai") return resolveXaiFactory(STATIC_PROVIDERS_MODULE);
-  if (provider === "openai-codex") return resolveOpenAICodexFactory(STATIC_PROVIDERS_MODULE);
-  if (provider === "codex-api") return resolveCodexApiFactory(STATIC_PROVIDERS_MODULE);
-  return resolveMiniMaxFactory(STATIC_PROVIDERS_MODULE);
-}
-
-function readMiniMaxOptionsFromEnv(input: HostModelOptions): ProviderRouterOptions {
-  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_MINIMAX_MAX_TOKENS };
-  const env = readMiniMaxEnvironment();
-  const resolvedApiKey = input.apiKey ?? env.apiKey;
-  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? MINIMAX_ANTHROPIC_BASE_URL;
-  const resolvedModel = input.model ?? env.model ?? MINIMAX_M3_MODEL;
-
-  if (resolvedApiKey) options.apiKey = resolvedApiKey;
-  if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
-  if (resolvedModel) options.model = resolvedModel;
-  if (input.temperature !== undefined) options.temperature = input.temperature;
-  if (input.fetch) options.fetch = input.fetch;
-  if (input.headers !== undefined) options.headers = input.headers;
-  if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
-  return options;
-}
-
-function readDeepSeekOptionsFromEnv(input: HostModelOptions): ProviderRouterOptions {
-  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_DEEPSEEK_MAX_TOKENS };
-  const env = readDeepSeekEnvironment();
-  const resolvedApiKey = input.apiKey ?? env.apiKey;
-  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? DEEPSEEK_OPENAI_BASE_URL;
-  const resolvedModel = input.model ?? env.model ?? DEEPSEEK_V4_PRO_MODEL;
-
-  if (resolvedApiKey) options.apiKey = resolvedApiKey;
-  if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
-  if (resolvedModel) options.model = resolvedModel;
-  if (input.temperature !== undefined) options.temperature = input.temperature;
-  if (input.fetch) options.fetch = input.fetch;
-  if (input.headers !== undefined) options.headers = input.headers;
-  return options;
-}
-
-function readKimiOptionsFromEnv(input: HostModelOptions): ProviderRouterOptions {
-  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_KIMI_MAX_TOKENS };
-  const env = readKimiEnvironment();
-  const resolvedApiKey = input.apiKey ?? env.apiKey;
-  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? KIMI_OPENAI_BASE_URL;
-  const resolvedModel = input.model ?? env.model ?? KIMI_K3_MODEL;
-
-  if (resolvedApiKey) options.apiKey = resolvedApiKey;
-  if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
-  if (resolvedModel) options.model = resolvedModel;
-  if (input.temperature !== undefined) options.temperature = input.temperature;
-  if (input.fetch) options.fetch = input.fetch;
-  if (input.headers !== undefined) options.headers = input.headers;
-  return options;
-}
-
-function readZaiOptionsFromEnv(input: HostModelOptions): ProviderRouterOptions {
-  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_ZAI_MAX_TOKENS };
-  const env = readZaiEnvironment();
-  const resolvedApiKey = input.apiKey ?? env.apiKey;
-  const resolvedModel = input.model ?? env.model ?? ZAI_GLM_53_MODEL;
-  const resolvedBaseUrl = input.baseUrl
-    ?? env.baseUrl
-    ?? findKnownModel(ZAI_PROVIDER_ID, resolvedModel)?.baseUrl
-    ?? ZAI_OPENAI_BASE_URL;
-
-  if (resolvedApiKey) options.apiKey = resolvedApiKey;
-  if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
-  if (resolvedModel) options.model = resolvedModel;
-  if (input.temperature !== undefined) options.temperature = input.temperature;
-  if (input.fetch) options.fetch = input.fetch;
-  if (input.headers !== undefined) options.headers = input.headers;
-  return options;
-}
-
-function readXaiOptionsFromEnv(input: HostModelOptions): ProviderRouterOptions {
-  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_XAI_MAX_TOKENS };
-  const env = readXaiEnvironment();
-  const resolvedApiKey = input.apiKey ?? env.apiKey;
-  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? XAI_OPENAI_BASE_URL;
-  const resolvedModel = input.model ?? env.model ?? XAI_GROK_46_MODEL;
-
-  if (resolvedApiKey) options.apiKey = resolvedApiKey;
-  if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
-  if (resolvedModel) options.model = resolvedModel;
-  if (input.temperature !== undefined) options.temperature = input.temperature;
-  if (input.fetch) options.fetch = input.fetch;
-  if (input.headers !== undefined) options.headers = input.headers;
-  return options;
-}
-
-function readOpenAICodexOptionsFromEnv(input: HostModelOptions): ProviderRouterOptions {
-  assertOpenAICodexHostOptions(input);
-  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_CODEX_MAX_TOKENS };
-  const resolvedModel = canonicalizeOpenAICodexModel(input.model ?? OPENAI_CODEX_DEFAULT_MODEL);
-
-  if (resolvedModel) options.model = resolvedModel;
-  if (input.temperature !== undefined) options.temperature = input.temperature;
-  if (input.fetch) options.fetch = input.fetch;
-  if (input.headers !== undefined) options.headers = input.headers;
-  if (input.authStorage !== undefined) options.authStorage = input.authStorage;
-  if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
-  if (input.reasoningMode !== undefined) options.reasoningMode = input.reasoningMode;
-  if (input.reasoningContext !== undefined) options.reasoningContext = input.reasoningContext;
-  return options;
-}
-
-function assertOpenAICodexHostOptions(input: Pick<ProviderRouterOptions, "apiKey" | "baseUrl">): void {
-  if (input.apiKey === undefined && input.baseUrl === undefined) return;
-  throw new Error("openai-codex is OAuth-only; use codex-api for API keys and custom endpoints");
-}
-
-function readCodexApiOptionsFromEnv(input: HostModelOptions): ProviderRouterOptions {
-  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_CODEX_MAX_TOKENS };
-  const env = readCodexApiEnvironment();
-  const resolvedApiKey = input.apiKey ?? env.apiKey;
-  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl;
-  const resolvedModel = canonicalizeCodexApiModel(input.model ?? env.model ?? CODEX_API_DEFAULT_MODEL);
-
-  if (resolvedApiKey) options.apiKey = resolvedApiKey;
-  if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
-  if (resolvedModel) options.model = resolvedModel;
-  if (input.temperature !== undefined) options.temperature = input.temperature;
-  if (input.fetch) options.fetch = input.fetch;
-  if (input.headers !== undefined) options.headers = input.headers;
-  if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
-  if (input.reasoningMode !== undefined) options.reasoningMode = input.reasoningMode;
-  if (input.reasoningContext !== undefined) options.reasoningContext = input.reasoningContext;
-  return options;
-}
-
-function readOptionsForProvider(provider: HostProviderName, input: ProviderRouterOptions): ProviderRouterOptions {
-  if (provider === "deepseek") return readDeepSeekOptionsFromEnv(input);
-  if (provider === "kimi") return readKimiOptionsFromEnv(input);
-  if (provider === "zai") return readZaiOptionsFromEnv(input);
-  if (provider === "xai") return readXaiOptionsFromEnv(input);
-  if (provider === "openai-codex") {
-    const options = readOpenAICodexOptionsFromEnv(input);
-    assertHostProviderModel(provider, options.model);
-    return options;
-  }
-  if (provider === "codex-api") {
-    const options = readCodexApiOptionsFromEnv(input);
-    assertHostProviderModel(provider, options.model);
-    return options;
-  }
-  return readMiniMaxOptionsFromEnv(input);
-}
-
-function providerScopedBaseOptions(
-  input: ProviderRouterOptions,
-  defaultProvider: HostProviderName,
-  targetProvider: HostProviderName,
-): ProviderRouterOptions {
-  const options: ProviderRouterOptions = {};
-  if (input.maxTokens !== undefined) options.maxTokens = input.maxTokens;
-  if (input.temperature !== undefined) options.temperature = input.temperature;
-  if (input.fetch !== undefined) options.fetch = input.fetch;
-  if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
-  if (input.reasoningMode !== undefined) options.reasoningMode = input.reasoningMode;
-  if (input.reasoningContext !== undefined) options.reasoningContext = input.reasoningContext;
-
-  if (targetProvider === defaultProvider) {
-    if (input.apiKey !== undefined) options.apiKey = input.apiKey;
-    if (input.baseUrl !== undefined) options.baseUrl = input.baseUrl;
-    if (input.headers !== undefined) options.headers = input.headers;
-  }
-  if (targetProvider === OPENAI_CODEX_PROVIDER_ID && input.authStorage !== undefined) {
-    options.authStorage = input.authStorage;
-  }
-  return options;
-}
-
 function requestLimitsForProvider(
   provider: HostProviderName,
-  options: ProviderRouterOptions,
+  options: ProviderModelOptions,
 ): ModelRequestLimits | undefined {
   const descriptor = options.model ? findKnownModel(provider, options.model) : undefined;
   const limits: ModelRequestLimits = {};
@@ -870,48 +358,8 @@ function requestLimitsForProvider(
   return Object.keys(limits).length > 0 ? limits : undefined;
 }
 
-function applyReasoningOptions(
-  options: ProviderRouterOptions,
-  provider: HostProviderName,
-  reasoningLevel: HostReasoningLevel | undefined,
-): void {
-  if (!reasoningLevel) return;
-  if (provider === OPENAI_CODEX_PROVIDER_ID || provider === CODEX_API_PROVIDER_ID) {
-    options.reasoningEffort = reasoningLevel;
-    options.reasoningSummary = "auto";
-    return;
-  }
-  if (provider === "minimax") {
-    options.reasoning = reasoningLevel !== "off";
-    return;
-  }
-  if (provider === "deepseek") {
-    options.reasoning = reasoningLevel !== "off";
-    if (reasoningLevel !== "off") options.reasoningEffort = reasoningLevel;
-    return;
-  }
-  if (provider === "kimi" || provider === "zai" || provider === "xai") {
-    options.reasoning = true;
-    options.reasoningEffort = reasoningLevel;
-  }
-}
-
-function isProviderModel(value: unknown): value is ProviderModel {
-  return isRecord(value) && typeof value.stream === "function";
-}
-
-function isProviderModelProvider(value: unknown): value is ProviderModelProvider {
-  return isRecord(value) && typeof value.getModel === "function";
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
-}
-
-function connectionLabelForProvider(provider: string): string | undefined {
-  if (provider === OPENAI_CODEX_PROVIDER_ID) return "ChatGPT OAuth";
-  if (provider === CODEX_API_PROVIDER_ID) return "Third-party API";
-  return undefined;
 }
 
 function safeEndpointOrigin(value: string | undefined): string | undefined {
@@ -926,13 +374,11 @@ function safeEndpointOrigin(value: string | undefined): string | undefined {
 }
 
 class ProviderModelRouterAdapter implements ModelRouter {
-  constructor(private readonly model: ProviderModel, private readonly profileId?: string) {}
+  constructor(private readonly model: ChiliModel, private readonly profileId?: string) {}
 
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
     for await (const event of this.model.stream(toProviderInput(input, this.profileId))) {
-      if (isModelStreamEvent(event)) {
-        yield enrichMetadata(event as ModelStreamEvent);
-      }
+      yield enrichMetadata(event);
     }
   }
 }
@@ -950,23 +396,6 @@ function enrichMetadata(event: ModelStreamEvent): ModelStreamEvent {
     output.maxOutputTokens = descriptor.maxOutputTokens;
   }
   return output;
-}
-
-function isModelStreamEvent(event: ProviderModelStreamEvent): boolean {
-  return (
-    event.type === "metadata" ||
-    event.type === "text_delta" ||
-    event.type === "text_end" ||
-    event.type === "reasoning_delta" ||
-    event.type === "reasoning_end" ||
-    event.type === "reasoning_item" ||
-    event.type === "tool_call_start" ||
-    event.type === "tool_call_delta" ||
-    event.type === "tool_call_end" ||
-    event.type === "tool_call" ||
-    event.type === "finish" ||
-    event.type === "error"
-  );
 }
 
 function toProviderInput(input: ModelStreamInput, profileId?: string): ProviderModelStreamInput {

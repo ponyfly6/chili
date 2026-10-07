@@ -1,3 +1,4 @@
+import { BUILTIN_PROVIDERS } from "./provider-definition.js";
 import type { ServiceTier } from "@chili/protocol";
 import type { ChiliModelProvider, ModelDescriptor } from "./types.js";
 import {
@@ -33,7 +34,6 @@ export interface MiniMaxModelOptions {
   env?: EnvironmentSource;
 }
 
-const DEFAULT_MINIMAX_MAX_TOKENS = 128 * 1024;
 
 export class MiniMaxAnthropicProvider implements ChiliModelProvider {
   readonly id = MINIMAX_PROVIDER_ID;
@@ -115,7 +115,7 @@ export function createMiniMaxM3Model(options: MiniMaxModelOptions = {}): Anthrop
     apiKey: options.apiKey ?? env.apiKey ?? "",
     authScheme: options.authScheme ?? "bearer",
     reasoning: options.reasoning ?? true,
-    maxTokens: options.maxTokens ?? DEFAULT_MINIMAX_MAX_TOKENS,
+    maxTokens: options.maxTokens ?? BUILTIN_PROVIDERS.minimax.defaultRequestMaxTokens,
   };
   if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;

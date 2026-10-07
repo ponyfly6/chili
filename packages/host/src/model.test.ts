@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import type { ModelStreamInput } from "@chili/core";
 import type { PreparedModelIdentity, SessionId, TurnId } from "@chili/protocol";
+import { FileAuthStorage } from "@chili/providers";
 import { createHostModel } from "./model.js";
 
 const input: ModelStreamInput = {
@@ -81,4 +82,45 @@ test("Host forwards completed reasoning and text boundaries from a provider", as
     { type: "reasoning_end", index: 0 },
     { type: "text_end", index: 0 },
   ]);
+});
+
+test("switching providers isolates connection options while preserving request controls", async () => {
+  const requests: { url: string; headers: Headers; body: Record<string, unknown> }[] = [];
+  const router = await createHostModel("deepseek", {
+    env: { MOONSHOT_API_KEY: "kimi-test-key", MOONSHOT_BASE_URL: "https://kimi.invalid/v1" },
+    apiKey: "deepseek-test-key", baseUrl: "https://deepseek.invalid/chat/completions",
+    headers: { "x-private-connection": "deepseek-only" }, maxTokens: 2048,
+    fetch: (async (url, init) => {
+      requests.push({ url: String(url), headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) });
+      return Response.json({ choices: [{ index: 0, message: { content: "ok" }, finish_reason: "stop" }] });
+    }) as typeof fetch,
+  });
+  for (const modelSelection of [undefined, { provider: "kimi", model: "kimi-k3" }, undefined]) {
+    for await (const _ of router.stream({ ...input, ...(modelSelection ? { modelSelection } : {}) })) { /* consume */ }
+  }
+  expect(requests.map((request) => request.headers.get("authorization"))).toEqual(["Bearer deepseek-test-key", "Bearer kimi-test-key", "Bearer deepseek-test-key"]);
+  expect(requests.map((request) => request.headers.get("x-private-connection"))).toEqual(["deepseek-only", null, "deepseek-only"]);
+  expect(requests.map((request) => request.url)).toEqual(["https://deepseek.invalid/chat/completions", "https://kimi.invalid/v1/chat/completions", "https://deepseek.invalid/chat/completions"]);
+  expect(requests.map((request) => request.body.max_tokens ?? request.body.max_completion_tokens)).toEqual([2048, 2048, 2048]);
+});
+
+test("custom model limits stay unknown and explicit model/provider conflicts fail", async () => {
+  const router = await createHostModel({ provider: "deepseek", model: "custom-model" }, { env: {}, maxTokens: 1024 });
+  expect(await router.resolveRequestLimits?.({})).toEqual({ requestMaxOutputTokens: 1024 });
+  await expect(createHostModel({ provider: "deepseek", model: "kimi/kimi-k3" })).rejects.toThrow("conflicts");
+});
+
+test("Host model availability uses the same explicit environment as request resolution", async () => {
+  class EmptyAuth extends FileAuthStorage {
+    override async get(): Promise<undefined> { return undefined; }
+  }
+  const router = await createHostModel("deepseek", {
+    env: { DEEPSEEK_API_KEY: "catalog-test-key", DEEPSEEK_BASE_URL: "https://catalog.invalid/v1" },
+    authStorage: new EmptyAuth("/unused-host-catalog-test.json"),
+  });
+  const models = await router.listModels?.();
+  const deepseek = models?.filter((model) => model.provider === "deepseek");
+  expect(deepseek?.length).toBeGreaterThan(0);
+  expect(deepseek?.every((model) => model.available && model.endpoint === "https://catalog.invalid")).toBe(true);
+  expect(models?.filter((model) => model.provider !== "deepseek").every((model) => !model.available)).toBe(true);
 });

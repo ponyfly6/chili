@@ -1,3 +1,4 @@
+import { BUILTIN_PROVIDERS } from "./provider-definition.js";
 import type { AuthStatus, FileAuthStorage } from "./auth.js";
 import {
   findConfiguredEnvironmentNames,
@@ -7,14 +8,9 @@ import {
 } from "./env.js";
 import {
   CODEX_API_PROVIDER_ID,
-  DEEPSEEK_PROVIDER_ID,
-  KIMI_PROVIDER_ID,
   listKnownModels,
   OPENAI_CODEX_BASE_URL,
-  MINIMAX_PROVIDER_ID,
   OPENAI_CODEX_PROVIDER_ID,
-  XAI_PROVIDER_ID,
-  ZAI_PROVIDER_ID,
 } from "./models.js";
 import type { ModelDescriptor } from "./types.js";
 
@@ -49,15 +45,9 @@ export interface ProviderCatalogOptions {
   endpoint?: string;
 }
 
-export const BUILTIN_PROVIDER_DISPLAY_NAMES: Record<string, string> = {
-  [CODEX_API_PROVIDER_ID]: "Api",
-  [DEEPSEEK_PROVIDER_ID]: "DeepSeek",
-  [KIMI_PROVIDER_ID]: "Kimi",
-  [MINIMAX_PROVIDER_ID]: "MiniMax",
-  [OPENAI_CODEX_PROVIDER_ID]: "ChatGPT",
-  [XAI_PROVIDER_ID]: "xAI",
-  [ZAI_PROVIDER_ID]: "Z.ai",
-};
+export const BUILTIN_PROVIDER_DISPLAY_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(BUILTIN_PROVIDERS).map(([id, definition]) => [id, definition.displayName]),
+);
 
 export function getProviderDisplayName(provider: string, overrides: Record<string, string> = {}): string {
   return overrides[provider] ?? BUILTIN_PROVIDER_DISPLAY_NAMES[provider] ?? provider;

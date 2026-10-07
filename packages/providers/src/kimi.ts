@@ -1,3 +1,4 @@
+import { BUILTIN_PROVIDERS } from "./provider-definition.js";
 import type { ChiliModelProvider, ModelDescriptor, ReasoningLevel } from "./types.js";
 import { type EnvironmentSource, readKimiEnvironment } from "./env.js";
 import {
@@ -25,7 +26,6 @@ export interface KimiModelOptions {
   env?: EnvironmentSource;
 }
 
-const DEFAULT_KIMI_MAX_TOKENS = 128 * 1024;
 
 export class KimiOpenAIProvider implements ChiliModelProvider {
   readonly id = KIMI_PROVIDER_ID;
@@ -116,7 +116,7 @@ export function createKimiModel(options: KimiModelOptions = {}): OpenAICompletio
     model,
     baseUrl: options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? KIMI_OPENAI_BASE_URL,
     apiKey,
-    maxTokens: options.maxTokens ?? DEFAULT_KIMI_MAX_TOKENS,
+    maxTokens: options.maxTokens ?? BUILTIN_PROVIDERS.kimi.defaultRequestMaxTokens,
   };
   if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
   if (descriptor?.compatibility?.chatCompletions) modelOptions.compatibility = descriptor.compatibility.chatCompletions;
