@@ -2,6 +2,7 @@ import { formatToolResultForModel, type Message } from "@chili/protocol";
 
 interface ContextMessageFormatOptions {
   includeToolCallStatus?: boolean;
+  includeToolContent?: boolean;
   errorToolResultMode?: "error_only" | "error_and_output";
   nestedCompactionLabel?: "compaction" | "previous_context_summary";
 }
@@ -17,6 +18,7 @@ export function formatConversationMessages(messages: readonly Message[]): string
 export function formatCompactionSourceMessages(messages: readonly Message[]): string {
   return formatContextMessages(messages, {
     includeToolCallStatus: false,
+    includeToolContent: true,
     errorToolResultMode: "error_and_output",
     nestedCompactionLabel: "previous_context_summary",
   });
@@ -73,12 +75,15 @@ function formatToolResultPart(
     : options.errorToolResultMode === "error_and_output"
       ? `Error: ${part.error}\n${part.output}`
       : part.error;
-  const formatted = `${prefix}\n${body}`;
+  const content = options.includeToolContent ? (part.content ?? []).map((item) => (
+    item.type === "text" ? `[tool_result text]\n${item.text}` : `[image ${item.mimeType}]`
+  )).join("\n") : "";
+  const formatted = [`${prefix}\n${body}`, content].filter(Boolean).join("\n");
   const executionContext = part.executionContext
     ? formatToolResultForModel({ output: "", executionContext: part.executionContext })
     : "";
   if (!executionContext) return formatted;
-  return body ? `${formatted}\n\n${executionContext}` : `${prefix}\n${executionContext}`;
+  return body || content ? `${formatted}\n\n${executionContext}` : `${prefix}\n${executionContext}`;
 }
 
 function safeJson(value: unknown): string {

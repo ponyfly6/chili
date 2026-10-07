@@ -34,7 +34,10 @@ import {
   ContextCompactionService,
   ContextWindowExceededError,
   ContextWindowBuilder,
+  compactedMessageView,
   type CompactionBoundary,
+  type CompactionRequestSource,
+  type ContextBuildResult,
   type ContextBudgetOptions,
   type ContextCompactionOptions,
   type ContextCompactionResult,
@@ -235,10 +238,16 @@ export class SingleAgentRuntime implements AgentRunner {
         estimatedChars: boundary.estimatedChars,
         budgetChars: boundary.budgetChars,
       });
-      const result = await this.compactMessages(input, turnId, rawMessages, boundary);
+      const limits = await this.options.model.resolveRequestLimits?.({
+        ...(input.modelSelection ? { modelSelection: input.modelSelection } : {}),
+        ...(input.reasoningLevel !== undefined ? { reasoningLevel: input.reasoningLevel } : {}),
+        ...(input.serviceTier !== undefined ? { serviceTier: input.serviceTier } : {}),
+      });
+      const result = await this.compactMessages(input, turnId, rawMessages, boundary, {
+        ...limits,
+        tools: await this.options.toolRegistry.list(),
+      }, true);
       usage = addModelUsage(usage, result.usage);
-      throwIfTurnAborted(input.signal);
-      await this.append(input, "turn.completed", { turnId, status: "completed" });
       const completed: Extract<CompactContextResult, { status: "completed" }> = {
         status: "completed",
         turnId,
@@ -317,6 +326,7 @@ export class SingleAgentRuntime implements AgentRunner {
         ...(input.serviceTier !== undefined ? { serviceTier: input.serviceTier } : {}),
       });
       const contextSurface: ContextRequestSurface = {
+        ...(input.promptDebug ? { promptDebug: input.promptDebug } : {}),
         ...(requestLimits?.contextWindowTokens !== undefined
           ? { contextWindowTokens: requestLimits.contextWindowTokens }
           : {}),
@@ -329,6 +339,7 @@ export class SingleAgentRuntime implements AgentRunner {
         tools: modelTools,
       };
       const rawMessages = await messagesForContext(this.options.store, input.sessionId);
+      let contextMessages = rawMessages;
       let context = this.contextBuilder().build(rawMessages, contextSurface);
       contextUsage = context.usage;
       if (context.compactionBoundary) {
@@ -339,18 +350,17 @@ export class SingleAgentRuntime implements AgentRunner {
           estimatedChars: context.compactionBoundary.estimatedChars,
           budgetChars: context.compactionBoundary.budgetChars,
         });
-        const compacted = await this.tryCompactMessages(input, turnId, rawMessages, context.compactionBoundary);
+        const compacted = await this.tryCompactMessages(input, turnId, rawMessages, context.compactionBoundary, contextSurface);
         turnUsage = addModelUsage(turnUsage, compacted.usage);
         if (compacted.completed) {
-          context = this.contextBuilder().build(
-            await messagesForContext(this.options.store, input.sessionId),
-            contextSurface,
-          );
-          if (context.overflow) throw new ContextWindowExceededError(context.overflow);
+          const compactedMessages = await messagesForContext(this.options.store, input.sessionId);
+          contextMessages = compactedMessages;
+          context = this.contextBuilder().build(compactedMessages, contextSurface);
+          assertCompleteContext(compactedMessages, context);
           contextUsage = context.usage;
         }
       }
-      if (context.overflow) throw new ContextWindowExceededError(context.overflow);
+      assertCompleteContext(contextMessages, context);
 
       assistantMessageId = this.id<MessageId>("msg");
       await this.append(input, "message.created", {
@@ -392,14 +402,12 @@ export class SingleAgentRuntime implements AgentRunner {
           estimatedChars: recoveryBoundary.estimatedChars,
           budgetChars: recoveryBoundary.budgetChars,
         });
-        const recovered = await this.tryCompactMessages(input, turnId, recoveryMessages, recoveryBoundary);
+        const recovered = await this.tryCompactMessages(input, turnId, recoveryMessages, recoveryBoundary, contextSurface);
         turnUsage = addModelUsage(turnUsage, recovered.usage);
         if (!recovered.completed) throw err;
-        const recoveredContext = this.contextBuilder().build(
-          await messagesForContext(this.options.store, input.sessionId),
-          contextSurface,
-        );
-        if (recoveredContext.overflow) throw new ContextWindowExceededError(recoveredContext.overflow);
+        const recoveredMessages = await messagesForContext(this.options.store, input.sessionId);
+        const recoveredContext = this.contextBuilder().build(recoveredMessages, contextSurface);
+        assertCompleteContext(recoveredMessages, recoveredContext);
         contextUsage = recoveredContext.usage;
         modelInput = {
           ...modelInput,
@@ -558,6 +566,7 @@ export class SingleAgentRuntime implements AgentRunner {
     usage?: ContextUsage,
     purpose: "turn" | "compaction" = "turn",
     advertisedCatalogRevision?: number,
+    compactionSource?: CompactionRequestSource,
   ): Promise<PreparedModelRequest> {
     const sourceMessages = await messagesForContext(this.options.store, modelInput.sessionId);
     const lastEvent = (await this.options.store.events({ sessionId: modelInput.sessionId, tail: true, limit: 1, compactRequests: true }))[0];
@@ -570,6 +579,7 @@ export class SingleAgentRuntime implements AgentRunner {
     const identity = (identityEvent?.payload as { identity?: ExecutionIdentity } | undefined)?.identity;
     return prepareModelRequest({
       modelInput, sourceMessages, sourceSurface, purpose,
+      ...(compactionSource ? { compactionSource } : {}),
       ...(identity ? { executionIdentity: identity } : {}),
       ...(usage ? { usage } : {}),
       ...(lastEvent ? { sourceEventId: lastEvent.id } : {}),
@@ -794,9 +804,10 @@ export class SingleAgentRuntime implements AgentRunner {
     turnId: TurnId,
     messages: readonly Message[],
     boundary: CompactionBoundary,
+    surface: ContextRequestSurface,
   ): Promise<CompactionAttemptResult> {
     try {
-      const result = await this.compactMessages(input, turnId, messages, boundary);
+      const result = await this.compactMessages(input, turnId, messages, boundary, surface);
       return { completed: true, ...(result.usage ? { usage: result.usage } : {}) };
     } catch (error) {
       const err = toError(error);
@@ -818,6 +829,8 @@ export class SingleAgentRuntime implements AgentRunner {
     turnId: TurnId,
     messages: readonly Message[],
     boundary: CompactionBoundary,
+    surface: ContextRequestSurface,
+    completeTurn = false,
   ): Promise<{ messageId: MessageId; boundaryMessageId: MessageId; summaryChars: number; usage?: ModelUsage }> {
     await this.append(input, "turn.compaction_started", {
       turnId,
@@ -831,7 +844,7 @@ export class SingleAgentRuntime implements AgentRunner {
       turnId: TurnId;
       messages: readonly Message[];
       boundary: CompactionBoundary;
-      onPreparedRequest?: (request: ModelStreamInput) => Promise<void>;
+      onPreparedRequest?: (request: ModelStreamInput, source: CompactionRequestSource) => Promise<void>;
       instructions?: string;
       modelSelection?: ModelSelection;
       reasoningLevel?: ReasoningLevel;
@@ -842,13 +855,15 @@ export class SingleAgentRuntime implements AgentRunner {
       turnId,
       messages,
       boundary,
-      onPreparedRequest: async (modelInput) => {
+      onPreparedRequest: async (modelInput, source) => {
         const request = await this.prepareRequest(modelInput, {
+          ...(surface.contextWindowTokens !== undefined ? { contextWindowTokens: surface.contextWindowTokens } : {}),
+          ...(modelInput.maxTokens !== undefined ? { requestMaxOutputTokens: modelInput.maxTokens } : {}),
           system: modelInput.system,
           ...(modelInput.developer ? { developer: modelInput.developer } : {}),
           ...(modelInput.contextualUser ? { contextualUser: modelInput.contextualUser } : {}),
           tools: modelInput.tools,
-        }, undefined, "compaction");
+        }, undefined, "compaction", undefined, source);
         const requestId = this.id("request");
         await this.append(input, "model.request_prepared", { turnId, requestId, attempt: 1, contentVersion: request.contentVersion, request });
         modelInput.onRequestIdentity = async (identity) => {
@@ -864,44 +879,51 @@ export class SingleAgentRuntime implements AgentRunner {
     if (input.signal !== undefined) compactInput.signal = input.signal;
     throwIfTurnAborted(input.signal);
     const result = await this.compactor().compact(compactInput);
-    throwIfTurnAborted(input.signal);
-    const messageId = await this.appendCompactionMessage(input, turnId, result);
-    throwIfTurnAborted(input.signal);
-    await this.append(input, "turn.compaction_completed", {
-      turnId,
-      messageId,
-      boundaryMessageId: result.boundary.boundaryMessageId,
-      summaryChars: result.summary.length,
-      sourceMessageCount: result.sourceMessageCount,
-      estimatedCharsBefore: result.estimatedCharsBefore,
-      estimatedCharsAfter: result.estimatedCharsAfter,
-    });
-    return {
-      messageId,
-      boundaryMessageId: result.boundary.boundaryMessageId,
-      summaryChars: result.summary.length,
-      ...(result.usage ? { usage: result.usage } : {}),
-    };
+    try {
+      throwIfTurnAborted(input.signal);
+      const summaryMessage = this.compactionMessage(input, turnId, result);
+      const prospectiveMessages = [...messages, summaryMessage];
+      assertCompleteContext(prospectiveMessages, this.contextBuilder().build(prospectiveMessages, surface));
+      throwIfTurnAborted(input.signal);
+      // The existing store batch commits the replacement and its completion fact
+      // together. Cancellation after this point must not relabel it as failed.
+      await this.options.store.appendMany([
+        this.event(input, "message.created", { messageId: summaryMessage.id, role: "user", turnId }),
+        ...summaryMessage.parts.map((part) => this.event(input, "message.part_added", { messageId: summaryMessage.id, part })),
+        this.event(input, "turn.compaction_completed", {
+          turnId,
+          messageId: summaryMessage.id,
+          boundaryMessageId: result.boundary.boundaryMessageId,
+          summaryChars: result.summary.length,
+          sourceMessageCount: result.sourceMessageCount,
+          estimatedCharsBefore: result.estimatedCharsBefore,
+          estimatedCharsAfter: result.estimatedCharsAfter,
+        }),
+        ...(completeTurn ? [this.event(input, "turn.completed", { turnId, status: "completed" })] : []),
+      ]);
+      return {
+        messageId: summaryMessage.id,
+        boundaryMessageId: result.boundary.boundaryMessageId,
+        summaryChars: result.summary.length,
+        ...(result.usage ? { usage: result.usage } : {}),
+      };
+    } catch (error) {
+      throw attachModelUsage(toError(error), result.usage);
+    }
   }
 
-  private async appendCompactionMessage(input: EventContext, turnId: TurnId, result: ContextCompactionResult): Promise<MessageId> {
+  private compactionMessage(input: EventContext, turnId: TurnId, result: ContextCompactionResult): Message {
     const messageId = this.id<MessageId>("msg");
-    await this.append(input, "message.created", {
-      messageId,
-      role: "user",
-      turnId,
-    });
-
     const summaryText = renderContextSummary(result);
-    await this.appendPart(input, messageId, {
+    const textPart: MessagePart = {
       id: this.id<PartId>("part"),
       messageId,
       sessionId: input.sessionId,
       type: "text",
       text: summaryText,
       synthetic: true,
-    });
-    await this.appendPart(input, messageId, {
+    };
+    const compactionPart: MessagePart = {
       id: this.id<PartId>("part"),
       messageId,
       sessionId: input.sessionId,
@@ -912,8 +934,8 @@ export class SingleAgentRuntime implements AgentRunner {
       sourceMessageIds: result.sourceMessageIds,
       estimatedCharsBefore: result.estimatedCharsBefore,
       estimatedCharsAfter: result.estimatedCharsAfter,
-    });
-    return messageId;
+    };
+    return { id: messageId, sessionId: input.sessionId, role: "user", turnId, createdAt: this.now(), parts: [textPart, compactionPart] };
   }
 
   private async appendTextDelta(
@@ -1389,6 +1411,14 @@ export class SingleAgentRuntime implements AgentRunner {
     type: TType,
     payload: TPayload,
   ): Promise<void> {
+    await this.options.store.append(this.event(input, type, payload));
+  }
+
+  private event<TType extends RuntimeEvent["type"], TPayload>(
+    input: EventContext,
+    type: TType,
+    payload: TPayload,
+  ): RuntimeEvent {
     const event: EventEnvelope<TType, TPayload> = {
       id: this.id("event"),
       type,
@@ -1396,7 +1426,7 @@ export class SingleAgentRuntime implements AgentRunner {
       sessionId: input.sessionId,
       payload,
     };
-    await this.options.store.append(event as RuntimeEvent);
+    return event as RuntimeEvent;
   }
 
   private id<T extends string>(prefix: string): T {
@@ -1818,6 +1848,28 @@ function renderContextSummary(result: ContextCompactionResult): string {
     stripContextSummary(result.summary),
     "</context_summary>",
   ].join("\n");
+}
+
+function assertCompleteContext(messages: readonly Message[], built: ContextBuildResult): void {
+  if (built.overflow) throw new ContextWindowExceededError(built.overflow);
+  const effectiveMessages = compactedMessageView(messages).filter((message) => message.parts.length > 0);
+  const visibleById = new Map(built.messages.map((message) => [message.id, message]));
+  for (const message of effectiveMessages) {
+    const visible = visibleById.get(message.id);
+    if (!visible) {
+      throw Object.assign(new Error("Context budget would omit unsummarized history; reduce the current request or increase the context budget"), {
+        name: "ContextWindowExceededError",
+      });
+    }
+    if (!message.parts.some((part) => part.type === "compaction")) continue;
+    const summaryText = message.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+    const visibleSummaryText = visible.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+    if (summaryText !== visibleSummaryText) {
+      throw Object.assign(new Error("Context budget would truncate the context summary; reduce the summary size or increase the context budget"), {
+        name: "ContextWindowExceededError",
+      });
+    }
+  }
 }
 
 function stripContextSummary(summary: string): string {

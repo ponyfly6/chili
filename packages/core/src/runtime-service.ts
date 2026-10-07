@@ -855,7 +855,9 @@ export class RuntimeService {
         if (modelState.serviceTier !== undefined) compactInput.serviceTier = modelState.serviceTier;
         if (controller.signal.aborted) throw abortError("Compaction aborted");
         const result = normalizeCompactContextResult(await compactContext(compactInput));
-        if (controller.signal.aborted) throw abortError("Compaction aborted");
+        // A completed result already committed its replacement; a late abort
+        // cannot undo it or replace an explicit failure/cancellation outcome.
+        if (controller.signal.aborted && result.status === "skipped") throw abortError("Compaction aborted");
         await this.publishStatus({
           sessionId: input.sessionId,
           status: result.status === "failed" || result.status === "cancelled" ? result.status : "idle",

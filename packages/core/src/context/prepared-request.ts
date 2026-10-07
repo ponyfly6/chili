@@ -4,6 +4,7 @@ import type { EventStore } from "@chili/store";
 import type { ModelStreamInput } from "../runtime.js";
 import type { PromptDebugManifest, PromptDebugManifestItem } from "../prompt/debug.js";
 import type { RenderedPromptFragment } from "../prompt/fragment.js";
+import type { CompactionRequestSource } from "./compaction.js";
 import type { ContextRequestSurface, ContextUsage } from "./window.js";
 
 type Source = PreparedModelRequest["sources"][number];
@@ -14,6 +15,7 @@ export interface PrepareModelRequestInput {
   sourceSurface: ContextRequestSurface;
   usage?: ContextUsage;
   purpose?: "turn" | "compaction";
+  compactionSource?: CompactionRequestSource;
   sourceEventId?: string;
   toolCatalogRevision?: number;
   executionIdentity?: ExecutionIdentity;
@@ -29,29 +31,70 @@ export function prepareModelRequest(input: PrepareModelRequestInput): PreparedMo
     ["contextual_user", input.sourceSurface.contextualUser ?? [], model.contextualUser ?? [], "contextual_user"],
   ] as const) {
     const fragments = model.promptDebug?.fragments.filter((fragment) => fragment.layer === layer) ?? [];
+    const unmatchedFragments = new Set(fragments);
+    const selectedIndices = new Set<number>();
     original.forEach((content, index) => {
-      const fragment = fragments[index];
-      const actual = selected.find((value) => value === content)
-        ?? (original.length === 1 ? selected[0] : undefined);
+      const renderedVersion = contentHash(content);
+      // Empty/omitted fragments and deduplication can change array positions.
+      // Match the actual rendered material, consuming each occurrence once.
+      const fragment = fragments.find((candidate) => (
+        unmatchedFragments.has(candidate) && candidate.contentVersion === renderedVersion
+      ));
+      if (fragment) unmatchedFragments.delete(fragment);
+      let selectedIndex = selected.findIndex((value, candidateIndex) => (
+        !selectedIndices.has(candidateIndex) && value === content
+      ));
+      if (selectedIndex < 0 && original.length === 1 && selected.length === 1) selectedIndex = 0;
+      const actual = selectedIndex < 0 ? undefined : selected[selectedIndex];
+      if (selectedIndex >= 0) selectedIndices.add(selectedIndex);
+      const optionalMemory = fragment?.source === "memory"
+        && (fragment.metadata?.kind === "user_memory" || fragment.metadata?.kind === "project_memory");
       sources.push({
         id: fragment?.id ?? `${kind}:${index}`,
         kind,
-        version: contentHash(content),
+        version: typeof fragment?.metadata?.sourceContentVersion === "string"
+          ? fragment.metadata.sourceContentVersion : renderedVersion,
         status: actual === undefined ? "omitted" : actual === content && fragment?.metadata?.truncated !== true ? "included" : "truncated",
-        ...(actual !== content ? { reason: "prompt_material_budget" } : fragment?.metadata?.truncated === true ? { reason: "source_fragment_budget" } : {}),
+        ...(actual !== content ? { reason: optionalMemory ? "memory_context_budget" : "prompt_material_budget" }
+          : fragment?.metadata?.truncated === true ? { reason: "source_fragment_budget" } : {}),
         metadata: {
           ...fragment?.metadata,
           ...(fragment ? { source: fragment.source, trust: fragment.trust, lifecycle: fragment.lifecycle, priority: fragment.priority } : {}),
-          originalChars: content.length,
+          originalChars: typeof fragment?.metadata?.sourceChars === "number" ? fragment.metadata.sourceChars : content.length,
+          renderedChars: content.length,
+          renderedVersion,
           actualChars: actual?.length ?? 0,
           ...(actual !== undefined ? { actualVersion: contentHash(actual) } : {}),
         },
       });
     });
+    for (const fragment of unmatchedFragments) {
+      sources.push({
+        id: fragment.id, kind,
+        version: typeof fragment.metadata?.sourceContentVersion === "string"
+          ? fragment.metadata.sourceContentVersion : fragment.contentVersion ?? contentHash(""),
+        status: "omitted",
+        reason: fragment.chars === 0 ? "source_fragment_budget" : "prompt_material_not_selected",
+        metadata: { ...fragment.metadata, source: fragment.source, trust: fragment.trust,
+          lifecycle: fragment.lifecycle, priority: fragment.priority, actualChars: 0 },
+      });
+    }
   }
+  const compactionSource = input.purpose === "compaction" ? input.compactionSource : undefined;
+  const compactionIds = new Set(compactionSource?.messageIds);
   for (const message of input.sourceMessages) {
     const actual = model.messages.find((candidate) => candidate.id === message.id);
     const version = contentHash(message);
+    if (compactionSource) {
+      sources.push({ id: message.id, kind: "message", version,
+        status: compactionIds.has(message.id) ? "included" : "omitted",
+        reason: compactionIds.has(message.id) ? "compaction_serialized_source" : "outside_compaction_batch",
+        metadata: { role: message.role, partIds: message.parts.map((part) => part.id),
+          batch: compactionSource.batch, stage: compactionSource.stage,
+          representation: "text_and_attachment_metadata" },
+      });
+      continue;
+    }
     sources.push({
       id: message.id,
       kind: "message",
@@ -60,6 +103,17 @@ export function prepareModelRequest(input: PrepareModelRequestInput): PreparedMo
       ...(actual === undefined ? { reason: message.parts.length === 0 ? "empty_message" : "history_compaction_or_budget" } : contentHash(actual) !== version ? { reason: "message_or_tool_result_budget" } : {}),
       metadata: { role: message.role, partIds: message.parts.map((part) => part.id) },
     });
+  }
+  if (compactionSource) {
+    for (const message of model.messages) {
+      sources.push({ id: message.id, kind: "message", version: contentHash(message), status: "included",
+        reason: "compaction_request",
+        metadata: { sourceMessageIds: [...compactionSource.messageIds], batch: compactionSource.batch, stage: compactionSource.stage,
+          ...(compactionSource.previousSummary ? { previousSummaryVersion: contentHash(compactionSource.previousSummary) } : {}),
+          ...(compactionSource.draftSummary ? { draftSummaryVersion: contentHash(compactionSource.draftSummary) } : {}),
+        },
+      });
+    }
   }
   for (const tool of input.sourceSurface.tools ?? []) {
     const original = toolSchema(tool);
@@ -140,7 +194,12 @@ export function preparedRequestDebug(request: PreparedModelRequest): PromptDebug
 }
 
 export function contentHash(value: unknown): string {
-  return createHash("sha256").update(typeof value === "string" ? value : JSON.stringify(value)).digest("hex");
+  const serialized = typeof value === "string" ? value : JSON.stringify(value, (_key, item: unknown) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+    const record = item as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(record).sort().map((key) => [key, record[key]]));
+  });
+  return createHash("sha256").update(serialized).digest("hex");
 }
 
 function toolSchema(tool: ModelStreamInput["tools"][number]) {
