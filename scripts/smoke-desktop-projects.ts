@@ -164,16 +164,27 @@ async function inspect(request: Request): Promise<unknown> {
   assert.ok(launch, "Unregistered Electron launch");
   if (request.action === "fixtures") {
     const toolPids = request.toolPids ?? [];
-    assert.equal(toolPids.length, 6, "Expected a shell leader and inherited child for each of three projects");
+    assert.equal(toolPids.length, 6, "Expected a guarded shell and inherited child for each of three projects");
+    const toolGroups: Array<{ sidecarPid: number; guardianPid: number; guardianStartedAt: string; shellPid: number; childPid: number }> = [];
     for (let index = 0; index < toolPids.length; index += 2) {
-      const leader = rows.find((row) => row.pid === toolPids[index]);
+      const shell = rows.find((row) => row.pid === toolPids[index]);
       const child = rows.find((row) => row.pid === toolPids[index + 1]);
-      assert.ok(leader && child, "Tool fixture PIDs must be observed under this run");
-      assert.equal(leader.pid, leader.processGroupPid);
-      assert.equal(child.processGroupPid, leader.pid);
-      assert.equal(child.parentPid, leader.pid);
-      assert.ok(rows.some((row) => row.pid === leader.parentPid && row.parentPid === launch.pid), "Tool shell must descend from an owned project sidecar");
+      assert.ok(shell && child, "Tool fixture PIDs must be observed under this run");
+      const guardian = rows.find((row) => row.pid === shell.parentPid);
+      assert.ok(guardian, "Tool shell must be a direct child of its observed guardian");
+      assert.equal(guardian.pid, guardian.processGroupPid, "Tool guardian must lead its detached process group");
+      assert.equal(shell.processGroupPid, guardian.pid, "Tool shell must inherit its guardian's process group");
+      assert.equal(child.processGroupPid, guardian.pid, "Tool child must remain in the guarded process group");
+      assert.equal(child.parentPid, shell.pid, "Tool child must be a direct child of the recorded shell");
+      const sidecar = rows.find((row) => row.pid === guardian.parentPid);
+      assert.ok(sidecar && sidecar.parentPid === launch.pid
+        && /apps\/desktop\/src\/sidecar\/(?:index|entry)\.ts(?:\s|$)/u.test(sidecar.command)
+        && !sidecar.command.includes("--chili-git-supervisor-v1"), "Tool guardian must descend from an owned project sidecar");
+      toolGroups.push({ sidecarPid: sidecar.pid, guardianPid: guardian.pid, guardianStartedAt: guardian.startedAt,
+        shellPid: shell.pid, childPid: child.pid });
     }
+    assert.equal(new Set(toolGroups.map((group) => group.sidecarPid)).size, 3, "Each tool group must belong to a different project sidecar");
+    assert.equal(new Set(toolGroups.map((group) => group.guardianPid)).size, 3, "Each project must own a separate guarded tool group");
     const git = (request.workspaces ?? []).map((workspace) => {
       const matches = rows.filter((row) => row.parentPid === launch.pid && row.command.includes(`--work-tree=${workspace}`));
       assert.equal(matches.length, 1, `Expected one blocked main-owned Git for ${workspace}`);
@@ -191,7 +202,7 @@ async function inspect(request: Request): Promise<unknown> {
         ...(supervised ? { supervisorPid: row.pid, supervisorStartedAt: row.startedAt } : {}),
       };
     });
-    return { git, toolPids: request.toolPids };
+    return { git, toolPids: request.toolPids, toolGroups };
   }
   if (request.action === "kill") {
     const current = rows.find((row) => row.pid === launch.pid);

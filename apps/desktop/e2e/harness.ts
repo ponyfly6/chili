@@ -68,6 +68,36 @@ assert.equal(providerPromptText({
 assert.throws(() => providerPromptText({
   messages: [{ role: "system", content: SLOW_STEER_PROMPT }],
 }), /omitted a user message/u);
+const slowResponsesRequest = {
+  model: "deepseek-v4-pro",
+  stream: true,
+  input: [{ role: "user", content: [{ type: "input_text", text: SLOW_STEER_PROMPT }] }],
+};
+assert.equal(providerPromptText(slowResponsesRequest), SLOW_STEER_PROMPT);
+assert.equal(providerPromptText({
+  input: [
+    ...slowResponsesRequest.input,
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: SLOW_STEER_PROMPT }] },
+    { role: "user", content: [{ type: "input_text", text: STEER_REPLACEMENT }] },
+    { type: "function_call_output", call_id: "call_fixture", output: SLOW_STEER_PROMPT },
+  ],
+}), STEER_REPLACEMENT);
+assert.equal(providerPromptText({
+  input: [
+    ...slowResponsesRequest.input,
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: STEER_REPLACEMENT }] },
+  ],
+}), SLOW_STEER_PROMPT);
+assert.equal(providerPromptText({
+  input: [{ role: "user", content: [
+    { type: "input_text", text: "first block" },
+    { type: "input_image", image_url: "data:image/png;base64,fixture" },
+    { type: "input_text", text: "second block" },
+  ] }],
+}), "first block\nsecond block");
+assert.throws(() => providerPromptText({
+  input: [{ role: "system", content: [{ type: "input_text", text: SLOW_STEER_PROMPT }] }],
+}), /omitted a user message/u);
 
 if (process.env.CHILI_E2E_MATCHER_CANARY_ONLY === "1") {
   process.stdout.write("electron E2E provider matcher canary passed\n");
@@ -1111,9 +1141,10 @@ async function assertWithinViewport(locator: Locator, width: number, label: stri
 }
 
 async function waitForProviderRequest(text: string, expectedCount: number): Promise<void> {
-  await waitUntil(`provider request ${JSON.stringify(text)}`, () => (
-    provider.requests.filter((request) => request.text.includes(text)).length >= expectedCount
-  ), PROVIDER_TIMEOUT_MS);
+  await waitUntil(`provider request ${JSON.stringify(text)}`, () => {
+    assert.deepEqual(provider.failures, [], `Local provider failures:\n${provider.failures.join("\n")}`);
+    return provider.requests.filter((request) => request.text.includes(text)).length >= expectedCount;
+  }, PROVIDER_TIMEOUT_MS);
 }
 
 async function waitForProviderAbort(text: string, expectedCount: number): Promise<void> {
@@ -1187,13 +1218,15 @@ async function handleFixtureRequest(
     await writeRendererAsset(response, url);
     return;
   }
-  if (request.method !== "POST" || !url.pathname.endsWith("/chat/completions")) {
+  if (request.method !== "POST" || !url.pathname.endsWith("/responses")) {
     throw new Error(`Unexpected fixture request: ${request.method ?? "UNKNOWN"} ${url.pathname}`);
   }
   if (request.headers.authorization !== `Bearer ${LOCAL_API_KEY}`) {
     throw new Error("Local provider received the wrong authorization header");
   }
   const body = JSON.parse(await readRequestBody(request)) as unknown;
+  assert.ok(isRecord(body) && body.stream === true && Array.isArray(body.input), "Responses fixture requires streamed input");
+  assert.equal(body.model, "deepseek-v4-pro");
   const text = providerPromptText(body);
   const slow = text.includes(SLOW_STEER_PROMPT);
   const observed: ProviderRequest = { text, slow, aborted: false };
@@ -1207,16 +1240,13 @@ async function handleFixtureRequest(
     writeSlowProviderResponse(request, response, observed, responseId);
     return;
   }
-  writeJson(response, 200, {
-    id: `chili_e2e_${responseId}`,
-    model: "deepseek-v4-pro",
-    choices: [{
-      index: 0,
-      finish_reason: "stop",
-      message: { content: `Fixture response: ${text}` },
-    }],
-    usage: { prompt_tokens: 8, completion_tokens: 8, total_tokens: 16 },
-  });
+  const content = `Fixture response: ${text}`;
+  openFixtureResponse(response, responseId);
+  response.write(sseData({
+    type: "response.output_text.delta", item_id: `msg_chili_e2e_${responseId}`,
+    output_index: 0, content_index: 0, delta: content,
+  }));
+  finishFixtureResponse(response, responseId, content);
 }
 
 async function writeRendererAsset(response: ServerResponse, url: URL): Promise<void> {
@@ -1269,32 +1299,53 @@ function writeSlowProviderResponse(
   response.once("close", () => {
     if (!settled) markAborted();
   });
-  response.writeHead(200, {
-    "cache-control": "no-cache",
-    "content-type": "text/event-stream; charset=utf-8",
-  });
+  const content = `Fixture stream opened: ${observed.text}`;
+  openFixtureResponse(response, id);
   response.write(sseData({
-    id: `chili_e2e_${id}`,
-    model: "deepseek-v4-pro",
-    choices: [{
-      index: 0,
-      finish_reason: null,
-      delta: { content: `Fixture stream opened: ${observed.text}` },
-    }],
+    type: "response.output_text.delta", item_id: `msg_chili_e2e_${id}`,
+    output_index: 0, content_index: 0, delta: content,
   }));
   observed.finish = () => {
     if (settled) return;
     settled = true;
     if (timer) clearTimeout(timer);
-    response.write(sseData({
-      id: `chili_e2e_${id}`,
-      model: "deepseek-v4-pro",
-      choices: [{ index: 0, finish_reason: "stop", delta: {} }],
-      usage: { prompt_tokens: 8, completion_tokens: 8, total_tokens: 16 },
-    }));
-    response.end("data: [DONE]\n\n");
+    finishFixtureResponse(response, id, content);
   };
   timer = setTimeout(observed.finish, 120_000);
+}
+
+function openFixtureResponse(response: ServerResponse, id: number): void {
+  response.writeHead(200, {
+    "cache-control": "no-cache",
+    "content-type": "text/event-stream; charset=utf-8",
+  });
+  response.write(sseData({
+    type: "response.created",
+    response: { id: `chili_e2e_${id}`, model: "deepseek-v4-pro", status: "in_progress", output: [] },
+  }));
+  response.write(sseData({
+    type: "response.output_item.added", output_index: 0,
+    item: { id: `msg_chili_e2e_${id}`, type: "message", role: "assistant", status: "in_progress", content: [] },
+  }));
+}
+
+function finishFixtureResponse(response: ServerResponse, id: number, text: string): void {
+  const item = {
+    id: `msg_chili_e2e_${id}`, type: "message", role: "assistant", status: "completed",
+    content: [{ type: "output_text", text, annotations: [] }],
+  };
+  response.write(sseData({
+    type: "response.output_text.done", item_id: item.id, output_index: 0, content_index: 0, text,
+  }));
+  response.write(sseData({ type: "response.output_item.done", output_index: 0, item }));
+  response.write(sseData({
+    type: "response.completed",
+    response: {
+      id: `chili_e2e_${id}`, model: "deepseek-v4-pro", status: "completed", output: [item],
+      usage: { input_tokens: 8, output_tokens: 8, total_tokens: 16 },
+    },
+  }));
+  response.end();
 }
 
 async function readRequestBody(request: IncomingMessage): Promise<string> {
@@ -1322,9 +1373,11 @@ function sseData(value: unknown): string {
 }
 
 function providerPromptText(value: unknown): string {
-  if (!isRecord(value) || !Array.isArray(value.messages)) throw new Error("Provider body omitted messages");
-  for (let index = value.messages.length - 1; index >= 0; index -= 1) {
-    const message = value.messages[index];
+  if (!isRecord(value)) throw new Error("Provider body omitted input");
+  const messages = Array.isArray(value.input) ? value.input : value.messages;
+  if (!Array.isArray(messages)) throw new Error("Provider body omitted input");
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
     if (!isRecord(message) || message.role !== "user") continue;
     const text = messageText(message);
     if (text.trim()) return text;
@@ -1337,7 +1390,7 @@ function messageText(message: unknown): string {
   if (typeof message.content === "string") return message.content;
   if (!Array.isArray(message.content)) return "";
   return message.content.flatMap((part) => (
-    isRecord(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : []
+    isRecord(part) && (part.type === "input_text" || part.type === "text") && typeof part.text === "string" ? [part.text] : []
   )).join("\n");
 }
 

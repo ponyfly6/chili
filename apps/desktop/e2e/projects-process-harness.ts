@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { _electron as electron, type ElectronApplication, type Page } from "playwright-core";
 import type { ChiliDesktopApi, DesktopState } from "../src/shared/contracts.js";
+import { responsesFixtureUserText, writeResponsesFixtureText, writeResponsesFixtureTool } from "./responses-fixture.js";
 
 const repositoryRoot = requiredEnvironment("CHILI_PROJECTS_REPOSITORY_ROOT");
 const temporaryRoot = requiredEnvironment("CHILI_PROJECTS_TEMPORARY_ROOT");
@@ -37,28 +38,24 @@ const provider = createServer(async (request, response) => {
       return;
     }
     assert.equal(request.method, "POST");
-    assert.ok(url.pathname.endsWith("/chat/completions"));
+    assert.ok(url.pathname.endsWith("/responses"));
     assert.equal(request.headers.authorization, "Bearer project-process-fixture");
     let body = "";
     for await (const chunk of request) { body += String(chunk); assert.ok(body.length < 4_000_000); }
-    const parsed = JSON.parse(body) as { messages: Array<{ role: string; content: unknown }> };
-    const user = parsed.messages.filter((message) => message.role === "user").at(-1)?.content;
-    const text = typeof user === "string" ? user : JSON.stringify(user);
+    const text = responsesFixtureUserText(JSON.parse(body));
     const match = /project-process-(native|crash)-(stream|tool)-([abc])/u.exec(text);
     assert.ok(match, `Unexpected provider prompt ${text.slice(0, 200)}`);
     const key = match[0];
     if (match[2] === "tool") {
       const command = "printf '%s\\n' \"$$\" > .process-tool-leader.pid\n/bin/sleep 300 &\nprintf '%s\\n' \"$!\" > .process-tool-child.pid\nwait";
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ id: key, model: "deepseek-v4-pro", choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls: [{ id: `${key}-bash`, type: "function", function: { name: "bash", arguments: JSON.stringify({ command, timeoutMs: 300_000 }) } }] } }], usage: { prompt_tokens: 8, completion_tokens: 8, total_tokens: 16 } }));
+      writeResponsesFixtureTool(response, key, "bash", { command, timeoutMs: 300_000 });
       return;
     }
     assert.ok(!streams.has(key), `Unexpected duplicate stream ${key}`);
     const stream = { aborted: false, response };
     streams.set(key, stream);
     response.once("close", () => { stream.aborted = true; });
-    response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-    response.write(`data: ${JSON.stringify({ id: key, model: "deepseek-v4-pro", choices: [{ index: 0, finish_reason: null, delta: { content: `Holding ${key}` } }] })}\n\n`);
+    writeResponsesFixtureText(response, key, `Holding ${key}`, false);
   } catch (error) {
     providerErrors.push(String(error));
     response.writeHead(500, { "content-type": "application/json" });
@@ -182,9 +179,15 @@ try {
       ids.forEach((projectId, index) => { void api.invoke({ type: "diff.get", scope: "workspace", sessionId: tasks[index]!, projectId }).catch(() => undefined); });
     }, { ids: projectIds, tasks: sessions });
     let fixtures: unknown;
-    await waitFor(async () => {
-      try { fixtures = await inspect("fixtures", pid, { workspaces, toolPids }); return true; } catch { return false; }
-    }, 4_000);
+    let fixtureInspectionError: unknown;
+    try {
+      await waitFor(async () => {
+        try { fixtures = await inspect("fixtures", pid, { workspaces, toolPids }); return true; }
+        catch (error) { fixtureInspectionError = error; return false; }
+      }, 4_000);
+    } catch (error) {
+      throw new Error(`Process fixture verification failed: ${String(fixtureInspectionError ?? error)}`, { cause: fixtureInspectionError ?? error });
+    }
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.deepEqual(await inspect("fixtures", pid, { workspaces, toolPids }), fixtures, "Blocked children must remain alive across an independent observation");
     const measurement: Record<string, unknown> = { mode, switchesMs: switches, switchCount: switches.length, before, after, fixtures, outcome: "pending" };
@@ -232,9 +235,14 @@ async function saveMeasurements(): Promise<void> {
 }
 
 async function createTask(page: Page, prompt: string): Promise<void> {
+  // Project activation can briefly disable the composer while restoring state.
+  // Wait for that transition so the shared helper does not create a blank task.
+  await waitFor(async () => !await page.getByLabel("Message composer", { exact: true }).isDisabled());
   const dialog = await openAdvancedTaskDialog(page);
   await dialog.getByLabel("Task title", { exact: true }).fill(prompt);
   await dialog.getByLabel("What should Chili accomplish?", { exact: true }).fill(prompt);
+  // This fixture serves one configured model; do not depend on dialog defaults.
+  await dialog.getByLabel("Model", { exact: true }).selectOption(JSON.stringify(["deepseek", "deepseek-v4-pro"]));
   const permissions = dialog.getByLabel("Permission profile", { exact: true });
   const option = await permissions.locator("option").evaluateAll((options) => options.map((option) => ({ value: (option as HTMLOptionElement).value, text: option.textContent ?? "" })).find((option) => /^full access\b/iu.test(option.text))?.value);
   assert.ok(option);

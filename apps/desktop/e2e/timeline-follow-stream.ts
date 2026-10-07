@@ -12,6 +12,7 @@ const TITLE = "Live timeline follow E2E";
 export class TimelineFollowFixture {
   private response: ServerResponse | undefined;
   private id = 0;
+  private content = "";
   private settled = false;
 
   open(request: IncomingMessage, response: ServerResponse, observed: { aborted: boolean }, id: number): void {
@@ -30,28 +31,51 @@ export class TimelineFollowFixture {
       "cache-control": "no-cache",
       "content-type": "text/event-stream; charset=utf-8",
     });
+    this.writeEvent({
+      type: "response.created",
+      response: { id: `chili_e2e_${id}`, model: "deepseek-v4-pro", status: "in_progress", output: [] },
+    });
+    this.writeEvent({
+      type: "response.output_item.added", output_index: 0,
+      item: { id: `msg_chili_e2e_${id}`, type: "message", role: "assistant", status: "in_progress", content: [] },
+    });
     this.append("Short live response.");
   }
 
   append(content: string): void {
     assert.ok(this.response && !this.settled, "Timeline provider stream must remain active");
-    this.response.write(this.chunk(content, false));
+    this.content += content;
+    this.writeEvent({
+      type: "response.output_text.delta", item_id: `msg_chili_e2e_${this.id}`,
+      output_index: 0, content_index: 0, delta: content,
+    });
   }
 
   finish(): void {
     assert.ok(this.response && !this.settled, "Timeline stream must finish normally");
     this.settled = true;
-    this.response.write(this.chunk("", true));
-    this.response.end("data: [DONE]\n\n");
+    const item = {
+      id: `msg_chili_e2e_${this.id}`, type: "message", role: "assistant", status: "completed",
+      content: [{ type: "output_text", text: this.content, annotations: [] }],
+    };
+    this.writeEvent({
+      type: "response.output_text.done", item_id: item.id,
+      output_index: 0, content_index: 0, text: this.content,
+    });
+    this.writeEvent({ type: "response.output_item.done", output_index: 0, item });
+    this.writeEvent({
+      type: "response.completed",
+      response: {
+        id: `chili_e2e_${this.id}`, model: "deepseek-v4-pro", status: "completed", output: [item],
+        usage: { input_tokens: 8, output_tokens: 8, total_tokens: 16 },
+      },
+    });
+    this.response.end();
   }
 
-  private chunk(content: string, complete: boolean): string {
-    return `data: ${JSON.stringify({
-      id: `chili_e2e_${this.id}`,
-      model: "deepseek-v4-pro",
-      choices: [{ index: 0, finish_reason: complete ? "stop" : null, delta: complete ? {} : { content } }],
-      ...(complete ? { usage: { prompt_tokens: 8, completion_tokens: 8, total_tokens: 16 } } : {}),
-    })}\n\n`;
+  private writeEvent(event: Record<string, unknown>): void {
+    assert.ok(this.response, "Timeline provider stream must be open");
+    this.response.write(`data: ${JSON.stringify(event)}\n\n`);
   }
 }
 

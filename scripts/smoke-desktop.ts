@@ -249,7 +249,7 @@ try {
       const result = await runPackagedLaunch(
         executable,
         launch,
-        launch === 1 ? new URL("chat/completions", providerLoadServer.url).href : undefined,
+        launch === 1 ? new URL("responses", providerLoadServer.url).href : undefined,
       );
       const { sidecarPid, shutdownExitMs } = result;
       sidecarPids.push(sidecarPid);
@@ -567,26 +567,30 @@ function startProviderLoadServer(): ReturnType<typeof Bun.serve> {
     async fetch(request) {
       try {
         const url = new URL(request.url);
-        if (request.method !== "POST" || url.pathname !== "/chat/completions") {
+        if (request.method !== "POST" || url.pathname !== "/responses") {
           throw new Error(`Packaged real-provider smoke received ${request.method} ${url.pathname}`);
         }
         if (request.headers.get("authorization") !== `Bearer ${providerLoadApiKey}`) {
           throw new Error("Packaged real-provider smoke received the wrong authorization header");
         }
         const body = await request.json() as Record<string, unknown>;
-        if (body.model !== "deepseek-v4-pro" || body.stream !== true) {
+        if (body.model !== "deepseek-v4-pro" || body.stream !== true || !Array.isArray(body.input)) {
           throw new Error(`Packaged real-provider smoke received an invalid request: ${JSON.stringify(body)}`);
         }
         providerLoadRequests += 1;
-        return Response.json({
-          id: "chatcmpl_desktop_provider_load",
-          model: "deepseek-v4-pro",
-          choices: [{
-            index: 0,
-            finish_reason: "stop",
-            message: { content: "offline packaged provider loaded" },
-          }],
-          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        const item = {
+          id: "msg_desktop_provider_load", type: "message", role: "assistant", status: "completed",
+          content: [{ type: "output_text", text: "offline packaged provider loaded", annotations: [] }],
+        };
+        const payload = {
+          type: "response.completed",
+          response: {
+            id: "resp_desktop_provider_load", model: "deepseek-v4-pro", status: "completed", output: [item],
+            usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+          },
+        };
+        return new Response(`event: response.completed\ndata: ${JSON.stringify(payload)}\n\n`, {
+          headers: { "content-type": "text/event-stream" },
         });
       } catch (error) {
         providerLoadFailure = error;

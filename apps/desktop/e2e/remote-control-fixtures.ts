@@ -4,6 +4,7 @@ import { createHash, X509Certificate } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
+import { responsesFixtureUserText, writeResponsesFixtureText } from "./responses-fixture.js";
 
 export interface TestCertificate {
   certificate: string;
@@ -68,7 +69,7 @@ export async function waitUntil(label: string, predicate: () => boolean | Promis
   throw new Error(`Timed out: ${label}`);
 }
 
-export interface ModelRequest { text: string; aborted: boolean; slow: boolean }
+export interface ModelRequest { text: string; aborted: boolean; slow: boolean; finish?: () => void }
 export const FIXTURE_KEY = "chili-remote-e2e-local-model-only";
 
 /** Only the model is a fixture. All control, queue, persistence and sidecar code is production. */
@@ -98,7 +99,8 @@ export async function startModelFixture(desktopRoot: string): Promise<{
       response.setHeader("Content-Type", asset.endsWith(".html") ? "text/html" : asset.endsWith(".css") ? "text/css" : "text/javascript");
       response.end(bytes); return;
     }
-    assert.ok(url.pathname.endsWith("/chat/completions"));
+    assert.equal(request.method, "POST");
+    assert.ok(url.pathname.endsWith("/responses"));
     assert.equal(request.headers.authorization, `Bearer ${FIXTURE_KEY}`);
     const chunks: Buffer[] = [];
     let size = 0;
@@ -106,24 +108,18 @@ export async function startModelFixture(desktopRoot: string): Promise<{
       const bytes = Buffer.from(chunk as Uint8Array); size += bytes.length;
       assert.ok(size <= 2_000_000, "Model fixture body bound"); chunks.push(bytes);
     }
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { messages: { role: string; content: unknown }[] };
-    const latest = body.messages.findLast((message) => message.role === "user");
-    assert.equal(typeof latest?.content, "string");
-    const text = latest!.content as string;
+    const text = responsesFixtureUserText(JSON.parse(Buffer.concat(chunks).toString("utf8")));
     const observed: ModelRequest = { text, aborted: false, slow: text.includes("[slow]") };
     requests.push(observed);
     const id = `remote_fixture_${requests.length}`;
     if (!observed.slow) {
-      response.setHeader("Content-Type", "application/json");
-      response.end(JSON.stringify({ id, model: "deepseek-v4-pro", choices: [{ index: 0, finish_reason: "stop",
-        message: { role: "assistant", content: `Remote fixture response: ${text}` } }],
-        usage: { prompt_tokens: 8, completion_tokens: 8, total_tokens: 16 } }));
+      writeResponsesFixtureText(response, id, `Remote fixture response: ${text}`, true);
       return;
     }
-    response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
-    response.write(`data: ${JSON.stringify({ id, model: "deepseek-v4-pro", choices: [{ index: 0, finish_reason: null,
-      delta: { content: `Remote fixture stream: ${text}` } }] })}\n\n`);
-    response.once("close", () => { observed.aborted = true; });
+    let completed = false;
+    response.once("close", () => { if (!completed) observed.aborted = true; });
+    const finish = writeResponsesFixtureText(response, id, `Remote fixture stream: ${text}`, false);
+    observed.finish = () => { completed = true; finish(); };
   }
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);

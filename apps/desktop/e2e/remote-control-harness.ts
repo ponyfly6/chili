@@ -179,10 +179,11 @@ try {
   process.stdout.write("[remote-e2e] Queue, local concurrent operation, Steer and Stop\n");
   await mobile.getByTestId("message-input").fill("phone queued once");
   await mobile.getByTestId("queue-send").click();
-  await waitUntil("desktop sees remotely queued prompt", async () => /1 条待处理/u.test(await desktopPage!.locator(".composer").innerText()));
+  await desktopPage.getByRole("button", { name: "关闭设置", exact: true }).click();
+  await desktopPage.getByRole("list", { name: "待处理消息", exact: true })
+    .getByText("phone queued once", { exact: true }).waitFor();
   assert.equal(fixture.requests.filter((request) => request.text === "phone queued once").length, 0, "Queue must not preempt running task");
   // A real local window and a real phone share the service's queue simultaneously.
-  await desktopPage.getByRole("button", { name: "关闭设置", exact: true }).click();
   await desktopPage.getByLabel("Message composer", { exact: true }).fill("desktop queued concurrently");
   await desktopPage.getByRole("button", { name: "Queue message", exact: true }).click();
   await mobile.getByTestId("message-input").fill("phone steer replacement");
@@ -199,8 +200,10 @@ try {
   await mobile.getByTestId("stop-task").click();
   await waitUntil("phone Stop aborts real runtime turn", () => fixture.requests.some((request) => request.text === "[slow] phone stop target" && request.aborted));
   evidence.stopElapsedMs = Date.now() - stopStarted;
-  // Stop now persists a paused input queue; explicit local resume admits follow-ups.
+  // Resume first recovers the interrupted input. Finish that model stream before
+  // testing new queued work; the fixture otherwise deliberately holds it forever.
   await desktopPage.getByRole("button", { name: "继续处理", exact: true }).click();
+  await finishRecoveredModelInput("[slow] phone stop target");
 
   process.stdout.write("[remote-e2e] Disconnect/reconnect, refresh requires fresh pairing, device revocation\n");
   await mobile.getByTestId("disconnect").click();
@@ -666,9 +669,10 @@ async function proveStickyUnknownOutcomeUi(context: BrowserContext, local: Page,
   const unknown = page.getByTestId("outcome-unknown");
   const unknownItems = unknown.locator('[data-testid^="unknown-outcome-"]');
   const confirmations = unknown.getByRole("button", { name: /已核对，清除此提醒/u });
-  const resumeLocalQueue = async (): Promise<void> => {
+  const resumeLocalQueue = async (interruptedText?: string): Promise<void> => {
     await local.getByRole("button", { name: "关闭设置", exact: true }).click();
     await local.getByRole("button", { name: "继续处理", exact: true }).click();
+    if (interruptedText) await finishRecoveredModelInput(interruptedText);
     await openPhoneSettings(local);
   };
   const assertOneWarning = async (message: string): Promise<void> => {
@@ -735,7 +739,7 @@ async function proveStickyUnknownOutcomeUi(context: BrowserContext, local: Page,
     assert.equal(fixture.requests.filter((request) => request.text === lostSend).length, 1);
     assert.equal(fixture.requests.filter((request) => request.text === concurrentSend).length, 1);
     process.stdout.write("[remote-e2e] Production UI retains admitted command uncertainty after desktop revocation\n");
-    await resumeLocalQueue();
+    await resumeLocalQueue(concurrentSend);
     const revocationStarted = Date.now();
     await page.getByTestId("message-input").fill(revokedSend);
     await page.getByTestId("queue-send").click();
@@ -768,7 +772,8 @@ async function proveStickyUnknownOutcomeUi(context: BrowserContext, local: Page,
       eachConfirmationClearsOnlyItsOwnRecord: true,
       admittedOutcomeSurvivesRevocationBeforeTimeout: true,
       millisecondsBeforeRevocation,
-      executedSendCounts: { lostSend: 1, concurrentSend: 1, revokedSend: 1 },
+      modelRequestCounts: { lostSend: 1, concurrentSend: 2, revokedSend: 1 },
+      interruptedInputExplicitlyRecovered: true,
     };
   } catch (error) {
     await Promise.allSettled([
@@ -877,6 +882,12 @@ async function proveWireLoss(context: BrowserContext, local: Page, origin: strin
     await page.evaluate(async () => { (window as unknown as BrowserFaultWindow).remoteFaultClient.disconnect(); await (window as unknown as BrowserFaultWindow).remoteFaultClient.reconnect(); });
     await page.evaluate(async () => (window as unknown as BrowserFaultWindow).remoteFaultPending);
     results.push({ unresolvedSnapshotDidNotBlockStop: true, stopElapsedMs: stopElapsed });
+    // Stop retains the unfinished read-test input. Keep the independent wire-loss
+    // queue probes in their own session instead of resuming that held stream.
+    const queueSession = await local.evaluate(async () => (window as unknown as DesktopOrderingWindow).chiliDesktop.invoke({
+      type: "sessions.create", title: "Wire loss queue runtime",
+    }));
+    sessionId = queueSession.sessionId;
     for (const loss of ["ack", "result", "both"] as const) {
       process.stdout.write(`[remote-e2e] Real encrypted wire loss: ${loss}\n`);
       const holder = `[slow] ${loss} queue holder`;
@@ -1109,4 +1120,11 @@ async function resumePausedQueue(local: Page, sessionId: string): Promise<void> 
     const snapshot = await desktop.invoke({ type: "session.snapshot", sessionId: id });
     if (snapshot.inputQueue?.paused) await desktop.invoke({ type: "session.resume", sessionId: id });
   }, sessionId);
+}
+
+async function finishRecoveredModelInput(text: string): Promise<void> {
+  await waitUntil("interrupted model input resumes", () => fixture.requests.filter((request) => request.text === text).length === 2);
+  const resumed = fixture.requests.findLast((request) => request.text === text);
+  assert.ok(resumed?.finish && !resumed.aborted, "The recovered input must have a live model stream");
+  resumed.finish();
 }
