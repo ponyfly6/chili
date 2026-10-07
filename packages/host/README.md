@@ -32,9 +32,33 @@ and `bashRunner` can be injected for tests. `model: "fake"` runs the existing
 offline fixtures; `@chili/host/testing` exposes their router for test code.
 
 Host has no terminal UI and writes no execution output to stdout. An optional
-`onEvent` observer receives committed events from initialization through shutdown;
-observer exceptions do not change the committed result. CLI and Desktop supply
+`onEvent` observer receives accepted events, including transient stream deltas,
+from initialization through shutdown; observer exceptions do not change the
+operation result. CLI and Desktop supply
 user-input interfaces for clarification, independently from execution review.
+
+Host registers a fixed list of typed `modules` at construction. Each `HostModule`
+has one unique ID and can provide several capabilities: `prompt.collect`,
+`tools.review/processResult/ended`, `model.started/event/ended`,
+`agent.started/ended`, `runtime.event`, and `modelSelection.changed`. Root and
+child services share the list. Built-in modules run before extensions; the
+`chili.` namespace is reserved. There is no plugin loader, dynamic registration,
+`next()` middleware, or callback that can replay an operation.
+
+The execution-review module is a registered `tools.review` capability, required
+by the host's gate adapter. Full Access skips all review capabilities. Auto-review
+requires the built-in review and every additional reviewer to allow the prepared
+operation; an extension cannot override a denial. The executor still calls the
+gate at the effect boundary and rechecks the returned permits. Lifecycle
+observers cannot grant authorization.
+
+Observers are synchronous and failure-isolated. `onHookError` identifies the
+`moduleId`, capability `point`, and error; a failed observer disables only that
+capability. The legacy `onEvent` option is adapted once into `runtime.event` and
+retains its compact public event data. Internal `model.event` streams are a
+separate observation surface and are not automatically published to SSE or
+conversation history. See [Host modules and Hooks](hooks.md) for the full API,
+deadline, cancellation, and completion contracts.
 
 Host supports exactly two execution modes. `full-access` executes tools directly.
 `auto-review` (the default) asks an independent model to allow or deny each exact
@@ -62,10 +86,19 @@ Legacy `[permissions]` tables are ignored. `reviewerModelRouter` and
 `reviewTimeoutMs` support isolated fake-model tests. The built-in fake model also
 provides deterministic review decisions without network calls.
 
-`close()` returns one shared promise. It closes admission, interrupts/drains root
-and child execution, stops managed processes and maintenance, settles interaction
-queues, closes MCP, then closes SQLite. Initialization failures also drain the
-resources already created.
+`close()` returns one shared promise. It closes admission, cancels cancellable
+module waits, interrupts/drains root and child execution, stops managed processes
+and maintenance, settles interaction queues, closes MCP, then closes SQLite.
+Observers remain active until terminal events have been delivered. Initialization
+failures also drain the resources already created.
+
+`modelSelection.changed(input, signal)` is awaited completion work after the
+selection event commits, not an optional observer. Host closure does not cancel
+it, including when an event observer starts closing before persistence begins.
+Each handler still has its module deadline; the host separately drains its
+already-started atomic preference writes before releasing ownership. Extension
+handlers must await all their work and honor their deadline signal. A failure
+does not roll back the committed selection. This is not a durable callback queue.
 
 ## Dependency boundary
 
@@ -128,6 +161,22 @@ invalidate stale calls. The effect boundary rechecks the execution permit and
 resource identity, including after snapshots and file-lock waits. Structured
 program data is stored separately from model previews and compact UI transport.
 
+Result processors run after canonical output and sidecar handling. They may
+change `title`, `output`, and `content`; canonical `structuredData`, `metadata`,
+and `artifactIds` remain authoritative. Processing neither repeats tool execution
+nor creates another sidecar pass. Tool terminal audit events retain canonical
+output; lifecycle completion provides both canonical and returned results. A
+processor error or deadline preserves successful execution with an explanatory
+notice, rather than inviting the model to repeat an already-completed effect.
+
+Model lifecycle observation follows each consumed router stream invocation.
+Runtime retries create new invocations; provider-internal retry, timeout,
+backpressure, and iterator cleanup remain unchanged. `purpose` distinguishes
+`task`, `review`, `compaction`, and `validation`, independently of the originating
+session's `root`/`child` role and parent. Agent lifecycle observation spans one
+accepted input that starts running, including its model/tool continuations, and
+ends after settlement and lease release.
+
 Both modes execute approved ordinary shell calls through the normal host backend.
 Explicit delegated worker scopes remain enforced by the tool executor and process
 sandbox. A worker cannot widen its assigned filesystem, command or network scope
@@ -148,7 +197,9 @@ The actual budgeted model request is persisted, with sources and omission reason
 Existing conversation history is retained. Internal tool IDs are now independent
 of provider IDs, and old history keeps its protocol mapping. Memory Markdown is
 imported transactionally once into the profile database and is thereafter an
-export format, not a second mutable authority.
+export format, not a second mutable authority. Module prompt collection uses the
+existing context snapshots; it adds no automatic Memory extraction, update hook,
+or background maintenance interface.
 
 ## Durable session inputs
 
