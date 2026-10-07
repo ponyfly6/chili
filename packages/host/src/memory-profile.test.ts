@@ -36,7 +36,7 @@ test("Host execution and later model requests share profile-scoped Memory and sk
   await writeFile(join(profileA, "skills", "quartz", "SKILL.md"), "---\nname: quartz\ndescription: Quartz profile skill\n---\nQuartz instructions\n");
   try {
     const writer = new MemoryHostRouter(true);
-    const first = await createChiliHost({ cwd, chiliHome: profileA, model: "fake", modelRouter: writer, mcpConnectMode: "manual", askApproval: async () => ({ action: "allow_once" }), staleTurnRecoveryIntervalMs: false });
+    const first = await createChiliHost({ cwd, chiliHome: profileA, model: "fake", permissionProfile: "full-access", modelRouter: writer, mcpConnectMode: "manual", staleTurnRecoveryIntervalMs: false });
     try {
       const session = await first.service.createSession();
       const outcome = await first.service.submitPrompt({ sessionId: session.sessionId, text: "Remember the Quartz reconnect preference." });
@@ -49,7 +49,7 @@ test("Host execution and later model requests share profile-scoped Memory and sk
       expect(actual).toContain("Quartz profile skill");
     } finally { await first.close(); }
     const reader = new MemoryHostRouter(false);
-    const second = await createChiliHost({ cwd, chiliHome: profileB, model: "fake", modelRouter: reader, mcpConnectMode: "manual", staleTurnRecoveryIntervalMs: false });
+    const second = await createChiliHost({ cwd, chiliHome: profileB, model: "fake", permissionProfile: "full-access", modelRouter: reader, mcpConnectMode: "manual", staleTurnRecoveryIntervalMs: false });
     try {
       const session = await second.service.createSession();
       expect((await second.service.submitPrompt({ sessionId: session.sessionId, text: "Explain Quartz reconnect." })).status).toBe("completed");
@@ -84,7 +84,7 @@ test("Host loads applicable path rules on the next turn from this session's actu
   await writeFile(join(cwd, ".chili", "rules", "source.md"), "---\npaths: [src/**]\nalwaysApply: false\n---\nApply Quartz source conventions.\n");
   const router = new ScopedRuleRouter();
   try {
-    const host = await createChiliHost({ cwd, chiliHome: join(root, "profile"), model: "fake", modelRouter: router, mcpConnectMode: "manual", staleTurnRecoveryIntervalMs: false });
+    const host = await createChiliHost({ cwd, chiliHome: join(root, "profile"), model: "fake", permissionProfile: "full-access", modelRouter: router, mcpConnectMode: "manual", staleTurnRecoveryIntervalMs: false });
     try {
       const session = await host.service.createSession();
       expect((await host.service.submitPrompt({ sessionId: session.sessionId, text: "Read the app source." })).status).toBe("completed");
@@ -99,14 +99,14 @@ test("Host loads applicable path rules on the next turn from this session's actu
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("Host rechecks current memory.read policy before automatically loading Memory", async () => {
+test("Host ignores retired permission rules when loading profile Memory", async () => {
   const root = await mkdtemp(join(tmpdir(), "chili-host-memory-deny-"));
   const cwd = join(root, "repo");
   await mkdir(join(cwd, ".chili"), { recursive: true });
   await writeFile(join(cwd, "AGENTS.md"), "Project instructions remain separate from Memory.\n");
   const router = new MemoryHostRouter(false);
   try {
-    const host = await createChiliHost({ cwd, chiliHome: join(root, "profile"), model: "fake", modelRouter: router, mcpConnectMode: "manual", staleTurnRecoveryIntervalMs: false });
+    const host = await createChiliHost({ cwd, chiliHome: join(root, "profile"), model: "fake", permissionProfile: "full-access", modelRouter: router, mcpConnectMode: "manual", staleTurnRecoveryIntervalMs: false });
     try {
       await addChiliMemoryEntry({ cwd, chiliHome: host.identity.profilePath, projectRoot: host.identity.projectRoot, projectId: host.identity.projectId, text: "Quartz memory secret preference" });
       const allowed = await host.service.createSession();
@@ -116,9 +116,9 @@ test("Host rechecks current memory.read policy before automatically loading Memo
       const denied = await host.service.createSession();
       expect((await host.service.submitPrompt({ sessionId: denied.sessionId, text: "Explain Quartz memory." })).status).toBe("completed");
       const actual = JSON.stringify(router.captured.at(-1));
-      expect(actual).not.toContain("Quartz memory secret preference");
+      expect(actual).toContain("Quartz memory secret preference");
       expect(actual).toContain("Project instructions remain separate from Memory.");
-      expect(actual).toContain("memory_read_not_authorized");
+      expect(actual).not.toContain("memory_read_not_authorized");
     } finally { await host.close(); }
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -154,7 +154,7 @@ test("one Host keeps project Memory isolated across sessions with different work
   await mkdir(repoB, { recursive: true });
   const router = new MultiProjectMemoryRouter();
   try {
-    const host = await createChiliHost({ cwd: repoB, chiliHome: join(root, "profile"), model: "fake", modelRouter: router, mcpConnectMode: "manual", askApproval: async () => ({ action: "allow_once" }), staleTurnRecoveryIntervalMs: false });
+    const host = await createChiliHost({ cwd: repoB, chiliHome: join(root, "profile"), model: "fake", permissionProfile: "full-access", modelRouter: router, mcpConnectMode: "manual", staleTurnRecoveryIntervalMs: false });
     try {
       const a = await host.service.createSession({ cwd: repoA });
       expect((await host.service.submitPrompt({ sessionId: a.sessionId, text: "Remember project A Quartz preference." })).status).toBe("completed");

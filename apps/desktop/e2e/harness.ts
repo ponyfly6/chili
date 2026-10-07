@@ -28,8 +28,8 @@ const PROVIDER_TIMEOUT_MS = 20_000;
 const LOCAL_API_KEY = "chili-electron-e2e-local-fixture-key";
 const CONVERSATION_TITLE = "Conversation recovery E2E";
 const CONVERSATION_PROMPT = "desktop conversation fixture";
-const APPROVAL_TITLE = "Approval and input E2E";
-const RENAMED_APPROVAL_TITLE = "Renamed approval E2E";
+const REVIEW_TITLE = "Automatic review and input E2E";
+const RENAMED_REVIEW_TITLE = "Renamed review E2E";
 const SLOW_TITLE = "Steer and stop E2E";
 const SLOW_STEER_PROMPT = "electron slow steer fixture";
 const STEER_REPLACEMENT = "electron steer replacement";
@@ -168,13 +168,13 @@ try {
     await closeDesktop(currentLaunch);
     currentLaunch = undefined;
 
-    logStep("launch 2/4: reload the conversation and exercise approval, input, rename, search, and archive");
+    logStep("launch 2/4: reload the conversation and exercise automatic review, input, rename, search, and archive");
     currentLaunch = await launchDesktop("conversation-recovery", "fake");
     await assertDesktopAppearanceRestored(currentLaunch.page);
     await waitForTaskTitle(currentLaunch.page, CONVERSATION_TITLE);
     await assertConversationAndSettings(currentLaunch.page);
-    await createApprovalTaskThroughUi(currentLaunch.page);
-    await resolveApprovalThroughUi(currentLaunch.page);
+    await createReviewTaskThroughUi(currentLaunch.page);
+    await assertAutomaticReviewThroughUi(currentLaunch.page);
     await resolveUserInputThroughUi(currentLaunch.page);
     await renameSearchAndArchiveThroughUi(currentLaunch.page);
     await assertDelegatedConversation(currentLaunch.page, workspace, artifacts);
@@ -249,7 +249,7 @@ try {
 }
 
 process.stdout.write(
-  "electron desktop E2E passed: conversation create/reload, input recovery, approval, input, steer, stop, "
+  "electron desktop E2E passed: conversation create/reload, input recovery, automatic review, input, steer, stop, "
   + "rename/search/archive, delegated conversations and settings, background projects and isolated drafts, "
   + "theme switching/system tracking/restart persistence, nine native widths from 390 to 1440, keyboard panel navigation, and live timeline following\n",
 );
@@ -543,7 +543,7 @@ async function createConversationThroughUi(page: Page): Promise<void> {
   await assertTaskConfigurationControls(dialog);
   await chooseOptionIfAvailable(dialog.getByLabel("Reasoning", { exact: true }), /^medium$/iu);
   await chooseOptionIfAvailable(dialog.getByLabel("Service tier", { exact: true }), /^standard$/iu);
-  await chooseOptionIfAvailable(dialog.getByLabel("Permission profile", { exact: true }), /^default\b/iu);
+  await dialog.getByLabel("Permission profile", { exact: true }).selectOption("auto-review");
   await chooseOptionIfAvailable(dialog.getByLabel("Delegation", { exact: true }), /^proactive\b/iu);
   await dialog.getByRole("button", { name: "Create & run", exact: true }).click();
   await dialog.waitFor({ state: "hidden" });
@@ -561,36 +561,58 @@ async function assertConversationAndSettings(page: Page): Promise<void> {
   assert.equal(await page.locator(".timeline .message-user").count(), 1, "The configured prompt is submitted once");
   const settings = await openDesktopSettings(page);
   await settings.getByRole("button", { name: "权限与协作", exact: true }).click();
-  await expectVisible(settings.getByLabel("Task permission profile", { exact: true }));
+  const permissionMode = settings.getByLabel("Task permission profile", { exact: true });
+  assert.deepEqual((await permissionMode.locator("option").evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value))).sort(), ["auto-review", "full-access"]);
+  await permissionMode.selectOption("auto-review");
+  const reviewInstructions = settings.getByLabel("审查说明", { exact: true });
+  await expectVisible(reviewInstructions);
+  await expectVisible(settings.getByLabel("审查模型", { exact: true }));
+  const defaultReviewInstructions = await reviewInstructions.inputValue();
+  assert.ok(defaultReviewInstructions.trim().length > 0, "Automatic review starts with default instructions");
+  const customReviewInstructions = "Allow project changes and reject unrelated destructive actions.";
+  await reviewInstructions.fill(customReviewInstructions);
+  await settings.getByRole("button", { name: "保存设置", exact: true }).click();
+  await settings.waitFor({ state: "hidden" });
+  await openDesktopSettings(page);
+  await settings.getByRole("button", { name: "权限与协作", exact: true }).click();
+  assert.equal(await reviewInstructions.inputValue(), customReviewInstructions, "Custom review instructions survive a runtime settings roundtrip");
+  await settings.getByRole("button", { name: "恢复默认说明", exact: true }).click();
+  assert.equal(await reviewInstructions.inputValue(), defaultReviewInstructions);
+  await settings.getByRole("button", { name: "保存设置", exact: true }).click();
+  await settings.waitFor({ state: "hidden" });
+  await openDesktopSettings(page);
+  await settings.getByRole("button", { name: "权限与协作", exact: true }).click();
+  assert.equal(await reviewInstructions.inputValue(), defaultReviewInstructions, "Reset review instructions survive a runtime settings roundtrip");
+  await page.screenshot({ path: join(artifacts, "review-settings.png") });
+  await permissionMode.selectOption("full-access");
+  assert.equal(await reviewInstructions.count(), 0, "Full access does not expose automatic review settings");
+  await permissionMode.selectOption("auto-review");
   await expectVisible(settings.getByLabel("Task delegation", { exact: true }));
   await settings.getByRole("button", { name: "工具与技能", exact: true }).click();
   await expectVisible(settings.getByRole("heading", { name: "工具连接 · MCP", exact: true }));
   await closeSettings(page);
 }
 
-async function createApprovalTaskThroughUi(page: Page): Promise<void> {
+async function createReviewTaskThroughUi(page: Page): Promise<void> {
   const dialog = await openNewTaskDialog(page);
-  await dialog.getByLabel("Task title", { exact: true }).fill(APPROVAL_TITLE);
-  await dialog.getByLabel("What should Chili accomplish?", { exact: true }).fill("desktop approval fixture");
+  await dialog.getByLabel("Task title", { exact: true }).fill(REVIEW_TITLE);
+  await dialog.getByLabel("What should Chili accomplish?", { exact: true }).fill("desktop review fixture");
   await assertTaskConfigurationControls(dialog);
   await chooseOptionIfAvailable(dialog.getByLabel("Reasoning", { exact: true }), /^low$/iu);
   await chooseOptionIfAvailable(dialog.getByLabel("Reasoning", { exact: true }), /^high\b/iu);
   await chooseOptionIfAvailable(dialog.getByLabel("Service tier", { exact: true }), /^standard$/iu);
   await chooseOptionIfAvailable(dialog.getByLabel("Permission profile", { exact: true }), /^full access\b/iu);
-  await chooseOptionIfAvailable(dialog.getByLabel("Permission profile", { exact: true }), /^default\b/iu);
+  await dialog.getByLabel("Permission profile", { exact: true }).selectOption("auto-review");
   await chooseOptionIfAvailable(dialog.getByLabel("Delegation", { exact: true }), /^off\b/iu);
   await chooseOptionIfAvailable(dialog.getByLabel("Delegation", { exact: true }), /^explicit\b/iu);
   await dialog.getByRole("button", { name: "Create & run", exact: true }).click();
   await dialog.waitFor({ state: "hidden" });
-  await waitForTaskTitle(page, APPROVAL_TITLE);
+  await waitForTaskTitle(page, REVIEW_TITLE);
 }
 
-async function resolveApprovalThroughUi(page: Page): Promise<void> {
-  const approval = page.locator(".approval-card").filter({ hasText: "/usr/bin/true" });
-  await expectVisible(approval.getByText(/Approval required/iu));
-  await approval.getByRole("button", { name: "Allow once", exact: true }).click();
-  await approval.waitFor({ state: "hidden" });
+async function assertAutomaticReviewThroughUi(page: Page): Promise<void> {
   await expectVisible(page.getByText("I read the file and the tool loop works.", { exact: true }));
+  assert.equal(await page.locator(".approval-card").count(), 0, "Automatic review must not request manual approval");
 }
 
 async function resolveUserInputThroughUi(page: Page): Promise<void> {
@@ -612,9 +634,9 @@ async function resolveUserInputThroughUi(page: Page): Promise<void> {
 }
 
 async function renameSearchAndArchiveThroughUi(page: Page): Promise<void> {
-  const initialActions = page.getByRole("button", { name: `Task actions for ${APPROVAL_TITLE}`, exact: true });
+  const initialActions = page.getByRole("button", { name: `Task actions for ${REVIEW_TITLE}`, exact: true });
   await initialActions.click();
-  const initialMenu = page.getByRole("menu", { name: `Task actions for ${APPROVAL_TITLE}`, exact: true });
+  const initialMenu = page.getByRole("menu", { name: `Task actions for ${REVIEW_TITLE}`, exact: true });
   await expectFocused(initialMenu.getByRole("menuitem", { name: "重命名", exact: true }));
   await page.keyboard.press("Escape");
   await expectFocused(initialActions);
@@ -623,19 +645,19 @@ async function renameSearchAndArchiveThroughUi(page: Page): Promise<void> {
   const renameDialog = page.getByRole("dialog", { name: "Rename task", exact: true });
   await expectVisible(renameDialog);
   const titleInput = renameDialog.getByLabel("New task title", { exact: true });
-  await titleInput.fill(RENAMED_APPROVAL_TITLE);
+  await titleInput.fill(RENAMED_REVIEW_TITLE);
   await renameDialog.getByRole("button", { name: "Save name", exact: true }).click();
   await renameDialog.waitFor({ state: "hidden" });
-  await waitForTaskTitle(page, RENAMED_APPROVAL_TITLE);
+  await waitForTaskTitle(page, RENAMED_REVIEW_TITLE);
 
   await page.getByRole("button", { name: "搜索会话", exact: true }).click();
   const search = page.getByLabel("Search tasks", { exact: true });
-  await search.fill("renamed approval");
-  const renamedTaskRow = page.getByRole("button", { name: /^Renamed approval E2E\b/iu });
+  await search.fill("renamed review");
+  const renamedTaskRow = page.getByRole("button", { name: /^Renamed review E2E\b/iu });
   await expectVisible(renamedTaskRow);
-  await page.getByRole("button", { name: `Task actions for ${RENAMED_APPROVAL_TITLE}`, exact: true }).click();
+  await page.getByRole("button", { name: `Task actions for ${RENAMED_REVIEW_TITLE}`, exact: true }).click();
   const renamedMenu = page.getByRole("menu", {
-    name: `Task actions for ${RENAMED_APPROVAL_TITLE}`,
+    name: `Task actions for ${RENAMED_REVIEW_TITLE}`,
     exact: true,
   });
   await renamedMenu.getByRole("menuitem", { name: "归档会话", exact: true }).click();
@@ -651,7 +673,7 @@ async function renameSearchAndArchiveThroughUi(page: Page): Promise<void> {
   ));
   await expectVisible(renamedTaskRow);
   assert.equal(
-    await page.getByRole("button", { name: `Task actions for ${RENAMED_APPROVAL_TITLE}`, exact: true }).count(),
+    await page.getByRole("button", { name: `Task actions for ${RENAMED_REVIEW_TITLE}`, exact: true }).count(),
     0,
     "Archived tasks must not expose mutation actions",
   );
@@ -682,7 +704,7 @@ async function recoverSlowInputThroughUi(page: Page, inputId: string): Promise<v
   await waitForTaskTitle(page, SLOW_TITLE);
   const settings = await openDesktopSettings(page);
   await settings.getByRole("button", { name: "权限与协作", exact: true }).click();
-  assert.equal(await settings.getByLabel("Task permission profile", { exact: true }).inputValue(), "default");
+  assert.equal(await settings.getByLabel("Task permission profile", { exact: true }).inputValue(), "full-access", "Permission mode persists across restart");
   await settings.getByRole("button", { name: "模型与账号", exact: true }).click();
   assert.equal(await settings.getByLabel("Task service tier", { exact: true }).inputValue(), "");
   await closeSettings(page);
@@ -952,7 +974,7 @@ async function assertTaskConfigurationControls(dialog: Locator): Promise<void> {
     await expectVisible(dialog.getByLabel(name, { exact: true }));
   }
   await expectVisible(dialog.getByText(
-    "Applies to every task until the local runtime restarts; restart returns to Default.",
+    "Saved as your default and applied to every task in this workspace.",
     { exact: true },
   ));
 }
@@ -1290,7 +1312,7 @@ async function assertDurablePostconditions(): Promise<void> {
     "select title, status from sessions order by created_at asc",
   );
   assert.ok(sessions.some((session) => session.title === CONVERSATION_TITLE && session.status === "active"));
-  assert.ok(sessions.some((session) => session.title === RENAMED_APPROVAL_TITLE && session.status === "archived"));
+  assert.ok(sessions.some((session) => session.title === RENAMED_REVIEW_TITLE && session.status === "archived"));
   assert.ok(sessions.some((session) => session.title === SLOW_TITLE && session.status === "active"));
 
   const inputs = await querySqliteRows<{ title: string; text: string; outcome: string; resumed: number }>(
@@ -1313,7 +1335,6 @@ async function assertDurablePostconditions(): Promise<void> {
   );
   const eventCounts = new Map(eventRows.map((row) => [row.type, row.count]));
   for (const [type, minimum] of [
-    ["approval.resolved", 1],
     ["user_input.resolved", 1],
     ["session.renamed", 1],
     ["session.archived", 1],
@@ -1329,6 +1350,13 @@ async function assertDurablePostconditions(): Promise<void> {
     0,
     "Provider-default deterministic models must not persist a synthetic service tier",
   );
+  assert.equal(eventCounts.get("approval.requested") ?? 0, 0, "Automatic review must never create manual approval requests");
+  assert.equal(eventCounts.get("approval.resolved") ?? 0, 0, "Automatic review must never persist manual approval decisions");
+  const reviewedCalls = await querySqliteRows<{ count: number }>(
+    `select count(*) as count from events
+       where type = 'tool.call_updated' and json_extract(payload_json, '$.metadata.review.decision') = 'allow'`,
+  );
+  assert.ok((reviewedCalls[0]?.count ?? 0) >= 1, "Automatic review decisions must be recorded with tool execution");
   const databaseBytes = await readFile(databasePath);
   assert.equal(databaseBytes.includes(Buffer.from(LOCAL_API_KEY, "utf8")), false, "Local fixture key leaked into SQLite");
 }

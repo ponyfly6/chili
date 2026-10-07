@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { SessionId, TimestampMs, TurnId } from "@chili/protocol";
 import { SqliteMemoryRepository } from "@chili/store";
-import { InMemoryToolRegistry, PolicyApprovalBroker, ToolExecutor } from "@chili/tools";
+import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
 import {
   addChiliMemoryEntry,
   buildChiliMemoryPromptFragments,
@@ -543,7 +543,7 @@ test("memory tool supports add and list", async () => {
     const executor = new ToolExecutor({
       registry,
       events: { publish: async () => undefined },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
       createId: createSequentialId(),
       now: () => 1 as TimestampMs,
     });
@@ -674,10 +674,10 @@ test("imported Memory no longer depends on the old Markdown being readable", asy
   } finally { await fixture.cleanup(); }
 });
 
-test("dynamic Memory binds approval and execution to one prepared project and ignores forged bindings", async () => {
+test("dynamic Memory binds review and execution to one prepared project and ignores forged bindings", async () => {
   const fixture = await createMemoryFixture();
   const chiliHome = join(fixture.home, "profile");
-  let projectId = "project-before-approval";
+  let projectId = "project-before-review";
   let resolutions = 0;
   const patterns: string[][] = [];
   try {
@@ -689,10 +689,13 @@ test("dynamic Memory binds approval and execution to one prepared project and ig
     } }));
     const executor = new ToolExecutor({
       registry, events: { publish: async () => undefined }, createId: createSequentialId(), now: () => 1 as TimestampMs,
-      approvals: { decide: async (request) => {
-        patterns.push(request.patterns);
-        projectId = "different-project-after-approval";
-        return { action: "allow_once" };
+      gate: { review: async (request) => {
+        patterns.push(request.resources?.patterns ?? []);
+        expect(request.input).toMatchObject({ operation: "add", memoryBinding: {
+          projectId: "project-before-review", chiliHome,
+        } });
+        projectId = "different-project-after-review";
+        return { decision: "allow" };
       } },
     });
     const result = await executor.execute({
@@ -704,21 +707,21 @@ test("dynamic Memory binds approval and execution to one prepared project and ig
     });
     expect(result.status).toBe("completed");
     expect(resolutions).toBe(1);
-    expect(patterns).toEqual([[`profile:${chiliHome}/project:project-before-approval`]]);
-    expect((await listChiliMemoryEntries({ cwd: fixture.repo, chiliHome, projectRoot: fixture.repo, projectId: "project-before-approval" })).map((entry) => entry.text)).toEqual(["Prepared resource fact"]);
-    expect(await listChiliMemoryEntries({ cwd: fixture.repo, chiliHome, projectRoot: fixture.repo, projectId: "different-project-after-approval" })).toEqual([]);
+    expect(patterns).toEqual([[`profile:${chiliHome}/project:project-before-review`]]);
+    expect((await listChiliMemoryEntries({ cwd: fixture.repo, chiliHome, projectRoot: fixture.repo, projectId: "project-before-review" })).map((entry) => entry.text)).toEqual(["Prepared resource fact"]);
+    expect(await listChiliMemoryEntries({ cwd: fixture.repo, chiliHome, projectRoot: fixture.repo, projectId: "different-project-after-review" })).toEqual([]);
     expect(await listChiliMemoryEntries({ cwd: fixture.repo, chiliHome, projectRoot: fixture.repo, projectId: "forged-project" })).toEqual([]);
   } finally { await fixture.cleanup(); }
 });
 
-test("Memory rechecks real policy after waiting on migration preparation before committing effects", async () => {
+test("Memory rechecks execution authority after waiting on migration preparation before committing effects", async () => {
   const fixture = await createMemoryFixture();
   const chiliHome = join(fixture.home, "profile");
   let release!: () => void;
   let reached!: () => void;
   const paused = new Promise<void>((resolve) => { reached = resolve; });
   const resumed = new Promise<void>((resolve) => { release = resolve; });
-  const broker = new PolicyApprovalBroker({ rulesets: [[{ permission: "memory.write", pattern: "*", action: "allow", source: "test-policy" }]] });
+  let revoked = false;
   let pending: ReturnType<ToolExecutor["execute"]> | undefined;
   try {
     await writeFile(join(fixture.repo, ".chili", "memory.md"), "Uncommitted legacy fact\n");
@@ -733,7 +736,11 @@ test("Memory rechecks real policy after waiting on migration preparation before 
         await context.assertCurrentAuthorization?.();
       },
     }) });
-    const executor = new ToolExecutor({ registry, approvals: broker, events: { publish: async () => undefined },
+    const executor = new ToolExecutor({ registry, gate: { review: async () => ({
+      decision: "allow", assertCurrent: async () => {
+        if (revoked) throw new Error("Memory execution denied after review was revoked");
+      },
+    }) }, events: { publish: async () => undefined },
       policyResolver: { resolve: () => ({ allowedTools: ["memory"], writeScope: [], executeScope: [] }) },
     });
     pending = executor.execute({ sessionId: "session_memory_revoke" as SessionId, turnId: "turn_memory_revoke" as TurnId,
@@ -744,7 +751,7 @@ test("Memory rechecks real policy after waiting on migration preparation before 
     try {
       await Promise.race([paused, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Memory never reached the final migration authorization boundary")), 2000); })]);
     } finally { if (timer) clearTimeout(timer); }
-    broker.setRulesets([[{ permission: "memory.write", pattern: "*", action: "deny", source: "revoked-policy" }]]);
+    revoked = true;
     release();
     const outcome = await pending;
     expect(outcome.status).toBe("failed");

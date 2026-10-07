@@ -45,7 +45,7 @@ export function createActivateSkillTool(
       }
       return { ok: true, value: { name: input.name.trim() } };
     },
-    approval: () => false,
+    resources: () => false,
     async execute(input, context) {
       const scopedRegistry = typeof registry === "function" ? await registry(context) : registry;
       const skill = scopedRegistry.get(input.name);

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { InMemoryToolRegistry, createMcpResourceReadTool, ToolExecutor, PolicyApprovalBroker, type ChiliToolExecutionContext } from "@chili/tools";
+import { InMemoryToolRegistry, createMcpResourceReadTool, ToolExecutor, type ChiliToolExecutionContext } from "@chili/tools";
 import { type McpClient, type McpServerConfig } from "@chili/mcp";
 import { type SessionId, type TurnId, type ToolCallId } from "@chili/protocol";
 import { createHostMcpRuntime } from "./mcp-control.js";
@@ -26,7 +26,6 @@ test("manual Host connect, dynamic schema changes and disconnect invalidate exec
     outputArtifactId: "c" as ToolCallId, signal: new AbortController().signal,
     registerPersistedOutput: async () => {},
     metadata: async () => {}, streamOutput: async () => {},
-    requestApproval: async () => ({ action: "allow_once" }),
   };
   try {
     expect(starts).toBe(0);
@@ -79,7 +78,7 @@ function fakeClient(server: McpServerConfig) {
 }
 
 
-test("MCP resource approvals are target-bound and a reload during approval cannot retarget the read", async () => {
+test("MCP resource reviews are target-bound and a reload during review cannot retarget the read", async () => {
   const root = await mkdtemp(join(tmpdir(), "chili-mcp-resource-"));
   const cwd = join(root, "workspace");
   const chiliHome = join(root, "profile");
@@ -112,11 +111,11 @@ test("MCP resource approvals are target-bound and a reload during approval canno
   const waiting = new Promise<void>((resolve) => { entered = resolve; });
   const executor = new ToolExecutor({
     registry, events: { publish: async () => {} },
-    approvals: new PolicyApprovalBroker({ ask: async () => {
+    gate: { review: async () => {
       approvals += 1;
       if (approvals === 3) { entered(); await blocked; }
-      return { action: "allow_session" };
-    } }),
+      return { decision: "allow" };
+    } },
   });
   const run = () => executor.execute({ sessionId: "resource-session" as SessionId, turnId: "turn" as TurnId,
     toolName: "mcp_resource_read", input: { serverName: "same", uri: "fixture://same", resourceIdentity: "forged", revision: "forged" }, cwd });
@@ -144,7 +143,7 @@ test("MCP resource approvals are target-bound and a reload during approval canno
   }
 });
 
-test("MCP resource reads recheck policy after asynchronous Host scope resolution", async () => {
+test("MCP resource reads recheck review validity after asynchronous Host scope resolution", async () => {
   const root = await mkdtemp(join(tmpdir(), "chili-mcp-resource-revocation-"));
   const cwd = join(root, "workspace");
   const chiliHome = join(root, "profile");
@@ -168,10 +167,12 @@ test("MCP resource reads recheck policy after asynchronous Host scope resolution
   let approvals = 0;
   const executor = new ToolExecutor({
     registry, events: { publish: async () => {} },
-    approvals: new PolicyApprovalBroker({
-      rulesetsForRequest: () => denied ? [[{ permission: "mcp_resource_read", pattern: "*", action: "deny" }]] : [],
-      ask: async () => { approvals += 1; return { action: "allow_once" }; },
-    }),
+    gate: { review: async () => {
+      approvals += 1;
+      return { decision: "allow", assertCurrent: async () => {
+        if (denied) throw new Error("Review settings changed before resource read");
+      } };
+    } },
   });
   let release!: () => void;
   const blocked = new Promise<void>((resolve) => { release = resolve; });

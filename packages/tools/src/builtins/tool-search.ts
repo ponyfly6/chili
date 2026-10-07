@@ -63,7 +63,7 @@ export function createToolSearchTool(
       if (input.load !== undefined) value.load = input.load;
       return { ok: true, value };
     },
-    approval: () => false,
+    resources: () => false,
     async execute(input, context) {
       const tools = context.visibleTools ? await context.visibleTools() : registry.list();
       const maxResults = input.maxResults ?? 8;

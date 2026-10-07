@@ -50,7 +50,7 @@ export function createMemoryTool(options: ChiliMemoryToolOptions = {}): ChiliToo
     },
     isReadOnly: isRead,
     isConcurrencySafe: isRead,
-    approval(input) {
+    resources(input) {
       const binding = input.memoryBinding;
       const profileResource = `profile:${binding.chiliHome}`;
       const projectResource = `${profileResource}/project:${binding.projectId}`;

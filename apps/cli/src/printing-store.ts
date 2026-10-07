@@ -100,7 +100,7 @@ export class CliPrinter {
     }
 
     if (event.type === "tool.call_updated" && event.payload.status === "waiting_for_approval") {
-      this.line(`\n[tool] waiting for approval (${event.payload.callId})`);
+      this.line(`\n[tool] historical approval pending (${event.payload.callId})`);
       return;
     }
 

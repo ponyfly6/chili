@@ -7,11 +7,8 @@ import type {
   Message,
   MessageImageContent,
   PendingUserInputRequest as ProtocolPendingUserInputRequest,
-  ApprovalId,
-  ApprovalDecisionAction,
   ApprovalScope,
   DelegationPolicy,
-  RuntimeApprovalResolveResult,
   RuntimeInterruptResult,
   RuntimeDelegationConfig,
   RuntimeModelConfig,
@@ -28,6 +25,7 @@ import type {
   RuntimeMcpToolsResponse,
   RuntimePermissionConfig,
   RuntimePermissionProfileId,
+  RuntimePermissionUpdateOptions,
   RuntimeCommandCatalog,
   RuntimeCommandInvocation,
   RuntimePromptAccepted,
@@ -52,7 +50,6 @@ import {
   parseChiliEvent,
   parseChiliEventArray,
   parsePendingUserInputRequestArray,
-  parseRuntimeApprovalResolveResult,
   parseRuntimeArray,
   parseRuntimeBoolean,
   parseRuntimeDelegationConfig,
@@ -119,9 +116,6 @@ export interface RuntimeClient {
   submitCommand(input: SubmitCommandRequest): Promise<RuntimePromptResult>;
   submitCommandAsync(input: SubmitCommandRequest): Promise<RuntimePromptAccepted>;
   interruptSession(input: InterruptSessionRequest): Promise<RuntimeInterruptResult>;
-  resolveApproval(input: ResolveApprovalRequest): Promise<RuntimeApprovalResolveResult>;
-  approveApproval(input: ApproveApprovalRequest): Promise<RuntimeApprovalResolveResult>;
-  rejectApproval(input: RejectApprovalRequest): Promise<RuntimeApprovalResolveResult>;
   listPendingApprovals?(input?: ListPendingApprovalsRequest): Promise<RuntimePendingApprovalRequest[]>;
   pendingApprovalWindow?(input?: ListPendingApprovalsRequest): Promise<RuntimePendingApprovalWindow>;
   listUserInputs(input?: ListUserInputsRequest): Promise<RuntimeUserInputRequest[]>;
@@ -211,7 +205,7 @@ export interface GetPermissionConfigRequest {
   signal?: AbortSignal;
 }
 
-export interface SetPermissionProfileRequest {
+export interface SetPermissionProfileRequest extends RuntimePermissionUpdateOptions {
   profile: RuntimePermissionProfileId;
   signal?: AbortSignal;
 }
@@ -291,13 +285,6 @@ export interface InterruptSessionRequest {
   signal?: AbortSignal;
 }
 
-export interface ResolveApprovalRequest {
-  approvalId: ApprovalId;
-  decision: ApprovalDecisionAction;
-  feedback?: string;
-  signal?: AbortSignal;
-}
-
 export type RuntimeUserInputQuestion = ProtocolUserInputQuestion;
 export type RuntimeUserInputAnswers = ProtocolUserInputAnswers;
 export type RuntimeUserInputRequest = ProtocolPendingUserInputRequest;
@@ -315,21 +302,6 @@ export interface ResolveUserInputRequest {
 
 export interface RuntimeUserInputResolveResult {
   resolved: boolean;
-}
-
-export type ApprovalGrantScope = ApprovalScope;
-
-export interface ApproveApprovalRequest {
-  approvalId: ApprovalId;
-  scope?: ApprovalGrantScope;
-  feedback?: string;
-  signal?: AbortSignal;
-}
-
-export interface RejectApprovalRequest {
-  approvalId: ApprovalId;
-  feedback?: string;
-  signal?: AbortSignal;
 }
 
 export interface RuntimeSessionSummary {
@@ -354,6 +326,7 @@ export interface ListPendingApprovalsRequest {
   signal?: AbortSignal;
 }
 
+/** Historical pending requests are read-only; manual approval is no longer supported. */
 export interface RuntimePendingApprovalRequest {
   id: string;
   sessionId?: SessionId;
@@ -551,7 +524,11 @@ export class HttpRuntimeClient implements RuntimeClient {
   }
 
   setPermissionProfile(input: SetPermissionProfileRequest): Promise<RuntimePermissionConfig> {
-    return this.post("permissions", { profile: input.profile }, input.signal, parseRuntimePermissionConfig);
+    return this.post("permissions", {
+      profile: input.profile,
+      ...(input.reviewInstructions !== undefined ? { reviewInstructions: input.reviewInstructions } : {}),
+      ...(input.reviewerModel !== undefined ? { reviewerModel: input.reviewerModel } : {}),
+    }, input.signal, parseRuntimePermissionConfig);
   }
 
   listCommands(input: ListCommandsRequest = {}): Promise<RuntimeCommandCatalog> {
@@ -659,33 +636,6 @@ export class HttpRuntimeClient implements RuntimeClient {
 
   interruptSession(input: InterruptSessionRequest): Promise<RuntimeInterruptResult> {
     return this.post(`sessions/${encodeURIComponent(input.sessionId)}/interrupt`, { reason: input.reason, expectedExecutionRef: input.expectedExecutionRef }, input.signal, parseRuntimeInterruptResult);
-  }
-
-  resolveApproval(input: ResolveApprovalRequest): Promise<RuntimeApprovalResolveResult> {
-    return this.post(`approvals/${encodeURIComponent(input.approvalId)}/resolve`, {
-      decision: input.decision,
-      feedback: input.feedback,
-    }, input.signal, parseRuntimeApprovalResolveResult);
-  }
-
-  approveApproval(input: ApproveApprovalRequest): Promise<RuntimeApprovalResolveResult> {
-    const request: ResolveApprovalRequest = {
-      approvalId: input.approvalId,
-      decision: approvalDecisionForApproveRequest(input),
-    };
-    if (input.feedback !== undefined) request.feedback = input.feedback;
-    if (input.signal) request.signal = input.signal;
-    return this.resolveApproval(request);
-  }
-
-  rejectApproval(input: RejectApprovalRequest): Promise<RuntimeApprovalResolveResult> {
-    const request: ResolveApprovalRequest = {
-      approvalId: input.approvalId,
-      decision: "deny",
-    };
-    if (input.feedback !== undefined) request.feedback = input.feedback;
-    if (input.signal) request.signal = input.signal;
-    return this.resolveApproval(request);
   }
 
   listPendingApprovals(input: ListPendingApprovalsRequest = {}): Promise<RuntimePendingApprovalRequest[]> {
@@ -1095,13 +1045,6 @@ function commandCatalogSessionId(value: unknown): SessionId {
 function sessionScopedRequestPath(path: string, sessionId: SessionId | undefined): string {
   if (sessionId === undefined) return path;
   return `${path}?sessionId=${encodeURIComponent(commandCatalogSessionId(sessionId))}`;
-}
-
-function approvalDecisionForApproveRequest(input: ApproveApprovalRequest): ApprovalDecisionAction {
-  if (input.scope === undefined || input.scope === "once") return "allow_once";
-  if (input.scope === "session") return "allow_session";
-  if (input.scope === "persistent") return "allow_always";
-  throw new Error("approval scope must be one of once, session, persistent");
 }
 
 type ParsedSseFrame =

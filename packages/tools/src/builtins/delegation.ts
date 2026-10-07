@@ -39,7 +39,7 @@ export function createDelegationStatusTool(
       type: "object",
       properties: {},
     },
-    approval: () => false,
+    resources: () => false,
     async execute(_input, context) {
       return delegationToolResult("delegation_status", await controller.getDelegationConfig(context));
     },
@@ -70,7 +70,7 @@ export function createDelegationSetTool(
     validate(input): ValidationResult<DelegationSetToolInput> {
       return validateDelegationSetInput(input);
     },
-    approval: () => false,
+    resources: () => false,
     async execute(input, context) {
       await context.metadata({ metadata: { policy: input.policy } });
       return delegationToolResult(

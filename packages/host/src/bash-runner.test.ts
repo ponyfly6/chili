@@ -108,7 +108,7 @@ macOsTest("latest command authorization is checked after guardian registration a
     if (event.type === "started" && event.cwd === workspace) denied = true;
   });
   try {
-    const runner = createHostBashRunner({ permissionProfile: () => "default" });
+    const runner = createHostBashRunner({ permissionProfile: () => "auto-review" });
     await expect(runner.run({
       ...request(workspace, "printf unsafe > effect"),
       assertCurrentAuthorization: async () => { if (denied) throw new Error("command permission was revoked"); },
@@ -119,9 +119,9 @@ macOsTest("latest command authorization is checked after guardian registration a
 
 macOsTest("revoking full-access after backend selection cannot launch the selected unsandboxed command", async () => {
   const workspace = await realpath(await mkdtemp(join(tmpdir(), "chili-host-shell-profile-revoked-")));
-  let profile: "default" | "full-access" = "full-access";
+  let profile: "auto-review" | "full-access" = "full-access";
   const unsubscribe = observeProcessGuardianLifecycle((event) => {
-    if (event.type === "started" && event.cwd === workspace) profile = "default";
+    if (event.type === "started" && event.cwd === workspace) profile = "auto-review";
   });
   try {
     const runner = createHostBashRunner({ permissionProfile: () => profile });

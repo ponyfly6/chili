@@ -13,7 +13,6 @@ import {
   RUNTIME_PERMISSION_PROFILE_IDS,
   SERVICE_TIERS,
   type ModelSelection,
-  type RuntimeApprovalResolveResult,
   type RuntimeDelegationConfig,
   type RuntimeInterruptResult,
   type RuntimeMcpAuthResponse,
@@ -27,6 +26,7 @@ import {
   type RuntimeModelConfig,
   type RuntimeModelDescriptor,
   type RuntimePermissionConfig,
+  type RuntimePermissionUpdateOptions,
   type RuntimePromptAccepted,
   type RuntimePromptResult,
   type RuntimeSessionRef,
@@ -291,6 +291,9 @@ export function parseRuntimePermissionConfig(value: unknown, path = "response"):
   const record = parseRuntimeRecord(value, path);
   return {
     profile: parseRuntimeEnum(record.profile, RUNTIME_PERMISSION_PROFILE_IDS, `${path}.profile`),
+    reviewInstructions: parseRuntimeReviewInstructions(record.reviewInstructions, `${path}.reviewInstructions`),
+    defaultReviewInstructions: parseRuntimeReviewInstructions(record.defaultReviewInstructions, `${path}.defaultReviewInstructions`),
+    ...(record.reviewerModel !== undefined ? { reviewerModel: parseRuntimeReviewerModelSelection(record.reviewerModel, `${path}.reviewerModel`) } : {}),
     profiles: parseRuntimeArray(record.profiles, (item, itemPath) => {
       const profile = parseRuntimeRecord(item, itemPath);
       const parsed: RuntimePermissionConfig["profiles"][number] = {
@@ -305,6 +308,39 @@ export function parseRuntimePermissionConfig(value: unknown, path = "response"):
       return parsed;
     }, `${path}.profiles`),
   };
+}
+
+function parseRuntimeReviewerModelSelection(value: unknown, path: string): ModelSelection {
+  const record = parseRuntimeRecord(value, path);
+  rejectRuntimeUnknownFields(record, ["provider", "model"], path);
+  const selection = parseRuntimeModelSelection(record, path);
+  selection.provider = selection.provider.trim();
+  selection.model = selection.model.trim();
+  if (!selection.provider) throw new RuntimeValidationError(`${path}.provider`, "must not be blank");
+  if (!selection.model) throw new RuntimeValidationError(`${path}.model`, "must not be blank");
+  return selection;
+}
+
+export function parseRuntimeReviewInstructions(value: unknown, path = "reviewInstructions"): string {
+  const instructions = parseRuntimeString(value, path, { maxChars: 32_000 });
+  if (instructions.trim().length === 0) throw new RuntimeValidationError(path, "must not be blank");
+  return instructions;
+}
+
+/** Parse only the customizable review settings; profile selection is validated separately. */
+export function parseRuntimePermissionUpdateOptions(value: unknown, path = "options"): RuntimePermissionUpdateOptions {
+  const record = parseRuntimeRecord(value, path);
+  rejectRuntimeUnknownFields(record, ["reviewInstructions", "reviewerModel"], path);
+  const options: RuntimePermissionUpdateOptions = {};
+  if (record.reviewInstructions !== undefined) {
+    options.reviewInstructions = parseRuntimeReviewInstructions(record.reviewInstructions, `${path}.reviewInstructions`);
+  }
+  if (record.reviewerModel === null) {
+    options.reviewerModel = null;
+  } else if (record.reviewerModel !== undefined) {
+    options.reviewerModel = parseRuntimeReviewerModelSelection(record.reviewerModel, `${path}.reviewerModel`);
+  }
+  return options;
 }
 
 export function parseRuntimePromptAccepted(value: unknown, path = "response"): RuntimePromptAccepted {
@@ -446,11 +482,6 @@ export function parsePendingUserInputRequestArray(value: unknown, path = "respon
 export function parseRuntimeInterruptResult(value: unknown, path = "response"): RuntimeInterruptResult {
   const record = parseRuntimeRecord(value, path);
   return { interrupted: parseRuntimeBoolean(record.interrupted, `${path}.interrupted`) };
-}
-
-export function parseRuntimeApprovalResolveResult(value: unknown, path = "response"): RuntimeApprovalResolveResult {
-  const record = parseRuntimeRecord(value, path);
-  return { resolved: parseRuntimeBoolean(record.resolved, `${path}.resolved`) };
 }
 
 const RUNTIME_MCP_SERVER_STATUSES = [

@@ -10,7 +10,6 @@
     }
   },
   "dependencies": {
-    "@chili/policy": "workspace:*",
     "@chili/protocol": "workspace:*",
     "@chili/skills": "workspace:*",
     "quickjs-wasi": "3.6.2",

@@ -10,7 +10,6 @@
     }
   },
   "dependencies": {
-    "@chili/policy": "workspace:*",
     "@chili/protocol": "workspace:*",
     "@chili/providers": "workspace:*",
     "@chili/store": "workspace:*",

@@ -16,6 +16,7 @@ import {
   createReadFileTool,
   createToolSearchTool,
   createWriteFileTool,
+  type ToolExecutionGate,
 } from "../packages/tools/src/index.js";
 
 function idFactory(): (prefix: string) => string {
@@ -36,7 +37,12 @@ function registerTools(): InMemoryToolRegistry {
   return registry;
 }
 
-function createHarness(workspace: string, model: SingleAgentRuntimeConstructor["model"], options: Partial<SingleAgentRuntimeConstructor> = {}) {
+function createHarness(
+  workspace: string,
+  model: SingleAgentRuntimeConstructor["model"],
+  options: Partial<SingleAgentRuntimeConstructor> = {},
+  gate: ToolExecutionGate = { review: async () => ({ decision: "allow" }) },
+) {
   const createId = idFactory();
   const store = new SqliteEventStore(join(workspace, `${globalThis.crypto.randomUUID()}.sqlite`));
   const registry = registerTools();
@@ -48,7 +54,7 @@ function createHarness(workspace: string, model: SingleAgentRuntimeConstructor["
   const toolExecutor = new ToolExecutor({
     registry,
     events: { publish: (event) => store.append(event) },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate,
     snapshotProvider,
     createId,
     now: () => 1 as never,
@@ -72,6 +78,7 @@ const workspace = await mkdtemp(join(tmpdir(), "chili-p0-p1-"));
 
 try {
   await smokeSingleAgentToolLoop(workspace);
+  await smokeReviewFeedback(workspace);
   await smokeInterruptSyntheticResult(workspace);
   await smokeRetry(workspace);
   await smokeDoomLoopGuard(workspace);
@@ -104,10 +111,53 @@ async function smokeSingleAgentToolLoop(workspace: string): Promise<void> {
   assert.equal(result.status, "completed");
   assert.equal(await readFile(join(workspace, "a.txt"), "utf8"), "new\n");
   const events = await harness.store.events({ sessionId, limit: 100 });
-  assert.ok(events.some((event) => event.type === "approval.requested"));
+  assert.ok(events.some((event) => event.type === "tool.call_updated"
+    && (event.payload.metadata?.review as { decision?: string } | undefined)?.decision === "allow"));
+  assert.ok(events.every((event) => !event.type.startsWith("approval.")));
   assert.ok(events.some((event) => event.type === "snapshot.created"));
   assert.ok(events.some((event) => event.type === "tool.call_finished" && event.payload.status === "completed"));
   harness.store.close();
+}
+
+async function smokeReviewFeedback(workspace: string): Promise<void> {
+  const target = join(workspace, "review-denied.txt");
+  let proposed = false;
+  let reviews = 0;
+  const reason = "The requested task does not include creating this file.";
+  const harness = createHarness(workspace, {
+    stream: async function* (input) {
+      if (!proposed) {
+        proposed = true;
+        yield { type: "tool_call", name: "write", input: { filePath: target, content: "blocked" } } as const;
+        yield { type: "finish", reason: "tool_use" } as const;
+        return;
+      }
+      assert.ok(input.messages.some((message) => message.parts.some((part) =>
+        part.type === "tool_result" && part.error?.includes(reason))));
+      yield { type: "text_delta", text: "Continuing with the requested task." } as const;
+      yield { type: "finish", reason: "stop" } as const;
+    },
+  }, {}, {
+    review: async (request) => {
+      reviews++;
+      assert.equal(request.toolName, "write");
+      assert.equal((request.input as { content: string }).content, "blocked");
+      return { decision: "deny", reason };
+    },
+  });
+  try {
+    const sessionId = await harness.runtime.createSession({ cwd: workspace });
+    await harness.runtime.appendUserMessage({ sessionId, text: "Review this workspace." });
+    const result = await harness.runtime.runTurn({ sessionId, cwd: workspace });
+    assert.equal(result.status, "completed");
+    assert.equal(reviews, 1);
+    await assert.rejects(readFile(target), { code: "ENOENT" });
+    const events = await harness.store.events({ sessionId, limit: 100 });
+    assert.ok(events.some((event) => event.type === "tool.call_finished" && event.payload.status === "failed"));
+    assert.ok(events.every((event) => !event.type.startsWith("approval.")));
+  } finally {
+    harness.store.close();
+  }
 }
 
 async function smokeInterruptSyntheticResult(workspace: string): Promise<void> {
@@ -280,13 +330,13 @@ async function smokeContextAndOutputTruncation(workspace: string): Promise<void>
     description: "Emit a large output.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "large", output: "12345678901234567890" }),
   });
   const executor = new ToolExecutor({
     registry,
     events: { publish: (event) => store.append(event) },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     createId,
     now: () => 1 as never,
     maxResultOutputBytes: 12,

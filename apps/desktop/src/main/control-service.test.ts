@@ -244,7 +244,7 @@ describe("desktop task controls", () => {
         reasoningLevel: "high",
         serviceTier: "fast",
       }),
-      getPermissionConfig: async () => permissionConfig("default"),
+      getPermissionConfig: async () => permissionConfig("auto-review"),
       getDelegationConfig: async () => ({
         sessionId: "session_archived",
         policy: "proactive",
@@ -266,11 +266,37 @@ describe("desktop task controls", () => {
 
     expect(config).toMatchObject({
       model: { sessionId: "session_archived", reasoningLevel: "high" },
-      permission: { profile: "default" },
+      permission: { profile: "auto-review" },
       delegation: { sessionId: "session_archived", policy: "proactive" },
       mcp: { summary: { running: 1 } },
     });
     expect(mcpScopes).toEqual(["session_archived"]);
+  });
+
+  test("forwards review preferences as one runtime permission update", async () => {
+    const updates: unknown[] = [];
+    const client = {
+      setPermissionProfile: async (update: unknown) => {
+        updates.push(update);
+        return permissionConfig("auto-review");
+      },
+    } as unknown as RuntimeClient;
+    const service = serviceFor(client);
+    await service.invoke({
+      type: "permissions.set",
+      profile: "auto-review",
+      reviewInstructions: "Allow necessary project edits.",
+      reviewerModel: { provider: "local", model: "reviewer" },
+    });
+    await service.invoke({ type: "permissions.set", profile: "auto-review", reviewerModel: null });
+    expect(updates).toMatchObject([
+      {
+        profile: "auto-review",
+        reviewInstructions: "Allow necessary project edits.",
+        reviewerModel: { provider: "local", model: "reviewer" },
+      },
+      { profile: "auto-review", reviewerModel: null },
+    ]);
   });
 
   test("rejects an over-limit New Task title before allocating a partial session", async () => {
@@ -340,7 +366,7 @@ describe("desktop task controls", () => {
 
   test("configures a task in safe order before submitting its prompt", async () => {
     const order: string[] = [];
-    let permission: "default" | "full-access" = "default";
+    let permission: "auto-review" | "full-access" = "auto-review";
     let promptSubmissions = 0;
     const client = {
       createSession: async () => {
@@ -371,7 +397,7 @@ describe("desktop task controls", () => {
         order.push(`permission:get:${permission}`);
         return permissionConfig(permission);
       },
-      setPermissionProfile: async ({ profile }: { profile: "default" | "full-access" }) => {
+      setPermissionProfile: async ({ profile }: { profile: "auto-review" | "full-access" }) => {
         permission = profile;
         order.push(`permission:set:${profile}`);
         return permissionConfig(permission);
@@ -402,7 +428,7 @@ describe("desktop task controls", () => {
       "reasoning",
       "service_tier",
       "delegation",
-      "permission:get:default",
+      "permission:get:auto-review",
       "permission:set:full-access",
       "prompt",
     ]);
@@ -412,7 +438,7 @@ describe("desktop task controls", () => {
   test("serializes global permission rollback before a later desktop permission write", async () => {
     const permissionGate = deferred<void>();
     const order: string[] = [];
-    let permission: "default" | "full-access" | "auto-review" = "default";
+    let permission: "auto-review" | "full-access" = "auto-review";
     let archived = 0;
     const client = {
       createSession: async () => ({ sessionId: "session_partial" }),
@@ -457,10 +483,10 @@ describe("desktop task controls", () => {
     });
     expect((await laterWrite).profile).toBe("auto-review");
     expect(order).toEqual([
-      "get:default",
+      "get:auto-review",
       "set:full-access",
       "get:full-access",
-      "set:default",
+      "set:auto-review",
       "set:auto-review",
     ]);
     expect(String(permission)).toBe("auto-review");
@@ -468,7 +494,7 @@ describe("desktop task controls", () => {
   });
 
   test("does not roll back global permission after an uncertain launch commit", async () => {
-    let permission: "default" | "full-access" = "default";
+    let permission: "auto-review" | "full-access" = "auto-review";
     const order: string[] = [];
     const client = {
       createSession: async () => ({ sessionId: "session_uncertain" }),
@@ -498,7 +524,7 @@ describe("desktop task controls", () => {
       started: false,
       failure: { stage: "prompt", launchMayHaveCommitted: true },
     });
-    expect(order).toEqual(["get:default", "set:full-access", "prompt:dispatch"]);
+    expect(order).toEqual(["get:auto-review", "set:full-access", "prompt:dispatch"]);
     expect(String(permission)).toBe("full-access");
   });
 
@@ -1211,10 +1237,12 @@ function sessionSummary(id: string, status: "active" | "archived" = "active") {
   } as never;
 }
 
-function permissionConfig(profile: "default" | "auto-review" | "full-access") {
+function permissionConfig(profile: "auto-review" | "full-access") {
   return {
     profile,
-    profiles: ["default", "auto-review", "full-access"].map((id) => ({
+    reviewInstructions: "Review the exact operation against user intent.",
+    defaultReviewInstructions: "Review the exact operation against user intent.",
+    profiles: ["auto-review", "full-access"].map((id) => ({
       id,
       label: id,
       description: id,

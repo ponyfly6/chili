@@ -64,7 +64,7 @@ export function createMcpResourcesListTool(controller: McpResourcesController): 
       if (serverName !== undefined) value.serverName = serverName;
       return { ok: true, value };
     },
-    approval: () => false,
+    resources: () => false,
     async execute(input, context) {
       const resources = await controller.listResources(input, mcpControllerContext(context));
       return {
@@ -107,7 +107,7 @@ export function createMcpResourceReadTool(controller: McpResourcesController): C
       const prepared = controller.prepareRead && context ? await controller.prepareRead({ serverName, uri }, context) : undefined;
       return { ok: true, value: { serverName, uri, ...prepared } };
     },
-    approval(input) {
+    resources(input) {
       return {
         permission: "mcp_resource_read",
         patterns: [`${input.serverName}:${input.uri}`],

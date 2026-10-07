@@ -1,7 +1,4 @@
 import type {
-  ApprovalDecision,
-  ApprovalId,
-  ApprovalScope,
   RuntimeEvent,
   EventEnvelope,
   SessionId,
@@ -21,10 +18,8 @@ import {
 } from "@chili/protocol";
 import { randomUUID } from "node:crypto";
 import { ToolDeniedError, ToolValidationError, UnknownToolError, isAbortError, toError } from "./errors.js";
-import { approvalDecisionWithinScope } from "./approval.js";
-import { assertApprovalAuthority, captureApprovalPolicy } from "./authorization.js";
 import { validateToolSchema } from "./input-schema.js";
-import { canonicalApprovalSpec } from "./resource-policy.js";
+import { canonicalToolResources } from "./resource-policy.js";
 import { validateStructuredToolData } from "./structured-data.js";
 import { FileReadStateStore } from "./file-read-state.js";
 import { ToolDispatchScope } from "./dispatch-scope.js";
@@ -40,19 +35,18 @@ import type {
   ChiliToolExecutionContext,
   ExecuteToolInput,
   ExecuteToolResult,
-  ApprovalPreflightDecision,
-  ApprovalBrokerRequest,
-  ApprovalResolution,
   SnapshotRecord,
   ToolAccessPolicy,
-  ToolApprovalSpecWithDefaults,
+  ToolResourceSpecWithDefaults,
+  ToolReviewRequest,
+  ToolReviewResult,
   ToolExecutorOptions,
   PersistedToolOutputRegistration,
   ToolRegistryContext,
   PreparedToolCall,
 } from "./types.js";
 
-type ExecutableApprovalSpec = ToolApprovalSpecWithDefaults & { maxApprovalScope: ApprovalScope };
+type ExecutableResourceSpec = ToolResourceSpecWithDefaults;
 
 const MAX_TOOL_RESULT_CONTENT_ITEMS = 64;
 // The desktop outbox admits at most 2,000,000 bytes for one retained envelope.
@@ -80,10 +74,10 @@ const MAX_TOOL_RESULT_ARTIFACT_IDS_BYTES = 64_000;
 const MAX_TOOL_RESULT_ARTIFACT_IDS_SCAN = 256;
 const MAX_TOOL_STREAM_DELTA_BYTES = 256_000;
 const MAX_TOOL_STREAM_TOTAL_BYTES = 4_000_000;
-const MAX_APPROVAL_PERMISSION_BYTES = 512;
-const MAX_APPROVAL_PATTERNS = 64;
-const MAX_APPROVAL_PATTERN_BYTES = 8_192;
-const MAX_APPROVAL_PATTERNS_BYTES = 64_000;
+const MAX_RESOURCE_PERMISSION_BYTES = 512;
+const MAX_RESOURCE_PATTERNS = 64;
+const MAX_RESOURCE_PATTERN_BYTES = 8_192;
+const MAX_RESOURCE_PATTERNS_BYTES = 64_000;
 
 export class ToolExecutor {
   private readonly fileReads: FileReadStateStore;
@@ -91,8 +85,8 @@ export class ToolExecutor {
     tool: ChiliToolDefinition;
     context: string;
     fingerprint: string;
-    spec: false | ExecutableApprovalSpec;
-    originalSpec: false | ExecutableApprovalSpec;
+    spec: false | ExecutableResourceSpec;
+    originalSpec: false | ExecutableResourceSpec;
   }>();
   private readonly activeCallIds = new Set<string>();
   private readonly eventPublishFailures = new WeakSet<object>();
@@ -156,17 +150,9 @@ export class ToolExecutor {
         const workerAuthorization = await this.authorizeWorkerPolicy(tool, validated, input, spec);
         const { executionPolicy, callerToolPolicy } = workerAuthorization;
 
-        const authorization = await this.requestLifecycleApproval(tool, input, callId, spec);
-        const approval = authorization.decision;
-        if (!isApprovalDecisionAction(approval.action)) {
-          throw new ToolDeniedError(tool.name, `Invalid approval decision action: ${String(approval.action)}`);
-        }
-        if (approval.action === "deny") {
-          throw new ToolDeniedError(tool.name, approval.feedback);
-        }
-
+        const review = await this.review(tool, validated, input, callId, spec);
         const assertCurrentAuthorization = () => this.assertExecutionAuthorized(
-          prepared, input, callId, authorization.authority, workerAuthorization,
+          prepared, input, review, workerAuthorization,
         );
         await this.createSnapshotIfNeeded(tool, input, callId, validated, spec, assertCurrentAuthorization);
         throwIfAborted(input.signal);
@@ -258,13 +244,13 @@ export class ToolExecutor {
     const tool = input.catalogTool ?? await this.toolForContext(input.toolName, toolRegistryContext(input));
     if (!tool) throw new UnknownToolError(input.toolName);
     const validated = await this.validate(tool, input.input, toolRegistryContext(input), input.signal);
-    const originalSpec = this.approvalSpec(tool, validated);
-    if (originalSpec !== false) await canonicalApprovalSpec(input.cwd, originalSpec);
+    const originalSpec = this.resourceSpec(tool, validated);
+    if (originalSpec !== false) await canonicalToolResources(input.cwd, originalSpec);
     const preparedInput = tool.prepareInput ? await tool.prepareInput(validated, toolRegistryContext(input)) : validated;
     await validateToolSchema(tool, preparedInput, input.signal);
     const validatedInput = freezePreparedValue(preparedInput);
-    const preparedSpec = this.approvalSpec(tool, validatedInput);
-    const spec = preparedSpec === false ? false : await canonicalApprovalSpec(input.cwd, preparedSpec);
+    const preparedSpec = this.resourceSpec(tool, validatedInput);
+    const spec = preparedSpec === false ? false : await canonicalToolResources(input.cwd, preparedSpec);
     const explicit = await this.resolvePredicate(tool.isConcurrencySafe, validatedInput);
     const isConcurrencySafe = !tool.isOrchestrator && (explicit ?? (await this.resolvePredicate(tool.isReadOnly, validatedInput)) ?? false);
     throwIfAborted(input.signal);
@@ -322,7 +308,7 @@ export class ToolExecutor {
       throw new ToolDeniedError(prepared.toolName, "Tool catalog changed after preparation; prepare a new call.");
     }
     if (details.originalSpec !== false) {
-      const resolved = await canonicalApprovalSpec(input.cwd, details.originalSpec);
+      const resolved = await canonicalToolResources(input.cwd, details.originalSpec);
       if (JSON.stringify(resolved.patterns) !== JSON.stringify(details.spec && details.spec.patterns)) {
         throw new ToolDeniedError(prepared.toolName, "Resource target changed after preparation; prepare a new call.");
       }
@@ -331,13 +317,13 @@ export class ToolExecutor {
 
   private async authorizeWorkerPolicy<Input>(
     tool: ChiliToolDefinition<Input>, validatedInput: Input, input: ExecuteToolInput,
-    spec: false | ExecutableApprovalSpec,
+    spec: false | ExecutableResourceSpec,
   ): Promise<{ executionPolicy?: ToolAccessPolicy; callerToolPolicy?: ToolAccessPolicy }> {
     const policies = await this.policies(input);
     for (const policy of policies) {
       await authorizeToolByPolicy({
         tool, executeInput: input, validatedInput,
-        approvalSpec: spec === false ? { permission: tool.name, patterns: ["*"], metadata: {} } : spec,
+        resourceSpec: spec === false ? { permission: tool.name, patterns: ["*"], metadata: {} } : spec,
         policy, isReadOnly: (definition, value) => this.resolvePredicate(definition.isReadOnly, value),
       });
     }
@@ -362,8 +348,8 @@ export class ToolExecutor {
   }
 
   private async assertExecutionAuthorized(
-    prepared: PreparedToolCall, input: ExecuteToolInput, callId: ToolCallId,
-    authority: ApprovalPreflightDecision | undefined,
+    prepared: PreparedToolCall, input: ExecuteToolInput,
+    review: ToolReviewResult,
     workerAuthorization: { executionPolicy?: ToolAccessPolicy; callerToolPolicy?: ToolAccessPolicy },
   ): Promise<void> {
     throwIfAborted(input.signal);
@@ -373,56 +359,55 @@ export class ToolExecutor {
     if (JSON.stringify(current) !== JSON.stringify(workerAuthorization)) {
       throw new ToolDeniedError(tool.name, "Execution resource scope changed or caller tool policy changed; prepare a new operation and backend isolation profile.");
     }
-    if (spec === false && tool.resourcePolicy !== undefined) {
-      throwIfAborted(input.signal);
-      return;
-    }
-    // Resource denials, cross-tool file checks and approval all share one fresh
-    // ruleset. Never retain this snapshot across a wait or an effect boundary.
-    const policy = await captureApprovalPolicy(this.options.approvals, {
-      sessionId: input.sessionId, callId, toolName: tool.name, risk: tool.risk,
-      ...(spec === false ? { permission: tool.name, patterns: ["*"] } : spec),
-      workspaceRoot: input.cwd,
-    });
-    if (tool.resourcePolicy === undefined) {
-      const denials = await policy.resourceDenials();
-      if (denials && (denials.readPaths.length > 0 || denials.writePaths.length > 0)) {
-        throw new ToolDeniedError(tool.name, "This tool cannot enforce the current filesystem resource denials.");
-      }
-    }
-    if (spec !== false) {
-      if (spec.permission === "read" || spec.permission === "read_image" || spec.permission === "write" || spec.permission === "edit") {
-        await policy.assertFileResourceAccess(spec.patterns,
-          spec.permission === "write" || spec.permission === "edit" ? "write" : "read");
-      }
-      assertApprovalAuthority(tool.name, await policy.preflight(), authority);
-    }
+    await review.assertCurrent?.();
     throwIfAborted(input.signal);
   }
 
-  private async requestLifecycleApproval<Input>(
-    tool: ChiliToolDefinition<Input>,
-    input: ExecuteToolInput,
-    callId: ToolCallId,
-    spec: false | ExecutableApprovalSpec,
-  ): Promise<{ decision: ApprovalDecision; authority?: ApprovalPreflightDecision }> {
-    if (spec === false) return { decision: { action: "allow_once" } };
-
-    const preflight = await this.preflightApproval(input, callId, tool, spec);
-    if (preflight.action === "allow") return { decision: { action: "allow_once" }, authority: preflight };
-    if (preflight.action === "deny") return { decision: denyDecision(preflight), authority: preflight };
-
-    await this.update(input, callId, "waiting_for_approval");
-    return this.createApprovalRequest(input, callId, tool, spec, preflight);
+  private async review<Input>(
+    tool: ChiliToolDefinition<Input>, validatedInput: Input, input: ExecuteToolInput,
+    callId: ToolCallId, spec: false | ExecutableResourceSpec,
+  ): Promise<ToolReviewResult> {
+    const request: ToolReviewRequest = Object.freeze({
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      callId,
+      ...(input.parentCallId ? { parentCallId: input.parentCallId } : {}),
+      toolName: tool.name,
+      toolDescription: tool.description,
+      risk: tool.risk,
+      input: validatedInput,
+      cwd: input.cwd,
+      ...(spec === false ? {} : { resources: freezePreparedValue(spec) as ToolResourceSpecWithDefaults }),
+    });
+    const result = await withAbort(this.options.gate.review(request, input.signal), input.signal);
+    throwIfAborted(input.signal);
+    const decision = result?.decision;
+    const assertCurrent = result?.assertCurrent;
+    if (decision !== "allow" && decision !== "deny") {
+      throw new ToolDeniedError(tool.name, "Execution review returned an invalid decision.");
+    }
+    const reason = typeof result.reason === "string" ? result.reason : undefined;
+    if (assertCurrent !== undefined && typeof assertCurrent !== "function") {
+      throw new ToolDeniedError(tool.name, "Execution review returned an invalid authorization check.");
+    }
+    await this.publish("tool.call_updated", input, {
+      callId, status: "validating",
+      metadata: boundToolEventMetadata({ review: { decision, ...(reason ? { reason } : {}) } }),
+    });
+    if (decision === "deny") {
+      throw new ToolDeniedError(tool.name, reason ?? "Execution review rejected this operation.");
+    }
+    // Copy the permit so a mutable gate result cannot replace its check later.
+    return Object.freeze({ decision: "allow", ...(reason ? { reason } : {}),
+      ...(assertCurrent ? { assertCurrent } : {}) });
   }
 
-  private approvalSpec<Input>(tool: ChiliToolDefinition<Input>, input: Input): false | ExecutableApprovalSpec {
-    const spec = tool.approval ? tool.approval(input) : { patterns: ["*"] };
+  private resourceSpec<Input>(tool: ChiliToolDefinition<Input>, input: Input): false | ExecutableResourceSpec {
+    const spec = tool.resources ? tool.resources(input) : { patterns: ["*"] };
     if (spec === false) return false;
-    return validateApprovalSpec(tool.name, {
+    return validateResourceSpec(tool.name, {
       permission: spec.permission ?? tool.name,
       patterns: spec.patterns,
-      maxApprovalScope: spec.maxApprovalScope ?? "persistent",
       metadata: spec.metadata ?? {},
     });
   }
@@ -432,7 +417,7 @@ export class ToolExecutor {
     input: ExecuteToolInput,
     callId: ToolCallId,
     validated: Input,
-    spec: false | ExecutableApprovalSpec,
+    spec: false | ExecutableResourceSpec,
     assertCurrentAuthorization?: () => Promise<void>,
   ): Promise<SnapshotRecord | undefined> {
     if (spec === false) return undefined;
@@ -483,7 +468,7 @@ export class ToolExecutor {
     tool: ChiliToolDefinition<Input>,
     input: ExecuteToolInput,
     callId: ToolCallId,
-    spec: ExecutableApprovalSpec,
+    spec: ExecutableResourceSpec,
     assertCurrentAuthorization?: () => Promise<void>,
   ): Promise<SnapshotRecord | undefined> {
     try {
@@ -644,10 +629,6 @@ export class ToolExecutor {
       if (revision !== this.options.registry.getRevision?.()) throw new Error("Tool catalog changed; start a new code_mode call.");
       return { tools, revision };
     })();
-    const resourceRequest: import("./types.js").ApprovalPreflightRequest = {
-      sessionId: input.sessionId, callId, toolName: tool.name, risk: tool.risk,
-      permission: tool.name, patterns: ["*"], workspaceRoot: input.cwd,
-    };
     return {
       sessionId: input.sessionId,
       turnId: input.turnId,
@@ -659,12 +640,6 @@ export class ToolExecutor {
       ...(executionPolicy ? { executionPolicy } : {}),
       ...(callerToolPolicy ? { callerToolPolicy: structuredClone(callerToolPolicy) } : {}),
       ...(assertCurrentAuthorization ? { assertCurrentAuthorization } : {}),
-      currentResourceDenials: () => this.options.approvals.resourceDenials?.(resourceRequest) ?? Promise.resolve(undefined),
-      assertFileResourceAccess: async (paths, access) => {
-        throwIfAborted(input.signal);
-        await this.options.approvals.assertFileResourceAccess?.(resourceRequest, paths, access);
-        throwIfAborted(input.signal);
-      },
       visibleTools: tool.isOrchestrator ? async () => (await loadCatalog()).tools : () => this.visibleTools(input),
       invocationMode: input.parentCallId ? "code" : "direct",
       loadTools: async (names) => {
@@ -721,122 +696,7 @@ export class ToolExecutor {
         outputSequence += 1;
         return this.streamOutput(input, callId, outputSequence, bounded);
       },
-      requestApproval: async (request) => {
-        const spec = await canonicalApprovalSpec(input.cwd, validateApprovalSpec(tool.name, {
-          permission: request.permission,
-          patterns: request.patterns,
-          maxApprovalScope: request.maxApprovalScope ?? "persistent",
-          metadata: request.metadata ?? {},
-        }));
-        await this.authorizeWorkerPolicy(tool, validatedInput, input, spec);
-        return this.approveOrRequest(input, callId, tool, spec);
-      },
     };
-  }
-
-  private async approveOrRequest(
-    input: ExecuteToolInput,
-    callId: ToolCallId,
-    tool: ChiliToolDefinition,
-    spec: ExecutableApprovalSpec,
-  ): Promise<ApprovalDecision> {
-    const preflight = await this.preflightApproval(input, callId, tool, spec);
-    if (preflight.action === "allow") return { action: "allow_once" };
-    if (preflight.action === "deny") return denyDecision(preflight);
-    return (await this.createApprovalRequest(input, callId, tool, spec, preflight)).decision;
-  }
-
-  private async createApprovalRequest(
-    input: ExecuteToolInput,
-    callId: ToolCallId,
-    tool: ChiliToolDefinition,
-    spec: ExecutableApprovalSpec,
-    preflight?: ApprovalPreflightDecision,
-  ): Promise<{ decision: ApprovalDecision; authority: ApprovalPreflightDecision }> {
-    const approvalId = this.id<ApprovalId>("approval");
-
-    await this.publish("approval.requested", input, {
-      approvalId,
-      callId,
-      permission: spec.permission,
-      patterns: spec.patterns,
-      maxApprovalScope: spec.maxApprovalScope,
-      ...metadataPayload(approvalRequestMetadata(spec, preflight)),
-    });
-
-    let resolution: ApprovalResolution;
-    try {
-      const request: ApprovalBrokerRequest = {
-        approvalId,
-        sessionId: input.sessionId,
-        callId,
-        toolName: tool.name,
-        risk: tool.risk,
-        permission: spec.permission,
-        patterns: spec.patterns,
-        maxApprovalScope: spec.maxApprovalScope,
-        metadata: spec.metadata,
-        workspaceRoot: input.cwd,
-      };
-      const broker = this.options.approvals;
-      if (broker.resolve) {
-        resolution = await withAbort(broker.resolve(request, input.signal), input.signal);
-      } else {
-        const decision = await withAbort(broker.decide(request, input.signal), input.signal);
-        resolution = { decision, authority: await this.preflightApproval(input, callId, tool, spec) };
-      }
-      throwIfAborted(input.signal);
-    } catch (error) {
-      if (input.signal?.aborted || isAbortError(error)) {
-        await this.publish("approval.resolved", input, {
-          approvalId,
-          decision: "deny",
-          feedback: "Approval cancelled because tool execution was aborted.",
-        });
-      }
-      throw error;
-    }
-    let decision = normalizeApprovalDecision(resolution.decision, spec.maxApprovalScope);
-    const authority = resolution.authority;
-    if (decision.action !== "deny" && authority.action === "deny") decision = denyDecision(authority);
-
-    await this.publish("approval.resolved", input, {
-      approvalId,
-      decision: decision.action,
-      ...(decision.feedback ? { feedback: decision.feedback } : {}),
-    });
-
-    return { decision, authority };
-  }
-
-  private async preflightApproval(
-    input: ExecuteToolInput,
-    callId: ToolCallId,
-    tool: ChiliToolDefinition,
-    spec: ExecutableApprovalSpec,
-  ): Promise<ApprovalPreflightDecision> {
-    if (!this.options.approvals.preflight) {
-      return {
-        action: "ask",
-        source: "approval_broker",
-        reason: "Approval broker does not support preflight.",
-        metadata: {
-          permission: spec.permission,
-          patterns: spec.patterns,
-        },
-      };
-    }
-    return this.options.approvals.preflight({
-      sessionId: input.sessionId,
-      callId,
-      toolName: tool.name,
-      risk: tool.risk,
-      permission: spec.permission,
-      patterns: spec.patterns,
-      maxApprovalScope: spec.maxApprovalScope,
-      metadata: spec.metadata,
-      workspaceRoot: input.cwd,
-    });
   }
 
   private async metadata(input: ExecuteToolInput, callId: ToolCallId, update: ToolMetadataUpdate): Promise<void> {
@@ -900,7 +760,7 @@ export class ToolExecutor {
   private async update(
     input: ExecuteToolInput,
     callId: ToolCallId,
-    status: "validating" | "waiting_for_approval" | "running",
+    status: "validating" | "running",
   ): Promise<void> {
     await this.publish("tool.call_updated", input, { callId, status });
   }
@@ -1021,90 +881,36 @@ function toolRegistryContext(
   };
 }
 
-function approvalRequestMetadata(
-  spec: ExecutableApprovalSpec,
-  preflight: ApprovalPreflightDecision | undefined,
-): Record<string, unknown> | undefined {
-  const metadata = boundToolMetadata(spec.metadata);
-  if (preflight) {
-    if (preflight.reason) metadata.reason = preflight.reason;
-    if (preflight.feedback) metadata.feedback = preflight.feedback;
-    metadata.source = preflight.source;
-    if (preflight.matchedRule) metadata.matchedRule = preflight.matchedRule;
-    if (preflight.suggestions) metadata.suggestions = preflight.suggestions;
-    if (preflight.metadata) {
-      for (const key of ["patternDecisions", "risks", "approvalRisks"] as const) {
-        if (preflight.metadata[key] !== undefined) metadata[key] = preflight.metadata[key];
-      }
-    }
-    metadata.preflightDecision = preflight;
-  }
-  return Object.keys(metadata).length > 0 ? boundApprovalRequestMetadata(metadata) : undefined;
-}
-
-function metadataPayload(metadata: Record<string, unknown> | undefined): { metadata?: Record<string, unknown> } {
-  return metadata ? { metadata: boundToolEventMetadata(metadata) } : {};
-}
-
-function validateApprovalSpec(toolName: string, spec: ExecutableApprovalSpec): ExecutableApprovalSpec {
+function validateResourceSpec(toolName: string, spec: ExecutableResourceSpec): ExecutableResourceSpec {
   if (typeof spec.permission !== "string"
     || spec.permission.length === 0
     || spec.permission !== spec.permission.trim()
-    || Buffer.byteLength(spec.permission, "utf8") > MAX_APPROVAL_PERMISSION_BYTES
+    || Buffer.byteLength(spec.permission, "utf8") > MAX_RESOURCE_PERMISSION_BYTES
     || /[\u0000-\u001f\u007f]/u.test(spec.permission)) {
-    throw new ToolValidationError(toolName, "Approval permission must be a canonical bounded string.");
+    throw new ToolValidationError(toolName, "Resource category must be a canonical bounded string.");
   }
   if (!Array.isArray(spec.patterns) || spec.patterns.length === 0) {
-    throw new ToolValidationError(toolName, "Approval spec must include at least one pattern.");
+    throw new ToolValidationError(toolName, "Tool resource spec must include at least one pattern.");
   }
-  if (spec.patterns.length > MAX_APPROVAL_PATTERNS) {
-    throw new ToolValidationError(toolName, `Approval spec must include at most ${MAX_APPROVAL_PATTERNS} patterns.`);
+  if (spec.patterns.length > MAX_RESOURCE_PATTERNS) {
+    throw new ToolValidationError(toolName, `Tool resource spec must include at most ${MAX_RESOURCE_PATTERNS} patterns.`);
   }
   const invalidIndex = spec.patterns.findIndex((pattern) => typeof pattern !== "string" || pattern.trim().length === 0);
   if (invalidIndex >= 0) {
-    throw new ToolValidationError(toolName, `Approval spec pattern at index ${invalidIndex} must be a non-empty string.`);
+    throw new ToolValidationError(toolName, `Tool resource spec pattern at index ${invalidIndex} must be a non-empty string.`);
   }
   let serializedPatternBytes = 2;
   for (const [index, pattern] of spec.patterns.entries()) {
     const patternBytes = boundedJsonBytes(pattern);
-    if (patternBytes > MAX_APPROVAL_PATTERN_BYTES) {
-      throw new ToolValidationError(toolName, `Approval spec pattern at index ${index} exceeds the byte limit.`);
+    if (patternBytes > MAX_RESOURCE_PATTERN_BYTES) {
+      throw new ToolValidationError(toolName, `Tool resource spec pattern at index ${index} exceeds the byte limit.`);
     }
     serializedPatternBytes += (index === 0 ? 0 : 1) + patternBytes;
-    if (serializedPatternBytes > MAX_APPROVAL_PATTERNS_BYTES) {
-      throw new ToolValidationError(toolName, "Approval spec patterns exceed the aggregate byte limit.");
+    if (serializedPatternBytes > MAX_RESOURCE_PATTERNS_BYTES) {
+      throw new ToolValidationError(toolName, "Tool resource spec patterns exceed the aggregate byte limit.");
     }
-  }
-  if (!isApprovalScope(spec.maxApprovalScope)) {
-    throw new ToolValidationError(toolName, `Invalid maximum approval scope: ${String(spec.maxApprovalScope)}`);
   }
   return spec;
-}
-
-function isApprovalDecisionAction(action: unknown): action is ApprovalDecision["action"] {
-  return action === "allow_once" || action === "allow_session" || action === "allow_always" || action === "deny";
-}
-
-function normalizeApprovalDecision(decision: ApprovalDecision, maxApprovalScope: ApprovalScope): ApprovalDecision {
-  const action = safeRecordValue(decision, "action");
-  const rawFeedback = safeRecordValue(decision, "feedback");
-  const feedback = typeof rawFeedback === "string" && rawFeedback.length > 0
-    ? toError(rawFeedback).message
-    : undefined;
-  if (isApprovalDecisionAction(action)) {
-    if (approvalDecisionWithinScope(action, maxApprovalScope)) {
-      return { action, ...(feedback ? { feedback } : {}) };
-    }
-    return {
-      action: "deny",
-      feedback: `Approval decision ${action} exceeds the maximum approval scope ${maxApprovalScope}.`,
-    };
-  }
-  return { action: "deny", feedback: `Invalid approval decision action: ${String(action)}` };
-}
-
-function isApprovalScope(scope: unknown): scope is ApprovalScope {
-  return scope === "once" || scope === "session" || scope === "persistent";
 }
 
 function defaultCreateId(prefix: string): string {
@@ -1300,17 +1106,6 @@ function boundToolEventName(value: string): string {
 }
 
 function boundToolMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
-  return boundToolMetadataWithOptions(metadata, "tool");
-}
-
-function boundApprovalRequestMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
-  return boundToolMetadataWithOptions(metadata, "approval");
-}
-
-function boundToolMetadataWithOptions(
-  metadata: Record<string, unknown>,
-  diagnosticMode: "tool" | "approval",
-): Record<string, unknown> {
   const state = {
     nodes: 0,
     seen: new WeakSet<object>(),
@@ -1320,7 +1115,6 @@ function boundToolMetadataWithOptions(
     state,
     0,
     MAX_TOOL_RESULT_METADATA_BYTES,
-    diagnosticMode,
     [],
   );
   return isPlainRecord(bounded) ? bounded : { value: bounded };
@@ -1331,7 +1125,6 @@ function visitToolMetadata(
   state: { nodes: number; seen: WeakSet<object> },
   depth: number,
   maxSerializedBytes: number,
-  diagnosticMode: "tool" | "approval",
   path: readonly string[],
 ): unknown {
   state.nodes += 1;
@@ -1369,7 +1162,6 @@ function visitToolMetadata(
         state,
         depth + 1,
         childBudget,
-        diagnosticMode,
         path,
       );
       const childBytes = boundedJsonBytes(child);
@@ -1405,7 +1197,7 @@ function visitToolMetadata(
       }
       const rawChild = safeRecordValue(value, rawKey);
       const normalizedKey = normalizedToolMetadataKey(rawKey);
-      const childValue = isToolMetadataDiagnosticField(normalizedKey, path, diagnosticMode)
+      const childValue = isToolMetadataDiagnosticField(normalizedKey, path)
         ? toError(rawChild).message
         : rawChild;
       const child = visitToolMetadata(
@@ -1413,7 +1205,6 @@ function visitToolMetadata(
         state,
         depth + 1,
         childBudget,
-        diagnosticMode,
         [...path, normalizedKey],
       );
       const childBytes = boundedJsonBytes(child);
@@ -1435,11 +1226,9 @@ function visitToolMetadata(
 function isToolMetadataDiagnosticField(
   key: string,
   path: readonly string[],
-  mode: "tool" | "approval",
 ): boolean {
   if (key === "reason" || key === "error" || key === "failurereason") return true;
   if (key !== "feedback") return false;
-  if (mode === "approval") return true;
   return path.some((segment) =>
     segment === "diagnostic"
       || segment === "diagnostics"
@@ -1672,11 +1461,6 @@ function appendRegisteredOutputNotice(
     ...result,
     output: `${result.output}${result.output ? "\n" : ""}[${savedDescription}]`,
   };
-}
-
-function denyDecision(decision: ApprovalPreflightDecision): ApprovalDecision {
-  const feedback = decision.feedback ?? decision.reason;
-  return feedback ? { action: "deny", feedback } : { action: "deny" };
 }
 
 function preparationContext(input: ExecuteToolInput): string {

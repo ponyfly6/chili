@@ -122,6 +122,7 @@ export type ToolEvent =
   | EventEnvelope<"tool.output_delta", { callId: ToolCallId; stream: ToolOutputStream; delta: string; bytes?: number; truncated?: boolean; sequence?: number }>
   | EventEnvelope<"tool.call_finished", { callId: ToolCallId; providerCallId?: string; status: "completed" | "failed" | "cancelled"; output?: string; error?: string; errorDetails?: PersistedErrorDetails; synthetic?: boolean }>;
 
+/** Historical manual approvals. New tool execution uses automatic review metadata. */
 export type ApprovalEvent =
   | EventEnvelope<"approval.requested", { approvalId: ApprovalId; callId?: ToolCallId; permission: string; patterns: string[]; maxApprovalScope?: ApprovalScope; metadata?: Record<string, unknown> }>
   | EventEnvelope<"approval.resolved", { approvalId: ApprovalId; decision: ApprovalDecisionAction; feedback?: string }>;

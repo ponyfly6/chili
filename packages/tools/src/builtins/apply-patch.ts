@@ -133,7 +133,7 @@ export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
       })));
       return { ...input, operations };
     },
-    approval(input) {
+    resources(input) {
       return {
         permission: "edit",
         patterns: input.operations.flatMap((operation) => operation.type === "raw_update" && operation.movePath ? [operation.path, operation.movePath] : [operation.path]),

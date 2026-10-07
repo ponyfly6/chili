@@ -15,11 +15,10 @@ import {
   type PromptFragment,
   type RuntimePromptTurnContext,
 } from "@chili/core";
-import type { ChiliEvent, ExecutionIdentity, ModelSelection, RuntimeEvent, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId } from "@chili/protocol";
+import type { ChiliEvent, ExecutionIdentity, ModelSelection, RuntimeEvent, RuntimePermissionConfig, RuntimePermissionProfileId, RuntimePermissionUpdateOptions, ServiceTier, SessionId } from "@chili/protocol";
 import { compactRuntimeEvent } from "@chili/protocol";
 import { HostOwnerClaim, ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
 import {
-  DeferredApprovalQueue,
   DeferredUserInputQueue,
   DELEGATION_OFF_DENIED_TOOL_NAMES,
   CODING_TOOL_GROUPS,
@@ -29,10 +28,7 @@ import {
   InMemoryToolRegistry,
   ManagedProcessManager,
   observeProcessGuardianLifecycle,
-  resolveFileResourceDenials,
   withProcessOwner,
-  PolicyApprovalBroker,
-  PolicyApprovalState,
   ToolExecutor,
   createApplyPatchTool,
   createActivateSkillTool,
@@ -60,7 +56,6 @@ import {
   createWriteFileTool,
   type BashRunner,
   type ChiliToolDefinition,
-  type BashRunRequest,
   type DelegationToolController,
   type ToolAccessPolicyResolver,
   type ToolAccessPolicy,
@@ -79,19 +74,19 @@ import {
 import { defaultAuthPath, FileAuthStorage } from "@chili/providers";
 import { resolveHostExecutionIdentity } from "./identity.js";
 import { targetPathsForSession } from "./context-targets.js";
-import { evaluatePolicy } from "@chili/policy";
 import { createFilesystemPromptCommandControl, type PromptCommandControl } from "@chili/commands";
 import {
   assertSupportedPermissionProfile,
-  createApprovalRulesets,
-  createRequestScopedPolicyApprovalBroker,
-  dangerousShellCommandsForProfile,
-  persistAllowAlwaysDecision,
+  createHostExecutionGate,
+  DEFAULT_REVIEW_INSTRUCTIONS,
+  reviewPromptFragment,
   runtimePermissionConfig,
-  type ApprovalRulesetResolver,
+  type ReviewSettings,
 } from "./approval.js";
+import { buildToolReviewContext } from "./review-context.js";
+import { readUserReviewSettings, writeUserReviewSettings, type UserReviewSettings } from "./user-review-state.js";
 import { createHostBashRunner } from "./bash-runner.js";
-import { loadHostConfig, type HostConfig, type HostAgentConfig } from "./config.js";
+import { loadHostConfig, type HostAgentConfig } from "./config.js";
 import { resolveAgentAncestry } from "./agent-expansion.js";
 import { createIdFactory } from "./id.js";
 import type { HostModelName, HostReasoningLevel } from "./model.js";
@@ -135,9 +130,7 @@ export interface ChiliHostOptions {
   reasoningLevel?: HostReasoningLevel;
   serviceTier?: ServiceTier;
   permissionProfile?: RuntimePermissionProfileId;
-  askApproval?: import("@chili/tools").PolicyApprovalBrokerOptions["ask"];
   onEvent?: (event: ChiliEvent) => void;
-  approvalQueue?: DeferredApprovalQueue;
   userInputQueue?: DeferredUserInputQueue;
   chiliHome?: string;
   projectRoot?: string;
@@ -145,6 +138,8 @@ export interface ChiliHostOptions {
   mcpConnectMode?: "eager" | "background" | "manual";
   bashRunner?: BashRunner;
   modelRouter?: ModelRouter;
+  reviewerModelRouter?: ModelRouter;
+  reviewTimeoutMs?: number;
   staleTurnRecoveryMs?: number;
   staleTurnRecoveryIntervalMs?: number | false;
   sessionClaimLeaseMs?: number;
@@ -177,11 +172,11 @@ export interface ChiliHost {
 
 export interface HostPermissionProfileControl {
   get(): RuntimePermissionConfig;
-  set(profile: RuntimePermissionProfileId): RuntimePermissionConfig;
+  set(profile: RuntimePermissionProfileId, options?: RuntimePermissionUpdateOptions): Promise<RuntimePermissionConfig>;
 }
 
 export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliHost> {
-  assertSupportedPermissionProfile(options.permissionProfile ?? "default");
+  assertSupportedPermissionProfile(options.permissionProfile ?? "auto-review");
   const identity = await resolveHostExecutionIdentity(options);
   const cwd = identity.workspaceRoot;
   const stateDir = join(cwd, ".chili");
@@ -249,7 +244,6 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       if (staleTurnRecoveryTimer) clearTimeout(staleTurnRecoveryTimer);
       return staleTurnRecoveryRun?.catch(() => undefined);
     });
-    initializationDrains.push(() => options.approvalQueue?.denyAll("Host initialization failed."));
     initializationDrains.push(() => options.userInputQueue?.denyAll("Host initialization failed."));
     const reconcileStaleRuntimeState = async (includePending = false): Promise<void> => {
       const now = Date.now();
@@ -322,54 +316,27 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       return discoverSkills({ cwd: canonicalCwd, chiliHome, projectRoot: current.projectRoot });
     };
     await skillRegistryForCwd(cwd);
-    const approvalState = new PolicyApprovalState();
-    const approvalRootBySession = new Map<SessionId, SessionId>();
-    const sandboxedShell = options.bashRunner === undefined && process.platform === "darwin";
-    const permissions = createPermissionProfileControl(
-      config,
-      options.permissionProfile ?? "default",
-      sandboxedShell,
-    );
-    const approvalRulesetsForRequest: ApprovalRulesetResolver = async (request) => {
-      if (!delegationPolicyGate) throw new Error("Delegation policy gate is not initialized");
-      const rootSessionId = await delegationPolicyGate.rootSessionId(request.sessionId);
-      const sessions = await eventStore.sessions();
-      const session = sessions.find((candidate) => candidate.id === request.sessionId);
-      if (!session) throw new Error(`Session not found: ${request.sessionId}`);
-      if (session.status !== "active") {
-        throw new Error(`Session is not active: ${request.sessionId} (${session.status})`);
-      }
-      const rootSession = sessions.find((candidate) => candidate.id === rootSessionId);
-      if (!rootSession) throw new Error(`Approval root session not found: ${rootSessionId}`);
-      if (rootSession.status !== "active") {
-        throw new Error(`Approval root session is not active: ${rootSessionId} (${rootSession.status})`);
-      }
-      if (rootSession.agent) {
-        throw new Error(`Approval root session must be a root: ${rootSessionId}`);
-      }
-      const sessionCwd = await canonicalSkillWorkspace(session.cwd);
-      const sessionConfig = await loadHostConfig(sessionCwd, { chiliHome });
-      const rulesets = createApprovalRulesets(permissions.get().profile, sessionConfig, { sandboxedShell });
-      const previousRootSessionId = approvalRootBySession.get(request.sessionId);
-      if (previousRootSessionId && previousRootSessionId !== rootSessionId) {
-        throw new Error(
-          `Approval ancestry changed for session ${request.sessionId}: ${previousRootSessionId} -> ${rootSessionId}`,
-        );
-      }
-      approvalRootBySession.set(request.sessionId, rootSessionId);
-      approvalState.linkSession(rootSessionId, request.sessionId);
-      return rulesets;
-    };
-    const resolveResourceDenials = async (request: BashRunRequest) => {
-      const sessionCwd = request.workspaceRoot ?? request.cwd;
-      const latestConfig = await loadHostConfig(sessionCwd, { chiliHome });
-      return resolveFileResourceDenials(sessionCwd, createApprovalRulesets(
-        permissions.get().profile, latestConfig, { sandboxedShell },
-      ));
-    };
+    const savedReviewSettings = await readUserReviewSettings({ chiliHome });
+    const permissions = createPermissionProfileControl({
+      profile: options.permissionProfile ?? savedReviewSettings?.profile ?? "auto-review",
+      reviewInstructions: savedReviewSettings?.reviewInstructions ?? DEFAULT_REVIEW_INSTRUCTIONS,
+      ...(savedReviewSettings?.reviewerModel ? { reviewerModel: savedReviewSettings.reviewerModel } : {}),
+    }, chiliHome);
+    const executionGate = createHostExecutionGate({
+      settings: () => permissions.settings(),
+      model: options.reviewerModelRouter ?? model,
+      contextForRequest: (request) => buildToolReviewContext(eventStore, request),
+      modelSelectionForRequest: async (request) => {
+        const events = await eventStore.events({ sessionId: request.sessionId, type: "session.model_changed", tail: true, limit: 1 });
+        const latest = events[0];
+        return latest?.type === "session.model_changed"
+          ? (latest as Extract<RuntimeEvent, { type: "session.model_changed" }>).payload.modelSelection : serviceDefaultModelSelection;
+      },
+      assertRequestCurrent: async (request) => { await resolveAgentAncestry(eventStore, request.sessionId); },
+      ...(options.reviewTimeoutMs === undefined ? {} : { timeoutMs: options.reviewTimeoutMs }),
+    });
     const bashRunner = createHostBashRunner({
       permissionProfile: () => permissions.get().profile,
-      resolveResourceDenials,
       ...(options.bashRunner ? { sandboxedRunner: options.bashRunner, unsandboxedRunner: options.bashRunner } : {}),
     });
     const processes = new ManagedProcessManager();
@@ -388,36 +355,26 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     }
     let mcpRuntime: HostMcpRuntime | undefined;
     cleanupMcp = () => mcpRuntime?.close();
-    const allowedMemoryScopes = async (sessionCwd: string): Promise<Array<"user" | "project">> => {
-      const current = await executionIdentityForCwd(sessionCwd);
-      const latestConfig = await loadHostConfig(sessionCwd, { chiliHome });
-      const rulesets = createApprovalRulesets(permissions.get().profile, latestConfig, { sandboxedShell });
-      return (["user", "project"] as const).filter((scope) => evaluatePolicy(
-        "memory.read",
-        scope === "user" ? `profile:${chiliHome}/user` : `profile:${chiliHome}/project:${current.projectId}`,
-        rulesets,
-      ).action === "allow");
-    };
     const promptFragments = async (context: { sessionId: SessionId; cwd: string; turn?: RuntimePromptTurnContext }) =>
       buildHostPromptFragments({
         cwd: context.cwd,
         ...(await memoryOptionsForCwd(context.cwd)),
-        memoryScopes: await allowedMemoryScopes(context.cwd),
+        memoryScopes: ["user", "project"],
         targetPaths: await targetPathsForSession(eventStore, context.sessionId, context.cwd),
         skillRegistry: await skillRegistryForCwd(context.cwd),
         ...(context.turn ? { turn: context.turn } : {}),
-      }).then((fragments) => [...fragments, agentExpansionPromptFragment(config.agents)]);
+      }).then((fragments) => [...fragments, agentExpansionPromptFragment(config.agents), reviewPromptFragment(permissions.get())]);
     const childPromptFragments = async (context: { sessionId: SessionId; cwd: string; turn?: RuntimePromptTurnContext }) =>
       buildHostChildPromptFragments({
         cwd: context.cwd,
         ...(await memoryOptionsForCwd(context.cwd)),
-        memoryScopes: await allowedMemoryScopes(context.cwd),
+        memoryScopes: ["user", "project"],
         sessionId: context.sessionId,
         targetPaths: await targetPathsForSession(eventStore, context.sessionId, context.cwd),
         skillRegistry: await skillRegistryForCwd(context.cwd),
         store: eventStore,
         ...(context.turn ? { turn: context.turn } : {}),
-      }).then((fragments) => [...fragments, agentExpansionPromptFragment(config.agents)]);
+      }).then((fragments) => [...fragments, agentExpansionPromptFragment(config.agents), reviewPromptFragment(permissions.get())]);
     const snapshotProvider = new FileSystemSnapshotProvider({
       rootDir: join(stateDir, "snapshots"),
       createId,
@@ -426,7 +383,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       registry: childRegistry,
       executionContext: (operation) => withProcessOwner(owner.token, operation),
       events: { publish: (event: RuntimeEvent) => eventStore.append(event) },
-      approvals: createApprovalBroker({ ...options, chiliHome }, config, approvalState, permissions, approvalRulesetsForRequest),
+      gate: executionGate,
       policyResolver: combinedChildToolPolicyResolver,
       snapshotProvider,
       createId,
@@ -484,7 +441,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       registry,
       executionContext: (operation) => withProcessOwner(owner.token, operation),
       events: { publish: (event: RuntimeEvent) => eventStore.append(event) },
-      approvals: createApprovalBroker({ ...options, chiliHome }, config, approvalState, permissions, approvalRulesetsForRequest),
+      gate: executionGate,
       policyResolver: rootToolPolicyResolver,
       snapshotProvider,
       createId,
@@ -619,7 +576,6 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       startDrain(() => service.shutdown("runtime_closed"));
       startDrain(() => childService.shutdown("runtime_closed"));
       startDrain(() => processes.close("runtime_closed"));
-      startDrain(() => options.approvalQueue?.denyAll("Runtime closed while waiting for approval."));
       startDrain(() => options.userInputQueue?.denyAll("Runtime closed while waiting for user input."));
       startDrain(() => staleTurnRecoveryRun?.catch(() => undefined));
 
@@ -850,7 +806,7 @@ export async function buildHostPromptFragments(input: {
       content: [
         "When code_mode is available, use it to combine tool calls with predictable JavaScript control flow and summarize intermediate results with text(...). Direct tool calls remain available for individual actions.",
         "Await dependent operations in order. Use Promise.allSettled for independent work and inspect every result; the host enforces tool concurrency limits. Await all work before returning.",
-        "Tool permissions, approvals, and worker scope still apply to every nested call, including writes. A failed script does not roll back completed actions; inspect what ran before retrying.",
+        "Host execution review and worker scope still apply to every nested call, including writes. A failed script does not roll back completed actions; inspect what ran before retrying.",
       ].join("\n"),
     },
     ...(await buildChiliMemoryPromptFragments({
@@ -1047,81 +1003,32 @@ function registerGitTools(registry: InMemoryToolRegistry): void {
 }
 
 interface MutableHostPermissionProfileControl extends HostPermissionProfileControl {
-  register(broker: PolicyApprovalBroker): void;
-  rulesets(): readonly (readonly import("@chili/policy").PermissionRule[])[];
-  dangerousShellCommands(): "ask" | "allow";
+  settings(): ReviewSettings;
 }
 
-function createPermissionProfileControl(
-  config: HostConfig,
-  initialProfile: RuntimePermissionProfileId,
-  sandboxedShell: boolean,
-): MutableHostPermissionProfileControl {
-  let profile = initialProfile;
-  const brokers = new Set<PolicyApprovalBroker>();
+function createPermissionProfileControl(initial: UserReviewSettings, chiliHome: string): MutableHostPermissionProfileControl {
+  let settings: ReviewSettings = { ...initial, revision: 0 };
+  let pending = Promise.resolve();
   const control: MutableHostPermissionProfileControl = {
-    get() {
-      return runtimePermissionConfig(profile);
-    },
-    set(nextProfile) {
-      assertSupportedPermissionProfile(nextProfile);
-      profile = nextProfile;
-      for (const broker of brokers) {
-        broker.setRulesets(control.rulesets());
-        broker.setDangerousShellCommands(control.dangerousShellCommands());
-      }
-      return control.get();
-    },
-    register(broker) {
-      brokers.add(broker);
-      broker.setRulesets(control.rulesets());
-      broker.setDangerousShellCommands(control.dangerousShellCommands());
-    },
-    rulesets() {
-      return createApprovalRulesets(profile, config, { sandboxedShell });
-    },
-    dangerousShellCommands() {
-      return dangerousShellCommandsForProfile(profile);
+    get: () => runtimePermissionConfig(settings),
+    settings: () => ({ ...settings, ...(settings.reviewerModel ? { reviewerModel: { ...settings.reviewerModel } } : {}) }),
+    set(profile, update = {}) {
+      const change = pending.then(async () => {
+        assertSupportedPermissionProfile(profile);
+        const next: UserReviewSettings = {
+          profile,
+          reviewInstructions: update.reviewInstructions ?? settings.reviewInstructions,
+          ...(update.reviewerModel === null ? {} : update.reviewerModel
+            ? { reviewerModel: { provider: update.reviewerModel.provider.trim(), model: update.reviewerModel.model.trim() } }
+            : settings.reviewerModel ? { reviewerModel: { ...settings.reviewerModel } } : {}),
+        };
+        await writeUserReviewSettings(next, { chiliHome });
+        settings = { ...next, revision: settings.revision + 1 };
+        return control.get();
+      });
+      pending = change.then(() => undefined, () => undefined);
+      return change;
     },
   };
   return control;
-}
-
-function createApprovalBroker(
-  options: ChiliHostOptions,
-  config: HostConfig,
-  approvalState: PolicyApprovalState,
-  permissions?: MutableHostPermissionProfileControl,
-  rulesetsForRequest?: ApprovalRulesetResolver,
-): PolicyApprovalBroker {
-  const sandboxedShell = options.bashRunner === undefined && process.platform === "darwin";
-  let broker: PolicyApprovalBroker;
-  const brokerOptions: import("@chili/tools").PolicyApprovalBrokerOptions = {
-    rulesets: permissions?.rulesets() ?? createApprovalRulesets(options.permissionProfile ?? "default", config, { sandboxedShell }),
-    ...(permissions ? { dangerousShellCommands: permissions.dangerousShellCommands() } : {}),
-    state: approvalState,
-    allowOneShotPolicyBypass: () => (
-      permissions?.get().profile ?? (options.permissionProfile ?? "default")
-    ) === "full-access",
-    ask: async (request, signal) => {
-      return options.approvalQueue
-        ? await options.approvalQueue.ask(request, signal)
-        : options.askApproval
-          ? await options.askApproval(request, signal)
-          : { action: "deny", feedback: "No approval interface available." };
-    },
-    // The broker validates the latest policy before this commit. Never cache
-    // persistent grants: the request resolver rereads config so removal revokes.
-    onApproved: (request, decision) => persistAllowAlwaysDecision(request, decision, {
-      ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
-    }),
-    onSessionGrant: async () => {
-      await options.approvalQueue?.recheckPending((request) => broker.preflight(request));
-    },
-  };
-  broker = rulesetsForRequest
-    ? createRequestScopedPolicyApprovalBroker({ ...brokerOptions, rulesetsForRequest })
-    : new PolicyApprovalBroker(brokerOptions);
-  permissions?.register(broker);
-  return broker;
 }

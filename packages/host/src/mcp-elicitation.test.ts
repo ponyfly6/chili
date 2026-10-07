@@ -85,7 +85,7 @@ test("Host completes a real MCP tool round trip through its session user-input q
   try {
     const toolContext: ChiliToolExecutionContext = { ...context, cwd, turnId: "turn_form" as TurnId, outputArtifactId: context.callId,
       assertCurrentAuthorization: async () => { authorizationChecks++; }, registerPersistedOutput: async () => {}, metadata: async () => {}, streamOutput: async () => {},
-      requestApproval: async () => ({ action: "allow_once" }) };
+    };
     const tools = await registry.listForContext(toolContext);
     expect(tools).toHaveLength(1);
     expect(await tools[0]!.execute({}, toolContext)).toMatchObject({ structuredData: { form: { action: "accept", content: { project: "Chili" } } } });

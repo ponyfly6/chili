@@ -234,7 +234,6 @@ function executionContext(signal = new AbortController().signal): ChiliToolExecu
     cwd: "/repo",
     metadata: async () => undefined,
     streamOutput: async () => undefined,
-    requestApproval: async () => ({ action: "deny" }),
     registerPersistedOutput: async () => undefined,
   };
 }

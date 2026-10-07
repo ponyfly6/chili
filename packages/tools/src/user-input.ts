@@ -184,7 +184,7 @@ export function createRequestUserInputTool(
         return { ok: false, message: error instanceof Error ? error.message : String(error) };
       }
     },
-    approval: () => false,
+    resources: () => false,
     async execute(input, context) {
       const inputId = createId("userinput") as UserInputId;
       const createdAt = timestampNow();

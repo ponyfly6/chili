@@ -232,7 +232,7 @@ export function usage(): string {
     "  --model <pattern>   Provider alias, provider/model, or bare model id; default last selected model, then minimax",
     "  --thinking <level>  Thinking level: off | minimal | low | medium | high | xhigh | max | ultra",
     "  --reasoning <level> Alias for --thinking",
-    "  --yes, -y           Auto-approve tool permissions",
+    "  --yes, -y           Full Access: execute tools without automatic review",
     "  --mcp               Connect configured MCP servers for this CLI run",
     "  --no-mcp            Do not connect configured MCP servers",
     "  --json              Print machine-readable JSON for supported read commands",

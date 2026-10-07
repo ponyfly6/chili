@@ -5,14 +5,13 @@ import { expect, test } from "bun:test";
 import type { ChiliEvent, SessionId, TimestampMs, TurnId } from "@chili/protocol";
 import {
   createBashTool, InMemoryToolRegistry, runProcess, ToolExecutor,
-  type ApprovalBrokerRequest, type BashInput, type ExecuteToolResult,
+  type ToolReviewRequest, type BashInput, type ExecuteToolResult,
 } from "@chili/tools";
-import { createHostApprovalBroker } from "./approval.js";
 import { createHostBashRunner } from "./bash-runner.js";
 
 const macOsTest = process.platform === "darwin" ? test : test.skip;
 
-macOsTest("Git through Bash preserves sandbox boundaries, approvals, hooks and unrelated work", async () => {
+macOsTest("Git through Bash reviews each action and preserves hooks and unrelated work", async () => {
   const cwd = await realpath(await mkdtemp(join(tmpdir(), "chili-git-shell-")));
   try {
     await git(cwd, ["init", "-b", "main"]);
@@ -26,21 +25,18 @@ macOsTest("Git through Bash preserves sandbox boundaries, approvals, hooks and u
     await writeFile(join(cwd, "tracked.txt"), "user work\n");
     await writeFile(join(cwd, "next file.txt"), "agent work\n");
 
-    const approvals: ApprovalBrokerRequest[] = [];
+    const approvals: ToolReviewRequest[] = [];
     const events: ChiliEvent[] = [];
     let allow = false;
     const registry = new InMemoryToolRegistry();
-    registry.register(createBashTool({ runner: createHostBashRunner({ permissionProfile: () => "default" }) }));
+    registry.register(createBashTool({ runner: createHostBashRunner({ permissionProfile: () => "auto-review" }) }));
     const executor = new ToolExecutor({
       registry,
       events: { publish: async (event) => { events.push(event); } },
-      approvals: createHostApprovalBroker({
-        sandboxedShell: true,
-        askApproval: async (request) => {
-          approvals.push(request);
-          return allow ? { action: "allow_once" } : { action: "deny" };
-        },
-      }),
+      gate: { review: async (request) => {
+        approvals.push(request);
+        return { decision: allow ? "allow" : "deny", reason: "Fixture review" };
+      } },
       now: () => Date.now() as TimestampMs,
     });
     const execute = (input: BashInput) => executor.execute({
@@ -49,26 +45,20 @@ macOsTest("Git through Bash preserves sandbox boundaries, approvals, hooks and u
       toolName: "bash", cwd, input,
     });
 
+    allow = true;
     const inspected = await execute({ command: "git --no-optional-locks status --short" });
     expect(completed(inspected).structuredData).toMatchObject({ exitCode: 0 });
     expect(completed(inspected).output).toContain("tracked.txt");
     expect(events.some((event) => event.type === "tool.call_updated"
-      && event.payload.callId === inspected.callId && event.payload.metadata?.readOnly === true)).toBe(true);
-    expect(approvals).toHaveLength(0);
+      && event.payload.callId === inspected.callId && event.payload.metadata?.sandbox === "none")).toBe(true);
+    expect(approvals).toHaveLength(1);
 
-    // The default shell never silently retries outside the sandbox.
-    const blocked = await execute({ command: "git add -- 'next file.txt'" });
-    expect(completed(blocked).structuredData).not.toMatchObject({ exitCode: 0 });
-    expect(await git(cwd, ["diff", "--cached"])).toBe("");
-    expect(approvals).toHaveLength(0);
-
+    allow = false;
     const commit: BashInput = {
       command: "git add -- 'next file.txt' && git commit -m 'Add next file'",
-      sandboxPermissions: "require_escalated",
-      justification: "Stage and commit the requested file.",
     };
     expect((await execute(commit)).status).toBe("failed");
-    expect(approvals).toHaveLength(1);
+    expect(approvals).toHaveLength(2);
     expect(await git(cwd, ["diff", "--cached"])).toBe("");
 
     const hook = join(cwd, ".git", "hooks", "pre-commit");
@@ -84,8 +74,9 @@ macOsTest("Git through Bash preserves sandbox boundaries, approvals, hooks and u
     const committed = await execute(commit);
     expect(completed(committed).structuredData).toMatchObject({ exitCode: 0 });
     expect(completed(committed).metadata).toMatchObject({ readOnly: false, sandbox: "none" });
-    expect(approvals).toHaveLength(3);
-    expect(approvals.every((request) => request.permission === "bash.unsandboxed" && request.maxApprovalScope === "once")).toBe(true);
+    expect(approvals).toHaveLength(4);
+    expect(approvals.every((request) => request.toolName === "bash")).toBe(true);
+    expect(approvals.at(-1)?.input).toMatchObject({ command: commit.command });
     expect((await git(cwd, ["log", "-1", "--format=%B"])).trim()).toBe("Add next file");
     expect(await git(cwd, ["show", "HEAD:next file.txt"])).toBe("agent work\n");
     expect(await git(cwd, ["show", "HEAD:tracked.txt"])).toBe("initial\n");
@@ -107,38 +98,24 @@ macOsTest("Git through Bash preserves sandbox boundaries, approvals, hooks and u
   }
 }, 30_000);
 
-macOsTest("explicit Git shell denies still apply in full-access mode", async () => {
+macOsTest("automatic review can reject git clean before it deletes an untracked file", async () => {
   const cwd = await realpath(await mkdtemp(join(tmpdir(), "chili-git-shell-deny-")));
   try {
     await git(cwd, ["init", "-b", "main"]);
     await writeFile(join(cwd, "keep.txt"), "keep\n");
     const registry = new InMemoryToolRegistry();
-    registry.register(createBashTool({ runner: createHostBashRunner({ permissionProfile: () => "full-access" }) }));
-    const executor = new ToolExecutor({
-      registry,
-      events: { publish: async () => undefined },
-      approvals: createHostApprovalBroker({
-        permissionProfile: "full-access",
-        config: { userPermissions: [], projectPermissions: [
-          { permission: "bash", pattern: "git clean*", action: "deny" },
-          { permission: "bash.unsandboxed", pattern: "git clean*", action: "deny" },
-        ] },
-      }),
+    registry.register(createBashTool({ runner: createHostBashRunner({ permissionProfile: () => "auto-review" }) }));
+    const executor = new ToolExecutor({ registry, events: { publish: async () => undefined },
+      gate: { review: async (request) => {
+        expect(request.input).toMatchObject({ command: "git clean -fd" });
+        return { decision: "deny", reason: "Untracked user files were not requested for deletion." };
+      } },
     });
-    for (const sandboxPermissions of ["use_default", "require_escalated"] as const) {
-      const result = await executor.execute({
-        sessionId: "session_git_shell_deny" as SessionId,
-        turnId: "turn_git_shell_deny" as TurnId,
-        toolName: "bash", cwd,
-        input: { command: "git clean -fd", sandboxPermissions,
-          ...(sandboxPermissions === "require_escalated" ? { justification: "Denial fixture" } : {}) },
-      });
-      expect(result.status).toBe("failed");
-    }
+    const result = await executor.execute({ sessionId: "session_git_shell_deny" as SessionId,
+      turnId: "turn_git_shell_deny" as TurnId, toolName: "bash", cwd, input: { command: "git clean -fd" } });
+    expect(result.status).toBe("failed");
     expect(await readFile(join(cwd, "keep.txt"), "utf8")).toBe("keep\n");
-  } finally {
-    await rm(cwd, { recursive: true, force: true });
-  }
+  } finally { await rm(cwd, { recursive: true, force: true }); }
 });
 
 function completed(result: ExecuteToolResult) {

@@ -136,6 +136,26 @@ describe("desktop IPC contracts", () => {
     })).toThrow("unsupported value");
   });
 
+  test("accepts review instructions and an independent reviewer model without legacy permission modes", () => {
+    const request = {
+      type: "permissions.set",
+      profile: "auto-review",
+      reviewInstructions: "Allow routine project work. Reject unrelated destructive operations.",
+      reviewerModel: { provider: "local", model: "reviewer" },
+    } as const;
+    expect(parseDesktopRequest(request)).toEqual(request);
+    expect(parseDesktopRequest({ type: "permissions.set", profile: "full-access", reviewerModel: null }))
+      .toEqual({ type: "permissions.set", profile: "full-access", reviewerModel: null });
+    expect(() => parseDesktopRequest({ type: "permissions.set", profile: "default" })).toThrow();
+    expect(() => parseDesktopRequest({ type: "sessions.create", permissionProfile: "default" })).toThrow();
+    expect(() => parseDesktopRequest({ type: "approval.resolve", approvalId: "approval_1", decision: "allow_once" })).toThrow();
+    expect(() => parseDesktopRequest({ ...request, reviewInstructions: 42 })).toThrow();
+    expect(() => parseDesktopRequest({ ...request, reviewInstructions: "" })).toThrow();
+    expect(() => parseDesktopRequest({ ...request, reviewInstructions: "x".repeat(32_001) })).toThrow();
+    expect(() => parseDesktopRequest({ ...request, reviewerModel: { provider: "local" } })).toThrow();
+    expect(() => parseDesktopRequest({ ...request, permissions: [{ permission: "bash", action: "allow" }] })).toThrow();
+  });
+
   test("exports one shared canonical session title limit", () => {
     expect(SESSION_TITLE_MAX_CHARS).toBe(120);
   });
@@ -192,10 +212,12 @@ describe("desktop IPC contracts", () => {
         serviceTier: "fast",
       },
       permission: {
-        profile: "default",
+        profile: "auto-review",
+        reviewInstructions: "Allow authorized work and reject destructive actions outside its scope.",
+        defaultReviewInstructions: "Allow authorized work and reject destructive actions outside its scope.",
         profiles: [
-          { id: "default", label: "Default", description: "Review writes", current: true },
-          { id: "auto-review", label: "Auto review", description: "Review risky actions", current: false },
+          { id: "auto-review", label: "Auto review", description: "Review tool actions", current: true },
+          { id: "full-access", label: "Full access", description: "Execute tools directly", current: false },
         ],
       },
       delegation: { sessionId: "session_1", policy: "proactive", source: "session" },

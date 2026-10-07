@@ -27,7 +27,7 @@ function harness(model: ModelRouter, doomLoopGuard?: DoomLoopGuardOptions) {
     description: "Inspect a fake file.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async (_input, context) => {
       executed.push(context.sessionId);
       return { title: "inspect", output: "unchanged" };
@@ -40,7 +40,7 @@ function harness(model: ModelRouter, doomLoopGuard?: DoomLoopGuardOptions) {
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     retryPolicy: { maxAttempts: 3, initialDelayMs: 0 },
     ...(doomLoopGuard ? { doomLoopGuard } : {}),
@@ -276,7 +276,7 @@ test("preserves completed parallel results when cancellation precedes the next s
     description: "A parallel fake inspection.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     isReadOnly: true,
     isConcurrencySafe: true,
     execute: async () => {
@@ -325,7 +325,7 @@ test("fails undispatched tools after a planning error without repeating complete
     description: "A fake tool with a failing concurrency predicate.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     isConcurrencySafe: (input: { path: string }) => {
       if (input.path === "planned_second") throw new Error("tool scheduling failed");
       return false;

@@ -193,6 +193,5 @@ function context(cwd: string): ChiliToolExecutionContext {
     sessionId: "session_structured" as never, turnId: "turn_structured" as never, callId: "call_structured" as never,
     outputArtifactId: "output_structured" as never, cwd, signal: new AbortController().signal,
     fileReads: new FileReadStateStore(), registerPersistedOutput: async () => {}, metadata: async () => {}, streamOutput: async () => {},
-    requestApproval: async () => ({ action: "allow_once" }),
   };
 }

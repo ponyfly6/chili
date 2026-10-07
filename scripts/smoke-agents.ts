@@ -34,7 +34,7 @@ async function fixture(limits: string) {
   const cwd = await mkdtemp(join(tmpdir(), "chili-smoke-agents-"));
   await mkdir(join(cwd, ".chili"));
   await writeFile(join(cwd, ".chili", "config.toml"), `[agents]\n${limits}\n`);
-  return { cwd, chiliHome: join(cwd, "profile"), model: "fake" as const, mcpConnectMode: "manual" as const, staleTurnRecoveryIntervalMs: false as const };
+  return { cwd, chiliHome: join(cwd, "profile"), model: "fake" as const, permissionProfile: "full-access" as const, mcpConnectMode: "manual" as const, staleTurnRecoveryIntervalMs: false as const };
 }
 
 async function open(options: Awaited<ReturnType<typeof fixture>>, modelRouter: ModelRouter) {

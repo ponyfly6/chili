@@ -22,7 +22,7 @@ import {
 import { createCodeModeTool } from "./builtins/code-mode.js";
 import { ToolExecutor } from "./executor.js";
 import { InMemoryToolRegistry } from "./registry.js";
-import type { ApprovalBrokerRequest, ChiliToolExecutionContext, ExecuteToolInput, ExecuteToolResult } from "./types.js";
+import type { ToolReviewRequest, ChiliToolExecutionContext, ExecuteToolInput, ExecuteToolResult } from "./types.js";
 
 const AGENT_NAMES = ["agent_list", "agent_resume", "agent_send", "agent_spawn", "agent_stop", "agent_wait"];
 
@@ -38,8 +38,8 @@ test("the registry exposes six strict Agent contracts and code mode without lega
   }
 });
 
-test("legacy fields and invalid input values fail before the controller or approvals run", async () => {
-  const { executor, controller, approvals } = setup();
+test("legacy fields and invalid input values fail before the controller or reviews run", async () => {
+  const { executor, controller, reviews } = setup();
   const cases: Array<[string, unknown]> = [
     ["agent_spawn", { name: "review", prompt: "Inspect", taskId: "old" }],
     ["agent_spawn", { name: "review", prompt: "Inspect", mode: "background" }],
@@ -79,7 +79,7 @@ test("legacy fields and invalid input values fail before the controller or appro
     expect(result.error.name).toBe("ToolValidationError");
   }
   expect(controller.calls).toEqual([]);
-  expect(approvals).toEqual([]);
+  expect(reviews).toEqual([]);
 });
 
 test("removed task, Team and completion tools are unknown calls", async () => {
@@ -169,24 +169,26 @@ test("list preserves visible hierarchy identities and idle, running and paused s
   expect(controller.contexts[0]!.sessionId).toBe("session_agents" as SessionId);
 });
 
-test("Agent mutations request write approval under their own tool permissions", async () => {
-  const { executor, approvals } = setup();
+test("all Agent operations enter the execution gate with their tool identity", async () => {
+  const { executor, reviews } = setup();
   completed(await executor.execute(input("agent_spawn", { name: "review", prompt: "Inspect" })));
   completed(await executor.execute(input("agent_send", { agentId: "agent_1", text: "Verify" })));
   completed(await executor.execute(input("agent_stop", { agentId: "agent_1" })));
   completed(await executor.execute(input("agent_resume", { agentId: "agent_1" })));
   completed(await executor.execute(input("agent_wait", { agentId: "agent_1", inputId: "input_1", timeoutMs: 1 })));
   completed(await executor.execute(input("agent_list", {})));
-  expect(approvals.map(({ toolName, permission, risk, patterns }) => ({ toolName, permission, risk, patterns }))).toEqual([
-    { toolName: "agent_spawn", permission: "agent_spawn", risk: "write", patterns: ["*"] },
-    { toolName: "agent_send", permission: "agent_send", risk: "write", patterns: ["agent_1"] },
-    { toolName: "agent_stop", permission: "agent_stop", risk: "write", patterns: ["agent_1"] },
-    { toolName: "agent_resume", permission: "agent_resume", risk: "write", patterns: ["agent_1"] },
+  expect(reviews.map(({ toolName, risk }) => ({ toolName, risk }))).toEqual([
+    { toolName: "agent_spawn", risk: "write" },
+    { toolName: "agent_send", risk: "write" },
+    { toolName: "agent_stop", risk: "write" },
+    { toolName: "agent_resume", risk: "write" },
+    { toolName: "agent_wait", risk: "read" },
+    { toolName: "agent_list", risk: "read" },
   ]);
 });
 
 test("code mode composes parallel spawn calls and waits on their structured input receipts", async () => {
-  const { executor, controller, events, approvals } = setup();
+  const { executor, controller, events, reviews } = setup();
   controller.completeWaits = true;
   const script = completed(await executor.execute(input("code_mode", {
     code: `
@@ -214,7 +216,7 @@ test("code mode composes parallel spawn calls and waits on their structured inpu
   const nested = starts.filter((event) => event.payload.parentCallId === outer.payload.callId);
   expect(nested.map((event) => event.payload.toolName).sort()).toEqual(["agent_spawn", "agent_spawn", "agent_wait", "agent_wait"]);
   expect(new Set(nested.map((event) => event.payload.callId)).size).toBe(4);
-  expect(approvals.map((request) => request.permission)).toEqual(["agent_spawn", "agent_spawn"]);
+  expect(reviews.map((request) => request.toolName)).toEqual(["code_mode", "agent_spawn", "agent_spawn", "agent_wait", "agent_wait"]);
 });
 
 function completed(result: ExecuteToolResult) {
@@ -226,7 +228,7 @@ function completed(result: ExecuteToolResult) {
 function setup() {
   const controller = new FakeController();
   const registry = new InMemoryToolRegistry();
-  const approvals: ApprovalBrokerRequest[] = [];
+  const reviews: ToolReviewRequest[] = [];
   const events: ChiliEvent[] = [];
   for (const tool of [
     createAgentSpawnTool(controller), createAgentListTool(controller), createAgentSendTool(controller),
@@ -236,11 +238,11 @@ function setup() {
   const executor = new ToolExecutor({
     registry,
     events: { publish: async (event) => { events.push(event); } },
-    approvals: { decide: async (request) => { approvals.push(request); return { action: "allow_once" }; } },
+    gate: { review: async (request) => { reviews.push(request); return { decision: "allow" }; } },
     createId: (prefix) => `${prefix}_${++nextId}`,
     now: () => 1 as TimestampMs,
   });
-  return { controller, registry, executor, approvals, events };
+  return { controller, registry, executor, reviews, events };
 }
 
 class FakeController implements AgentToolController {

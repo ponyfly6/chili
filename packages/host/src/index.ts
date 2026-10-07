@@ -7,19 +7,13 @@ export {
   type HostPermissionProfileControl,
 } from "./host.js";
 export {
-  createHostApprovalBroker,
-  createApprovalRulesets,
-  createPermissionRules,
-  createRequestScopedPolicyApprovalBroker,
-  dangerousShellCommandsForProfile,
-  persistApprovalGrantForRequest,
-  persistAllowAlwaysDecision,
+  createHostExecutionGate,
+  DEFAULT_REVIEW_INSTRUCTIONS,
+  REVIEWER_SYSTEM_INSTRUCTIONS,
+  ToolReviewError,
   runtimePermissionConfig,
-  type HostApprovalOptions,
-  type ApprovalRulesetOptions,
-  type ApprovalRulesetResolver,
-  type PersistAllowAlwaysDecisionOptions,
-  type RequestScopedPolicyApprovalBrokerOptions,
+  type HostExecutionGateOptions,
+  type ReviewSettings,
 } from "./approval.js";
 export {
   createHostModel,
@@ -37,18 +31,18 @@ export {
 } from "./mcp-control.js";
 export {
   loadHostConfig,
-  addPersistentPermissionGrant,
-  addPersistentPermissionGrants,
-  permissionRulesFromConfig,
-  parsePermissionRuleSpec,
-  formatPermissionSpec,
-  PERMISSION_ACTIONS,
   DEFAULT_HOST_AGENT_CONFIG,
   type HostConfig,
   type HostAgentConfig,
   type LoadHostConfigOptions,
-  type AddPersistentPermissionGrantOptions,
 } from "./config.js";
+export {
+  readUserReviewSettings,
+  writeUserReviewSettings,
+  userReviewSettingsPath,
+  type UserReviewSettings,
+  type UserReviewSettingsOptions,
+} from "./user-review-state.js";
 export {
   createHostBashRunner,
   type HostBashRunnerOptions,

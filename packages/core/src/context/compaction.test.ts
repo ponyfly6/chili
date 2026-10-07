@@ -797,7 +797,7 @@ test("runtime sends the bounded request surface to the model", async () => {
     description: "d".repeat(400),
     risk: "read",
     inputSchema: { type: "object", properties: { query: { type: "string" } } },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "lookup", output: "done" }),
   });
   registry.register({
@@ -805,7 +805,7 @@ test("runtime sends the bounded request surface to the model", async () => {
     description: "oversized",
     risk: "read",
     inputSchema: { type: "object", description: "s".repeat(2_000) },
-    approval: () => false,
+    resources: () => false,
     execute: async () => {
       hiddenExecutions++;
       return { title: "oversized", output: "done" };
@@ -826,7 +826,7 @@ test("runtime sends the bounded request surface to the model", async () => {
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
@@ -879,7 +879,7 @@ test("runtime fails before model streaming when fixed input exhausts the model w
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
@@ -1255,7 +1255,7 @@ test("runtime auto-compacts before the main model request and sends the summary 
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
@@ -1376,7 +1376,7 @@ async function expectReactiveCompactionRecovery(firstError: () => Error): Promis
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,

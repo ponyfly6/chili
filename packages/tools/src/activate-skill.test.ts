@@ -127,7 +127,7 @@ function createExecutor(registry: InMemoryToolRegistry): ToolExecutor {
   return new ToolExecutor({
     registry,
     events: { publish: async (_event: ChiliEvent) => undefined },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
   });

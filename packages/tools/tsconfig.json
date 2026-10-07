@@ -13,9 +13,6 @@
       "path": "../protocol"
     },
     {
-      "path": "../policy"
-    },
-    {
       "path": "../skills"
     }
   ]

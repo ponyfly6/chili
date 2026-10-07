@@ -16,9 +16,6 @@
       "path": "../../packages/protocol"
     },
     {
-      "path": "../../packages/policy"
-    },
-    {
       "path": "../../packages/store"
     },
     {

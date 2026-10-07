@@ -179,7 +179,7 @@ function tool(name: string, aliases: string[] = [], description = `${name} tool`
     description,
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     isReadOnly: true,
     isConcurrencySafe: true,
     execute: async () => ({ title: name, output: name }),
@@ -198,7 +198,7 @@ function createExecutor(registry: InMemoryToolRegistry, policyResolver?: ToolAcc
   return new ToolExecutor({
     registry,
     events: { publish: async (_event: ChiliEvent) => {} },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     ...(policyResolver ? { policyResolver } : {}),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,

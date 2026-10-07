@@ -29,7 +29,7 @@ for (const code of [false, true]) test(`${code ? "code mode" : "direct"} spawn c
   registry.register(createCodeModeTool());
   const executor = new ToolExecutor({
     registry, events: { publish: async () => undefined },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
     policyResolver: { resolve: () => ({ allowedTools: ["*"], deniedTools: ["bash"], writeScope: ["*"], executeScope: ["*"] }) },
   });
   const allowedTools = ["agent_spawn", "read", ...(code ? ["code_mode"] : [])];
@@ -43,7 +43,7 @@ for (const code of [false, true]) test(`${code ? "code mode" : "direct"} spawn c
   expect(resourceScopes).toEqual({ writeScope: ["*"], executeScope: ["*"] });
 
   const child = new ToolExecutor({
-    registry, events: { publish: async () => undefined }, approvals: { decide: async () => ({ action: "allow_once" }) },
+    registry, events: { publish: async () => undefined }, gate: { review: async () => ({ decision: "allow" }) },
     policyResolver: { resolve: () => inherited },
   });
   expect((await child.execute({ ...context("child"), toolName: "read", input: {} })).status).toBe("completed");
@@ -62,23 +62,23 @@ test("delegated grants intersect aliases with wildcard policies and preserve emp
   } });
   registry.register(fakeTool("write", []));
   const executor = new ToolExecutor({
-    registry, events: { publish: async () => undefined }, approvals: { decide: async () => ({ action: "allow_once" }) },
+    registry, events: { publish: async () => undefined }, gate: { review: async () => ({ decision: "allow" }) },
     policyResolver: { resolve: () => ({ allowedTools: ["*"], writeScope: [], executeScope: [] }) },
   });
   expect((await executor.execute({ ...context("parent"), toolName: "inspect", input: {}, policy: { allowedTools: ["inspect", "read_file"] } })).status).toBe("completed");
   expect(inherited).toEqual({ allowedTools: ["inspect", "read"], writeScope: [], executeScope: [] });
 });
 
-test("narrowing caller grants while an approval is pending invalidates delegated authority", async () => {
+test("narrowing caller grants while a review is pending invalidates delegated authority", async () => {
   let policy: ToolAccessPolicy = { allowedTools: ["inspect", "read", "extra"] };
   const effects: string[] = [];
   const registry = new InMemoryToolRegistry();
-  registry.register({ ...fakeTool("inspect", effects), approval: () => ({ permission: "inspect", patterns: ["*"] }) });
+  registry.register({ ...fakeTool("inspect", effects), resources: () => ({ permission: "inspect", patterns: ["*"] }) });
   registry.register(fakeTool("read", effects));
   registry.register(fakeTool("extra", effects));
   const executor = new ToolExecutor({
     registry, events: { publish: async () => undefined }, policyResolver: { resolve: () => policy },
-    approvals: { decide: async () => { policy = { allowedTools: ["inspect", "read"] }; return { action: "allow_once" }; } },
+    gate: { review: async () => { policy = { allowedTools: ["inspect", "read"] }; return { decision: "allow" }; } },
   });
   const result = await executor.execute({ ...context("parent"), toolName: "inspect", input: {} });
   expect(result.status).toBe("failed");
@@ -95,14 +95,14 @@ test("tool-name grants do not invent resource scopes that the caller did not spe
     return { title: "write", output: "ok" };
   } });
   const executor = new ToolExecutor({
-    registry, events: { publish: async () => undefined }, approvals: { decide: async () => ({ action: "allow_once" }) },
+    registry, events: { publish: async () => undefined }, gate: { review: async () => ({ decision: "allow" }) },
   });
   expect((await executor.execute({ ...context("parent"), toolName: "write", input: {}, policy: { allowedTools: ["write"] } })).status).toBe("completed");
   expect(inherited).toEqual({ allowedTools: ["write"] });
 });
 
 function fakeTool(name: string, effects: string[]): ChiliToolDefinition {
-  return { name, description: name, risk: "read", resourcePolicy: "internal", codeMode: true, inputSchema: { type: "object" }, approval: () => false,
+  return { name, description: name, risk: "read", resourcePolicy: "internal", codeMode: true, inputSchema: { type: "object" }, resources: () => false,
     execute: async () => { effects.push(name); return { title: name, output: "ok" }; } };
 }
 

@@ -32,7 +32,7 @@ test("does not start or retry already aborted model requests", async () => {
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     retryPolicy: { maxAttempts: 3, initialDelayMs: 0 },
     createId: createSequentialId(),
@@ -77,7 +77,7 @@ test("retries transient socket failures before assistant output", async () => {
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     retryPolicy: { maxAttempts: 2, initialDelayMs: 0 },
     createId: createSequentialId(),
@@ -117,7 +117,7 @@ test("does not retry provider errors explicitly marked non-retryable", async () 
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     retryPolicy: { maxAttempts: 3, initialDelayMs: 0 },
     createId: createSequentialId(),
@@ -190,7 +190,7 @@ test("consumes rich model streams and executes tool calls after the stream finis
     description: "Echo a value.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async (input) => {
       expect(streamFinished).toBe(true);
       toolInputs.push(input);
@@ -230,7 +230,7 @@ test("consumes rich model streams and executes tool calls after the stream finis
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
@@ -306,7 +306,7 @@ test("bounds partial and final tool inputs only at persistence and desktop bound
     description: "Receives a large provider input.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async (input: { payload?: string }) => {
       executedInputBytes = Buffer.byteLength(input.payload ?? "", "utf8");
       return { title: "large input", output: "ok" };
@@ -365,7 +365,7 @@ test("keeps one desktop-safe call id across provider stream, message parts, and 
     description: "Return a small result.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "stable", output: "ok" }),
   });
   const model: ModelRouter = {
@@ -428,7 +428,7 @@ test("RuntimeService shutdown fences a signal-ignoring model EOF before tool exe
     description: "Must remain fenced after shutdown.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => {
       executions += 1;
       return { title: "unexpected", output: "unexpected" };
@@ -455,7 +455,7 @@ test("RuntimeService shutdown fences a signal-ignoring model EOF before tool exe
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
       createId,
       now: () => 1 as TimestampMs,
     }),
@@ -496,7 +496,7 @@ test("copies only allowlisted tool metadata into model-visible execution context
     description: "Run a sandboxed command.",
     risk: "execute",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({
       title: "exit 1",
       output: "command failed",
@@ -565,7 +565,7 @@ test("keeps indexed reasoning sections in separate message parts", async () => {
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
@@ -642,7 +642,7 @@ test("does not execute tool calls from output-limited model responses", async ()
     description: "Write a file.",
     risk: "write",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => {
       executed = true;
       return { title: "write_file", output: "should not run" };
@@ -686,7 +686,7 @@ test("does not execute tool calls when the provider reports invalid JSON argumen
     description: "Write a file.",
     risk: "write",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => {
       executed = true;
       return { title: "write_file", output: "should not run" };
@@ -734,7 +734,7 @@ test("keeps live tool output deltas out of model-facing tool result parts", asyn
     description: "Emit live output before final result.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async (_input, context) => {
       await context.streamOutput({ stream: "stdout", delta: "partial stdout\n" });
       await context.streamOutput({ stream: "stderr", delta: "partial stderr\n" });
@@ -819,7 +819,7 @@ test("suppresses MCP image understanding tools when direct image input is availa
     description: "Read an image from the workspace.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "read", output: "ok" }),
   });
   registry.register({
@@ -827,7 +827,7 @@ test("suppresses MCP image understanding tools when direct image input is availa
     description: "Analyze and describe image content.",
     risk: "network",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "mcp", output: "ok" }),
     mcp: {
       rawServerName: "MiniMax",
@@ -865,7 +865,7 @@ test("prefers MCP image understanding tools over read_image for path-only image 
     description: "Read an image and return it as an image block.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "read", output: "ok" }),
   });
   registry.register({
@@ -873,7 +873,7 @@ test("prefers MCP image understanding tools over read_image for path-only image 
     description: "Analyze and describe image content.",
     risk: "network",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "mcp", output: "ok" }),
     mcp: {
       rawServerName: "MiniMax",
@@ -996,7 +996,7 @@ test("runtime hides unauthorized tools from model input", async () => {
     risk: "read",
     resourcePolicy: "internal",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "read", output: "ok" }),
   });
   registry.register({
@@ -1004,7 +1004,7 @@ test("runtime hides unauthorized tools from model input", async () => {
     description: "Write",
     risk: "write",
     inputSchema: { type: "object" },
-    approval: () => ({ permission: "write", patterns: ["src/a.ts"] }),
+    resources: () => ({ permission: "write", patterns: ["src/a.ts"] }),
     execute: async () => ({ title: "write", output: "ok" }),
   });
   const seenTools: string[][] = [];
@@ -1027,7 +1027,7 @@ test("runtime hides unauthorized tools from model input", async () => {
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
       policyResolver,
     }),
     toolPolicyResolver: policyResolver,
@@ -1052,7 +1052,7 @@ test("runtime hides all tools when tool mode is disabled", async () => {
     description: "Read",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "read", output: "ok" }),
   });
   const seenTools: string[][] = [];
@@ -1083,7 +1083,7 @@ test("runtime refuses model-emitted tool calls when tool mode is disabled", asyn
     description: "Read",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => {
       executed = true;
       return { title: "read", output: "should not run" };
@@ -1125,7 +1125,7 @@ test("runtime applies per-turn tool policy to visible and executed tools", async
     description: "Read",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     execute: async () => ({ title: "read", output: "ok" }),
   });
   registry.register({
@@ -1133,7 +1133,7 @@ test("runtime applies per-turn tool policy to visible and executed tools", async
     description: "Shell",
     risk: "execute",
     inputSchema: { type: "object" },
-    approval: () => ({ permission: "bash", patterns: ["ls"] }),
+    resources: () => ({ permission: "bash", patterns: ["ls"] }),
     execute: async () => ({ title: "bash", output: "unexpected" }),
   });
   const seenTools: string[][] = [];
@@ -1151,7 +1151,7 @@ test("runtime applies per-turn tool policy to visible and executed tools", async
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
@@ -1184,7 +1184,7 @@ test("runs concurrency-safe tool calls in parallel and preserves result order", 
     description: "Parallel read tool.",
     risk: "read",
     inputSchema: { type: "object" },
-    approval: () => false,
+    resources: () => false,
     isReadOnly: true,
     isConcurrencySafe: true,
     execute: async (input) => {
@@ -1210,7 +1210,7 @@ test("runs concurrency-safe tool calls in parallel and preserves result order", 
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
@@ -1275,7 +1275,7 @@ test("preserves failed model event usage and provider response metadata", async 
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     createId,
     now: () => 1 as TimestampMs,
@@ -1373,7 +1373,7 @@ function testRuntime(
     toolExecutor: new ToolExecutor({
       registry,
       events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) },
+      gate: { review: async () => ({ decision: "allow" }) },
     }),
     ...(retryPolicy ? { retryPolicy } : {}),
     createId: createSequentialId(),

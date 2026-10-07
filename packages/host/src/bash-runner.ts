@@ -58,7 +58,7 @@ export function createHostBashRunner(options: HostBashRunnerOptions): BashRunner
       };
     }
     // Non-macOS platforms do not currently have a Chili shell sandbox. The
-    // tool approval lifecycle still gates require_escalated before this runner
+    // tool review gate runs before this runner
     // is called, while both execution modes use the same unsandboxed backend.
     return {
       async run(request) {
@@ -84,7 +84,7 @@ export function createHostBashRunner(options: HostBashRunnerOptions): BashRunner
         throw new Error("This shell backend cannot enforce explicit file resource denies.");
       }
       if (
-        (allowHostSandboxEscape && !request.executionPolicy && !resourceRestricted && options.permissionProfile() === "full-access")
+        (allowHostSandboxEscape && !request.executionPolicy && !resourceRestricted)
         || request.sandboxPermissions === "require_escalated"
       ) {
         await request.assertCurrentAuthorization?.();

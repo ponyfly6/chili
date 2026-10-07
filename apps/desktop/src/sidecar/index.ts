@@ -6,7 +6,6 @@ import { isAbsolute, resolve } from "node:path";
 import { createChiliHost, type ChiliHost } from "@chili/host";
 import { startRuntimeHttpServer } from "@chili/server";
 import {
-  DeferredApprovalQueue,
   DeferredUserInputQueue,
   observeRunProcessLifecycle,
   runProcess,
@@ -43,7 +42,6 @@ for (const name of [
 }
 
 const activeToolProcessGroups = new Set<number>();
-const approvalQueue = new DeferredApprovalQueue();
 const userInputQueue = new DeferredUserInputQueue();
 let host: ChiliHost | undefined;
 let server: ReturnType<typeof startRuntimeHttpServer> | undefined;
@@ -140,7 +138,6 @@ const close = (reason: string): Promise<void> => {
   if (closing) return closing;
   closing = closeSidecarResources({
     denyPending() {
-      approvalQueue.denyAll(reason);
       userInputQueue.denyAll(reason);
     },
     ...(server ? { closeServer: () => server?.close() ?? Promise.resolve() } : {}),
@@ -173,7 +170,6 @@ try {
   const workspace = await realpath(workspaceInput);
   host = await createChiliHost({
     cwd: workspace,
-    approvalQueue,
     userInputQueue,
     mcpConnectMode: "manual",
     staleTurnRecoveryMs: 0,
@@ -190,7 +186,6 @@ try {
     service: host.service,
     store: host.events,
     agents: host.agents,
-    approvals: approvalQueue,
     userInputs: userInputQueue,
     permissions: host.permissions,
     commands: host.commands,

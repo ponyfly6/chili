@@ -45,7 +45,7 @@ test("ordinary MCP-style tools execute only after external schema validation suc
     risk: "read",
     inputSchemaSource: "external",
     inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
-    approval: () => false,
+    resources: () => false,
     async execute() {
       executions++;
       return { title: "fixture", output: "found" };
@@ -54,7 +54,7 @@ test("ordinary MCP-style tools execute only after external schema validation suc
   const executor = new ToolExecutor({
     registry,
     events: { publish: async () => undefined },
-    approvals: { decide: async () => ({ action: "allow_once" }) },
+    gate: { review: async () => ({ decision: "allow" }) },
   });
   const context = {
     sessionId: "schema_session" as SessionId,

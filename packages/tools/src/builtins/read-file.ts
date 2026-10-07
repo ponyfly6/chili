@@ -104,7 +104,7 @@ export function createReadFileTool(options: ReadFileToolOptions = {}): ChiliTool
     async prepareInput(input, context) {
       return { ...input, filePath: await canonicalResourcePattern(context.cwd, input.filePath, true) };
     },
-    approval(input) {
+    resources(input) {
       return {
         permission: "read",
         patterns: [input.filePath],

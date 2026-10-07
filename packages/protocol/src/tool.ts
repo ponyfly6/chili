@@ -1,4 +1,4 @@
-import type { ApprovalId, ArtifactId, SessionId, ToolCallId, TurnId } from "./ids.js";
+import type { ArtifactId, SessionId, ToolCallId, TurnId } from "./ids.js";
 
 export type ToolRisk = "read" | "write" | "execute" | "network" | "dangerous";
 
@@ -29,7 +29,6 @@ export interface ToolExecutionContext {
   cwd: string;
   metadata(update: ToolMetadataUpdate): Promise<void>;
   streamOutput(update: ToolOutputUpdate): Promise<void>;
-  requestApproval(request: ApprovalRequest): Promise<ApprovalDecision>;
 }
 
 export interface ToolMetadataUpdate {
@@ -68,14 +67,7 @@ export interface ToolResultImageContent {
   mimeType: string;
 }
 
-export interface ApprovalRequest {
-  id?: ApprovalId;
-  permission: string;
-  patterns: string[];
-  maxApprovalScope?: ApprovalScope;
-  metadata?: Record<string, unknown>;
-}
-
+/** Historical manual-approval types retained for stored event compatibility. */
 export type ApprovalScope = "once" | "session" | "persistent";
 
 export type ApprovalDecisionAction = "allow_once" | "allow_session" | "allow_always" | "deny";

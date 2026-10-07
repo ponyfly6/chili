@@ -79,7 +79,7 @@ test("a late model-config response from the previous session cannot overwrite th
       policy: "explicit" as const,
       source: "default" as const,
     }),
-    getPermissionConfig: async () => ({ profile: "default" as const, profiles: [] }),
+    getPermissionConfig: async () => ({ profile: "auto-review" as const, profiles: [], reviewInstructions: "Review actions", defaultReviewInstructions: "Review actions" }),
     listCommands: async () => ({ roots: [], diagnostics: [] }),
     mcpStatus: async () => ({
       servers: [],
@@ -361,7 +361,7 @@ test("MCP status follows the selected session and ignores a late prior-workspace
       policy: "explicit" as const,
       source: "default" as const,
     }),
-    getPermissionConfig: async () => ({ profile: "default" as const, profiles: [] }),
+    getPermissionConfig: async () => ({ profile: "auto-review" as const, profiles: [], reviewInstructions: "Review actions", defaultReviewInstructions: "Review actions" }),
     listCommands: async () => emptyCommandCatalog(),
     mcpStatus: async (input: { sessionId?: SessionId } = {}) => {
       requestedScopes.push(input.sessionId);
@@ -439,7 +439,7 @@ test("all late MCP operations return undefined and cannot refresh the next sessi
       policy: "explicit" as const,
       source: "default" as const,
     }),
-    getPermissionConfig: async () => ({ profile: "default" as const, profiles: [] }),
+    getPermissionConfig: async () => ({ profile: "auto-review" as const, profiles: [], reviewInstructions: "Review actions", defaultReviewInstructions: "Review actions" }),
     listCommands: async () => emptyCommandCatalog(),
     mcpStatus: async (input: { sessionId?: SessionId } = {}) => {
       requestedStatusScopes.push(input.sessionId);
@@ -597,7 +597,7 @@ test("a failed command-catalog load for the resumed session cannot retain a late
       policy: "explicit" as const,
       source: "default" as const,
     }),
-    getPermissionConfig: async () => ({ profile: "default" as const, profiles: [] }),
+    getPermissionConfig: async () => ({ profile: "auto-review" as const, profiles: [], reviewInstructions: "Review actions", defaultReviewInstructions: "Review actions" }),
     listCommands: async (input: { sessionId?: SessionId } = {}) => {
       requestedCatalogs.push(input.sessionId);
       if (input.sessionId === sessionA) return catalogA.promise;
@@ -688,7 +688,7 @@ function chatRuntimeClient(
       policy: "explicit" as const,
       source: "default" as const,
     }),
-    getPermissionConfig: async () => ({ profile: "default" as const, profiles: [] }),
+    getPermissionConfig: async () => ({ profile: "auto-review" as const, profiles: [], reviewInstructions: "Review actions", defaultReviewInstructions: "Review actions" }),
     listCommands: async () => emptyCommandCatalog(),
     mcpStatus: async () => mcpStatusResponse(),
     ...overrides,

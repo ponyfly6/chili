@@ -37,7 +37,7 @@ export function createCodeModeTool(): ChiliToolDefinition<CodeModeInput> {
       }
       return { ok: true, value: { code: record.code, ...(record.timeoutMs === undefined ? {} : { timeoutMs: record.timeoutMs as number }) } };
     },
-    approval: () => false,
+    resources: () => false,
     async execute(input, context) {
       if (!context.visibleTools || !context.invokeTool) throw new Error("Code mode requires a tool execution context");
       const callable = (await context.visibleTools()).filter((tool) => tool.codeMode === true && !tool.isOrchestrator && tool.name !== "code_mode");

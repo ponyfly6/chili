@@ -2,87 +2,71 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, spyOn, test } from "bun:test";
-import { type ModelStreamEvent } from "@chili/core";
+import { type ModelRouter, type ModelStreamInput, type ModelStreamEvent } from "@chili/core";
 import type { ChiliEvent, RuntimePermissionProfileId, SessionId, TimestampMs } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
-import type { ApprovalBrokerRequest, BashRunner } from "@chili/tools";
-import { createHostApprovalBroker } from "./approval.js";
+import type { BashRunner } from "@chili/tools";
 import { createChiliHost, type ChiliHost, type ChiliHostOptions } from "./host.js";
 import { createHostMcpRuntime } from "./mcp-control.js";
 
 const sessionId = "session_host_boundary" as SessionId;
 
-test("headless Host denies an approval-required tool without an approval interface", async () => {
+test("headless Host reviews a tool without a human approval interface", async () => {
   await withWorkspace(async (options) => {
     let executions = 0;
     const events: ChiliEvent[] = [];
-    const host = await createChiliHost({
-      ...options,
-      bashRunner: fakeRunner(() => { executions += 1; }),
-      onEvent: (event) => { events.push(event); },
-    });
+    const host = await createChiliHost({ ...options, permissionProfile: "auto-review",
+      reviewerModelRouter: reviewer(() => ({ decision: "deny", reason: "Outside the requested task." })),
+      bashRunner: fakeRunner(() => { executions++; }), onEvent: (event) => { events.push(event); } });
     try {
       await runApprovalFixture(host);
       expect(executions).toBe(0);
-      expect(events.find((event) => event.type === "approval.resolved")?.payload).toMatchObject({
-        decision: "deny",
-        feedback: "No approval interface available.",
-      });
+      expect(events.some((event) => event.type.startsWith("approval."))).toBe(false);
+      expect(JSON.stringify(events)).toContain("Outside the requested task.");
       expect(await host.store.pendingApprovals(sessionId)).toHaveLength(0);
-    } finally {
-      await host.close();
-    }
+    } finally { await host.close(); }
   });
 });
 
-test("Host sends approval to its injected interface and executes only after acceptance", async () => {
+test("Host reviews the exact action before executing it", async () => {
   await withWorkspace(async (options) => {
     let executions = 0;
-    const requests: ApprovalBrokerRequest[] = [];
-    const host = await createChiliHost({
-      ...options,
-      bashRunner: fakeRunner(() => { executions += 1; }),
-      askApproval: async (request, signal) => {
+    const requests: ModelStreamInput[] = [];
+    const host = await createChiliHost({ ...options, permissionProfile: "auto-review",
+      bashRunner: fakeRunner(() => { executions++; }),
+      reviewerModelRouter: reviewer((input) => {
         expect(executions).toBe(0);
-        expect(signal?.aborted).toBe(false);
-        requests.push(request);
-        return { action: "allow_once" };
-      },
+        expect(input.tools).toEqual([]);
+        expect(input.signal?.aborted).toBe(false);
+        requests.push(input);
+        return { decision: "allow", reason: "Requested fixture command." };
+      }),
     });
     try {
       await runApprovalFixture(host);
       expect(requests).toHaveLength(1);
-      expect(requests[0]).toMatchObject({ sessionId, permission: "bash.unsandboxed", maxApprovalScope: "once" });
+      expect(reviewAction(requests[0]!)).toMatchObject({ sessionId, toolName: "bash" });
+      expect(reviewAction(requests[0]!).input).toHaveProperty("command");
       expect(executions).toBe(1);
-    } finally {
-      await host.close();
-    }
+    } finally { await host.close(); }
   });
 });
 
-test("Host Full Access continues to enforce explicit project denies", async () => {
+test("Host Full Access ignores retired project rules and never invokes the reviewer", async () => {
   await withWorkspace(async (options) => {
-    const configDir = join(options.cwd, ".chili");
-    await mkdir(configDir, { recursive: true });
-    await writeFile(join(configDir, "config.toml"), '[permissions]\ndeny = ["bash.unsandboxed(*)"]\n');
+    await mkdir(join(options.cwd, ".chili"), { recursive: true });
+    await writeFile(join(options.cwd, ".chili", "config.toml"), '[permissions]\ndeny = ["bash(*)"]\n');
     let executions = 0;
-    let asks = 0;
-    const host = await createChiliHost({
-      ...options,
-      permissionProfile: "full-access",
-      bashRunner: fakeRunner(() => { executions += 1; }),
-      askApproval: async () => {
-        asks += 1;
-        return { action: "allow_once" };
-      },
+    let reviews = 0;
+    const host = await createChiliHost({ ...options, permissionProfile: "full-access",
+      bashRunner: fakeRunner(() => { executions++; }),
+      reviewerModelRouter: reviewer(() => { reviews++; throw new Error("Reviewer must not run"); }),
     });
     try {
       await runApprovalFixture(host);
-      expect(executions).toBe(0);
-      expect(asks).toBe(0);
-    } finally {
-      await host.close();
-    }
+      expect(executions).toBe(1);
+      expect(reviews).toBe(0);
+    } finally { await host.close(); }
   });
 });
 
@@ -140,21 +124,19 @@ test("Host initialization failure drains runtimes and closes SQLite", async () =
   });
 });
 
-test("Host rejects the unavailable auto-review profile at construction and runtime", async () => {
+test("Host exposes exactly two modes and rejects retired or unknown live modes", async () => {
   await withWorkspace(async (options) => {
-    await expect(createChiliHost({ ...options, permissionProfile: "auto-review" })).rejects.toThrow("not implemented");
-    expect(() => createHostApprovalBroker({ permissionProfile: "auto-review" })).toThrow("not implemented");
-    const unknownProfile = "unrecognized" as RuntimePermissionProfileId;
-    await expect(createChiliHost({ ...options, permissionProfile: unknownProfile })).rejects.toThrow("Unsupported permission profile");
-    expect(() => createHostApprovalBroker({ permissionProfile: unknownProfile })).toThrow("Unsupported permission profile");
-    const host = await createChiliHost(options);
-    try {
-      expect(() => host.permissions.set("auto-review")).toThrow("not implemented");
-      expect(() => host.permissions.set(unknownProfile)).toThrow("Unsupported permission profile");
-      expect(host.permissions.get().profile).toBe("default");
-    } finally {
-      await host.close();
+    for (const value of ["default", "unrecognized"]) {
+      await expect(createChiliHost({ ...options, permissionProfile: value as RuntimePermissionProfileId }))
+        .rejects.toThrow("Unsupported permission profile");
     }
+    const host = await createChiliHost({ ...options, permissionProfile: "auto-review" });
+    try {
+      expect(host.permissions.get().profiles.map((profile) => profile.id).sort()).toEqual(["auto-review", "full-access"]);
+      expect((await host.permissions.set("full-access")).profile).toBe("full-access");
+      expect((await host.permissions.set("auto-review")).profile).toBe("auto-review");
+      await expect(host.permissions.set("default" as RuntimePermissionProfileId)).rejects.toThrow("Unsupported permission profile");
+    } finally { await host.close(); }
   });
 });
 
@@ -171,7 +153,7 @@ test("Host code mode composes reads while only its selected output enters model 
           expect(input.tools.map((tool) => tool.name)).toContain("code_mode");
           expect(input.tools.map((tool) => tool.name)).toContain("read");
           if (requests === 1) {
-            expect(input.developer?.join("\n")).toContain("Tool permissions, approvals, and worker scope still apply");
+            expect(input.developer?.join("\n")).toContain("Host execution review and worker scope still apply");
             yield { type: "tool_call_start", toolCallId: "provider_code_mode_call", name: "code_mode" };
             yield {
               type: "tool_call_end",
@@ -216,41 +198,34 @@ test("Host code mode composes reads while only its selected output enters model 
   });
 });
 
-test("Host code mode sends nested shell execution through the approval interface", async () => {
+test("Host code mode sends nested shell execution through independent automatic review", async () => {
   await withWorkspace(async (options) => {
     let executions = 0;
-    const requests: ApprovalBrokerRequest[] = [];
-    const host = await createChiliHost({
-      ...options,
+    const actions: ReturnType<typeof reviewAction>[] = [];
+    const host = await createChiliHost({ ...options, permissionProfile: "auto-review",
       bashRunner: fakeRunner(() => { executions++; }),
-      askApproval: async (request) => {
-        expect(executions).toBe(0);
-        requests.push(request);
-        return { action: "deny", feedback: "Denied nested command for this test." };
-      },
-      modelRouter: {
-        async *stream(): AsyncIterable<ModelStreamEvent> {
-          yield {
-            type: "tool_call",
-            name: "code_mode",
-            input: { code: 'await tools.bash({command:"/usr/bin/true",sandbox_permissions:"require_escalated",justification:"Approval fixture"});' },
-          };
-          yield { type: "finish", reason: "tool_use" };
-        },
-      },
+      reviewerModelRouter: reviewer((input) => {
+        const action = reviewAction(input);
+        actions.push(action);
+        return action.toolName === "bash"
+          ? { decision: "deny", reason: "Denied nested command for this test." }
+          : { decision: "allow", reason: "Review nested calls separately." };
+      }),
+      modelRouter: { async *stream(): AsyncIterable<ModelStreamEvent> {
+        yield { type: "tool_call", name: "code_mode", input: { code: 'await tools.bash({command:"/usr/bin/true"});' } };
+        yield { type: "finish", reason: "tool_use" };
+      } },
     });
     try {
       await host.runtime.createSession({ sessionId, cwd: host.cwd });
       await host.runtime.runTurn({ sessionId, cwd: host.cwd });
       expect(executions).toBe(0);
-      expect(requests).toMatchObject([{ toolName: "bash", permission: "bash.unsandboxed" }]);
+      expect(actions.some((action) => action.toolName === "bash")).toBe(true);
       const completed = (await host.store.events({ sessionId, type: "tool.call_finished" }))
         .filter((event): event is Extract<ChiliEvent, { type: "tool.call_finished" }> => event.type === "tool.call_finished");
       expect(completed).toHaveLength(2);
       expect(completed.every((event) => event.payload.status === "failed")).toBe(true);
-    } finally {
-      await host.close();
-    }
+    } finally { await host.close(); }
   });
 });
 
@@ -334,7 +309,7 @@ async function withWorkspace(run: (options: ChiliHostOptions) => Promise<void>):
   try {
     const cwd = join(root, "workspace");
     await mkdir(cwd, { recursive: true });
-    await run({ cwd, chiliHome: join(root, "home"), model: "fake", mcpConnectMode: "manual", staleTurnRecoveryIntervalMs: false });
+    await run({ cwd, chiliHome: join(root, "home"), model: "fake", permissionProfile: "full-access", mcpConnectMode: "manual", staleTurnRecoveryIntervalMs: false });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -361,4 +336,17 @@ function fakeRunner(onRun: () => void): BashRunner {
       };
     },
   };
+}
+
+function reviewer(decide: (input: ModelStreamInput) => { decision: "allow" | "deny"; reason: string }): ModelRouter {
+  return { async *stream(input) {
+    yield { type: "text_delta", text: JSON.stringify(decide(input)) };
+    yield { type: "finish", reason: "stop" };
+  } };
+}
+
+function reviewAction(input: ModelStreamInput): { toolName: string; sessionId: string; input: unknown } {
+  const message = input.messages.findLast((message) => message.role === "user");
+  const text = message?.parts.filter((part) => part.type === "text").map((part) => part.text).join("") ?? "";
+  return JSON.parse(text).action;
 }

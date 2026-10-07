@@ -5,7 +5,7 @@ import type {
   ChiliToolDefinition,
   ExecuteToolInput,
   ToolAccessPolicy,
-  ToolApprovalSpecWithDefaults,
+  ToolResourceSpecWithDefaults,
   ToolPolicyContext,
 } from "./types.js";
 
@@ -37,7 +37,7 @@ export async function authorizeToolByPolicy<Input>(input: {
   tool: ChiliToolDefinition<Input>;
   executeInput: ExecuteToolInput;
   validatedInput: Input;
-  approvalSpec: ToolApprovalSpecWithDefaults;
+  resourceSpec: ToolResourceSpecWithDefaults;
   policy: ToolAccessPolicy | undefined;
   isReadOnly: (tool: ChiliToolDefinition<Input>, input: Input) => Promise<boolean | undefined>;
 }): Promise<void> {
@@ -54,20 +54,13 @@ export async function authorizeToolByPolicy<Input>(input: {
     throw new ToolDeniedError(input.tool.name, "This tool does not declare a trusted implementation of the current resource scopes.");
   }
 
-  if (normalizeToolName(input.approvalSpec.permission) === "bash.unsandboxed") {
-    throw new ToolDeniedError(
-      input.tool.name,
-      "Scoped workers cannot request execution outside the host sandbox.",
-    );
-  }
-
-  if (isFilesystemWriteRequest(input.tool, input.approvalSpec)) {
+  if (isFilesystemWriteRequest(input.tool, input.resourceSpec)) {
     const writeScope = await Promise.all(normalizedList(policy.writeScope)
       .map((scope) => canonicalResourcePattern(input.executeInput.cwd, scope)));
     if (writeScope.length === 0) {
       throw new ToolDeniedError(input.tool.name, "This worker does not have write scope.");
     }
-    const denied = input.approvalSpec.patterns.find(
+    const denied = input.resourceSpec.patterns.find(
       (pattern) => !pathPatternWithinScopes(input.executeInput.cwd, pattern, writeScope),
     );
     if (denied) {
@@ -88,7 +81,7 @@ export async function authorizeToolByPolicy<Input>(input: {
     if (executeScope.length === 0) {
       throw new ToolDeniedError(input.tool.name, "This worker does not have execute scope.");
     }
-    const denied = input.approvalSpec.patterns.find((pattern) => !commandWithinScopes(pattern, executeScope));
+    const denied = input.resourceSpec.patterns.find((pattern) => !commandWithinScopes(pattern, executeScope));
     if (denied) {
       throw new ToolDeniedError(
         input.tool.name,
@@ -125,9 +118,9 @@ function isFilesystemWriteTool(tool: ChiliToolDefinition): boolean {
   return toolNameMatches(tool, FILE_WRITE_TOOL_NAMES);
 }
 
-function isFilesystemWriteRequest(tool: ChiliToolDefinition, approvalSpec: ToolApprovalSpecWithDefaults): boolean {
+function isFilesystemWriteRequest(tool: ChiliToolDefinition, resourceSpec: ToolResourceSpecWithDefaults): boolean {
   if (isFilesystemWriteTool(tool)) return true;
-  return FILE_WRITE_PERMISSIONS.has(normalizeToolName(approvalSpec.permission));
+  return FILE_WRITE_PERMISSIONS.has(normalizeToolName(resourceSpec.permission));
 }
 
 function toolNameMatches(tool: ChiliToolDefinition, names: ReadonlySet<string>): boolean {

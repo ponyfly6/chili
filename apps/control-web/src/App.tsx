@@ -289,7 +289,7 @@ export function App() {
     }
   };
 
-  const needsDesktop = snapshot?.session.needsDesktop.approval || snapshot?.session.needsDesktop.input;
+  const needsDesktop = snapshot?.session.needsDesktop.input;
   const sendDisabled = !connected || !selectedId || !!sending || !canSendPrompt(draft) || !!needsDesktop;
   const byteLength = promptByteLength(draft);
 
@@ -373,7 +373,7 @@ export function App() {
                     <div className="task-title"><h2>{task?.title || "正在读取任务…"}</h2><div className="task-state"><span className={`run-badge ${snapshot?.session.runStatus === "running" ? "running" : ""}`} data-testid="task-run-status">{snapshot ? runStatusLabel(snapshot.session.runStatus) : "读取中"}</span>{snapshot && snapshot.session.queuedCount > 0 && <span data-testid="queued-count">{snapshot.session.queuedCount} 条排队中</span>}<span className="last-read">{lastRead ? `${connected ? "更新于" : "上次读取"} ${lastRead.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : ""}</span></div></div>
                     <button type="button" className="refresh-button" aria-label="刷新任务" onClick={() => setReadRevision((value) => value + 1)} disabled={!connected}>↻</button>
                   </header>
-                  {needsDesktop && <div className="desktop-needed" role="status" data-testid="needs-desktop"><strong>请回桌面处理</strong><p>{snapshot?.session.needsDesktop.approval ? "任务正在等待审批。手机不能批准或修改权限。" : "任务正在等待你的回答。请在桌面完成提问流程。"}</p></div>}
+                  {needsDesktop && <div className="desktop-needed" role="status" data-testid="needs-desktop"><strong>请回桌面处理</strong><p>任务正在等待你的回答。请在桌面完成提问流程。</p></div>}
                   {snapshot?.session.deliveryUnknown && <div className="desktop-needed" role="alert" data-testid="delivery-unknown"><strong>排队消息的执行结果未知</strong><p>可能已经执行，请先读取任务或回桌面核对，不要直接重发。Stop 仍可使用。</p></div>}
                   {!connected && <div className="stale-warning" role="status">当前显示上次读取的内容。连接恢复前无法发送指令。</div>}
                   <div className="transcript" data-testid="transcript" aria-label="最近消息" aria-busy={connected && !snapshot}>

@@ -29,7 +29,7 @@ async function fixture() {
     risk: "read", codeMode: name !== "native_only", resourcePolicy: "internal",
     inputSchema: { type: "object", properties: { query: { type: "string", description: "Exact record identifier" } } },
     outputSchema: { type: "object", properties: { found: { type: "boolean" } } },
-    approval: () => false,
+    resources: () => false,
     async execute() { executed.push(name); return { title: name, output: "ok", structuredData: { found: true } }; },
   });
   registry.register(createCodeModeTool());
@@ -48,7 +48,7 @@ async function fixture() {
     store, model, toolRegistry: registry, toolPolicyResolver: resolver,
     toolExposure: { eagerTools: ["read", "code_mode", "tool_search"], requiredTools: async () => { duringExposure?.(); return required; } },
     toolExecutor: new ToolExecutor({ registry, events: { publish: (event) => store.append(event) },
-      approvals: { decide: async () => ({ action: "allow_once" }) }, policyResolver: resolver }),
+      gate: { review: async () => ({ decision: "allow" }) }, policyResolver: resolver }),
   });
   let runtime = makeRuntime();
   const sessionId = await runtime.createSession({ cwd });

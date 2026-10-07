@@ -21,7 +21,6 @@
         "@chili/core": "workspace:*",
         "@chili/host": "workspace:*",
         "@chili/mcp": "workspace:*",
-        "@chili/policy": "workspace:*",
         "@chili/protocol": "workspace:*",
         "@chili/providers": "workspace:*",
         "@chili/server": "workspace:*",
@@ -133,7 +132,6 @@
       "name": "@chili/core",
       "version": "0.0.0",
       "dependencies": {
-        "@chili/policy": "workspace:*",
         "@chili/protocol": "workspace:*",
         "@chili/providers": "workspace:*",
         "@chili/store": "workspace:*",
@@ -147,7 +145,6 @@
         "@chili/commands": "workspace:*",
         "@chili/core": "workspace:*",
         "@chili/mcp": "workspace:*",
-        "@chili/policy": "workspace:*",
         "@chili/protocol": "workspace:*",
         "@chili/providers": "workspace:*",
         "@chili/skills": "workspace:*",
@@ -165,10 +162,6 @@
         "@modelcontextprotocol/core": "2.0.0",
         "zod": "^3.25.1 || ^4.0.0",
       },
-    },
-    "packages/policy": {
-      "name": "@chili/policy",
-      "version": "0.0.0",
     },
     "packages/protocol": {
       "name": "@chili/protocol",
@@ -218,7 +211,6 @@
       "name": "@chili/tools",
       "version": "0.0.0",
       "dependencies": {
-        "@chili/policy": "workspace:*",
         "@chili/protocol": "workspace:*",
         "@chili/skills": "workspace:*",
         "ajv": "8.20.0",
@@ -294,8 +286,6 @@
     "@chili/host": ["@chili/host@workspace:packages/host"],
 
     "@chili/mcp": ["@chili/mcp@workspace:packages/mcp"],
-
-    "@chili/policy": ["@chili/policy@workspace:packages/policy"],
 
     "@chili/protocol": ["@chili/protocol@workspace:packages/protocol"],
 

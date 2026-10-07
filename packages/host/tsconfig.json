@@ -5,16 +5,33 @@
     "rootDir": "src",
     "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
-  "include": ["src/**/*.ts"],
+  "include": [
+    "src/**/*.ts"
+  ],
   "references": [
-    { "path": "../commands" },
-    { "path": "../core" },
-    { "path": "../mcp" },
-    { "path": "../policy" },
-    { "path": "../protocol" },
-    { "path": "../providers" },
-    { "path": "../skills" },
-    { "path": "../store" },
-    { "path": "../tools" }
+    {
+      "path": "../commands"
+    },
+    {
+      "path": "../core"
+    },
+    {
+      "path": "../mcp"
+    },
+    {
+      "path": "../protocol"
+    },
+    {
+      "path": "../providers"
+    },
+    {
+      "path": "../skills"
+    },
+    {
+      "path": "../store"
+    },
+    {
+      "path": "../tools"
+    }
   ]
 }

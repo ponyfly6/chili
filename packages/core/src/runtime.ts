@@ -14,12 +14,10 @@ import type {
   ToolDefinition,
   TurnId,
 } from "@chili/protocol";
-import type { PermissionRule } from "@chili/policy";
 import type { PromptDebugManifest } from "./prompt/index.js";
 
 export interface RuntimeConfig {
   cwd: string;
-  permissions?: PermissionRule[];
 }
 
 export interface RuntimeServices {
