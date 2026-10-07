@@ -394,8 +394,8 @@ describe("real desktop remote adapter boundary", () => {
     fixture.adapter.revoke();
   });
 
-  test("local send no longer waits for client-side busy or Goal preflight", async () => {
-    const fixture = harness({ sessionEvents: async () => { throw new Error("unused busy read"); }, getGoal: async () => { throw new Error("unused Goal read"); } });
+  test("local send does not wait for client-side busy preflight", async () => {
+    const fixture = harness({ sessionEvents: async () => { throw new Error("unused busy read"); } });
     expect(await fixture.service.invoke({ type: "session.send", sessionId: "root", text: "work", mode: "steer" })).toEqual({ status: "accepted" });
     expect(await invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } })).toEqual({ interrupted: true });
     expect(fixture.submitted).toEqual(["work"]);
@@ -600,7 +600,6 @@ function harness(overrides: Partial<RuntimeClient> = {}, controlReadTimeoutMs = 
     sessionEvents: async () => [],
     listPendingApprovals: async () => [],
     listUserInputs: async () => [],
-    getGoal: async () => undefined,
     submitPromptAsync: async ({ text }: { text: string }) => {
       submitted.push(text);
       return { status: "accepted", sessionId: "root" };

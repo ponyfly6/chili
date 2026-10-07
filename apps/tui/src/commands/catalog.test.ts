@@ -55,17 +55,15 @@ test("TUI bindings execute auth and session paths", async () => {
   });
 });
 
-test("TUI model, thinking, and goal bindings preserve exact arguments", async () => {
+test("TUI model and thinking bindings preserve exact arguments", async () => {
   const registry = createTuiCommandRegistry();
   const model = resolveCommand(registry, context, "/model select openai-codex/gpt-5.5:high");
   const thinking = resolveCommand(registry, context, "/thinking effort xhigh");
-  const goal = resolveCommand(registry, context, "/goal set --budget 50k Ship The Goal");
 
   expect(model.status).toBe("matched");
   expect(thinking.status).toBe("matched");
-  expect(goal.status).toBe("matched");
-  if (model.status !== "matched" || thinking.status !== "matched" || goal.status !== "matched") return;
-  if (!model.command.run || !thinking.command.run || !goal.command.run) return;
+  if (model.status !== "matched" || thinking.status !== "matched") return;
+  if (!model.command.run || !thinking.command.run) return;
 
   expect(await model.command.run(context, model.args)).toEqual({
     type: "set_model",
@@ -73,12 +71,6 @@ test("TUI model, thinking, and goal bindings preserve exact arguments", async ()
     reasoningLevel: "high",
   });
   expect(await thinking.command.run(context, thinking.args)).toEqual({ type: "set_reasoning", level: "xhigh" });
-  expect(await goal.command.run(context, goal.args)).toEqual({
-    type: "goal_action",
-    action: "set",
-    objective: "Ship The Goal",
-    tokenBudget: 50_000,
-  });
 });
 
 test("TUI reasoning and service bindings honor active model capabilities", async () => {

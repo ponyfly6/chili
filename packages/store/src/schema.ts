@@ -30,20 +30,6 @@ export const SQLITE_SCHEMA = [
   `create index if not exists sessions_updated_idx on sessions(updated_at)`,
   `create unique index if not exists sessions_agent_name on sessions(parent_session_id, agent_name) where parent_session_id is not null`,
 
-  `create table if not exists session_goals (
-    session_id text not null primary key,
-    objective text not null,
-    status text not null,
-    token_budget integer,
-    tokens_used integer not null default 0,
-    time_used_seconds real not null default 0,
-    created_at integer not null,
-    updated_at integer not null,
-    completed_at integer,
-    last_reason text
-  )`,
-  `create index if not exists session_goals_status_idx on session_goals(status, updated_at)`,
-
   `create table if not exists messages (
     id text primary key,
     session_id text not null,

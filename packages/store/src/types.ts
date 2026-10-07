@@ -3,8 +3,6 @@ import type {
   EventEnvelope,
   Message,
   SessionId,
-  SessionGoal,
-  SessionGoalStatus,
   ToolCallId,
   ToolCallStatus,
   TurnId,
@@ -134,14 +132,6 @@ export interface ApprovalRow {
   resolvedAt?: number;
 }
 
-export interface SessionGoalRow extends SessionGoal {}
-
-export interface SessionGoalQuery {
-  sessionId?: SessionId;
-  status?: SessionGoalStatus;
-  limit?: number;
-}
-
 /**
  * A durable runtime claim that must still be owned when a write transaction
  * commits. Every event written under it must have that Session identity.
@@ -201,44 +191,6 @@ export interface StaleTurnRecoveryInput {
 /** Optional atomic recovery capability for stores with durable turn state. */
 export interface StaleTurnRecoveryStore {
   reconcileStaleTurns(input: StaleTurnRecoveryInput): Promise<RuntimeEvent[]>;
-}
-
-export type GoalMutationEvent = Extract<RuntimeEvent, { type: "goal.updated" | "goal.cleared" }>;
-
-export interface GoalMutationSnapshot {
-  readonly goal?: SessionGoalRow;
-  readonly updatedEvents: readonly Extract<RuntimeEvent, { type: "goal.updated" }>[];
-}
-
-export interface GoalMutationDecision<T> {
-  value: T;
-  event?: GoalMutationEvent;
-}
-
-export interface GoalMutationResult<T> {
-  value: T;
-  /** Only events committed by this invocation; empty for an idempotent no-op. */
-  events: readonly GoalMutationEvent[];
-}
-
-/** Optional atomic Goal read/decide/append capability. */
-export interface GoalMutationStore {
-  /** decide must be synchronous, free of I/O, and safe to invoke on retry. */
-  mutateGoal<T>(
-    sessionId: SessionId,
-    decide: (snapshot: GoalMutationSnapshot) => GoalMutationDecision<T>,
-    options?: EventAppendOptions,
-  ): Promise<GoalMutationResult<T>>;
-}
-
-/** Wrappers report whether the complete inner chain supports atomic Goals. */
-export interface GoalMutationCapabilityStore {
-  supportsGoalMutation(): boolean;
-}
-
-export interface GoalProjectionStore {
-  sessionGoal(sessionId: SessionId): Promise<SessionGoalRow | undefined>;
-  sessionGoals(query?: SessionGoalQuery): Promise<SessionGoalRow[]>;
 }
 
 export interface EventMirror {

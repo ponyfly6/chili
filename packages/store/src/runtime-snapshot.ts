@@ -268,16 +268,6 @@ export function readRuntimeStateSnapshot(db: Database, options: RuntimeSnapshotO
           ...(approval.metadata_json ? { metadata: boundedJson(approval.metadata_json) } : {}),
         }, sessionId, Number(approval.created_at), (tip?.seq ?? 0) + 0.3);
       }
-      const goal = db.query<Row, [string]>(`select session_id, substr(objective,1,${FIELD_CHARS}) as objective, length(objective) as objective_length,
-        status, token_budget, tokens_used, time_used_seconds, created_at, updated_at, completed_at,
-        substr(last_reason, 1, 512) as last_reason
-        from session_goals where session_id = ?`).get(sessionId);
-      if (goal) add("goal.updated", { goal: { sessionId, objective: text(goal.objective, goal.objective_length), status: goal.status,
-        tokensUsed: goal.tokens_used, timeUsedSeconds: goal.time_used_seconds, createdAt: goal.created_at, updatedAt: goal.updated_at,
-        ...(goal.token_budget !== null ? { tokenBudget: goal.token_budget } : {}),
-        ...(goal.completed_at !== null ? { completedAt: goal.completed_at } : {}),
-        ...(goal.last_reason !== null ? { lastReason: goal.last_reason } : {}),
-      } }, sessionId, Number(goal.updated_at), (tip?.seq ?? 0) + 0.4);
       // Archive/cancellation may update the queue projection without a separate queue event.
       // Read the current projection, excluding private payload/identity columns entirely.
       const dispatch = db.query<Row, [string]>("select paused, revision from session_dispatch where session_id = ?").get(sessionId);

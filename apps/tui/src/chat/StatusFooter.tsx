@@ -78,24 +78,11 @@ export function statusFooterStatusText(
           : chatView.status === "running"
             ? "running"
             : canSubmit ? undefined : "waiting";
-  const goal = goalStatusText(chatView);
   const agents = agentExperience && agentExperience.activeAgents > 0
     ? `${agentExperience.activeAgents} agent${agentExperience.activeAgents === 1 ? "" : "s"}`
     : undefined;
-  const status = [session, goal, agents].filter(Boolean).join(" · ");
+  const status = [session, agents].filter(Boolean).join(" · ");
   return status || undefined;
-}
-
-function goalStatusText(chatView: ChatSessionView): string | undefined {
-  const goal = chatView.goal;
-  if (!goal) return undefined;
-  const usage = goal.tokenBudget !== undefined
-    ? `${formatTokenCount(goal.tokensUsed)}/${formatTokenCount(goal.tokenBudget)}`
-    : formatTokenCount(goal.tokensUsed);
-  if (goal.status === "active") return `goal ${usage}`;
-  if (goal.status === "paused") return "goal paused";
-  if (goal.status === "budgetLimited") return `goal budget ${usage}`;
-  return "goal complete";
 }
 
 function contextText(usage: NonNullable<ChatSessionView["latestModelMetadata"]>["usage"] | undefined, contextWindowTokens: number | undefined): string | undefined {

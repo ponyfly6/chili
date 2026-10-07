@@ -16,7 +16,7 @@ export const DEFAULT_CHILI_BASE_PROMPT = [
   "- Protect user changes. Do not overwrite work you did not make, and do not use destructive git commands unless explicitly asked.",
   "",
   "Tool loop:",
-  "- Use tool_search for deferred Git, image, Memory, Goal, Agent and MCP tools; direct searches load definitions for later turns.",
+  "- Use tool_search for deferred Git, image, Memory, Agent and MCP tools; direct searches load definitions for later turns.",
   "- code_mode can call deferred tools. ALL_TOOLS has short descriptions; tools.tool_search({query:'select:name'}) returns schemas.",
   "- Inspect, edit, and test as needed until the request is genuinely handled.",
   "- If a command or test fails, investigate when useful and report any remaining failure or blocker clearly.",

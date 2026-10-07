@@ -195,30 +195,6 @@ test("queued permit cancellation settles the accepted input before any model exe
   expect(f.service.inputQueue(childId).paused).toBe(true);
 });
 
-test("standalone child Goal continuation acquires the same execution permit as submitted inputs", async () => {
-  const wrapped: SessionId[] = [];
-  const f = await fixture({
-    runInput: async (sessionId, signal, run) => {
-      wrapped.push(sessionId);
-      if (wrapped.length === 1) return run();
-      return new Promise((_resolve, reject) => {
-        const stop = () => reject(Object.assign(new Error("permit cancelled"), { name: "AbortError" }));
-        if (signal.aborted) stop(); else signal.addEventListener("abort", stop, { once: true });
-      });
-    },
-  });
-  f.start();
-  await f.service.waitForIdle();
-  await f.service.setGoal({ sessionId: childId, objective: "Continue inspecting" });
-  await until(() => wrapped.length === 2);
-  expect(wrapped).toEqual([childId, childId]);
-  expect(f.turns).toHaveLength(1);
-  await f.service.interrupt(childId);
-  await f.service.waitForIdle();
-  expect(f.turns).toHaveLength(1);
-  expect((await f.service.getGoal({ sessionId: childId }))?.status).toBe("paused");
-});
-
 test("trusted local control can join a busy Agent without granting authority to an unrelated tool context", async () => {
   const f = await fixture({ run: (input) => aborted(input) });
   f.start();

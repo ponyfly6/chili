@@ -89,7 +89,6 @@ test("stores external identifiers in null-prototype indexes", () => {
     view.toolCalls,
     view.approvals,
     view.modelMetadataByTurn,
-    view.goalsBySession,
     view.partIndex,
     view.transcriptOrder,
   ];
@@ -175,7 +174,6 @@ test("repairs JSON-roundtripped indexes before applying unsafe identifiers", () 
     roundtripped.toolCalls,
     roundtripped.approvals,
     roundtripped.modelMetadataByTurn,
-    roundtripped.goalsBySession,
     roundtripped.partIndex,
   ]) {
     expect(Object.getPrototypeOf(index)).toBeNull();
@@ -1102,54 +1100,7 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
   expect(chat.items.map((item) => item.id)).toEqual([visibleUserId, visibleAssistantId]);
 });
 
-test("projects and clears persistent goals by session", () => {
-  const sessionId = "session_goal_projection" as SessionId;
-  const view = reduceRuntimeEvents([
-    {
-      id: "event_goal_session",
-      type: "session.created",
-      time: 1 as TimestampMs,
-      sessionId,
-      payload: { sessionId, cwd: "/repo" },
-    },
-    {
-      id: "event_goal_updated",
-      type: "goal.updated",
-      time: 2 as TimestampMs,
-      sessionId,
-      payload: {
-        reason: "set",
-        goal: {
-          sessionId,
-          objective: "finish goal projection",
-          status: "active",
-          tokenBudget: 50_000,
-          tokensUsed: 1_200,
-          timeUsedSeconds: 7,
-          createdAt: 2 as TimestampMs,
-          updatedAt: 2 as TimestampMs,
-        },
-      },
-    },
-  ], createRuntimeView());
-
-  expect(chatSessionView(view, { sessionId }).goal).toMatchObject({
-    objective: "finish goal projection",
-    status: "active",
-    tokensUsed: 1_200,
-  });
-
-  applyRuntimeEvent(view, {
-    id: "event_goal_cleared",
-    type: "goal.cleared",
-    time: 3 as TimestampMs,
-    sessionId,
-    payload: { sessionId },
-  });
-  expect(chatSessionView(view, { sessionId }).goal).toBeUndefined();
-});
-
-test("ignores session and goal events with conflicting envelope and payload identities", () => {
+test("ignores session events with conflicting envelope and payload identities", () => {
   const sessionId = "session_identity_authority" as SessionId;
   const conflictingSessionId = "session_identity_conflict" as SessionId;
   const view = reduceRuntimeEvents([
@@ -1167,56 +1118,8 @@ test("ignores session and goal events with conflicting envelope and payload iden
       sessionId,
       payload: { sessionId: conflictingSessionId, cwd: "/untrusted" },
     },
-    {
-      id: "event_identity_goal",
-      type: "goal.updated",
-      time: 3 as TimestampMs,
-      sessionId,
-      payload: {
-        goal: {
-          sessionId,
-          objective: "trusted goal",
-          status: "active",
-          tokensUsed: 0,
-          timeUsedSeconds: 0,
-          createdAt: 3 as TimestampMs,
-          updatedAt: 3 as TimestampMs,
-        },
-      },
-    },
-    {
-      id: "event_identity_conflicting_goal",
-      type: "goal.updated",
-      time: 4 as TimestampMs,
-      sessionId,
-      payload: {
-        goal: {
-          sessionId: conflictingSessionId,
-          objective: "untrusted goal",
-          status: "active",
-          tokensUsed: 0,
-          timeUsedSeconds: 0,
-          createdAt: 4 as TimestampMs,
-          updatedAt: 4 as TimestampMs,
-        },
-      },
-    },
-    {
-      id: "event_identity_conflicting_clear",
-      type: "goal.cleared",
-      time: 5 as TimestampMs,
-      sessionId,
-      payload: { sessionId: conflictingSessionId },
-    },
   ], createRuntimeView());
 
-  applyRuntimeEvent(view, {
-    id: "event_identity_missing_goal",
-    type: "goal.updated",
-    time: 6 as TimestampMs,
-    sessionId,
-    payload: {},
-  } as unknown as ChiliEvent);
   applyRuntimeEvent(view, {
     id: "event_identity_missing_envelope",
     type: "session.created",
@@ -1226,8 +1129,6 @@ test("ignores session and goal events with conflicting envelope and payload iden
 
   expect(view.sessions[sessionId]).toMatchObject({ cwd: "/trusted" });
   expect(view.sessions[conflictingSessionId]).toBeUndefined();
-  expect(view.goalsBySession[sessionId]).toMatchObject({ objective: "trusted goal", sessionId });
-  expect(view.goalsBySession[conflictingSessionId]).toBeUndefined();
 });
 
 test("projects live tool input updates before the final assistant tool part", () => {

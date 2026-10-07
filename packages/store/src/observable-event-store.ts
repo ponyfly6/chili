@@ -6,20 +6,12 @@ import type {
   EventAppendOptions,
   EventCommitAwareStore,
   EventStore,
-  GoalMutationCapabilityStore,
-  GoalMutationDecision,
-  GoalMutationResult,
-  GoalMutationSnapshot,
-  GoalMutationStore,
-  GoalProjectionStore,
   SessionRow,
   AgentSessionStore,
   CreateChildSessionInput,
   CreateChildSessionResult,
   StaleTurnRecoveryInput,
   StaleTurnRecoveryStore,
-  SessionGoalQuery,
-  SessionGoalRow,
 } from "./types.js";
 
 export interface EventPublisher {
@@ -35,10 +27,7 @@ export class ObservableEventStore
     EventStore,
     EventCommitAwareStore,
     EventPublisher,
-    StaleTurnRecoveryStore,
-    GoalMutationCapabilityStore,
-    GoalMutationStore,
-    GoalProjectionStore
+    StaleTurnRecoveryStore
 {
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
   readonly eventReplayBoundary?: NonNullable<EventStore["eventReplayBoundary"]>;
@@ -159,30 +148,6 @@ export class ObservableEventStore
     return this.inner.pendingApprovals(sessionId, limit);
   }
 
-  sessionGoal(sessionId: SessionId): Promise<SessionGoalRow | undefined> {
-    return this.goalStore()?.sessionGoal(sessionId) ?? Promise.resolve(undefined);
-  }
-
-  sessionGoals(query?: SessionGoalQuery): Promise<SessionGoalRow[]> {
-    return this.goalStore()?.sessionGoals(query) ?? Promise.resolve([]);
-  }
-
-  supportsGoalMutation(): boolean {
-    return this.goalMutationStore() !== undefined;
-  }
-
-  async mutateGoal<T>(
-    sessionId: SessionId,
-    decide: (snapshot: GoalMutationSnapshot) => GoalMutationDecision<T>,
-    options?: EventAppendOptions,
-  ): Promise<GoalMutationResult<T>> {
-    const store = this.goalMutationStore();
-    if (!store) throw new Error("Inner event store does not support atomic goal mutations");
-    const result = await store.mutateGoal(sessionId, decide, options);
-    for (const event of result.events) this.emit(event);
-    return result;
-  }
-
   subscribe(listener: (event: RuntimeEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -202,21 +167,4 @@ export class ObservableEventStore
       }
     }
   }
-
-  private goalStore(): GoalProjectionStore | undefined {
-    const inner = this.inner as EventStore & Partial<GoalProjectionStore>;
-    if (inner.sessionGoal && inner.sessionGoals) {
-      return inner as EventStore & GoalProjectionStore;
-    }
-    return undefined;
-  }
-
-  private goalMutationStore(): GoalMutationStore | undefined {
-    const inner = this.inner as EventStore
-      & Partial<GoalMutationStore>
-      & Partial<GoalMutationCapabilityStore>;
-    if (!inner.mutateGoal || (inner.supportsGoalMutation && !inner.supportsGoalMutation())) return undefined;
-    return inner as EventStore & GoalMutationStore;
-  }
-
 }

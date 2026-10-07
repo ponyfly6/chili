@@ -185,29 +185,6 @@ test("uses persisted session cwd as the only prompt authority and normalizes new
   }
 });
 
-test("goal continuation resolves cwd from the persisted session instead of the process default", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-runtime-goal-cwd-"));
-  const store = new SqliteEventStore(join(dir, "events.sqlite"));
-  const sessionId = "session_goal_persisted_cwd" as SessionId;
-  const runner = new RecordingAgentRunner(store);
-  const service = new RuntimeService({ runtime: runner, store, cwd: "/different/default", maxGoalTurns: 2 });
-
-  try {
-    await service.createSession({ sessionId, cwd: "/persisted/goal-workspace" });
-    runner.onRunTurn = async () => {
-      await service.updateGoal({ sessionId, status: "complete" });
-    };
-    await service.setGoal({ sessionId, objective: "finish the persisted task" });
-    await waitUntil(() => !service.isRunning(sessionId));
-
-    expect(runner.turnInputs).toHaveLength(1);
-    expect(runner.turnInputs[0]?.cwd).toBe("/persisted/goal-workspace");
-  } finally {
-    store.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
 test("publishes prompt-level status and never bounces cancelling back to running", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-runtime-prompt-status-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -320,12 +297,4 @@ async function statuses(store: SqliteEventStore, sessionId: SessionId): Promise<
     .flatMap((event) => event.type === "session.status_changed"
       ? [(event as Extract<ChiliEvent, { type: "session.status_changed" }>).payload.status]
       : []);
-}
-
-async function waitUntil(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error("timed out waiting for background runtime work");
-    await new Promise((resolveWait) => setTimeout(resolveWait, 1));
-  }
 }

@@ -39,8 +39,6 @@ import type {
   ReasoningLevel,
   ServiceTier,
   SessionId,
-  SessionGoal,
-  SessionGoalStatus,
   UserInputAnswers as ProtocolUserInputAnswers,
   UserInputId,
   UserInputQuestion as ProtocolUserInputQuestion,
@@ -78,7 +76,6 @@ import {
   parseRuntimePromptAccepted,
   parseRuntimePromptResult,
   parseRuntimeRecord,
-  parseRuntimeSessionGoal,
   parseRuntimeSessionRef,
   parseRuntimeStateSnapshot,
   parseRuntimeString,
@@ -99,10 +96,6 @@ export interface RuntimeClient {
   setDelegationPolicy(input: SetDelegationPolicyRequest): Promise<RuntimeDelegationConfig>;
   getPermissionConfig(input?: GetPermissionConfigRequest): Promise<RuntimePermissionConfig>;
   setPermissionProfile(input: SetPermissionProfileRequest): Promise<RuntimePermissionConfig>;
-  getGoal(input: GetGoalRequest): Promise<SessionGoal | undefined>;
-  setGoal(input: SetGoalRequest): Promise<SessionGoal>;
-  updateGoal(input: UpdateGoalRequest): Promise<SessionGoal>;
-  clearGoal(input: ClearGoalRequest): Promise<ClearGoalResult>;
   listCommands(input?: ListCommandsRequest): Promise<RuntimeCommandCatalog>;
   reloadCommands(input?: ReloadCommandsRequest): Promise<RuntimeCommandCatalog>;
   listMcpServers(input?: ListMcpServersRequest): Promise<RuntimeMcpListResponse>;
@@ -221,37 +214,6 @@ export interface GetPermissionConfigRequest {
 export interface SetPermissionProfileRequest {
   profile: RuntimePermissionProfileId;
   signal?: AbortSignal;
-}
-
-export interface GetGoalRequest {
-  sessionId: SessionId;
-  signal?: AbortSignal;
-}
-
-export interface SetGoalRequest {
-  sessionId: SessionId;
-  objective: string;
-  tokenBudget?: number;
-  replace?: boolean;
-  signal?: AbortSignal;
-}
-
-export interface UpdateGoalRequest {
-  sessionId: SessionId;
-  status?: SessionGoalStatus;
-  objective?: string;
-  tokenBudget?: number;
-  signal?: AbortSignal;
-}
-
-export interface ClearGoalRequest {
-  sessionId: SessionId;
-  signal?: AbortSignal;
-}
-
-export interface ClearGoalResult {
-  cleared: boolean;
-  previousGoal?: SessionGoal;
 }
 
 export interface ListCommandsRequest {
@@ -592,24 +554,6 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.post("permissions", { profile: input.profile }, input.signal, parseRuntimePermissionConfig);
   }
 
-  getGoal(input: GetGoalRequest): Promise<SessionGoal | undefined> {
-    return this.get(`sessions/${encodeURIComponent(input.sessionId)}/goal`, input.signal, parseRuntimeSessionGoal, true);
-  }
-
-  setGoal(input: SetGoalRequest): Promise<SessionGoal> {
-    const { sessionId, signal, ...body } = input;
-    return this.post(`sessions/${encodeURIComponent(sessionId)}/goal`, body, signal, parseRuntimeSessionGoal);
-  }
-
-  updateGoal(input: UpdateGoalRequest): Promise<SessionGoal> {
-    const { sessionId, signal, ...body } = input;
-    return this.patch(`sessions/${encodeURIComponent(sessionId)}/goal`, body, signal, parseRuntimeSessionGoal);
-  }
-
-  clearGoal(input: ClearGoalRequest): Promise<ClearGoalResult> {
-    return this.delete(`sessions/${encodeURIComponent(input.sessionId)}/goal`, input.signal, parseClearGoalResult);
-  }
-
   listCommands(input: ListCommandsRequest = {}): Promise<RuntimeCommandCatalog> {
     const path = input.sessionId === undefined
       ? "commands"
@@ -834,7 +778,7 @@ export class HttpRuntimeClient implements RuntimeClient {
   eventSnapshot(input: EventSnapshotRequest = {}): Promise<RuntimeStateSnapshot> {
     return this.get(
       sessionScopedRequestPath("events/snapshot", input.sessionId), input.signal, parseRuntimeStateSnapshot,
-      false, RUNTIME_STATE_SNAPSHOT_MAX_BYTES,
+      RUNTIME_STATE_SNAPSHOT_MAX_BYTES,
     );
   }
 
@@ -918,12 +862,11 @@ export class HttpRuntimeClient implements RuntimeClient {
     path: string,
     signal?: AbortSignal,
     parser?: RuntimeParser<T>,
-    allowNoContent = false,
     maxResponseBytes?: number,
   ): Promise<T> {
     const init: RequestInit = { method: "GET" };
     if (signal) init.signal = signal;
-    return this.request(path, init, parser, allowNoContent, maxResponseBytes);
+    return this.request(path, init, parser, false, maxResponseBytes);
   }
 
   private post<T>(
@@ -940,16 +883,6 @@ export class HttpRuntimeClient implements RuntimeClient {
     };
     if (signal) init.signal = signal;
     return this.request(path, init, parser, allowNoContent);
-  }
-
-  private patch<T>(path: string, body: unknown, signal?: AbortSignal, parser?: RuntimeParser<T>): Promise<T> {
-    const init: RequestInit = {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    };
-    if (signal) init.signal = signal;
-    return this.request(path, init, parser);
   }
 
   private delete<T>(path: string, signal?: AbortSignal, parser?: RuntimeParser<T>): Promise<T> {
@@ -997,17 +930,6 @@ export class HttpRuntimeClient implements RuntimeClient {
   private url(path: string): URL {
     return new URL(path.replace(/^\/+/, ""), this.#baseUrl);
   }
-}
-
-function parseClearGoalResult(value: unknown, path = "response"): ClearGoalResult {
-  const record = parseRuntimeRecord(value, path);
-  const result: ClearGoalResult = {
-    cleared: parseRuntimeBoolean(record.cleared, `${path}.cleared`),
-  };
-  if (record.previousGoal !== undefined) {
-    result.previousGoal = parseRuntimeSessionGoal(record.previousGoal, `${path}.previousGoal`);
-  }
-  return result;
 }
 
 function parseRuntimeCommandCatalog(value: unknown, path = "response"): RuntimeCommandCatalog {

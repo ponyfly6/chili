@@ -622,11 +622,10 @@ test("rejects malformed JSON response shapes and unexpected no-content responses
     fetch: (async () => new Response(null, { status: 204 })) as unknown as typeof fetch,
   });
   await expect(empty.listSessions()).rejects.toThrow("unexpectedly had no content");
-  expect(await empty.getGoal({ sessionId: "session_1" as SessionId })).toBeUndefined();
 });
 
 test("session event responses and streams reject removed workflow events", async () => {
-  for (const type of ["agent.spawned", "agent.task_created", "team.created", "team.task_updated"]) {
+  for (const type of ["agent.spawned", "agent.task_created", "team.created", "team.task_updated", "goal.updated", "goal.cleared"]) {
     const event = { id: "removed", sessionId: "session_1", type, time: 1, payload: {} };
     const jsonClient = new HttpRuntimeClient({ baseUrl: "http://chili.test",
       fetch: (async () => Response.json([event])) as unknown as typeof fetch });

@@ -55,7 +55,6 @@ import {
   createGitDiffTool,
   createGitStageTool,
   createGitStatusTool,
-  createGoalTools,
   createGlobTool,
   createGrepTool,
   createMcpResourceReadTool,
@@ -69,7 +68,6 @@ import {
   type ChiliToolDefinition,
   type BashRunRequest,
   type DelegationToolController,
-  type GoalToolController,
   type ToolAccessPolicyResolver,
   type ToolAccessPolicy,
 } from "@chili/tools";
@@ -546,9 +544,6 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       store: eventStore,
       getDelegationConfig: (sessionId) => service.getDelegationConfig(sessionId),
     });
-    for (const tool of createGoalTools(createGoalToolController(service))) {
-      registry.register(tool);
-    }
     const delegationController = createDelegationToolController(service);
     registry.register(createDelegationStatusTool(delegationController));
     registry.register(createDelegationSetTool(delegationController));
@@ -822,28 +817,6 @@ function combineToolAccessPolicyResolvers(
 
 function uniqueStrings(values: readonly string[]): string[] {
   return [...new Set(values)];
-}
-
-function createGoalToolController(service: RuntimeService): GoalToolController {
-  return {
-    async getGoal(context) {
-      return service.getGoal({ sessionId: context.sessionId });
-    },
-    async createGoal(input, context) {
-      return service.setGoal({
-        sessionId: context.sessionId,
-        objective: input.objective,
-        ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
-        replace: false,
-      });
-    },
-    async updateGoal(input, context) {
-      return service.updateGoal({
-        sessionId: context.sessionId,
-        status: input.status,
-      });
-    },
-  };
 }
 
 function createDelegationToolController(service: RuntimeService): DelegationToolController {

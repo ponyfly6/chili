@@ -75,18 +75,16 @@ test("command retries return original accepted expansion and preserve command to
   expect(calls).toBe(1);
 });
 
-test("HTTP Goal controls resume a stopped Goal and budget-limited resume remains explicit", async () => {
+test("HTTP resumes a paused durable input queue explicitly", async () => {
   const { client, service, turns } = await fixture();
   await client.interruptSession({ sessionId });
-  await client.setGoal({ sessionId, objective: "finish", tokenBudget: 100 });
+  await client.submitPromptAsync({ sessionId, text: "finish", mode: "queue", submissionId: "resume-input" });
+  expect(service.inputQueue(sessionId).paused).toBe(true);
+  expect(turns).toHaveLength(0);
+  await client.resumeInputs({ sessionId });
   await until(() => turns.length === 1);
   expect(service.inputQueue(sessionId).paused).toBe(false);
   await client.interruptSession({ sessionId });
   await until(() => !service.isRunning(sessionId));
-  await client.updateGoal({ sessionId, status: "budgetLimited" });
-  await expect(client.resumeInputs({ sessionId })).rejects.toMatchObject({ status: 409 });
   expect(service.inputQueue(sessionId).paused).toBe(true);
-  await client.updateGoal({ sessionId, status: "active", tokenBudget: 200 });
-  await until(() => turns.length === 2);
-  expect(service.inputQueue(sessionId).paused).toBe(false);
 });

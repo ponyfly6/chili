@@ -28,7 +28,6 @@ import type {
   RuntimeSkillMention,
   ServiceTier,
   SessionId,
-  SessionGoal,
 } from "@chili/protocol";
 import { useRuntimeEvents, type RuntimeEventsState, type RuntimeTuiOptions } from "./useRuntimeEvents.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
@@ -82,10 +81,6 @@ export interface ChatRuntimeState extends RuntimeEventsState {
   authMcpServer?: (server: string, request?: RuntimeMcpAuthRequest) => Promise<RuntimeMcpAuthResponse | undefined>;
   logoutMcpServer?: (server: string) => Promise<RuntimeMcpLogoutResponse | undefined>;
   setRuntimePermissionProfile?: (profile: RuntimePermissionProfileId) => Promise<boolean>;
-  setGoal: (input: { objective: string; tokenBudget?: number }) => Promise<SessionGoal | undefined>;
-  pauseGoal: () => Promise<SessionGoal | undefined>;
-  resumeGoal: () => Promise<SessionGoal | undefined>;
-  clearGoal: () => Promise<boolean>;
   startNewSession: () => Promise<void>;
   listSessions: () => Promise<RuntimeSessionSummary[]>;
   resumeSession: (session: Pick<RuntimeSessionSummary, "id">) => Promise<boolean>;
@@ -956,68 +951,6 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     }
   }, [client, options.baseUrl, withAbort]);
 
-  const setGoal = useCallback(async (goalInput: { objective: string; tokenBudget?: number }): Promise<SessionGoal | undefined> => {
-    try {
-      const goal = await withAbort(async (signal) => {
-        const session = await ensureSession(signal);
-        return client.setGoal({
-          ...session,
-          objective: goalInput.objective,
-          ...(goalInput.tokenBudget !== undefined ? { tokenBudget: goalInput.tokenBudget } : {}),
-          replace: true,
-          signal,
-        });
-      });
-      setChatFeedback({ status: "success", message: "goal set" });
-      return goal;
-    } catch (error) {
-      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
-      return undefined;
-    }
-  }, [client, ensureSession, options.baseUrl, withAbort]);
-
-  const pauseGoal = useCallback(async (): Promise<SessionGoal | undefined> => {
-    try {
-      const goal = await withAbort(async (signal) => {
-        const session = await ensureSession(signal);
-        return client.updateGoal({ ...session, status: "paused", signal });
-      });
-      setChatFeedback({ status: "success", message: "goal paused" });
-      return goal;
-    } catch (error) {
-      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
-      return undefined;
-    }
-  }, [client, ensureSession, options.baseUrl, withAbort]);
-
-  const resumeGoal = useCallback(async (): Promise<SessionGoal | undefined> => {
-    try {
-      const goal = await withAbort(async (signal) => {
-        const session = await ensureSession(signal);
-        return client.updateGoal({ ...session, status: "active", signal });
-      });
-      setChatFeedback({ status: "success", message: "goal resumed" });
-      return goal;
-    } catch (error) {
-      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
-      return undefined;
-    }
-  }, [client, ensureSession, options.baseUrl, withAbort]);
-
-  const clearGoal = useCallback(async (): Promise<boolean> => {
-    try {
-      const result = await withAbort(async (signal) => {
-        const session = await ensureSession(signal);
-        return client.clearGoal({ ...session, signal });
-      });
-      setChatFeedback({ status: "success", message: result.cleared ? "goal cleared" : "no goal to clear" });
-      return result.cleared;
-    } catch (error) {
-      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
-      return false;
-    }
-  }, [client, ensureSession, options.baseUrl, withAbort]);
-
   const interruptActiveSession = useCallback(async () => {
     if (!activeSessionId) return;
     setChatFeedback({ status: "pending", message: "interrupting session" });
@@ -1207,10 +1140,6 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     authMcpServer,
     logoutMcpServer,
     setRuntimePermissionProfile,
-    setGoal,
-    pauseGoal,
-    resumeGoal,
-    clearGoal,
     startNewSession,
     listSessions,
     resumeSession,
@@ -1218,7 +1147,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     interruptActiveSession,
     approveApproval,
     rejectApproval,
-  }), [activeSessionId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, delegationConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshDelegationConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setRuntimeDelegationPolicy, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, listSessions, resumeSession, renameSession, submitCommand, submitPrompt, eventRuntime, stopAgent, resumeAgent]);
+  }), [activeSessionId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, delegationConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshDelegationConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setRuntimeDelegationPolicy, startNewSession, listSessions, resumeSession, renameSession, submitCommand, submitPrompt, eventRuntime, stopAgent, resumeAgent]);
 }
 
 function upsertMcpServer(current: RuntimeMcpStatusResponse | undefined, server: RuntimeMcpServerDescriptor): RuntimeMcpStatusResponse {

@@ -4,15 +4,12 @@ import type {
   ApprovalEvent,
   RuntimeEvent,
   EventEnvelope,
-  GoalEvent,
   Message,
   MessageId,
   MessageEvent,
   MessagePart,
   SessionId,
   SessionEvent,
-  SessionGoal,
-  SessionGoalStatus,
   TimestampMs,
   ToolEvent,
   TurnId,
@@ -39,12 +36,6 @@ import type {
   EventReplayBoundary,
   EventReplayBoundaryQuery,
   EventStore,
-  GoalProjectionStore,
-  GoalMutationDecision,
-  GoalMutationEvent,
-  GoalMutationResult,
-  GoalMutationSnapshot,
-  GoalMutationStore,
   SessionRow,
   CreateChildSessionInput,
   CreateChildSessionResult,
@@ -52,8 +43,6 @@ import type {
   SessionRunClaimFence,
   StaleTurnRecoveryInput,
   StaleTurnRecoveryStore,
-  SessionGoalQuery,
-  SessionGoalRow,
 } from "./types.js";
 
 interface StoredEventRow {
@@ -83,19 +72,6 @@ interface PendingPartDeltaRow {
   seq: number;
   part_id: string;
   payload_json: string;
-}
-
-interface SessionGoalProjectionRow {
-  session_id: string;
-  objective: string;
-  status: SessionGoalStatus;
-  token_budget: number | null;
-  tokens_used: number;
-  time_used_seconds: number;
-  created_at: number;
-  updated_at: number;
-  completed_at: number | null;
-  last_reason: string | null;
 }
 
 export const SQLITE_WAL_AUTO_CHECKPOINT_PAGES = 256;
@@ -199,9 +175,7 @@ export class SqliteEventStore
   implements
     EventStore,
     EventCommitAwareStore,
-    StaleTurnRecoveryStore,
-    GoalProjectionStore,
-    GoalMutationStore
+    StaleTurnRecoveryStore
 {
   private readonly db: Database;
   private readonly ownedCreationClaims = new Map<SessionId, string>();
@@ -501,7 +475,6 @@ export class SqliteEventStore
     sessionAccess?: "root" | "child";
     time: number;
     leaseDurationMs: number;
-    respectDispatch?: boolean;
   }): { status: "claimed" | "busy" | "inactive" | "not_found" | "forbidden"; sessionStatus?: string } {
     const claim = this.db.transaction(() => {
       const session = this.db
@@ -515,11 +488,6 @@ export class SqliteEventStore
       // See claimSessionCreation: replacing an owned claim on this connection
       // would erase the identity needed to reject the old operation's appends.
       if (this.ownedRunClaims.has(input.sessionId)) return { status: "busy" as const };
-      if (input.respectDispatch) {
-        const paused = this.db.query<{ paused: number }, [string]>("select paused from session_dispatch where session_id = ?").get(input.sessionId);
-        const queued = this.db.query<{ found: number }, [string]>("select 1 as found from session_inputs where session_id = ? and state != 'settled' limit 1").get(input.sessionId);
-        if (paused?.paused || queued) return { status: "busy" as const };
-      }
       this.db.query(
         `delete from session_creation_claims where session_id = ? and lease_expires_at <= ?`,
       ).run(input.sessionId, input.time);
@@ -847,105 +815,6 @@ export class SqliteEventStore
     const rows = this.db.query<Record<string, unknown>, any>(sql).all(...params);
 
     return rows.map((row) => approvalFromRow(row));
-  }
-
-  async mutateGoal<T>(
-    sessionId: SessionId,
-    decide: (snapshot: GoalMutationSnapshot) => GoalMutationDecision<T>,
-    options?: EventAppendOptions,
-  ): Promise<GoalMutationResult<T>> {
-    const run = this.db.transaction(() => {
-      const row = this.db
-        .query<SessionGoalProjectionRow, [string]>(
-          `select session_id, objective, status, token_budget, tokens_used,
-                  time_used_seconds, created_at, updated_at, completed_at, last_reason
-           from session_goals where session_id = ?`,
-        )
-        .get(sessionId);
-      const updatedEvents = this.db
-        .query<StoredEventRow, [string]>(
-          `select seq, id, type, time, session_id, payload_json from events
-           where session_id = ? and type = 'goal.updated' order by seq asc`,
-        )
-        .all(sessionId)
-        .map((event) => this.eventFromRow(event) as Extract<RuntimeEvent, { type: "goal.updated" }>);
-      let goal = row ? sessionGoalFromRow(row) : undefined;
-      if (!goal && updatedEvents.length > 0) {
-        // Match GoalService's event replay when a derived projection is absent.
-        // A clear also removes this row, so inspect the last committed Goal
-        // event before recovering an update; never resurrect a cleared ledger.
-        const latest = this.db
-          .query<{ type: string }, [string]>(
-            `select type from events
-             where session_id = ? and type in ('goal.updated', 'goal.cleared')
-             order by seq desc limit 1`,
-          )
-          .get(sessionId);
-        const update = updatedEvents.at(-1);
-        if (latest?.type === "goal.updated" && update) {
-          const lastReason = update.payload.reason ?? update.payload.goal.lastReason;
-          goal = { ...update.payload.goal, sessionId, ...(lastReason ? { lastReason } : {}) };
-        }
-      }
-      const snapshot: GoalMutationSnapshot = {
-        ...(goal ? { goal } : {}),
-        updatedEvents,
-      };
-      const decision = decide(snapshot);
-      if (decision && typeof (decision as { then?: unknown }).then === "function") {
-        // Observe a rejected async function without ever waiting inside SQLite.
-        if (decision instanceof Promise) void decision.catch(() => {});
-        throw new TypeError("Goal mutation decisions must be synchronous; thenables are not supported.");
-      }
-      if (!decision || typeof decision !== "object" || !("value" in decision)) {
-        throw new TypeError("Goal mutation must return a synchronous decision with a value.");
-      }
-      const event = decision.event;
-      if (event && ((event.type !== "goal.updated" && event.type !== "goal.cleared") || event.sessionId !== sessionId)) {
-        throw new Error("Goal mutation may only append a Goal event for its target session.");
-      }
-      const events = event
-        ? this.writeTransactionEvents([event], options?.runClaim, options?.creationClaim) as GoalMutationEvent[]
-        : [];
-      return { value: decision.value, events };
-    });
-    // Acquire the writer reservation before reading, so another connection or
-    // process cannot base its decision on the same stale Goal/receipt snapshot.
-    const result = this.runWithWriteRetry(() => run.immediate());
-    await this.writeMirrors(result.events);
-    return result;
-  }
-
-  async sessionGoal(sessionId: SessionId): Promise<SessionGoalRow | undefined> {
-    return (await this.sessionGoals({ sessionId, limit: 1 }))[0];
-  }
-
-  async sessionGoals(query: SessionGoalQuery = {}): Promise<SessionGoalRow[]> {
-    const clauses: string[] = [];
-    const params: Record<string, unknown> = {};
-
-    if (query.sessionId) {
-      clauses.push("session_id = $sessionId");
-      params.sessionId = query.sessionId;
-    }
-    if (query.status) {
-      clauses.push("status = $status");
-      params.status = query.status;
-    }
-
-    params.limit = query.limit ?? 500;
-    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
-    return this.db
-      .query<SessionGoalProjectionRow, any>(
-        `select session_id, objective, status, token_budget, tokens_used,
-                time_used_seconds, created_at, updated_at, completed_at, last_reason
-         from session_goals
-         ${where}
-         order by updated_at desc, session_id asc
-         limit $limit`,
-      )
-      .all(params)
-      .map((row) => sessionGoalFromRow(row));
   }
 
   private writeTransaction(
@@ -1318,10 +1187,6 @@ export class SqliteEventStore
       this.applyApprovalEvent(event as ApprovalEvent);
       return;
     }
-    if (event.type.startsWith("goal.")) {
-      this.applyGoalEvent(event as GoalEvent);
-      return;
-    }
   }
 
   private applySessionEvent(event: SessionEvent): void {
@@ -1606,46 +1471,6 @@ export class SqliteEventStore
     }
   }
 
-  private applyGoalEvent(event: GoalEvent): void {
-    if (event.type === "goal.updated") {
-      const goal = event.payload.goal;
-      this.db
-        .query(
-          `insert into session_goals
-             (session_id, objective, status, token_budget, tokens_used,
-              time_used_seconds, created_at, updated_at, completed_at, last_reason)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           on conflict(session_id) do update set
-             objective = excluded.objective,
-             status = excluded.status,
-             token_budget = excluded.token_budget,
-             tokens_used = excluded.tokens_used,
-             time_used_seconds = excluded.time_used_seconds,
-             created_at = excluded.created_at,
-             updated_at = excluded.updated_at,
-             completed_at = excluded.completed_at,
-             last_reason = excluded.last_reason`,
-        )
-        .run(
-          event.sessionId,
-          goal.objective,
-          goal.status,
-          goal.tokenBudget ?? null,
-          goal.tokensUsed,
-          goal.timeUsedSeconds,
-          goal.createdAt,
-          goal.updatedAt,
-          goal.completedAt ?? null,
-          event.payload.reason ?? goal.lastReason ?? null,
-        );
-      return;
-    }
-
-    this.db
-      .query(`delete from session_goals where session_id = ?`)
-      .run(event.sessionId);
-  }
-
   private nextPartOrdinal(messageId: string): number {
     const row = this.db
       .query<{ count: number }, [string]>(`select count(*) as count from message_parts where message_id = ?`)
@@ -1654,10 +1479,7 @@ export class SqliteEventStore
   }
 
   private eventFromRow(row: StoredEventRow): EventEnvelope {
-    if (
-      (row.type.startsWith("session.") || row.type === "goal.updated" || row.type === "goal.cleared")
-      && !row.session_id
-    ) {
+    if (row.type.startsWith("session.") && !row.session_id) {
       throw new Error(`Cannot replay ${row.type}: event has no SessionId.`);
     }
     const event: EventEnvelope = {
@@ -1687,34 +1509,6 @@ function validateScopedEventSessionIdentity(event: RuntimeEvent): void {
     }
     return;
   }
-  if (event.type === "goal.updated") {
-    if (!event.sessionId) {
-      throw new Error("goal.updated requires event.sessionId");
-    }
-    if (event.payload.goal.sessionId !== event.sessionId) {
-      throw new Error(
-        `goal.updated goal sessionId ${event.payload.goal.sessionId} does not match event.sessionId ${event.sessionId}`,
-      );
-    }
-    return;
-  }
-  if (event.type === "goal.cleared") {
-    if (!event.sessionId) {
-      throw new Error("goal.cleared requires event.sessionId");
-    }
-    if (event.payload.sessionId !== event.sessionId) {
-      throw new Error(
-        `goal.cleared payload sessionId ${event.payload.sessionId} does not match event.sessionId ${event.sessionId}`,
-      );
-    }
-    if (event.payload.previousGoal && event.payload.previousGoal.sessionId !== event.sessionId) {
-      throw new Error(
-        `goal.cleared previous goal sessionId ${event.payload.previousGoal.sessionId} does not match event.sessionId ${event.sessionId}`,
-      );
-    }
-    return;
-  }
-
 }
 
 function approvalFromRow(row: Record<string, unknown>): ApprovalRow {
@@ -1737,22 +1531,6 @@ function approvalFromRow(row: Record<string, unknown>): ApprovalRow {
 
 function isApprovalScope(value: unknown): value is NonNullable<ApprovalRow["maxApprovalScope"]> {
   return value === "once" || value === "session" || value === "persistent";
-}
-
-function sessionGoalFromRow(row: SessionGoalProjectionRow): SessionGoalRow {
-  const goal: SessionGoal = {
-    sessionId: row.session_id as SessionId,
-    objective: row.objective,
-    status: row.status,
-    tokensUsed: row.tokens_used,
-    timeUsedSeconds: row.time_used_seconds,
-    createdAt: row.created_at as SessionGoal["createdAt"],
-    updatedAt: row.updated_at as SessionGoal["updatedAt"],
-  };
-  if (row.token_budget !== null) goal.tokenBudget = row.token_budget;
-  if (row.completed_at !== null) goal.completedAt = row.completed_at as TimestampMs;
-  if (row.last_reason) goal.lastReason = row.last_reason as NonNullable<SessionGoal["lastReason"]>;
-  return goal;
 }
 
 function applyPartDelta(part: MessagePart, field: string, delta: string): MessagePart {

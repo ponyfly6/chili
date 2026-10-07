@@ -1,20 +1,16 @@
 import { expect, test } from "bun:test";
 import { applyRuntimeEvent, chatSessionView, createRuntimeView } from "@chili/sdk";
-import { parseChiliEvent, type SessionGoalStatus, type SessionId } from "@chili/protocol";
+import { parseChiliEvent, type SessionId } from "@chili/protocol";
 import { agentsViewModel } from "./AgentsView.js";
 import { statusFooterStatusText, statusFooterWorkspaceText } from "./StatusFooter.js";
 
 const sessionId = "session_main" as SessionId;
 
-function projectedChat(goalStatus?: SessionGoalStatus) {
+function projectedChat() {
   const view = createRuntimeView();
   applyRuntimeEvent(view, parseChiliEvent({
     id: "created_main", type: "session.created", time: 1, sessionId,
     payload: { sessionId, cwd: "/repo" },
-  }));
-  if (goalStatus) applyRuntimeEvent(view, parseChiliEvent({
-    id: "goal_main", type: "goal.updated", time: 2, sessionId,
-    payload: { goal: { sessionId, objective: "Finish the investigation", status: goalStatus, tokenBudget: 20_000, tokensUsed: 1_500, timeUsedSeconds: 20, createdAt: 1, updatedAt: 2 } },
   }));
   return { view, chat: chatSessionView(view, { sessionId, generatedAt: "now" }) };
 }
@@ -37,17 +33,6 @@ test("status footer counts active Agent sessions independently from parent execu
   expect(statusFooterStatusText({ ...chat, status: "running" }, true, agents)).toBe("running · 2 agents");
   expect(statusFooterStatusText(chat, true, { ...agents, activeAgents: 1 })).toBe("1 agent");
   expect(statusFooterStatusText(chat, true, { ...agents, activeAgents: 0 })).toBeUndefined();
-});
-
-test.each([
-  ["active", "goal 1.5k/20.0k"],
-  ["paused", "goal paused"],
-  ["budgetLimited", "goal budget 1.5k/20.0k"],
-  ["complete", "goal complete"],
-] as const)("status footer retains ordinary %s goal status", (goalStatus, expected) => {
-  const { chat } = projectedChat(goalStatus);
-  expect(statusFooterStatusText(chat, true, undefined)).toBe(expected);
-  expect(statusFooterStatusText({ ...chat, status: "running" }, true, undefined)).toBe(`running · ${expected}`);
 });
 
 test.each([

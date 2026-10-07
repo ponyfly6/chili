@@ -1934,7 +1934,6 @@ test("command palette keeps a fixed frame while selection crosses every command 
 
     expect(wrappedToFirstCommand).toBe(true);
     expect([...visitedCommands]).toEqual(expect.arrayContaining([
-      "/goal",
       "/agents",
       "/auth",
       "/skills",
@@ -4502,10 +4501,6 @@ async function mountShell(
     canSubmit: true,
     submitPrompt: async () => true,
     submitCommand: async () => true,
-    setGoal: async () => undefined,
-    pauseGoal: async () => undefined,
-    resumeGoal: async () => undefined,
-    clearGoal: async () => false,
     startNewSession: async () => undefined,
     listSessions: async () => [],
     resumeSession: async () => true,
@@ -4604,10 +4599,6 @@ function chatRuntime(
     canSubmit: true,
     submitPrompt: async () => true,
     submitCommand: async () => true,
-    setGoal: async () => undefined,
-    pauseGoal: async () => undefined,
-    resumeGoal: async () => undefined,
-    clearGoal: async () => false,
     startNewSession: async () => undefined,
     listSessions: async () => [],
     resumeSession: async () => true,

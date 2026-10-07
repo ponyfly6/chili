@@ -1,5 +1,6 @@
 import { expect, expectTypeOf, test } from "bun:test";
 import type { ChiliEvent, RuntimeEvent } from "./event.js";
+import type { SessionId, TimestampMs } from "./ids.js";
 import { parseChiliEvent, parseRuntimeEvent } from "./runtime-validation.js";
 
 test("event names refer to the same current runtime protocol", () => {
@@ -26,4 +27,17 @@ test("event decoders reject removed Agent and Team event types", () => {
       expect(() => parse({ id: "event_removed", type, time: 1, payload })).toThrow("event.type");
     }
   }
+});
+
+test("session event types require an envelope session identity", () => {
+  const sessionId = "session-1" as SessionId;
+  // @ts-expect-error Session-scoped events cannot omit the authoritative envelope identity.
+  const missingSessionEnvelope: Extract<ChiliEvent, { type: "session.created" }> = {
+    id: "session-missing-envelope",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    payload: { sessionId, cwd: "/workspace" },
+  };
+
+  expect(missingSessionEnvelope.payload.sessionId).toBe(sessionId);
 });

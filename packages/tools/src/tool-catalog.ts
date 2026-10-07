@@ -10,10 +10,8 @@ export const AGENT_CONTROL_TOOLS = [
   "agent_spawn", "agent_list", "agent_send", "agent_wait", "agent_stop", "agent_resume",
 ] as const;
 
-export const GOAL_CONTROL_TOOLS = ["create_goal", "get_goal", "update_goal"] as const;
-
 export const CODING_TOOL_GROUPS: readonly (readonly string[])[] = [
-  AGENT_CONTROL_TOOLS, GOAL_CONTROL_TOOLS,
+  AGENT_CONTROL_TOOLS,
   ["delegation_status", "delegation_set"],
 ];
 

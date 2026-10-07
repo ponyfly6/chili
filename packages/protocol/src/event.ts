@@ -9,7 +9,6 @@ import type {
   UserInputId,
 } from "./ids.js";
 import type { SessionAgentMetadata } from "./session-agent.js";
-import type { SessionGoal, SessionGoalUpdateReason, SessionGoalUsageDelta } from "./goal.js";
 import type { Message, MessagePart } from "./message.js";
 import type {
   McpDiagnosticPayload,
@@ -45,7 +44,6 @@ export type RuntimeEvent =
   | ToolEvent
   | ApprovalEvent
   | UserInputEvent
-  | GoalEvent
   | RecoveryEvent
   | McpEvent;
 
@@ -307,10 +305,6 @@ function userInputText(value: unknown, field: string, maxChars: number): string 
   if (/[\u0000-\u001f\u007f]/u.test(value)) throw new TypeError(`${field} must not contain control characters`);
   return text;
 }
-
-export type GoalEvent =
-  | SessionScopedEventEnvelope<"goal.updated", { goal: SessionGoal; reason?: SessionGoalUpdateReason; usageDelta?: SessionGoalUsageDelta }>
-  | SessionScopedEventEnvelope<"goal.cleared", { sessionId: SessionId; previousGoal?: SessionGoal; reason?: SessionGoalUpdateReason }>;
 
 export type RecoveryEvent =
   | EventEnvelope<"snapshot.created", { snapshotId: SnapshotId; callId?: ToolCallId; toolName?: string; paths: string[]; reason: string }>

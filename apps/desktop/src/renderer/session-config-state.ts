@@ -9,7 +9,6 @@ export function sessionConfigAfterSelectionChange<Config>(
 interface SessionScopedConfigAggregate {
   model: { sessionId: string };
   delegation: { sessionId: string };
-  goal: { sessionId: string } | null;
 }
 
 export function sessionConfigResponseForSelection<Config extends SessionScopedConfigAggregate>(
@@ -19,7 +18,6 @@ export function sessionConfigResponseForSelection<Config extends SessionScopedCo
   return selectedSessionId
     && response.model.sessionId === selectedSessionId
     && response.delegation.sessionId === selectedSessionId
-    && (!response.goal || response.goal.sessionId === selectedSessionId)
     ? response
     : undefined;
 }

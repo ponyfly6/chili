@@ -12,8 +12,6 @@ import {
   createNewTaskDraft,
   createSessionModelSettingsDraft,
   filterSessions,
-  goalResumeBudgetMinimum,
-  goalProgress,
   hydrateNewTaskChoices,
   isSessionReadOnly,
   isServiceTierSelectionValid,
@@ -96,7 +94,6 @@ describe("new task setup", () => {
       serviceTier: "standard",
       permissionProfile: "default",
       delegationPolicy: "proactive",
-      goalEnabled: false,
     });
   });
 
@@ -110,11 +107,11 @@ describe("new task setup", () => {
   });
 
   test("uses provider default and omits service tier for a tierless model", () => {
-    const draft = { ...createNewTaskDraft([tierlessModel]), prompt: "Run the deterministic Goal" };
+    const draft = { ...createNewTaskDraft([tierlessModel]), prompt: "Run the deterministic task" };
     expect(draft.serviceTier).toBe("");
     expect(availableServiceTiers([tierlessModel], draft.modelKey)).toEqual([]);
     expect(newTaskSubmission(draft, [tierlessModel])).toEqual({
-      prompt: "Run the deterministic Goal",
+      prompt: "Run the deterministic task",
       modelSelection: { provider: "deepseek", model: "deepseek-v4-pro" },
       reasoningLevel: "high",
       permissionProfile: "default",
@@ -309,33 +306,28 @@ describe("new task setup", () => {
     });
   });
 
-  test("hydrates async runtime choices without erasing outcome or Goal edits", () => {
+  test("hydrates async runtime choices without erasing outcome edits", () => {
     const editing = {
       ...createNewTaskDraft(),
       title: "Nightly",
       prompt: "Finish everything",
       delegationPolicy: "off" as const,
-      goalEnabled: true,
-      tokenBudget: "80000",
     };
     expect(hydrateNewTaskChoices(editing, models, "auto-review")).toMatchObject({
       title: "Nightly",
       prompt: "Finish everything",
       delegationPolicy: "off",
-      goalEnabled: true,
-      tokenBudget: "80000",
       modelKey: modelKey(models[0]!),
       permissionProfile: "auto-review",
     });
   });
 
-  test("validates required outcome and positive Goal budgets", () => {
-    const draft = { ...createNewTaskDraft(models), goalEnabled: true, tokenBudget: "1.5" };
+  test("validates the required outcome", () => {
+    const draft = createNewTaskDraft(models);
     expect(validateNewTaskDraft(draft, models)).toEqual({
       valid: false,
       errors: {
         prompt: "Describe what Chili should accomplish.",
-        tokenBudget: "Token budget must be a positive whole number.",
       },
     });
   });
@@ -347,13 +339,11 @@ describe("new task setup", () => {
     expect(validateNewTaskDraft(draft, unavailable).errors.model).toBe("Choose an available model.");
   });
 
-  test("builds one trimmed create-and-run submission and defaults Goal objective to the outcome", () => {
+  test("builds one trimmed create-and-run submission", () => {
     const draft = {
       ...createNewTaskDraft(models),
       title: "  Overnight polish  ",
       prompt: "  Finish the desktop control console.  ",
-      goalEnabled: true,
-      tokenBudget: "120000",
     };
     expect(newTaskSubmission(draft, models)).toEqual({
       title: "Overnight polish",
@@ -363,14 +353,13 @@ describe("new task setup", () => {
       serviceTier: "standard",
       permissionProfile: "default",
       delegationPolicy: "proactive",
-      goal: { objective: "Finish the desktop control console.", tokenBudget: 120000 },
     });
   });
 });
 
 test("filters active and archived tasks across title, preview, path, and id", () => {
   const sessions: RuntimeSessionSummary[] = [
-    session("session_active_old", "active", 10, "Desktop", "Goal console"),
+    session("session_active_old", "active", 10, "Desktop", "Desktop console"),
     session("session_archived", "archived", 30, "API hardening", "Authentication"),
     session("session_active_new", "active", 20, "SQLite gate", "WAL safety"),
   ];
@@ -386,9 +375,9 @@ test("keeps archived sessions visible without offering execution controls", () =
   expect(readOnly).toBe(true);
   expect(canExposeTaskActions(archived)).toBe(false);
   expect(canReloadSessionMcp(archived.id, readOnly, false)).toBe(false);
-  expect(canResumeTask("cancelled", "paused", readOnly)).toBe(false);
-  expect(canResumeTask("failed", "active", readOnly)).toBe(false);
-  expect(canResumeTask("idle", undefined, readOnly, true)).toBe(false);
+  expect(canResumeTask("cancelled", readOnly, true)).toBe(false);
+  expect(canResumeTask("failed", readOnly, true)).toBe(false);
+  expect(canResumeTask("idle", readOnly, true)).toBe(false);
 });
 
 test("only archived sessions are read-only", () => {
@@ -398,18 +387,15 @@ test("only archived sessions are read-only", () => {
   expect(canExposeTaskActions({ status: "active" })).toBe(true);
 });
 
-test("bounds Goal progress while preserving an unbudgeted state", () => {
-  expect(goalProgress(25, 100)).toBe(0.25);
-  expect(goalProgress(150, 100)).toBe(1);
-  expect(goalProgress(20)).toBeUndefined();
-});
-
-test("only offers generic resume for a stopped active or paused Goal", () => {
-  expect(canResumeTask("cancelled", "paused", false)).toBe(true);
-  expect(canResumeTask("failed", "active", false)).toBe(true);
-  expect(canResumeTask("cancelled", undefined, false)).toBe(false);
-  expect(canResumeTask("failed", "budgetLimited", false)).toBe(false);
-  expect(canResumeTask("cancelled", "paused", true)).toBe(false);
+test("only offers resume for a paused input queue after execution settles", () => {
+  for (const state of ["idle", "cancelled", "failed"] as const) {
+    expect(canResumeTask(state, false, true)).toBe(true);
+    expect(canResumeTask(state, false, false)).toBe(false);
+    expect(canResumeTask(state, true, true)).toBe(false);
+  }
+  for (const state of ["running", "cancelling", "waiting_for_approval"] as const) {
+    expect(canResumeTask(state, false, true)).toBe(false);
+  }
 });
 
 test("keeps archived task menus and MCP mutations fail closed", () => {
@@ -419,12 +405,6 @@ test("keeps archived task menus and MCP mutations fail closed", () => {
   expect(canReloadSessionMcp("session_archived", true, false)).toBe(false);
   expect(canReloadSessionMcp(undefined, false, false)).toBe(false);
   expect(canReloadSessionMcp("session_busy", false, true)).toBe(false);
-});
-
-test("requires budget-limited recovery to exceed both usage and the previous budget", () => {
-  expect(goalResumeBudgetMinimum({ tokensUsed: 50_000, tokenBudget: 50_000 })).toBe(50_001);
-  expect(goalResumeBudgetMinimum({ tokensUsed: 60_000, tokenBudget: 50_000 })).toBe(60_001);
-  expect(goalResumeBudgetMinimum({ tokensUsed: 5, tokenBudget: 10 })).toBe(11);
 });
 
 function session(

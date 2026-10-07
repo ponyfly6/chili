@@ -15,7 +15,6 @@ import type {
   ReasoningLevel,
   RuntimePermissionProfileId,
   ServiceTier,
-  SessionGoalStatus,
 } from "@chili/protocol";
 
 /**
@@ -41,12 +40,6 @@ export interface ControlTransport {
   permissionConfig(): Promise<DesktopResponseMap["permissions.get"]>;
   setPermission(profile: RuntimePermissionProfileId): Promise<DesktopResponseMap["permissions.set"]>;
   setDelegation(sessionId: string, policy: DelegationPolicy): Promise<DesktopResponseMap["session.delegation.set"]>;
-  setGoal(sessionId: string, objective: string, tokenBudget?: number): Promise<DesktopResponseMap["session.goal.set"]>;
-  updateGoal(
-    sessionId: string,
-    input: { status?: SessionGoalStatus; objective?: string; tokenBudget?: number },
-  ): Promise<DesktopResponseMap["session.goal.update"]>;
-  clearGoal(sessionId: string): Promise<DesktopResponseMap["session.goal.clear"]>;
   reloadMcp(sessionId?: string): Promise<DesktopResponseMap["mcp.reload"]>;
   send(sessionId: string, text: string, mode: SendMode): Promise<DesktopResponseMap["session.send"]>;
   stop(sessionId: string): Promise<DesktopResponseMap["session.stop"]>;

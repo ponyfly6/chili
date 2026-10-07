@@ -32,7 +32,6 @@ const TRUNCATION_MARKER = "# diff output truncated by the safety limit";
 const EXPLICIT_READ_ONLY_TOOLS = new Set([
   "activate_skill",
   "delegation_status",
-  "get_goal",
   "git_diff",
   "git_status",
   "glob",

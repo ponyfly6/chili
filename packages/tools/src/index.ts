@@ -13,7 +13,6 @@ export * from "./builtins/grep.js";
 export * from "./builtins/git-diff.js";
 export * from "./builtins/git-worktree.js";
 export * from "./builtins/git-apply-patch.js";
-export * from "./builtins/goal.js";
 export * from "./builtins/mcp-resources.js";
 export * from "./builtins/process.js";
 export * from "./builtins/read-file.js";

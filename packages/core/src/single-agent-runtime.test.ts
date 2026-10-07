@@ -4,7 +4,6 @@ import type { ModelUsage, SessionId } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
 import type { DoomLoopGuardOptions } from "./doom-loop-guard.js";
-import { GoalService } from "./goal.js";
 import type { ModelRouter, ModelStreamEvent } from "./runtime.js";
 import { RuntimeService } from "./runtime-service.js";
 import { SingleAgentRuntime } from "./single-agent-runtime.js";
@@ -46,7 +45,7 @@ function harness(model: ModelRouter, doomLoopGuard?: DoomLoopGuardOptions) {
     retryPolicy: { maxAttempts: 3, initialDelayMs: 0 },
     ...(doomLoopGuard ? { doomLoopGuard } : {}),
   });
-  const service = new RuntimeService({ runtime, store, cwd: tmpdir(), maxTurns: 8, maxGoalTurns: 8 });
+  const service = new RuntimeService({ runtime, store, cwd: tmpdir(), maxTurns: 8 });
   resources.push({ service, store });
   return { store, registry, runtime, service, executed };
 }
@@ -392,34 +391,6 @@ test("keeps concurrent sessions' repeated input histories separate", async () =>
     ["completed", "failed"],
   ]);
   expect(fixture.executed.toSorted()).toEqual(sessions.map((session) => session.sessionId).toSorted());
-});
-
-test("retains the same repetition scope when a prompt enters persistent Goal continuation", async () => {
-  let requests = 0;
-  const fixture = harness({
-    async *stream(): AsyncIterable<ModelStreamEvent> {
-      requests++;
-      if (requests === 2) {
-        yield { type: "text_delta", text: "I need to keep checking." };
-        yield { type: "finish", reason: "stop" };
-        return;
-      }
-      yield { type: "tool_call", name: "inspect", input: {} };
-      yield { type: "finish", reason: "tool_use" };
-    },
-  }, { maxRepeatedToolCalls: 1 });
-  const session = await fixture.service.createSession({ cwd: tmpdir() });
-  await new GoalService({ store: fixture.store }).setGoal({
-    sessionId: session.sessionId,
-    objective: "Complete the fake inspection.",
-  });
-  const result = await fixture.service.submitPrompt({ sessionId: session.sessionId, text: "Inspect the file." });
-  expect(result.status).toBe("failed");
-  expect(result.turns.map((turn) => turn.status)).toEqual(["completed", "completed", "failed"]);
-  expect(fixture.executed).toEqual([session.sessionId]);
-  expect(requests).toBe(3);
-  expect(await fixture.store.events({ sessionId: session.sessionId, type: "session.status_changed" }))
-    .toContainEqual(expect.objectContaining({ payload: expect.objectContaining({ reason: "goal_continuation" }) }));
 });
 
 test("keeps the total call allowance independent for successive model turns", async () => {

@@ -1205,20 +1205,11 @@ test("stale recovery preserves later idle and archived session outcomes", async 
   }
 });
 
-test("fails closed when scoped session and goal events lack or conflict with envelope identity", async () => {
+test("fails closed when scoped session events lack or conflict with envelope identity", async () => {
   const store = new SqliteEventStore(":memory:");
   const sessionId = "session_identity_primary" as SessionId;
   const conflictingSessionId = "session_identity_conflict" as SessionId;
   const time = 1 as TimestampMs;
-  const goalFor = (goalSessionId: SessionId) => ({
-    sessionId: goalSessionId,
-    objective: "preserve scoped event identity",
-    status: "active" as const,
-    tokensUsed: 0,
-    timeUsedSeconds: 0,
-    createdAt: time,
-    updatedAt: time,
-  });
   // These casts model untyped/external callers bypassing the compile-time scoped envelope requirement.
   const invalidEvents: Array<{ event: RuntimeEvent; error: string }> = [
     {
@@ -1240,54 +1231,6 @@ test("fails closed when scoped session and goal events lack or conflict with env
       },
       error: "session.renamed payload sessionId session_identity_conflict does not match event.sessionId session_identity_primary",
     },
-    {
-      event: {
-        id: "event_identity_goal_missing_envelope",
-        type: "goal.updated",
-        time,
-        payload: { goal: goalFor(sessionId) },
-      } as unknown as RuntimeEvent,
-      error: "goal.updated requires event.sessionId",
-    },
-    {
-      event: {
-        id: "event_identity_goal_payload_mismatch",
-        type: "goal.updated",
-        time,
-        sessionId,
-        payload: { goal: goalFor(conflictingSessionId) },
-      },
-      error: "goal.updated goal sessionId session_identity_conflict does not match event.sessionId session_identity_primary",
-    },
-    {
-      event: {
-        id: "event_identity_goal_clear_missing_envelope",
-        type: "goal.cleared",
-        time,
-        payload: { sessionId },
-      } as unknown as RuntimeEvent,
-      error: "goal.cleared requires event.sessionId",
-    },
-    {
-      event: {
-        id: "event_identity_goal_clear_payload_mismatch",
-        type: "goal.cleared",
-        time,
-        sessionId,
-        payload: { sessionId: conflictingSessionId },
-      },
-      error: "goal.cleared payload sessionId session_identity_conflict does not match event.sessionId session_identity_primary",
-    },
-    {
-      event: {
-        id: "event_identity_previous_goal_mismatch",
-        type: "goal.cleared",
-        time,
-        sessionId,
-        payload: { sessionId, previousGoal: goalFor(conflictingSessionId) },
-      },
-      error: "goal.cleared previous goal sessionId session_identity_conflict does not match event.sessionId session_identity_primary",
-    },
   ];
 
   try {
@@ -1296,12 +1239,11 @@ test("fails closed when scoped session and goal events lack or conflict with env
     }
     expect(await store.events({ limit: 20 })).toEqual([]);
     expect(await store.sessions()).toEqual([]);
-    expect(await store.sessionGoals()).toEqual([]);
 
     await expect(store.appendMany([
       sessionEvent("event_identity_atomic_valid", sessionId, time),
-      invalidEvents[3]!.event,
-    ])).rejects.toThrow("goal.updated goal sessionId");
+      invalidEvents[1]!.event,
+    ])).rejects.toThrow("session.renamed payload sessionId");
     expect(await store.events({ limit: 20 })).toEqual([]);
     expect(await store.sessions()).toEqual([]);
   } finally {
@@ -1339,55 +1281,6 @@ test("materializes maximum approval scope in pending approval rows", async () =>
         createdAt: 1,
       },
     ]);
-  } finally {
-    store.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("projects persistent session goals and clears them", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-store-goal-"));
-  const store = new SqliteEventStore(join(dir, "events.sqlite"));
-  const sessionId = "session_goal_store" as SessionId;
-
-  try {
-    await store.append(sessionEvent("event_goal_session", sessionId, 1 as TimestampMs));
-    await store.append({
-      id: "event_goal_set",
-      type: "goal.updated",
-      time: 2 as TimestampMs,
-      sessionId,
-      payload: {
-        reason: "set",
-        goal: {
-          sessionId,
-          objective: "ship /goal",
-          status: "active",
-          tokenBudget: 50_000,
-          tokensUsed: 123,
-          timeUsedSeconds: 4,
-          createdAt: 2 as TimestampMs,
-          updatedAt: 2 as TimestampMs,
-        },
-      },
-    });
-
-    expect(await store.sessionGoal(sessionId)).toMatchObject({
-      sessionId,
-      objective: "ship /goal",
-      status: "active",
-      tokenBudget: 50_000,
-      tokensUsed: 123,
-    });
-
-    await store.append({
-      id: "event_goal_clear",
-      type: "goal.cleared",
-      time: 3 as TimestampMs,
-      sessionId,
-      payload: { sessionId, reason: "clear" },
-    });
-    expect(await store.sessionGoal(sessionId)).toBeUndefined();
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

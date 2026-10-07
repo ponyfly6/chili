@@ -148,19 +148,6 @@ test("repeated recovery preserves original request and tool policy without repla
   }
 });
 
-test("an explicit Goal resume clears Stop and lets queued input precede Goal work", async () => {
-  const { service, turns } = await fixture(waitForAbort);
-  await service.interrupt(sessionId);
-  await service.setGoal({ sessionId, objective: "finish the task" });
-  expect(turns).toHaveLength(0);
-  await service.updateGoal({ sessionId, status: "paused" });
-  service.submitPromptAsync({ sessionId, text: "do this first", mode: "queue", submissionId: "priority" });
-  await service.updateGoal({ sessionId, status: "active", resumeDispatch: true });
-  await until(() => turns.length === 1);
-  expect(service.inputQueue(sessionId).paused).toBe(false);
-  expect(service.getInput(sessionId, "priority")?.state).toBe("claimed");
-});
-
 test("a later failure remains recoverable when a newer Steer submission completed first", async () => {
   const { service, turns } = await fixture(async (input, index) => {
     if (index === 1) return waitForAbort(input);

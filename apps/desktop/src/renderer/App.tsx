@@ -21,8 +21,6 @@ import type {
   RuntimeModelDescriptor,
   RuntimePermissionConfig,
   RuntimePermissionProfileId,
-  SessionGoal,
-  SessionGoalStatus,
 } from "@chili/protocol";
 import type {
   ChatMessagePart,
@@ -83,8 +81,6 @@ import {
   canResumeTask,
   createNewTaskDraft,
   filterSessions,
-  goalResumeBudgetMinimum,
-  goalProgress,
   hydrateNewTaskChoices,
   isSessionReadOnly,
   modelFromKey,
@@ -145,8 +141,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<RuntimeSessionSummary>();
   const [archiveTarget, setArchiveTarget] = useState<RuntimeSessionSummary>();
-  const [goalSetupOpen, setGoalSetupOpen] = useState(false);
-  const [goalBudgetOpen, setGoalBudgetOpen] = useState(false);
   const taskMenuButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const taskMenuRef = useRef<HTMLDivElement | null>(null);
   const dialogReturnFocusRef = useRef<HTMLElement | null>(null);
@@ -292,8 +286,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     () => filterSessions(sessions, sessionQuery, sessionListStatus),
     [sessionListStatus, sessionQuery, sessions],
   );
-  const selectedGoal = sessionConfig?.goal ?? undefined;
-  const canResumeSession = canResumeTask(presentation?.chat.status, selectedGoal?.status, selectedReadOnly, snapshot?.inputQueue?.paused);
+  const canResumeSession = canResumeTask(presentation?.chat.status, selectedReadOnly, snapshot?.inputQueue?.paused);
   const emptyConversation = !loadingSession && timelineItems.length === 0;
   const commands = commandsOpen && !selectedReadOnly ? matchingDesktopCommands(composer.startsWith("/") ? composer : "/") : [];
   useEffect(() => {
@@ -593,8 +586,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           setSettingsOpen(false);
           setRenameTarget(undefined);
           setArchiveTarget(undefined);
-          setGoalSetupOpen(false);
-          setGoalBudgetOpen(false);
           setTaskMenuId(undefined);
           workspaceRef.current = event.state.workspace;
           coordinator.invalidateRequests("sessions", "snapshot", "diff");
@@ -865,40 +856,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     });
   };
 
-  const changeGoalStatus = async (status: SessionGoalStatus) => {
-    if (!selectedId || selectedReadOnly) return;
-    await runAction(async () => {
-      await transport.updateGoal(selectedId, { status });
-      await reloadSessionConfig(selectedId);
-    });
-  };
-
-  const resumeBudgetLimitedGoal = async (tokenBudget: number) => {
-    if (!selectedId || !selectedGoal || selectedGoal.status !== "budgetLimited" || selectedReadOnly) return;
-    await runAction(async () => {
-      await transport.updateGoal(selectedId, { tokenBudget, status: "active" });
-      setGoalBudgetOpen(false);
-      await reloadSessionConfig(selectedId);
-    });
-  };
-
-  const addGoal = async (objective: string, tokenBudget?: number) => {
-    if (!selectedId || selectedReadOnly) return;
-    await runAction(async () => {
-      await transport.setGoal(selectedId, objective, tokenBudget);
-      setGoalSetupOpen(false);
-      await reloadSessionConfig(selectedId);
-    });
-  };
-
-  const clearGoal = async () => {
-    if (!selectedId || selectedReadOnly) return;
-    await runAction(async () => {
-      await transport.clearGoal(selectedId);
-      await reloadSessionConfig(selectedId);
-    });
-  };
-
   const reloadMcp = async () => {
     if (!selectedId || selectedReadOnly) return;
     await runAction(async () => {
@@ -918,8 +875,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       if (/^\/[^\s]*$/.test(composer)) setComposer("");
       if (command.group === "settings") openSettings(command.page);
       else if (command.group === "advanced") openAdvancedTask();
-      else if (selectedId) setGoalSetupOpen(true);
-      else openAdvancedTask();
     }
   };
 
@@ -1298,8 +1253,8 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                   {sessionBusy ? (
                     <button
                       className="composer-stop"
-                      title={selectedGoal?.status === "active" ? "Stop current turn and pause Goal" : "Stop current turn"}
-                      aria-label={selectedGoal?.status === "active" ? "Stop current turn and pause Goal" : "Stop current turn"}
+                      title="Stop current turn"
+                      aria-label="Stop current turn"
                       disabled={!selectedId || runtimeActionsDisabled}
                       onClick={() => void stop()}
                     >
@@ -1365,48 +1320,10 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         <DesktopSettings page={settingsPage} onPage={setSettingsPage} project={projectLabel} session={selectedId} config={sessionConfig}
           models={models} disabled={runtimeActionsDisabled} busy={working} error={error} theme={theme} onTheme={changeTheme}
           themeSaveFailed={themeSaveFailed} themeSaving={themeSaving || preferencesSaving} preferences={preferences} onPreferences={savePreferences} preferenceSaveFailed={preferenceSaveFailed}
-          goalControls={<section className="settings-section goal-section" aria-label="持续任务">
-            <div className="section-heading compact"><h4>持续任务</h4>{selectedGoal ? <span className={`goal-status goal-${selectedGoal.status}`}>{goalStatusLabel(selectedGoal.status)}</span> : null}</div>
-            {selectedGoal ? (
-              <GoalCard
-                goal={selectedGoal}
-                disabled={runtimeActionsDisabled}
-                busy={Boolean(sessionBusy)}
-                onStatus={(status) => void changeGoalStatus(status)}
-                onRaiseBudget={() => { setSettingsOpen(false); setGoalBudgetOpen(true); }}
-                onClear={() => void clearGoal()}
-              />
-            ) : (
-              <div className="compact-empty-action">
-                <p className="empty-copy">No autonomous Goal is attached to this task.</p>
-                {selectedId && !selectedReadOnly ? (
-                  <button className="secondary" disabled={runtimeActionsDisabled} onClick={() => { setSettingsOpen(false); setGoalSetupOpen(true); }}>Add Goal</button>
-                ) : null}
-              </div>
-            )}
-          </section>}
           onSave={(values, section) => void saveSessionSettings(values, section)} onReloadMcp={() => void reloadMcp()}
           onPrompt={(text) => { if (selectedReadOnly) return; setSettingsOpen(false); setComposer(text); requestAnimationFrame(() => composerRef.current?.focus()); }}
           onNewSession={() => { setSettingsOpen(false); openNewTask(); }} onClose={() => setSettingsOpen(false)} />
       </ModalFrame> : null}
-
-      {goalSetupOpen ? (
-        <GoalSetupDialog
-          defaultObjective={composer.trim()}
-          disabled={runtimeActionsDisabled}
-          onClose={() => !working && setGoalSetupOpen(false)}
-          onSubmit={(objective, tokenBudget) => void addGoal(objective, tokenBudget)}
-        />
-      ) : null}
-
-      {goalBudgetOpen && selectedGoal?.status === "budgetLimited" ? (
-        <GoalBudgetDialog
-          goal={selectedGoal}
-          disabled={runtimeActionsDisabled}
-          onClose={() => !working && setGoalBudgetOpen(false)}
-          onSubmit={(tokenBudget) => void resumeBudgetLimitedGoal(tokenBudget)}
-        />
-      ) : null}
     </div>
   );
 }
@@ -1444,7 +1361,7 @@ function NewTaskDialog({
           <button className="icon-button" type="button" aria-label="Close new task" disabled={disabled} onClick={onClose}><Icon name="close" /></button>
         </header>
         <div className="setup-flow" aria-label="Task setup steps">
-          <span><b>1</b> Outcome</span><span><b>2</b> Runtime</span><span><b>3</b> Goal</span>
+          <span><b>1</b> Outcome</span><span><b>2</b> Runtime</span>
         </div>
         <div className="modal-scroll">
           <section className="form-section">
@@ -1474,7 +1391,7 @@ function NewTaskDialog({
                 placeholder="Describe a verifiable outcome, constraints, and what done means…"
                 rows={5}
               />
-              <small id="new-task-prompt-help">This becomes the first turn, or the autonomous Goal objective when Goal mode is on.</small>
+              <small id="new-task-prompt-help">This becomes the first message in the conversation.</small>
               {validation.errors.prompt ? <small className="field-error" id="new-task-prompt-error">{validation.errors.prompt}</small> : null}
             </label>
           </section>
@@ -1538,43 +1455,10 @@ function NewTaskDialog({
               </label>
             </div>
           </section>
-
-          <section className={`form-section goal-setup-section ${draft.goalEnabled ? "enabled" : ""}`}>
-            <div className="form-section-heading"><span>3</span><div><h3>Overnight Goal</h3><p>Keep pursuing the outcome across turns until complete, paused, or budget-limited.</p></div></div>
-            <label className="goal-toggle">
-              <input
-                type="checkbox"
-                aria-label="Run as an overnight Goal"
-                checked={draft.goalEnabled}
-                disabled={disabled}
-                onChange={(event) => onChange({ ...draft, goalEnabled: event.target.checked })}
-              />
-              <span><strong>Run as an overnight Goal</strong><small>Starts autonomous continuation immediately after setup.</small></span>
-            </label>
-            {draft.goalEnabled ? (
-              <label className="field-label goal-budget-field">
-                <span>Token budget <em>optional</em></span>
-                <input
-                  type="number"
-                  inputMode="numeric"
-                  min="1"
-                  step="1"
-                  aria-label="Token budget"
-                  aria-invalid={Boolean(validation.errors.tokenBudget)}
-                  value={draft.tokenBudget}
-                  disabled={disabled}
-                  onChange={(event) => onChange({ ...draft, tokenBudget: event.target.value })}
-                  placeholder="Default · 50,000"
-                />
-                <small>Leave blank to use the runtime default (50,000 tokens).</small>
-                {validation.errors.tokenBudget ? <small className="field-error">{validation.errors.tokenBudget}</small> : null}
-              </label>
-            ) : null}
-          </section>
         </div>
         <footer className="modal-actions">
-          <span>{choicesLoading ? "Loading model and runtime permission choices…" : !choicesReady ? "Runtime choices could not be loaded. Close and try again." : draft.goalEnabled ? "Chili will continue autonomously." : "One task starts with one turn."}</span>
-          <div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary create-run-button" type="submit" disabled={disabled || choicesLoading || !choicesReady || !validation.valid}>{draft.goalEnabled ? "Create & start Goal" : "Create & run"}</button></div>
+          <span>{choicesLoading ? "Loading model and runtime permission choices…" : !choicesReady ? "Runtime choices could not be loaded. Close and try again." : "One task starts with one turn."}</span>
+          <div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary create-run-button" type="submit" disabled={disabled || choicesLoading || !choicesReady || !validation.valid}>Create & run</button></div>
         </footer>
       </form>
     </ModalFrame>
@@ -1630,59 +1514,6 @@ function ArchiveTaskDialog({
         <div className="compact-dialog-body archive-warning"><Icon name="archive" /><p>This removes the task from Active tasks. Archived tasks remain inspectable but are read-only and cannot be restored in this milestone.</p>{archiveDisabled ? <small>Stop the running task before archiving it.</small> : null}</div>
         <footer className="modal-actions"><span /><div><button autoFocus data-modal-initial-focus="true" className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="danger" type="button" disabled={disabled || archiveDisabled} onClick={onArchive}>归档会话</button></div></footer>
       </div>
-    </ModalFrame>
-  );
-}
-
-function GoalSetupDialog({
-  defaultObjective,
-  disabled,
-  onClose,
-  onSubmit,
-}: {
-  defaultObjective: string;
-  disabled: boolean;
-  onClose: () => void;
-  onSubmit: (objective: string, tokenBudget?: number) => void;
-}) {
-  const [objective, setObjective] = useState(defaultObjective);
-  const [budget, setBudget] = useState("");
-  useDialogEscape(onClose, disabled);
-  const budgetValid = !budget || (/^\d+$/.test(budget) && Number(budget) > 0 && Number.isSafeInteger(Number(budget)));
-  return (
-    <ModalFrame labelId="add-goal-title" className="compact-dialog goal-dialog" onClose={onClose} closeDisabled={disabled}>
-      <form onSubmit={(event) => { event.preventDefault(); if (objective.trim() && budgetValid && !disabled) onSubmit(objective.trim(), budget ? Number(budget) : undefined); }}>
-        <header className="modal-heading"><div><p className="eyebrow">Autonomous work</p><h2 id="add-goal-title">Add Goal</h2><p>The Goal starts immediately and continues across turns.</p></div></header>
-        <div className="compact-dialog-body"><label className="field-label"><span>Goal objective</span><textarea autoFocus data-modal-initial-focus="true" aria-label="Goal objective" rows={4} value={objective} disabled={disabled} onChange={(event) => setObjective(event.target.value)} /></label><label className="field-label"><span>Token budget <em>optional</em></span><input type="number" min="1" step="1" aria-label="Goal token budget" aria-invalid={!budgetValid} value={budget} disabled={disabled} onChange={(event) => setBudget(event.target.value)} placeholder="Default · 50,000" />{!budgetValid ? <small className="field-error">Token budget must be a positive whole number.</small> : <small>Leave blank to use the runtime default (50,000 tokens).</small>}</label></div>
-        <footer className="modal-actions"><span>可在设置中的“权限与协作”查看或暂停任务。</span><div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary" type="submit" disabled={disabled || !objective.trim() || !budgetValid}>Start Goal</button></div></footer>
-      </form>
-    </ModalFrame>
-  );
-}
-
-function GoalBudgetDialog({
-  goal,
-  disabled,
-  onClose,
-  onSubmit,
-}: {
-  goal: SessionGoal;
-  disabled: boolean;
-  onClose: () => void;
-  onSubmit: (tokenBudget: number) => void;
-}) {
-  const minimum = goalResumeBudgetMinimum(goal);
-  const [budget, setBudget] = useState(String(Math.max(minimum, Math.ceil(minimum * 1.25))));
-  const parsed = Number(budget);
-  const valid = /^\d+$/.test(budget) && Number.isSafeInteger(parsed) && parsed >= minimum;
-  useDialogEscape(onClose, disabled);
-  return (
-    <ModalFrame labelId="raise-goal-budget-title" className="compact-dialog goal-dialog" onClose={onClose} closeDisabled={disabled}>
-      <form onSubmit={(event) => { event.preventDefault(); if (valid && !disabled) onSubmit(parsed); }}>
-        <header className="modal-heading"><div><p className="eyebrow">Budget limited</p><h2 id="raise-goal-budget-title">Raise budget to resume</h2><p>This Goal used {formatTokenCount(goal.tokensUsed)} tokens. Its budget must increase before it can continue.</p></div></header>
-        <div className="compact-dialog-body"><label className="field-label"><span>New token budget</span><input autoFocus data-modal-initial-focus="true" type="number" min={minimum} step="1" aria-label="New Goal token budget" aria-invalid={!valid} value={budget} disabled={disabled} onChange={(event) => setBudget(event.target.value)} />{valid ? <small>Minimum {formatTokenCount(minimum)} tokens.</small> : <small className="field-error">Enter at least {formatTokenCount(minimum)} tokens.</small>}</label></div>
-        <footer className="modal-actions"><span>The Goal resumes only after the new budget is accepted.</span><div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary" type="submit" disabled={disabled || !valid}>Update & resume Goal</button></div></footer>
-      </form>
     </ModalFrame>
   );
 }
@@ -1789,39 +1620,6 @@ function canRestoreFocus(element: HTMLElement): boolean {
   if (!element.isConnected || element.matches(":disabled") || element.closest("[inert]")) return false;
   const style = window.getComputedStyle(element);
   return style.display !== "none" && style.visibility !== "hidden";
-}
-
-function GoalCard({
-  goal,
-  disabled,
-  busy,
-  onStatus,
-  onRaiseBudget,
-  onClear,
-}: {
-  goal: SessionGoal;
-  disabled: boolean;
-  busy: boolean;
-  onStatus: (status: SessionGoalStatus) => void;
-  onRaiseBudget: () => void;
-  onClear: () => void;
-}) {
-  const progress = goalProgress(goal.tokensUsed, goal.tokenBudget);
-  return (
-    <div className="goal-card">
-      <p>{goal.objective}</p>
-      <div className="goal-metrics"><span>{formatTokenCount(goal.tokensUsed)} tokens</span><span>{formatGoalTime(goal.timeUsedSeconds)}</span></div>
-      {progress !== undefined ? (
-        <div className="goal-progress-row"><div className="goal-progress" role="progressbar" aria-label="Goal token budget used" aria-valuemin={0} aria-valuemax={goal.tokenBudget} aria-valuenow={goal.tokensUsed}><span style={{ width: `${progress * 100}%` }} /></div><small>{Math.round(progress * 100)}%</small></div>
-      ) : <small className="goal-unlimited">Runtime default budget · 50,000 tokens</small>}
-      <div className="goal-actions">
-        {goal.status === "active" ? <button className="secondary" disabled={disabled} onClick={() => onStatus("paused")}><Icon name="pause" />Pause Goal</button> : null}
-        {goal.status === "paused" ? <button className="primary" disabled={disabled || busy} onClick={() => onStatus("active")}><Icon name="resume" />Resume Goal</button> : null}
-        {goal.status === "budgetLimited" ? <button className="primary" disabled={disabled || busy} onClick={onRaiseBudget}><Icon name="budget" />Raise budget to resume</button> : null}
-        <button className="text-button danger-text" disabled={disabled || busy} onClick={onClear}>Clear Goal</button>
-      </div>
-    </div>
-  );
 }
 
 function useDialogEscape(close: () => void, disabled: boolean): void {
@@ -2236,7 +2034,7 @@ function UserInputCard({
   );
 }
 
-type IconName = "activity" | "archive" | "budget" | "chevron" | "close" | "folder" | "message" | "more"
+type IconName = "activity" | "archive" | "chevron" | "close" | "folder" | "message" | "more"
   | "appearance" | "pause" | "plus" | "queue" | "resume" | "search" | "send" | "settings" | "shield" | "sidebar"
   | "steer" | "stop" | "terminal";
 
@@ -2257,7 +2055,6 @@ function Icon({ name }: { name: IconName }) {
       case "sidebar": return <><rect x="3" y="3" width="18" height="18" rx="3" /><path d="M9 3v18" /></>;
       case "activity": return <><path d="M4 12h3l2-5 4 10 2-5h5" /><path d="M4 4v16h16" /></>;
       case "archive": return <><path d="M4 7h16v13H4V7Zm-1-3h18v4H3V4Z" /><path d="M9 12h6" /></>;
-      case "budget": return <><circle cx="12" cy="12" r="8" /><path d="M12 7v10M9 9.5c0-1.2 1.2-2 3-2s3 .8 3 2-1.2 2-3 2-3 .8-3 2 1.2 2 3 2 3-.8 3-2" /></>;
       case "plus": return <path d="M12 5v14M5 12h14" />;
       case "message": return <path d="M5 5h14v10H9l-4 4V5Z" />;
       case "more": return <><circle cx="6" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="18" cy="12" r="1" fill="currentColor" stroke="none" /></>;
@@ -2297,23 +2094,6 @@ function formatRelativeTime(value: number): string {
   if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)}h`;
   if (elapsed < 604_800_000) return `${Math.floor(elapsed / 86_400_000)}d`;
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(new Date(value));
-}
-
-function formatGoalTime(seconds: number): string {
-  if (seconds < 60) return `${Math.max(0, Math.round(seconds))}s active`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m active`;
-  const hours = Math.floor(minutes / 60);
-  const remainder = minutes % 60;
-  return `${hours}h${remainder ? ` ${remainder}m` : ""} active`;
-}
-
-function formatTokenCount(value: number): string {
-  return new Intl.NumberFormat(undefined, { notation: value >= 10_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
-}
-
-function goalStatusLabel(status: SessionGoalStatus): string {
-  return status === "budgetLimited" ? "budget limited" : status;
 }
 
 function reasoningLabel(level: ReasoningLevel): string {
@@ -2357,8 +2137,6 @@ function refreshesSessionConfig(event: ChiliEvent): boolean {
     || event.type === "session.reasoning_changed"
     || event.type === "session.service_tier_changed"
     || event.type === "session.delegation_changed"
-    || event.type === "goal.updated"
-    || event.type === "goal.cleared"
     || event.type.startsWith("mcp.");
 }
 
