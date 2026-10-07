@@ -1,16 +1,17 @@
+import { BUILTIN_PROVIDERS } from "./provider-definition.js";
 import type { ChiliModelProvider, ModelDescriptor, ReasoningLevel } from "./types.js";
 import { type EnvironmentSource, readXaiEnvironment } from "./env.js";
 import {
   findDefaultKnownModel,
   findKnownModel,
   listKnownModels,
-  XAI_GROK_46_MODEL,
+  XAI_GROK_47_MODEL,
   XAI_OPENAI_BASE_URL,
   XAI_PROVIDER_ID,
 } from "./models.js";
 import { OpenAICompletionsModel, type OpenAICompletionsModelOptions } from "./openai-completions.js";
 
-export { XAI_GROK_46_MODEL, XAI_OPENAI_BASE_URL, XAI_PROVIDER_ID } from "./models.js";
+export { XAI_GROK_46_MODEL, XAI_GROK_47_MODEL, XAI_OPENAI_BASE_URL, XAI_PROVIDER_ID } from "./models.js";
 
 export interface XaiModelOptions {
   apiKey?: string;
@@ -25,7 +26,6 @@ export interface XaiModelOptions {
   env?: EnvironmentSource;
 }
 
-const DEFAULT_XAI_MAX_COMPLETION_TOKENS = 128_000;
 const DEFAULT_XAI_REASONING_EFFORT: ReasoningLevel = "high";
 
 export class XaiOpenAIProvider implements ChiliModelProvider {
@@ -68,7 +68,7 @@ export class XaiOpenAIProvider implements ChiliModelProvider {
 
   private defaultModel(): string {
     const env = readXaiEnvironment(this.options.env);
-    return this.options.model ?? env.model ?? XAI_GROK_46_MODEL;
+    return this.options.model ?? env.model ?? XAI_GROK_47_MODEL;
   }
 
   private defaultBaseUrl(): string {
@@ -88,7 +88,7 @@ export function createXaiRouter(options: XaiModelOptions = {}): OpenAICompletion
 
 export function createXaiModel(options: XaiModelOptions = {}): OpenAICompletionsModel {
   const env = readXaiEnvironment(options.env);
-  const model = options.model ?? env.model ?? XAI_GROK_46_MODEL;
+  const model = options.model ?? env.model ?? XAI_GROK_47_MODEL;
   const apiKey = options.apiKey ?? env.apiKey ?? "";
   if (!apiKey) throw new Error("xAI provider requires XAI_API_KEY");
 
@@ -98,7 +98,7 @@ export function createXaiModel(options: XaiModelOptions = {}): OpenAICompletions
     model,
     baseUrl: options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? XAI_OPENAI_BASE_URL,
     apiKey,
-    maxTokens: options.maxTokens ?? DEFAULT_XAI_MAX_COMPLETION_TOKENS,
+    maxTokens: options.maxTokens ?? BUILTIN_PROVIDERS.xai.defaultRequestMaxTokens,
     reasoning: options.reasoning ?? true,
   };
   if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;

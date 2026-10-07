@@ -401,7 +401,8 @@ export function buildOpenAICompletionsRequestBody(
   if ((options.stream ?? true) && compatibility.supportsUsageInStreaming) {
     body.stream_options = { include_usage: true };
   }
-  if (options.reasoning !== undefined || compatibility.reasoningParameterStyle === "zai-5.3") {
+  if (options.reasoning !== undefined || compatibility.reasoningParameterStyle === "zai-5.3"
+    || compatibility.reasoningParameterStyle === "moonshot-k2.7") {
     applyReasoningOptions(body, compatibility, options.reasoning ?? true, options.reasoningEffort);
   }
 
@@ -423,6 +424,12 @@ function applyReasoningOptions(
 ): void {
   const style = compatibility.reasoningParameterStyle;
   const alwaysReasons = style === "moonshot-k3" || style === "zai-5.3" || style === "xai";
+  if (style === "moonshot-k2.7") {
+    body.thinking = { type: "enabled", keep: "all" };
+    // This model has fixed sampling and no configurable reasoning effort.
+    if (body.temperature !== undefined) body.temperature = 1;
+    return;
+  }
   if (style === "zai-5.3") {
     body.thinking = { type: "enabled", clear_thinking: false };
   } else if (style === "deepseek" || style === "moonshot" || style === "zai") {

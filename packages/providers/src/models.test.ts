@@ -9,6 +9,7 @@ import {
   CODEX_API_PROVIDER_ID,
   DEEPSEEK_OPENAI_BASE_URL,
   DEEPSEEK_PROVIDER_ID,
+  DEEPSEEK_FLASH_MODEL,
   DEEPSEEK_V4_FLASH_MODEL,
   DEEPSEEK_V4_PRO_MODEL,
   findDefaultKnownModel,
@@ -16,22 +17,28 @@ import {
   isCodexApiModel,
   isOpenAICodexModel,
   KIMI_K3_MODEL,
+  KIMI_K27_CODE_MODEL,
+  KIMI_K27_CODE_HIGHSPEED_MODEL,
   KIMI_OPENAI_BASE_URL,
   KIMI_PROVIDER_ID,
   listKnownModels,
   MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M3_MODEL,
+  MINIMAX_M31_FLASH_PREVIEW_MODEL,
   MINIMAX_PROVIDER_ID,
   OPENAI_CODEX_BASE_URL,
   OPENAI_CODEX_DEFAULT_MODEL,
   OPENAI_CODEX_MODELS,
   OPENAI_CODEX_PROVIDER_ID,
   XAI_GROK_46_MODEL,
+  XAI_GROK_47_MODEL,
   XAI_OPENAI_BASE_URL,
   XAI_PROVIDER_ID,
   ZAI_ANTHROPIC_BASE_URL,
   ZAI_GLM_53_1M_MODEL,
   ZAI_GLM_53_MODEL,
+  ZAI_GLM_53_FLASH_MODEL,
+  ZAI_GLM_53_FLASHX_MODEL,
   ZAI_OPENAI_BASE_URL,
   ZAI_PROVIDER_ID,
 } from "./index.js";
@@ -45,21 +52,22 @@ const FULL_CAPABILITIES = {
   responseId: true,
 };
 
-test("catalog exposes only DeepSeek V4 Pro and Flash with their current limits", () => {
+test("catalog exposes current DeepSeek Pro and Flash, retaining the legacy Flash alias with their current limits", () => {
   expect(listKnownModels(DEEPSEEK_PROVIDER_ID).map((model) => model.model)).toEqual([
     DEEPSEEK_V4_PRO_MODEL,
+    DEEPSEEK_FLASH_MODEL,
     DEEPSEEK_V4_FLASH_MODEL,
   ]);
   expect(findDefaultKnownModel(DEEPSEEK_PROVIDER_ID)).toMatchObject({
     provider: DEEPSEEK_PROVIDER_ID,
     model: DEEPSEEK_V4_PRO_MODEL,
-    displayName: "DeepSeek V4 Pro",
+    displayName: "DeepSeek V4 Pro (0813)",
     apiFamily: "openai-completions",
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     default: true,
     inputCapabilities: ["text"],
     contextWindowTokens: 1_048_576,
-    maxOutputTokens: 384_000,
+    maxOutputTokens: 393_216,
     reasoningLevels: ["off", "low", "high", "max"],
     capabilities: FULL_CAPABILITIES,
     compatibility: {
@@ -87,16 +95,17 @@ test("catalog exposes only DeepSeek V4 Pro and Flash with their current limits",
   });
   expect(findKnownModel(DEEPSEEK_PROVIDER_ID, DEEPSEEK_V4_FLASH_MODEL)).toMatchObject({
     model: DEEPSEEK_V4_FLASH_MODEL,
-    displayName: "DeepSeek V4 Flash",
+    displayName: "DeepSeek V4.1 Flash (legacy alias)",
+    inputCapabilities: ["text", "image"],
     contextWindowTokens: 1_048_576,
-    maxOutputTokens: 384_000,
+    maxOutputTokens: 393_216,
     reasoningLevels: ["off", "low", "high", "max"],
   });
   expect(findKnownModel(DEEPSEEK_PROVIDER_ID, "deepseek-v3.2")).toBeUndefined();
 });
 
-test("catalog exposes only Kimi K3 with image input and current token limits", () => {
-  expect(listKnownModels(KIMI_PROVIDER_ID).map((model) => model.model)).toEqual([KIMI_K3_MODEL]);
+test("catalog exposes Kimi K3 and K2.7 Code with image input and current token limits", () => {
+  expect(listKnownModels(KIMI_PROVIDER_ID).map((model) => model.model)).toEqual([KIMI_K3_MODEL, KIMI_K27_CODE_MODEL, KIMI_K27_CODE_HIGHSPEED_MODEL]);
   expect(findDefaultKnownModel(KIMI_PROVIDER_ID)).toMatchObject({
     provider: KIMI_PROVIDER_ID,
     model: KIMI_K3_MODEL,
@@ -138,6 +147,8 @@ test("catalog exposes only Kimi K3 with image input and current token limits", (
 test("catalog exposes GLM-5.3 and its Anthropic protocol alias", () => {
   expect(listKnownModels(ZAI_PROVIDER_ID).map((model) => model.model)).toEqual([
     ZAI_GLM_53_MODEL,
+    ZAI_GLM_53_FLASH_MODEL,
+    ZAI_GLM_53_FLASHX_MODEL,
     ZAI_GLM_53_1M_MODEL,
   ]);
   expect(findDefaultKnownModel(ZAI_PROVIDER_ID)).toMatchObject({
@@ -180,8 +191,8 @@ test("catalog exposes GLM-5.3 and its Anthropic protocol alias", () => {
   expect(findKnownModel(ZAI_PROVIDER_ID, "glm-5.2[1m]")).toBeUndefined();
 });
 
-test("catalog exposes only MiniMax M3 with current reasoning, tier, and pricing metadata", () => {
-  expect(listKnownModels(MINIMAX_PROVIDER_ID).map((model) => model.model)).toEqual([MINIMAX_M3_MODEL]);
+test("catalog keeps MiniMax M3 as the default alongside its plan-only preview with current reasoning, tier, and pricing metadata", () => {
+  expect(listKnownModels(MINIMAX_PROVIDER_ID).map((model) => model.model)).toEqual([MINIMAX_M3_MODEL, MINIMAX_M31_FLASH_PREVIEW_MODEL]);
   expect(findDefaultKnownModel(MINIMAX_PROVIDER_ID)).toMatchObject({
     provider: MINIMAX_PROVIDER_ID,
     model: MINIMAX_M3_MODEL,
@@ -194,22 +205,22 @@ test("catalog exposes only MiniMax M3 with current reasoning, tier, and pricing 
     maxOutputTokens: 524_288,
     reasoningLevels: ["off", "high"],
     serviceTiers: ["standard", "fast"],
-    cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0 },
+    cost: { input: 2.1, output: 8.4, cacheRead: 0.42, cacheWrite: 0, currency: "CNY" },
     capabilities: FULL_CAPABILITIES,
     compatibility: { messages: { supportsEagerToolInputStreaming: true } },
   });
-  for (const retired of ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3[1m]"]) {
-    expect(findKnownModel(MINIMAX_PROVIDER_ID, retired)).toBeUndefined();
+  for (const unlisted of ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3[1m]"]) {
+    expect(findKnownModel(MINIMAX_PROVIDER_ID, unlisted)).toBeUndefined();
   }
 });
 
-test("catalog exposes xAI Grok 4.6 with current limits, reasoning, and pricing", () => {
-  expect(listKnownModels(XAI_PROVIDER_ID).map((model) => model.model)).toEqual([XAI_GROK_46_MODEL]);
+test("catalog defaults to xAI Grok 4.7 and retains explicit 4.6 selections with current limits, reasoning, and pricing", () => {
+  expect(listKnownModels(XAI_PROVIDER_ID).map((model) => model.model)).toEqual([XAI_GROK_47_MODEL, XAI_GROK_46_MODEL]);
   const grok = findDefaultKnownModel(XAI_PROVIDER_ID);
   expect(grok).toMatchObject({
     provider: XAI_PROVIDER_ID,
-    model: XAI_GROK_46_MODEL,
-    displayName: "Grok 4.6",
+    model: XAI_GROK_47_MODEL,
+    displayName: "Grok 4.7",
     apiFamily: "openai-completions",
     baseUrl: XAI_OPENAI_BASE_URL,
     default: true,

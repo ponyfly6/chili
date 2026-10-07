@@ -1,4 +1,6 @@
 export * from "./types.js";
+export * from "./provider-definition.js";
+export * from "./provider-registry.js";
 export * from "./provider-error.js";
 export * from "./provider-backpressure.js";
 export * from "./models.js";

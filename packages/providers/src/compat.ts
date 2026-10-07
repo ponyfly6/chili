@@ -5,6 +5,7 @@ export type ReasoningParameterStyle =
   | "deepseek"
   | "moonshot"
   | "moonshot-k3"
+  | "moonshot-k2.7"
   | "zai"
   | "zai-5.3"
   | "xai"
@@ -14,6 +15,8 @@ export type ToolCallDeltaMode = "standard" | "zai-tool-stream";
 
 export interface MessagesCompatibility {
   supportsEagerToolInputStreaming: boolean;
+  /** Always-on adaptive thinking with output_config.effort (low through max). */
+  supportsAdaptiveReasoningEffort?: boolean;
 }
 
 export interface ChatCompletionsCompatibility {
@@ -81,6 +84,8 @@ export function resolveMessagesCompatibility(
 ): MessagesCompatibility {
   return {
     supportsEagerToolInputStreaming: overrides.supportsEagerToolInputStreaming ?? true,
+    ...(overrides.supportsAdaptiveReasoningEffort !== undefined
+      ? { supportsAdaptiveReasoningEffort: overrides.supportsAdaptiveReasoningEffort } : {}),
   };
 }
 
@@ -123,23 +128,24 @@ function detectChatCompletionsCompatibility(input: CompatibilityResolutionInput)
   const isCerebras = provider === "cerebras" || baseUrl.includes("cerebras.ai");
   const isChutes = baseUrl.includes("chutes.ai");
   const isKimiK3 = isMoonshot && model === "kimi-k3";
-  const isGrok46 = isXai && model.startsWith("grok-4.6");
+  const isGrokConfigurable = isXai && (model.startsWith("grok-4.6") || model.startsWith("grok-4.7"));
+  const isKimiK27 = isMoonshot && (model === "kimi-k2.7-code" || model === "kimi-k2.7-code-highspeed");
   const isZai53 = isZai && model.startsWith("glm-5.3");
   const isNonStandard = isZai || isXai || isDeepSeek || isMoonshot || isCerebras || isChutes;
 
   return {
     supportsStore: !isNonStandard,
     supportsDeveloperRole: !isNonStandard,
-    supportsReasoningEffort: isKimiK3 || isGrok46 || isZai53 || (!isXai && !isMoonshot),
-    reasoningEffortMap: detectReasoningEffortMap(model, isDeepSeek, isGroq, isZai, isKimiK3, isGrok46, isZai53),
+    supportsReasoningEffort: isKimiK3 || isGrokConfigurable || isZai53 || (!isXai && !isMoonshot),
+    reasoningEffortMap: detectReasoningEffortMap(model, isDeepSeek, isGroq, isZai, isKimiK3, isGrokConfigurable, isZai53),
     supportsUsageInStreaming: true,
-    maxTokensField: isKimiK3
+    maxTokensField: isKimiK3 || isKimiK27
       ? "max_completion_tokens"
       : isDeepSeek || isMoonshot || isZai || isChutes
         ? "max_tokens"
         : "max_completion_tokens",
     requiresReasoningContentOnAssistantMessages: isDeepSeek || isMoonshot || isZai,
-    reasoningParameterStyle: detectReasoningParameterStyle(
+    reasoningParameterStyle: isKimiK27 ? "moonshot-k2.7" : detectReasoningParameterStyle(
       provider,
       baseUrl,
       isDeepSeek,
@@ -179,7 +185,7 @@ function detectReasoningEffortMap(
   isGroq: boolean,
   isZai: boolean,
   isKimiK3: boolean,
-  isGrok46: boolean,
+  isGrokConfigurable: boolean,
   isZai53: boolean,
 ): Partial<Record<string, string>> {
   if (isKimiK3 || isZai53) {
@@ -195,7 +201,7 @@ function detectReasoningEffortMap(
     };
   }
 
-  if (isGrok46) {
+  if (isGrokConfigurable) {
     return {
       off: "low",
       minimal: "low",

@@ -103,7 +103,7 @@ test("CLI DeepSeek env resolution uses official V4 OpenAI-compatible endpoint an
     provider: "deepseek",
     model: "deepseek-v4-flash",
     contextWindowTokens: 1048576,
-    maxOutputTokens: 384000,
+    maxOutputTokens: 393216,
   }));
 });
 
@@ -230,7 +230,7 @@ test("CLI Z.ai 1M alias selects the Anthropic endpoint from the model catalog", 
   }));
 });
 
-test("CLI grok alias routes to xAI Grok 4.6 with documented reasoning parameters", async () => {
+test("CLI grok alias routes to xAI Grok 4.7 with documented reasoning parameters", async () => {
   process.env.XAI_API_KEY = "env-key";
   process.env.XAI_BASE_URL = "https://api.x.ai/v1";
   delete process.env.XAI_MODEL;
@@ -243,7 +243,7 @@ test("CLI grok alias routes to xAI Grok 4.6 with documented reasoning parameters
     return new Response(
       JSON.stringify({
         id: "chatcmpl_grok_cli",
-        model: "grok-4.6",
+        model: "grok-4.7",
         choices: [{ index: 0, finish_reason: "stop", message: { content: "ok" } }],
       }),
       { status: 200, headers: { "content-type": "application/json" } },
@@ -256,7 +256,7 @@ test("CLI grok alias routes to xAI Grok 4.6 with documented reasoning parameters
 
   expect(url).toBe("https://api.x.ai/v1/chat/completions");
   expect(body).toMatchObject({
-    model: "grok-4.6",
+    model: "grok-4.7",
     max_completion_tokens: 128000,
     reasoning_effort: "xhigh",
   });
@@ -265,7 +265,7 @@ test("CLI grok alias routes to xAI Grok 4.6 with documented reasoning parameters
   expect(events).toContainEqual(expect.objectContaining({
     type: "metadata",
     provider: "xai",
-    model: "grok-4.6",
+    model: "grok-4.7",
     contextWindowTokens: 500000,
   }));
 });
@@ -329,7 +329,7 @@ test("CLI runtime model selection resolves explicit provider aliases to concrete
   });
   expect(resolveCliRuntimeModelSelection({ model: "grok" })).toEqual({
     provider: "xai",
-    model: "grok-4.6",
+    model: "grok-4.7",
   });
   expect(resolveCliRuntimeModelSelection({ model: "xai/grok-4.6" })).toEqual({
     provider: "xai",

@@ -2,22 +2,30 @@ import type { ModelCost, ModelDescriptor } from "./types.js";
 
 export const MINIMAX_PROVIDER_ID = "minimax";
 export const MINIMAX_M3_MODEL = "MiniMax-M3";
+export const MINIMAX_M31_FLASH_PREVIEW_MODEL = "MiniMax-M3.1-Flash-Preview";
 export const MINIMAX_ANTHROPIC_BASE_URL = "https://api.minimaxi.com/anthropic";
 export const DEEPSEEK_PROVIDER_ID = "deepseek";
 export const DEEPSEEK_V4_PRO_MODEL = "deepseek-v4-pro";
+export const DEEPSEEK_FLASH_MODEL = "deepseek-flash";
+/** Legacy API name; the provider now serves V4.1 Flash for this selection. */
 export const DEEPSEEK_V4_FLASH_MODEL = "deepseek-v4-flash";
 export const DEEPSEEK_OPENAI_BASE_URL = "https://api.deepseek.com";
 export const DEEPSEEK_ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic";
 export const KIMI_PROVIDER_ID = "kimi";
 export const KIMI_K3_MODEL = "kimi-k3";
+export const KIMI_K27_CODE_MODEL = "kimi-k2.7-code";
+export const KIMI_K27_CODE_HIGHSPEED_MODEL = "kimi-k2.7-code-highspeed";
 export const KIMI_OPENAI_BASE_URL = "https://api.moonshot.cn/v1";
 export const ZAI_PROVIDER_ID = "zai";
 export const ZAI_GLM_53_MODEL = "glm-5.3";
+export const ZAI_GLM_53_FLASH_MODEL = "glm-5.3-flash";
+export const ZAI_GLM_53_FLASHX_MODEL = "glm-5.3-flashx";
 export const ZAI_GLM_53_1M_MODEL = "glm-5.3[1m]";
 export const ZAI_OPENAI_BASE_URL = "https://api.z.ai/api/paas/v4";
 export const ZAI_ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic";
 export const XAI_PROVIDER_ID = "xai";
 export const XAI_GROK_46_MODEL = "grok-4.6";
+export const XAI_GROK_47_MODEL = "grok-4.7";
 export const XAI_OPENAI_BASE_URL = "https://api.x.ai/v1";
 export const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
 export const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
@@ -95,14 +103,15 @@ const BUILTIN_MODELS = [
   {
     provider: DEEPSEEK_PROVIDER_ID,
     model: DEEPSEEK_V4_PRO_MODEL,
-    displayName: "DeepSeek V4 Pro",
+    displayName: "DeepSeek V4 Pro (0813)",
     apiFamily: "openai-completions",
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     default: true,
     inputCapabilities: ["text"],
     contextWindowTokens: 1048576,
-    maxOutputTokens: 384000,
+    maxOutputTokens: 393216,
     reasoningLevels: ["off", "low", "high", "max"],
+    cost: { input: 1.32, output: 3.96, cacheRead: 0.044, cacheWrite: 0, notes: "USD peak rates; off-peak rates are 50%." },
     capabilities: {
       streaming: true,
       reasoning: true,
@@ -134,16 +143,17 @@ const BUILTIN_MODELS = [
       },
     },
   },
-  {
+  ...[DEEPSEEK_FLASH_MODEL, DEEPSEEK_V4_FLASH_MODEL].map((model): ModelDescriptor => ({
     provider: DEEPSEEK_PROVIDER_ID,
-    model: DEEPSEEK_V4_FLASH_MODEL,
-    displayName: "DeepSeek V4 Flash",
+    model,
+    displayName: model === DEEPSEEK_FLASH_MODEL ? "DeepSeek V4.1 Flash" : "DeepSeek V4.1 Flash (legacy alias)",
     apiFamily: "openai-completions",
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
-    inputCapabilities: ["text"],
+    inputCapabilities: ["text", "image"],
     contextWindowTokens: 1048576,
-    maxOutputTokens: 384000,
+    maxOutputTokens: 393216,
     reasoningLevels: ["off", "low", "high", "max"],
+    cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0, notes: "USD peak rates; off-peak rates are 50%." },
     capabilities: {
       streaming: true,
       reasoning: true,
@@ -174,7 +184,7 @@ const BUILTIN_MODELS = [
         toolCallDeltaMode: "standard",
       },
     },
-  },
+  })),
   {
     provider: KIMI_PROVIDER_ID,
     model: KIMI_K3_MODEL,
@@ -185,6 +195,7 @@ const BUILTIN_MODELS = [
     inputCapabilities: ["text", "image"],
     contextWindowTokens: 1048576,
     maxOutputTokens: 1048576,
+    cost: { input: 20, output: 100, cacheRead: 2, cacheWrite: 20, currency: "CNY", notes: "Moonshot CN; cache write uses the default 5m TTL. 1h TTL costs CNY 40/MTok." },
     reasoningLevels: ["low", "high", "max"],
     capabilities: {
       streaming: true,
@@ -217,18 +228,48 @@ const BUILTIN_MODELS = [
       },
     },
   },
-  {
+  ...[KIMI_K27_CODE_MODEL, KIMI_K27_CODE_HIGHSPEED_MODEL].map((model): ModelDescriptor => ({
+    provider: KIMI_PROVIDER_ID,
+    model,
+    displayName: model === KIMI_K27_CODE_MODEL ? "Kimi K2.7 Code" : "Kimi K2.7 Code Highspeed",
+    apiFamily: "openai-completions",
+    baseUrl: KIMI_OPENAI_BASE_URL,
+    inputCapabilities: ["text", "image"],
+    contextWindowTokens: 262144,
+    reasoningLevels: ["high"],
+    cost: model === KIMI_K27_CODE_MODEL
+      ? { input: 6.5, output: 27, cacheRead: 1.3, cacheWrite: 0, currency: "CNY", notes: "Moonshot CN; no separate cache-write rate listed for K2.7." }
+      : { input: 13, output: 54, cacheRead: 2.6, cacheWrite: 0, currency: "CNY", notes: "Moonshot CN; no separate cache-write rate listed for K2.7." },
+    capabilities: { streaming: true, reasoning: true, toolCalls: true, toolCallDeltas: true, usage: true, responseId: true },
+    compatibility: {
+      chatCompletions: {
+        supportsStore: false,
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: false,
+        supportsUsageInStreaming: true,
+        maxTokensField: "max_completion_tokens",
+        requiresReasoningContentOnAssistantMessages: true,
+        reasoningParameterStyle: "moonshot-k2.7",
+        toolCallDeltaMode: "standard",
+      },
+    },
+  })),
+  ...[
+    { model: ZAI_GLM_53_MODEL, displayName: "GLM-5.3", input: 1.4, output: 4.4, cacheRead: 0.26 },
+    { model: ZAI_GLM_53_FLASH_MODEL, displayName: "GLM-5.3 Flash", input: 0.15, output: 0.5, cacheRead: 0.03 },
+    { model: ZAI_GLM_53_FLASHX_MODEL, displayName: "GLM-5.3 FlashX", input: 0.37, output: 1.25, cacheRead: 0.075 },
+  ].map(({ model, displayName, input, output, cacheRead }): ModelDescriptor => ({
     provider: ZAI_PROVIDER_ID,
-    model: ZAI_GLM_53_MODEL,
-    displayName: "GLM-5.3",
+    model,
+    displayName,
     apiFamily: "openai-completions",
     baseUrl: ZAI_OPENAI_BASE_URL,
-    default: true,
-    inputCapabilities: ["text"],
+    ...(model === ZAI_GLM_53_MODEL ? { default: true } : {}),
+    inputCapabilities: model === ZAI_GLM_53_MODEL ? ["text"] : ["text", "image"],
     contextWindowTokens: 1000000,
     maxOutputTokens: 131072,
     reasoningLevels: ["low", "high", "max"],
-    cost: { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
+    cost: { input, output, cacheRead, cacheWrite: 0, notes: "Z.ai USD rates; cached-input storage is temporarily free." },
     capabilities: {
       streaming: true,
       reasoning: true,
@@ -259,7 +300,7 @@ const BUILTIN_MODELS = [
         toolCallDeltaMode: "zai-tool-stream",
       },
     },
-  },
+  })),
   {
     provider: ZAI_PROVIDER_ID,
     model: ZAI_GLM_53_1M_MODEL,
@@ -296,7 +337,7 @@ const BUILTIN_MODELS = [
     maxOutputTokens: 524288,
     reasoningLevels: ["off", "high"],
     serviceTiers: ["standard", "fast"],
-    cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0 },
+    cost: { input: 2.1, output: 8.4, cacheRead: 0.42, cacheWrite: 0, currency: "CNY", notes: "MiniMax CN standard tier, input <=512K. Longer inputs cost 2x; priority costs 1.5x." },
     capabilities: {
       streaming: true,
       reasoning: true,
@@ -312,16 +353,30 @@ const BUILTIN_MODELS = [
     },
   },
   {
+    provider: MINIMAX_PROVIDER_ID,
+    model: MINIMAX_M31_FLASH_PREVIEW_MODEL,
+    displayName: "MiniMax M3.1 Flash Preview (M Plan)",
+    apiFamily: "anthropic-messages",
+    baseUrl: MINIMAX_ANTHROPIC_BASE_URL,
+    inputCapabilities: ["text", "image"],
+    contextWindowTokens: 1000000,
+    reasoningLevels: ["low", "medium", "high", "xhigh", "max"],
+    capabilities: { streaming: true, reasoning: true, toolCalls: true, toolCallDeltas: true, usage: true, responseId: true },
+    compatibility: {
+      messages: { supportsEagerToolInputStreaming: true, supportsAdaptiveReasoningEffort: true },
+    },
+  },
+  ...[XAI_GROK_47_MODEL, XAI_GROK_46_MODEL].map((model): ModelDescriptor => ({
     provider: XAI_PROVIDER_ID,
-    model: XAI_GROK_46_MODEL,
-    displayName: "Grok 4.6",
+    model,
+    displayName: model === XAI_GROK_47_MODEL ? "Grok 4.7" : "Grok 4.6",
     apiFamily: "openai-completions",
     baseUrl: XAI_OPENAI_BASE_URL,
-    default: true,
+    ...(model === XAI_GROK_47_MODEL ? { default: true } : {}),
     inputCapabilities: ["text", "image"],
     contextWindowTokens: 500000,
     reasoningLevels: ["low", "medium", "high", "xhigh"],
-    cost: { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
+    cost: { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0, notes: "USD standard tier below 200K prompt tokens; long-context rates are 2x." },
     capabilities: {
       streaming: true,
       reasoning: true,
@@ -352,7 +407,7 @@ const BUILTIN_MODELS = [
         toolCallDeltaMode: "standard",
       },
     },
-  },
+  })),
   ...OPENAI_CODEX_MODELS.map((model) => codexModelDescriptor(OPENAI_CODEX_PROVIDER_ID, model, OPENAI_CODEX_BASE_URL)),
   ...CODEX_API_MODELS.map((model) => codexModelDescriptor(CODEX_API_PROVIDER_ID, model)),
 ] satisfies readonly ModelDescriptor[];

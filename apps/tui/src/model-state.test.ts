@@ -101,6 +101,7 @@ test("built-in picker exposes only current model generations", () => {
   expect(models).toContain("kimi/kimi-k3");
   expect(models).toContain("zai/glm-5.3");
   expect(models).toContain("xai/grok-4.6");
+  expect(models).toContain("xai/grok-4.7");
   expect(models.some((entry) => entry.includes("gpt-5.5"))).toBe(false);
   expect(models).not.toContain("minimax/MiniMax-M2.7");
   expect(models).not.toContain("minimax/MiniMax-M3[1m]");
@@ -127,10 +128,10 @@ test("model references canonicalize the official GPT alias", () => {
 
 test("Grok aliases select xAI and expose image and reasoning controls", () => {
   const candidates = defaultModelCandidates();
-  const grok = candidates.find(({ provider, model }) => provider === "xai" && model === "grok-4.6");
+  const grok = candidates.find(({ provider, model }) => provider === "xai" && model === "grok-4.7");
 
   expect(parseModelCommand("grok", candidates)).toEqual({
-    selection: { provider: "xai", model: "grok-4.6" },
+    selection: { provider: "xai", model: "grok-4.7" },
   });
   expect(findExactModelSelection("grok/grok-4.6", candidates)).toEqual({
     provider: "xai",

@@ -1,3 +1,4 @@
+import { BUILTIN_PROVIDERS } from "./provider-definition.js";
 import type { ChiliModelProvider, ModelDescriptor, ReasoningLevel } from "./types.js";
 import { type EnvironmentSource, readDeepSeekEnvironment } from "./env.js";
 import {
@@ -11,6 +12,7 @@ import {
 import { OpenAICompletionsModel, type OpenAICompletionsModelOptions } from "./openai-completions.js";
 
 export {
+  DEEPSEEK_FLASH_MODEL,
   DEEPSEEK_ANTHROPIC_BASE_URL,
   DEEPSEEK_OPENAI_BASE_URL,
   DEEPSEEK_PROVIDER_ID,
@@ -31,7 +33,6 @@ export interface DeepSeekModelOptions {
   env?: EnvironmentSource;
 }
 
-const DEFAULT_DEEPSEEK_MAX_TOKENS = 128 * 1024;
 const DEFAULT_DEEPSEEK_REASONING_EFFORT: ReasoningLevel = "high";
 
 export class DeepSeekOpenAIProvider implements ChiliModelProvider {
@@ -112,7 +113,7 @@ export function createDeepSeekV4Model(options: DeepSeekModelOptions = {}): OpenA
     baseUrl: resolveDeepSeekCompletionsUrl(options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? DEEPSEEK_OPENAI_BASE_URL),
     apiKey: options.apiKey ?? env.apiKey ?? "",
     reasoning: options.reasoning ?? true,
-    maxTokens: options.maxTokens ?? DEFAULT_DEEPSEEK_MAX_TOKENS,
+    maxTokens: options.maxTokens ?? BUILTIN_PROVIDERS.deepseek.defaultRequestMaxTokens,
   };
   if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
   if (descriptor?.compatibility?.chatCompletions) modelOptions.compatibility = descriptor.compatibility.chatCompletions;

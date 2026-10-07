@@ -237,8 +237,8 @@ test("catalog exposes configured xAI Grok with a sanitized endpoint", () => {
       XAI_MODEL: XAI_GROK_46_MODEL,
     },
   });
-  expect(catalog).toHaveLength(1);
-  expect(catalog[0]).toMatchObject({
+  expect(catalog).toHaveLength(2);
+  expect(catalog.find((entry) => entry.model === XAI_GROK_46_MODEL)).toMatchObject({
     provider: XAI_PROVIDER_ID,
     model: XAI_GROK_46_MODEL,
     displayName: "Grok 4.6",
@@ -247,8 +247,8 @@ test("catalog exposes configured xAI Grok with a sanitized endpoint", () => {
     authSource: "environment",
     endpoint: "https://gateway.x.ai:8443",
   });
-  expect(JSON.stringify(catalog[0])).not.toContain("secret");
-  expect(JSON.stringify(catalog[0])).not.toContain("hidden");
+  expect(JSON.stringify(catalog)).not.toContain("secret");
+  expect(JSON.stringify(catalog)).not.toContain("hidden");
 });
 
 test("catalog exposes ChatGPT auth state and current GPT-6.1 metadata", () => {

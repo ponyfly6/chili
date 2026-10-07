@@ -1,3 +1,4 @@
+import { BUILTIN_PROVIDERS } from "./provider-definition.js";
 import type { ChiliModel, ChiliModelProvider, ModelDescriptor, ReasoningLevel } from "./types.js";
 import { AnthropicCompatibleModel, type AnthropicCompatibleModelOptions } from "./anthropic-compatible.js";
 import { type EnvironmentSource, readZaiEnvironment } from "./env.js";
@@ -11,7 +12,7 @@ import {
 } from "./models.js";
 import { OpenAICompletionsModel, type OpenAICompletionsModelOptions } from "./openai-completions.js";
 
-export { ZAI_GLM_53_MODEL, ZAI_OPENAI_BASE_URL, ZAI_PROVIDER_ID } from "./models.js";
+export { ZAI_GLM_53_MODEL, ZAI_GLM_53_FLASH_MODEL, ZAI_GLM_53_FLASHX_MODEL, ZAI_OPENAI_BASE_URL, ZAI_PROVIDER_ID } from "./models.js";
 
 export interface ZaiModelOptions {
   apiKey?: string;
@@ -26,7 +27,6 @@ export interface ZaiModelOptions {
   env?: EnvironmentSource;
 }
 
-const DEFAULT_ZAI_MAX_TOKENS = 128 * 1024;
 
 export class ZaiOpenAIProvider implements ChiliModelProvider {
   readonly id = ZAI_PROVIDER_ID;
@@ -104,7 +104,7 @@ export function createZaiModel(options: ZaiModelOptions = {}): ChiliModel {
   if (!apiKey) throw new Error("Z.ai provider requires ZAI_API_KEY");
   const descriptor = findKnownModel(ZAI_PROVIDER_ID, model) ?? findDefaultKnownModel(ZAI_PROVIDER_ID);
   const baseUrl = options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? ZAI_OPENAI_BASE_URL;
-  const maxTokens = options.maxTokens ?? DEFAULT_ZAI_MAX_TOKENS;
+  const maxTokens = options.maxTokens ?? BUILTIN_PROVIDERS.zai.defaultRequestMaxTokens;
   if (isAnthropicEndpoint(baseUrl)) {
     const modelOptions: AnthropicCompatibleModelOptions = {
       provider: ZAI_PROVIDER_ID,

@@ -213,7 +213,7 @@ export function usage(): string {
     "  bun run chili -- --model kimi \"hello\"",
     "  bun run chili -- --model glm-5.3 \"hello\"",
     "  bun run chili -- --model grok \"hello\"",
-    "  bun run chili -- --model xai/grok-4.6:high \"hello\"",
+    "  bun run chili -- --model xai/grok-4.7:high \"hello\"",
     "  bun run chili -- --model codex \"hello\"",
     "  bun run chili -- --model codex-api/gpt-6.1-sol \"hello\"",
     "  bun run chili -- --provider openai-codex --model gpt-6.1-sol \"hello\"",

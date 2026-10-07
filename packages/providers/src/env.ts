@@ -7,6 +7,7 @@ import {
   XAI_PROVIDER_ID,
   ZAI_PROVIDER_ID,
 } from "./models.js";
+import type { BuiltinProviderId } from "./provider-definition.js";
 
 export type EnvironmentSource = Record<string, string | undefined>;
 
@@ -81,7 +82,21 @@ const PROVIDER_ENVIRONMENT: Record<string, ProviderEnvironmentSpec> = {
   [CODEX_API_PROVIDER_ID]: CODEX_API_ENVIRONMENT,
   [XAI_PROVIDER_ID]: XAI_ENVIRONMENT,
   [ZAI_PROVIDER_ID]: ZAI_ENVIRONMENT,
-};
+} satisfies Record<BuiltinProviderId, ProviderEnvironmentSpec>;
+
+/** Capture only this provider's inputs, preserving legacy-vs-explicit credential provenance. */
+export function snapshotProviderEnvironment(provider: string, env: EnvironmentSource = currentEnvironment()): EnvironmentSource {
+  const spec = PROVIDER_ENVIRONMENT[provider];
+  if (!spec) return {};
+  const specs = provider === CODEX_API_PROVIDER_ID ? [spec, LEGACY_CODEX_API_ENVIRONMENT] : [spec];
+  const snapshot: EnvironmentSource = {};
+  for (const entry of specs) {
+    for (const name of [...(entry.apiKey ?? []), ...(entry.baseUrl ?? []), ...(entry.model ?? [])]) {
+      if (env[name] !== undefined) snapshot[name] = env[name];
+    }
+  }
+  return snapshot;
+}
 
 export function readProviderEnvironment(
   provider: string,
