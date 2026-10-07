@@ -69,10 +69,9 @@ test("rejects cross-session and unknown snapshots without provider or event side
   expect(fixture.appended).toEqual([]);
 });
 
-test("rejects archived, child and read-only Sessions before reading snapshots", async () => {
+test("rejects archived and child Sessions before reading snapshots", async () => {
   for (const session of [
     { ...sessionRow(sessionId, "/workspace"), status: "archived" as const },
-    { ...sessionRow(sessionId, "/workspace"), readOnly: true as const },
     { ...sessionRow(sessionId, "/workspace"), agent: { parentSessionId: otherSessionId, name: "child", path: "/root/child" as import("@chili/protocol").AgentPath, policy: {} } },
   ]) {
     const fixture = recoveryFixture({

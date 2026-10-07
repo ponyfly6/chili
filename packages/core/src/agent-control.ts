@@ -240,7 +240,6 @@ export class AgentControlService implements AgentToolController {
   private async activeSession(sessionId: SessionId): Promise<SessionRow> {
     const session = await this.options.store.session(sessionId);
     if (!session || session.status !== "active") throw new AgentControlAuthorizationError(`Active Agent session not found: ${sessionId}`);
-    if (session.readOnly) throw new AgentControlAuthorizationError("Historical Sessions are read-only and cannot be activated through Agent control");
     return session;
   }
 

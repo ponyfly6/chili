@@ -6,71 +6,54 @@ import { expect, test } from "bun:test";
 import type { RuntimeEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 
-for (const existingColumn of [undefined, "provider_call_id", "parent_call_id"] as const) {
-  test(`migrates ${existingColumn ?? "legacy"} tool rows and preserves nested calls across reopen without model messages`, async () => {
-    const dir = await mkdtemp(join(tmpdir(), "chili-nested-tools-"));
-    const path = join(dir, "events.sqlite");
-    const legacy = new Database(path);
-    legacy.exec(`create table tool_calls (
-      id text primary key, ${existingColumn ? `${existingColumn} text,` : ""} session_id text, turn_id text, tool_name text not null,
-      status text not null, input_json text, output text, error text,
-      synthetic integer not null default 0, started_at integer not null, updated_at integer not null
-    )`);
-    legacy.query(`insert into tool_calls (id, tool_name, status, started_at, updated_at)
-      values ('legacy_read', 'read', 'completed', 1, 1)`).run();
-    if (existingColumn) legacy.query(`update tool_calls set ${existingColumn} = 'legacy_identity' where id = 'legacy_read'`).run();
-    legacy.close();
-    const sessionId = "session_nested_tools" as SessionId;
-    const turnId = "turn_nested_tools" as TurnId;
-    const parentCallId = "call_script" as ToolCallId;
-    const callId = "call_read" as ToolCallId;
-    const events: RuntimeEvent[] = [
-      {
-        id: "event_script_started", type: "tool.call_started", time: 2 as TimestampMs, sessionId,
-        payload: { turnId, callId: parentCallId, providerCallId: "provider_script", toolName: "code_mode", input: { code: "await tools.read({filePath:'README.md'})" } },
-      },
-      {
-        id: "event_read_started", type: "tool.call_started", time: 3 as TimestampMs, sessionId,
-        payload: { turnId, callId, parentCallId, toolName: "read", input: { filePath: "README.md" } },
-      },
-      {
-        id: "event_read_finished", type: "tool.call_finished", time: 4 as TimestampMs, sessionId,
-        payload: { callId, status: "completed", output: "file contents" },
-      },
-      {
-        id: "event_script_finished", type: "tool.call_finished", time: 5 as TimestampMs, sessionId,
-        payload: { callId: parentCallId, status: "completed", output: "selected result" },
-      },
-    ];
-    let store: SqliteEventStore | undefined;
+test("preserves nested calls across reopen without model messages", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-nested-tools-"));
+  const path = join(dir, "events.sqlite");
+  const sessionId = "session_nested_tools" as SessionId;
+  const turnId = "turn_nested_tools" as TurnId;
+  const parentCallId = "call_script" as ToolCallId;
+  const callId = "call_read" as ToolCallId;
+  const events: RuntimeEvent[] = [
+    {
+      id: "event_script_started", type: "tool.call_started", time: 2 as TimestampMs, sessionId,
+      payload: { turnId, callId: parentCallId, providerCallId: "provider_script", toolName: "code_mode", input: { code: "await tools.read({filePath:'README.md'})" } },
+    },
+    {
+      id: "event_read_started", type: "tool.call_started", time: 3 as TimestampMs, sessionId,
+      payload: { turnId, callId, parentCallId, toolName: "read", input: { filePath: "README.md" } },
+    },
+    {
+      id: "event_read_finished", type: "tool.call_finished", time: 4 as TimestampMs, sessionId,
+      payload: { callId, status: "completed", output: "file contents" },
+    },
+    {
+      id: "event_script_finished", type: "tool.call_finished", time: 5 as TimestampMs, sessionId,
+      payload: { callId: parentCallId, status: "completed", output: "selected result" },
+    },
+  ];
+  let store: SqliteEventStore | undefined;
+  try {
+    store = new SqliteEventStore(path);
+    await store.appendMany(events);
+    store.close();
+    store = new SqliteEventStore(path);
+    expect(await store.events({ sessionId })).toEqual(events);
+    expect(await store.events({ sessionId, compactRequests: true })).toEqual(events);
+    expect(await store.messages(sessionId)).toEqual([]);
+    const db = new Database(path, { readonly: true });
     try {
-      store = new SqliteEventStore(path);
-      await store.appendMany(events);
-      store.close();
-      store = new SqliteEventStore(path);
-      expect(await store.events({ sessionId })).toEqual(events);
-      expect(await store.events({ sessionId, compactRequests: true })).toEqual(events);
-      expect(await store.messages(sessionId)).toEqual([]);
-      const db = new Database(path, { readonly: true });
-      try {
-        expect(db.query("select parent_call_id, provider_call_id from tool_calls where id = 'legacy_read'").get())
-          .toEqual({
-            parent_call_id: existingColumn === "parent_call_id" ? "legacy_identity" : null,
-            provider_call_id: existingColumn === "provider_call_id" ? "legacy_identity" : null,
-          });
-        expect(db.query("select id, provider_call_id, parent_call_id, status, output from tool_calls where parent_call_id = ?").all(parentCallId))
-          .toEqual([{ id: callId, provider_call_id: null, parent_call_id: parentCallId, status: "completed", output: "file contents" }]);
-        expect(db.query("select provider_call_id, parent_call_id from tool_calls where id = ?").get(parentCallId))
-          .toEqual({ provider_call_id: "provider_script", parent_call_id: null });
-      } finally {
-        db.close();
-      }
+      expect(db.query("select id, provider_call_id, parent_call_id, status, output from tool_calls where parent_call_id = ?").all(parentCallId))
+        .toEqual([{ id: callId, provider_call_id: null, parent_call_id: parentCallId, status: "completed", output: "file contents" }]);
+      expect(db.query("select provider_call_id, parent_call_id from tool_calls where id = ?").get(parentCallId))
+        .toEqual({ provider_call_id: "provider_script", parent_call_id: null });
     } finally {
-      store?.close();
-      await rm(dir, { recursive: true, force: true });
+      db.close();
     }
-  });
-}
+  } finally {
+    store?.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("provider identifiers can repeat while nested internal identities remain fenced by session and turn", async () => {
   const store = new SqliteEventStore(":memory:");

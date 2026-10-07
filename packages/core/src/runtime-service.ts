@@ -285,7 +285,7 @@ interface RuntimeAtomicSessionStore {
     cwd: string;
     time: number;
     leaseDurationMs: number;
-  }): { status: "claimed" | "already_exists" | "forbidden" };
+  }): { status: "claimed" | "already_exists" };
   renewSessionCreation(input: {
     sessionId: SessionId;
     claimId: string;
@@ -500,9 +500,6 @@ export class RuntimeService {
         if (claimed.status === "already_exists") {
           throw new RuntimeSessionAlreadyExistsError(sessionId);
         }
-        if (claimed.status === "forbidden") {
-          throw new RuntimeSessionAccessError(sessionId);
-        }
         creationClaimId = claimId;
         if (atomicStore.renewSessionCreation) {
           creationClaimHeartbeat = this.startClaimHeartbeat(
@@ -647,10 +644,6 @@ export class RuntimeService {
     const sessions = await this.options.store.sessions();
     const session = sessions.find((candidate) => candidate.id === sessionId);
     if (!session) throw new RuntimeSessionNotFoundError(sessionId);
-    if (session.readOnly) {
-      if (!requireActive) return;
-      throw new RuntimeSessionAccessError(sessionId, "Historical Session is read-only");
-    }
     if (Boolean(session.agent) !== (this.options.sessionAccess === "child")) {
       throw new RuntimeSessionAccessError(sessionId);
     }
@@ -1163,7 +1156,7 @@ export class RuntimeService {
     if (!store) return;
     for (const session of await this.options.store.sessions()) {
       if (session.status !== "active" || this.running.has(session.id)) continue;
-      if (session.readOnly || Boolean(session.agent) !== (this.options.sessionAccess === "child")) continue;
+      if (Boolean(session.agent) !== (this.options.sessionAccess === "child")) continue;
       if (store.sessionInputQueue(session.id).items.some((item) => item.state === "claimed"
         || (options.includePending !== false && item.state === "pending"))) {
         this.assertControlOwner(session.id);

@@ -194,16 +194,6 @@ test("cancellation checks the exact pending revision and revoked sources cannot 
   expect(store.sessionInputQueue(sessionId).pendingCount).toBe(0);
 });
 
-test("old writers cannot bypass durable pause by acquiring a legacy claim", async () => {
-  const { path, store } = await fixture();
-  accept(store);
-  store.mutateSessionInputs({ kind: "pause", sessionId });
-  const oldWriter = new Database(path);
-  try {
-    expect(() => oldWriter.query("insert into session_run_claims(session_id, claim_id, claimed_at, heartbeat_at, lease_expires_at) values (?, 'old', 0, 0, ?)").run(sessionId, Date.now() + 60_000)).toThrow("Incompatible Chili writer");
-  } finally { oldWriter.close(); }
-});
-
 for (const phase of ["accepted", "claimed", "promoted"] as const) {
   test(`SIGKILL after ${phase} preserves receipt and requires explicit recovery`, async () => {
     const { path, store } = await fixture();

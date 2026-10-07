@@ -72,42 +72,7 @@ interface InputRepositoryOptions {
 
 /** SQLite operations only. RuntimeService owns dispatch and execution. */
 export class SessionInputRepository {
-  constructor(private readonly db: Database, private readonly options: InputRepositoryOptions) {
-    db.exec(`create table if not exists session_input_schema (version integer not null)`);
-    const version = db.query<{ version: number }, []>("select version from session_input_schema limit 1").get();
-    if (version && version.version !== 1) throw new Error("Unsupported Chili durable input schema version");
-    if (!version) db.exec("insert into session_input_schema values (1)");
-    db.exec(`create table if not exists session_dispatch (
-      session_id text primary key references sessions(id), paused integer not null default 0,
-      revision integer not null default 0
-    )`);
-    db.exec(`create table if not exists session_inputs (
-      sequence integer primary key autoincrement, input_id text not null unique,
-      submission_id text not null, session_id text not null references sessions(id),
-      mode text not null, state text not null, revision integer not null default 1,
-      payload text not null, identity text not null, text text not null, source text not null,
-      accepted_at integer not null, updated_at integer not null, settled_revision integer not null default 0,
-      claim_id text, execution_ref text, message_id text, turn_id text, outcome text, error text,
-      unique(session_id, submission_id)
-    )`);
-    db.exec("create index if not exists session_inputs_pending on session_inputs(session_id, state, sequence)");
-    const inputColumns = db.query<{ name: string }, []>("pragma table_info(session_inputs)").all();
-    if (!inputColumns.some((column) => column.name === "result_message_id")) db.exec("alter table session_inputs add column result_message_id text");
-    if (!inputColumns.some((column) => column.name === "resumed")) db.exec("alter table session_inputs add column resumed integer not null default 0");
-    db.exec("create table if not exists session_input_revocations(session_id text not null, source text not null, primary key(session_id, source))");
-    // Old runtimes do not populate this column. They must not acquire a durable
-    // session and bypass its queue or persisted pause state.
-    const columns = db.query<{ name: string }, []>("pragma table_info(session_run_claims)").all();
-    if (!columns.some((column) => column.name === "input_version")) {
-      db.exec("alter table session_run_claims add column input_version integer not null default 0");
-    }
-    for (const operation of ["insert", "update"]) {
-      db.exec(`create trigger if not exists session_inputs_writer_${operation}
-        before ${operation} on session_run_claims
-        when new.input_version != 1 and exists(select 1 from session_dispatch where session_id = new.session_id)
-        begin select raise(abort, 'Incompatible Chili writer: durable input support required'); end`);
-    }
-  }
+  constructor(private readonly db: Database, private readonly options: InputRepositoryOptions) {}
 
   get(sessionId: SessionId, submissionId: string): StoredSessionInput | undefined {
     const row = this.db.query<InputRow, [string, string]>(
@@ -175,10 +140,9 @@ export class SessionInputRepository {
         const queue = this.queue(sessionId);
         const revoked = this.db.query<{ found: number }, [string, string]>("select 1 as found from session_input_revocations where session_id = ? and source = ?").get(sessionId, command.source);
         if (revoked) throw new SessionInputConflictError("Input authorization was revoked");
-        const activeClaim = this.db.query<{ input_version: number }, [string, number]>(
-          "select input_version from session_run_claims where session_id = ? and lease_expires_at > ?",
+        const activeClaim = this.db.query<{ found: number }, [string, number]>(
+          "select 1 as found from session_run_claims where session_id = ? and lease_expires_at > ?",
         ).get(sessionId, time);
-        if (activeClaim?.input_version === 0) throw new SessionInputConflictError("An incompatible runtime owns this session; stop it before migrating input control");
         if (command.mode === "start" && (activeClaim || queue.pendingCount > 0 || queue.items.some((item) => item.state === "claimed"))) {
           throw new SessionInputConflictError("Session is busy or paused; enqueue input or explicitly resume it");
         }

@@ -2628,43 +2628,6 @@ test("rejects direct HTTP prompts, commands, controls, and lifecycle mutations f
   expect(commands.lastRun).toBeUndefined();
 });
 
-test("read-only historical sessions remain readable but reject execution and root Agent control", async () => {
-  const baseStore = new MemoryEventStore();
-  const store = new ObservableEventStore(baseStore);
-  const service = new FakeRuntimeService(store);
-  const sessionId = "session_http_history" as SessionId;
-  await service.createSession({ sessionId });
-  baseStore.sessionRows.set(sessionId, { ...baseStore.sessionRows.get(sessionId)!, readOnly: true });
-  const handler = createRuntimeHttpHandler({ service: Object.assign(service, {
-    inputQueue: () => ({ sessionId, paused: true, revision: 0, pendingCount: 0, interruptedCount: 0, items: [] }),
-  }), store, commands: new FakePromptCommandControl() });
-  const client = new HttpRuntimeClient({ baseUrl: "http://chili.test", fetch: ((input, init) => handler(new Request(input, init))) as typeof fetch });
-  expect((await client.listSessions())[0]).toMatchObject({ id: sessionId, readOnly: true });
-  expect(await client.messages(sessionId)).toEqual([]);
-  expect((await handler(new Request(`http://chili.test/sessions/${sessionId}/events`))).status).toBe(200);
-  expect((await handler(new Request(`http://chili.test/sessions/${sessionId}/agents`))).status).toBe(403);
-  for (const [action, body] of [
-    ["prompt", { text: "not executable" }],
-    ["prompt_async", { text: "not executable" }],
-    ["command_async", { commandId: "prompt.project.joke" }],
-    ["resume_inputs", {}],
-    ["interrupt", {}],
-    ["goal", { objective: "not executable" }],
-    ["model", { modelSelection: { provider: "fake", model: "fake" } }],
-    ["delegation", { policy: "proactive" }],
-    ["rename", { title: "not mutable" }],
-    ["archive", {}],
-    ["agents", { name: "child", prompt: "not executable" }],
-  ] as const) {
-    const response = await handler(new Request(`http://chili.test/sessions/${sessionId}/${action}`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-    }));
-    expect(response.status).toBe(403);
-  }
-  expect(service.lastPrompt).toBeUndefined();
-  expect(service.goal).toBeUndefined();
-});
-
 test("rejects prompt and mutation routes after a session is archived", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -3564,7 +3527,6 @@ class FakeRuntimeService implements RuntimeHttpService {
   async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
     await this.assertSessionReadAllowed(sessionId);
     const session = (await this.store.sessions()).find((candidate) => candidate.id === sessionId);
-    if (session?.readOnly) throw new RuntimeSessionAccessError(sessionId, "Historical Session is read-only");
     if (session && session.status !== "active") {
       throw new RuntimeSessionInactiveError(sessionId, session.status);
     }
@@ -3691,9 +3653,7 @@ class FakeRuntimeService implements RuntimeHttpService {
     this.lastPrompt = input;
   }
 
-  async interrupt(sessionId: SessionId): Promise<boolean> {
-    const session = (await this.store.sessions()).find((candidate) => candidate.id === sessionId);
-    if (session?.readOnly) throw new RuntimeSessionAccessError(sessionId, "Historical Session is read-only");
+  async interrupt(_sessionId: SessionId): Promise<boolean> {
     return true;
   }
 
@@ -4162,7 +4122,7 @@ test("Agent HTTP control rejects child and archived callers before invoking the 
   const row = base.sessionRows.get(sessionId)!;
   const handler = createRuntimeHttpHandler({ service, store, agents });
   const child = { parentSessionId: "session_parent" as SessionId, name: "worker", path: "/root/worker" as AgentPath, policy: {} };
-  for (const invalid of [{ ...row, agent: child }, { ...row, readOnly: true as const }, { ...row, status: "archived" as const }]) {
+  for (const invalid of [{ ...row, agent: child }, { ...row, status: "archived" as const }]) {
     base.sessionRows.set(sessionId, invalid);
     for (const [method, suffix] of [["GET", ""], ["POST", ""], ["POST", "/another/send"], ["POST", "/another/wait"], ["POST", "/another/stop"], ["POST", "/another/resume"]] as const) {
       const response = await handler(new Request(`http://chili.test/sessions/${sessionId}/agents${suffix}`, { method }));

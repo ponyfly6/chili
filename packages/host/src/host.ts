@@ -347,16 +347,13 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       if (session.status !== "active") {
         throw new Error(`Session is not active: ${request.sessionId} (${session.status})`);
       }
-      if (session.readOnly) {
-        throw new Error(`Session is read-only: ${request.sessionId}`);
-      }
       const rootSession = sessions.find((candidate) => candidate.id === rootSessionId);
       if (!rootSession) throw new Error(`Approval root session not found: ${rootSessionId}`);
       if (rootSession.status !== "active") {
         throw new Error(`Approval root session is not active: ${rootSessionId} (${rootSession.status})`);
       }
-      if (rootSession.readOnly || rootSession.agent) {
-        throw new Error(`Approval root session must be a writable root: ${rootSessionId}`);
+      if (rootSession.agent) {
+        throw new Error(`Approval root session must be a root: ${rootSessionId}`);
       }
       const sessionCwd = await canonicalSkillWorkspace(session.cwd);
       const sessionConfig = await loadHostConfig(sessionCwd, { chiliHome });
@@ -749,9 +746,6 @@ function registerMcpResourceTools(registry: InMemoryToolRegistry, runtime: HostM
 function createSessionToolPolicyResolver(store: ObservableEventStore): ToolAccessPolicyResolver {
   return { async resolve(context) {
     const session = await store.session(context.sessionId);
-    if (session?.readOnly) {
-      throw new Error(`Session is read-only: ${context.sessionId}`);
-    }
     return session?.agent?.policy;
   } };
 }

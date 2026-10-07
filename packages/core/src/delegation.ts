@@ -74,9 +74,6 @@ export class DelegationPolicyGate {
           if (rootSession.status !== "active") {
             throw new Error(`Delegation root session is not active: ${current} (${rootSession.status})`);
           }
-          if (rootSession.readOnly) {
-            throw new Error(`Historical Session is read-only: ${current}`);
-          }
         }
         return current;
       }
@@ -88,7 +85,7 @@ export class DelegationPolicyGate {
         if (!parentSession) {
           throw new Error(`Delegation parent session not found: ${parent} (child ${current})`);
         }
-        if (parentSession.status !== "active" || parentSession.readOnly) {
+        if (parentSession.status !== "active") {
           throw new Error(`Delegation parent session is not active: ${parent} (${parentSession.status})`);
         }
       }

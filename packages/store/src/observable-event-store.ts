@@ -99,7 +99,6 @@ export class ObservableEventStore
   }
 
   async appendCommitted(event: RuntimeEvent, options?: EventAppendOptions): Promise<boolean> {
-    assertCurrentEvent(event);
     const aware = this.inner as EventStore & Partial<EventCommitAwareStore>;
     const committed = aware.appendCommitted
       ? await aware.appendCommitted(event, options)
@@ -119,7 +118,6 @@ export class ObservableEventStore
     events: readonly RuntimeEvent[],
     options?: EventAppendOptions,
   ): Promise<readonly RuntimeEvent[]> {
-    for (const event of events) assertCurrentEvent(event);
     const aware = this.inner as EventStore & Partial<EventCommitAwareStore>;
     const committed = aware.appendManyCommitted
       ? await aware.appendManyCommitted(events, options)
@@ -221,10 +219,4 @@ export class ObservableEventStore
     return inner as EventStore & GoalMutationStore;
   }
 
-}
-
-function assertCurrentEvent(event: RuntimeEvent): void {
-  if (event.type.startsWith("agent.") || event.type.startsWith("team.")) {
-    throw new Error("Legacy workflow events are read-only");
-  }
 }

@@ -46,7 +46,7 @@ See [evaluation/README.md](evaluation/README.md) for provenance, usage and limit
 
 ## Validation
 
-Focused behavioral tests cover protocol endings and cancellation, event ordering and migration, prompt scopes, child model configuration, read-only shell boundaries, real Git dependency chains, and evaluation isolation.
+Focused behavioral tests cover protocol endings and cancellation, event ordering and persistence, prompt scopes, child model configuration, read-only shell boundaries, real Git dependency chains, and evaluation isolation.
 
 Final local validation on 2026-09-08:
 

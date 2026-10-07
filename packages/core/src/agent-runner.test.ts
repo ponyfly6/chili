@@ -198,31 +198,6 @@ test("child runtimes reject root sessions and cannot create sessions outside ato
   expect(store.items).toEqual([]);
 });
 
-test("historical sessions remain readable and reject execution and mutation in both runtimes", async () => {
-  const sessionId = "session_historical_read_only" as SessionId;
-  for (const sessionAccess of ["root", "child"] as const) {
-    const store = new SessionIdentityEventStore({ id: sessionId, cwd: "/history", readOnly: true,
-      status: "active", createdAt: 1, updatedAt: 1 });
-    const runner = new FakeAgentRunner();
-    const service = new RuntimeService({ runtime: runner, store, cwd: "/repo", sessionAccess });
-    await expect(service.assertSessionReadAllowed(sessionId)).resolves.toBeUndefined();
-    const mutations: Array<() => Promise<unknown>> = [
-      () => service.submitPrompt({ sessionId, text: "restart legacy work" }),
-      () => service.appendUserMessage({ sessionId, text: "change history" }),
-      () => service.compactSession({ sessionId }),
-      () => service.setGoal({ sessionId, objective: "restart legacy work" }),
-      () => service.updateGoal({ sessionId, status: "active" }),
-      () => service.setDelegationPolicy({ sessionId, policy: "proactive" }),
-      () => service.renameSession(sessionId, "changed"),
-      () => service.archiveSession(sessionId),
-    ];
-    for (const mutate of mutations) await expect(mutate()).rejects.toMatchObject({ name: "RuntimeSessionAccessError" });
-    expect(runner.userMessages).toEqual([]);
-    expect(runner.turnInputs).toEqual([]);
-    expect(store.items).toEqual([]);
-  }
-});
-
 test("RuntimeService allows archived root reads without reopening turn admission", async () => {
   const sessionId = "session_archived_root_read" as SessionId;
   const store = new SessionIdentityEventStore({
@@ -2833,7 +2808,7 @@ class LeaseControlledEventStore extends MemoryEventStore {
     const session = this.sessionRows.find((candidate) => candidate.id === input.sessionId);
     if (!session) return { status: "not_found" };
     if (session.status !== "active") return { status: "inactive", sessionStatus: session.status };
-    if (session.readOnly || Boolean(session.agent) !== (input.sessionAccess === "child")) return { status: "forbidden" };
+    if (Boolean(session.agent) !== (input.sessionAccess === "child")) return { status: "forbidden" };
     if (this.claimId) return { status: "busy" };
     this.claimId = input.claimId;
     return { status: "claimed" };

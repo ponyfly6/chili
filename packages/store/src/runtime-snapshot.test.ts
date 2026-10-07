@@ -243,14 +243,14 @@ test("runtime snapshot excludes temporary tool output while preserving durable c
   }
 });
 
-test("runtime snapshot recovers beyond an oversized legacy status event without losing lifecycle state", async () => {
+test("runtime snapshot recovers beyond an oversized status event without losing lifecycle state", async () => {
   const store = new SqliteEventStore(":memory:");
   try {
     await store.appendMany([
       sessionCreated(),
       event("event_started", "turn.started", { turnId }),
       event("event_oversized_status", "session.status_changed", {
-        sessionId, status: "running", turnId, reason: "legacy diagnostic ".repeat(250_000),
+        sessionId, status: "running", turnId, reason: "large diagnostic ".repeat(250_000),
       }),
     ]);
     const snapshot = parseRuntimeStateSnapshot(readRuntimeStateSnapshot(sqliteDatabase(store), { sessionId }));

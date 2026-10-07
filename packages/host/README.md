@@ -187,10 +187,10 @@ in SQLite regardless of renderer lifetime. Queue snapshots include previews only
 full input content and execution options remain in the store.
 
 Limits: 128 pending inputs per session, 4,096 globally, 64 MiB of pending payloads,
-and 16 MiB per payload, in addition to existing transport admission limits. New
-schema guards reject older writers trying to claim sessions protected by durable
-input state. Store migrations preserve conversation history; JSONL mirroring is a
-best-effort secondary copy and is drained before Host closes SQLite.
+and 16 MiB per payload, in addition to existing transport admission limits.
+The store opens the current schema directly; older database schemas
+are unsupported. JSONL mirroring is a best-effort secondary copy and is drained
+before Host closes SQLite.
 
 A second Host is rejected until the current owner and its resources have stopped.
 There is no control forwarding or attach protocol. Stores without durable input

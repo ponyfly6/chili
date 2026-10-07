@@ -1014,7 +1014,7 @@ class ClaimTrackingEventStore implements EventStore {
     const session = this.sessionRows.find((candidate) => candidate.id === input.sessionId);
     if (!session) return { status: "not_found" };
     if (session.status !== "active") return { status: "inactive", sessionStatus: session.status };
-    if (session.readOnly || Boolean(session.agent) !== (input.sessionAccess === "child")) return { status: "forbidden" };
+    if (Boolean(session.agent) !== (input.sessionAccess === "child")) return { status: "forbidden" };
     if (this.claims.has(input.sessionId)) return { status: "busy" };
     this.claims.set(input.sessionId, input.claimId);
     return { status: "claimed" };

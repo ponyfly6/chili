@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MessageId, SessionId, TimestampMs } from "@chili/protocol";
 import { ObservableEventStore } from "./observable-event-store.js";
-import { SessionAccessError, SqliteEventStore } from "./sqlite-event-store.js";
+import { SqliteEventStore } from "./sqlite-event-store.js";
 import type { CreateChildSessionInput } from "./types.js";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -89,89 +89,6 @@ test("only trusted queue operations execute new Agent Sessions; payload does not
   expect(store.mutateSessionInputs(claim, trusted).input?.state).toBe("claimed");
   expect(() => store.mutateSessionInputs({ kind: "accept", sessionId: childId, submissionId: "spoof", inputId: "spoof", mode: "queue", payload: '{"sessionAccess":true}', text: "spoof", source: "local" })).toThrow();
 });
-
-test("startup migration preserves a custom root lead but a historical child remains read-only when it also leads a Team", async () => {
-  const { path, store, input } = await fixture();
-  const leadId = "session_custom_lead" as SessionId;
-  for (const sessionId of [leadId, childId]) {
-    await store.append({ id: `created_${sessionId}`, type: "session.created", sessionId, time: Date.now() as TimestampMs, payload: { sessionId, cwd: input.cwd } });
-  }
-  store.releaseSessionRun({ sessionId: rootId, claimId: "parent_claim" });
-  store.close();
-  const migrated = reopenWithRetiredEvents(path, [
-    { type: "team.created", sessionId: leadId, payload: { teamId: "team_root", name: "root team", leadPath: "/root/lead" } },
-    { type: "team.owner_session_bound", sessionId: leadId, payload: { teamId: "team_root", ownerSessionId: leadId } },
-    { type: "team.member_added", sessionId: leadId, payload: { teamId: "team_root", path: "/root/lead", name: "lead", role: "lead", childSessionId: leadId } },
-    { type: "agent.message_queued", sessionId: leadId, payload: { path: "/root/lead", from: "/root/lead/worker", recipientSessionId: leadId, triggerTurn: true, message: { content: "Work completed" } } },
-    { type: "agent.message_queued", sessionId: rootId, payload: { path: "/root", from: "/root/lead", recipientSessionId: rootId, triggerTurn: true, message: { content: "Summary" } } },
-    { type: "agent.task_created", sessionId: leadId, payload: { taskId: "task_nested", parentSessionId: leadId, childSessionId: childId, parentPath: "/root/lead", path: "/root/lead/worker", taskName: "worker", cwd: input.cwd, prompt: "old pending action" } },
-    { type: "team.created", sessionId: childId, payload: { teamId: "team_nested", name: "nested team", leadPath: "/root/lead/worker" } },
-    { type: "team.owner_session_bound", sessionId: childId, payload: { teamId: "team_nested", ownerSessionId: childId } },
-    { type: "team.member_added", sessionId: childId, payload: { teamId: "team_nested", path: "/root/lead/worker", name: "worker", role: "lead", childSessionId: childId } },
-  ]);
-
-  expect(await migrated.session(childId)).toMatchObject({ readOnly: true, status: "active" });
-  expect((await migrated.session(childId))?.agent).toBeUndefined();
-  for (const sessionAccess of ["root", "child"] as const) {
-    expect(() => migrated.mutateSessionInputs({ ...input.initialInput, kind: "accept", sessionId: childId }, { sessionAccess })).toThrow(SessionAccessError);
-    expect(() => migrated.mutateSessionInputs({ kind: "claim", sessionId: childId, claimId: `retired_${sessionAccess}`, executionRef: "retired", leaseDurationMs: 60_000 }, { sessionAccess })).toThrow(SessionAccessError);
-    expect(migrated.claimSessionRun({ sessionId: childId, claimId: `run_${sessionAccess}`, sessionAccess, time: Date.now(), leaseDurationMs: 60_000 }).status).toBe("forbidden");
-  }
-  expect(migrated.sessionInputQueue(childId).pendingCount).toBe(0);
-  for (const sessionId of [rootId, leadId]) {
-    expect(await migrated.session(sessionId)).not.toHaveProperty("readOnly");
-    expect((await migrated.session(sessionId))?.agent).toBeUndefined();
-    migrated.mutateSessionInputs({ ...input.initialInput, kind: "accept", mode: "queue", sessionId, inputId: `input_${sessionId}`, submissionId: `submission_${sessionId}`, payload: JSON.stringify({ sessionId, text: "Continue" }) });
-    expect(migrated.mutateSessionInputs({ kind: "claim", sessionId, claimId: `claim_${sessionId}`, executionRef: `execution_${sessionId}`, leaseDurationMs: 60_000 }).input?.state).toBe("claimed");
-    migrated.releaseSessionRun({ sessionId, claimId: `claim_${sessionId}` });
-  }
-  expect(await migrated.events({ type: "agent.task_created" })).toHaveLength(0);
-  migrated.close();
-  const db = new Database(path);
-  try {
-    expect(db.query<{ read_only: number }, [string]>("select read_only from sessions where id = ?").get(childId)?.read_only).toBe(1);
-    db.exec("delete from events where type glob 'agent.*' or type glob 'team.*'");
-  } finally { db.close(); }
-  const restarted = new SqliteEventStore(path);
-  cleanup.push(async () => { restarted.close(); });
-  expect(await restarted.session(childId)).toMatchObject({ readOnly: true });
-  expect(restarted.claimSessionRun({ sessionId: childId, claimId: "after_restart", sessionAccess: "child", time: Date.now(), leaseDurationMs: 60_000 }).status).toBe("forbidden");
-});
-
-test("startup migration leaves current Agent metadata executable despite retired workflow references", async () => {
-  const { path, store, input } = await fixture();
-  const created = await store.createChildSession(input);
-  store.releaseSessionRun({ sessionId: rootId, claimId: "parent_claim" });
-  store.close();
-  const migrated = reopenWithRetiredEvents(path, [
-    { type: "agent.task_created", sessionId: rootId, payload: { taskId: "stale_task", parentSessionId: rootId, childSessionId: childId, path: "/root/old", parentPath: "/root", taskName: "old", cwd: input.cwd, prompt: "stale" } },
-    { type: "agent.message_queued", sessionId: rootId, payload: { path: "/root/old", from: "/root", recipientSessionId: childId, triggerTurn: true, message: { content: "stale" } } },
-  ]);
-  const child = await migrated.session(childId);
-  expect(child?.agent).toEqual(created.session.agent);
-  expect(child).not.toHaveProperty("readOnly");
-  expect(await migrated.session(rootId)).not.toHaveProperty("readOnly");
-  expect(migrated.claimSessionRun({ sessionId: childId, claimId: "wrong_root_access", sessionAccess: "root", time: Date.now(), leaseDurationMs: 60_000 }).status).toBe("forbidden");
-  const claimed = migrated.mutateSessionInputs({ kind: "claim", sessionId: childId, claimId: "current_child", executionRef: "current_execution", leaseDurationMs: 60_000 }, trusted);
-  expect(claimed.input).toMatchObject({ inputId: created.input.inputId, state: "claimed" });
-  migrated.releaseSessionRun({ sessionId: childId, claimId: "current_child" });
-});
-
-function reopenWithRetiredEvents(path: string, events: Array<{ type: string; sessionId: SessionId; payload: Record<string, unknown> }>): SqliteEventStore {
-  const db = new Database(path);
-  try {
-    // Model an old database on disk. No running Store is expected to discover
-    // workflow rows inserted after its one-time startup migration.
-    db.query("delete from schema_migrations where name = ?").run("retired_workflows_v1");
-    const insert = db.query("insert into events (id, type, time, session_id, payload_json) values (?, ?, ?, ?, ?)");
-    for (const [index, event] of events.entries()) {
-      insert.run(`retired_fixture_${index}`, event.type, Date.now() + index, event.sessionId, JSON.stringify(event.payload));
-    }
-  } finally { db.close(); }
-  const reopened = new SqliteEventStore(path);
-  cleanup.push(async () => { reopened.close(); });
-  return reopened;
-}
 
 test("result pointers belong to this input execution, survive restart, and resume keeps the input identity", async () => {
   const { path, store, input } = await fixture();

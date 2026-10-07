@@ -70,8 +70,6 @@ export interface SessionRow {
   cwd: string;
   title?: string;
   preview?: string;
-  /** Historical workflow Session; conversation is readable but cannot execute. */
-  readOnly?: true;
   status: "active" | "archived";
   createdAt: number;
   updatedAt: number;

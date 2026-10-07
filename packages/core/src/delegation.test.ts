@@ -22,10 +22,9 @@ test("nested Agent operations inherit the persisted root delegation override", a
   expect(await service.rootSessionId("leaf" as SessionId)).toBe("root" as SessionId);
   await expect(service.assertEnabled({sessionId:"leaf" as SessionId,action:"agent_spawn"})).rejects.toThrow("off");
 });
-test("missing, archived and legacy child ownership cannot become a root grant", async () => {
+test("missing and archived parent ownership cannot become a root grant", async () => {
   await expect(gate([session("child","missing")]).rootSessionId("child" as SessionId)).rejects.toThrow("not found");
   await expect(gate([{...session("root"),status:"archived"},session("child","root")]).rootSessionId("child" as SessionId)).rejects.toThrow("not active");
-  await expect(gate([{...session("legacy"),readOnly:true}]).rootSessionId("legacy" as SessionId)).rejects.toThrow("read-only");
 });
 test("persisted parent cycles and oversized chains fail closed", async () => {
   await expect(gate([session("a","b"),session("b","a")]).rootSessionId("a" as SessionId)).rejects.toThrow("Cyclic");

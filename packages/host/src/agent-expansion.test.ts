@@ -21,12 +21,6 @@ test("Agent ancestry uses persisted session metadata without a source classifica
   });
 });
 
-test("read-only sessions cannot be Agent callers or ancestors", async () => {
-  await expect(resolveAgentAncestry({ sessions: async () => [{ ...root, readOnly: true }] }, root.id)).rejects.toThrow("read-only");
-  await expect(resolveAgentAncestry({ sessions: async () => [root, { ...child, readOnly: true }] }, child.id)).rejects.toThrow("read-only");
-  await expect(resolveAgentAncestry({ sessions: async () => [{ ...root, readOnly: true }, child] }, child.id)).rejects.toThrow("read-only");
-});
-
 test("Agent ancestry rejects unavailable and cyclic parent chains", async () => {
   await expect(resolveAgentAncestry({ sessions: async () => [child] }, child.id)).rejects.toThrow("not active");
   await expect(resolveAgentAncestry({ sessions: async () => [{ ...root, status: "archived" }, child] }, child.id)).rejects.toThrow("not active");
