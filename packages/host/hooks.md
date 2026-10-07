@@ -88,8 +88,10 @@ const host = await createChiliHost({
 直接改写最终模型请求。
 
 提示词预览也调用贡献者，所以它们应只提供材料，不产生业务副作用。真实任务的
-signal 随 Stop 等取消；预览仍受模块时限和 Host 关闭约束。Memory 继续通过已有
-上下文快照进入提示词，使用原有读写接口。这次模块化不增加自动更新 Memory、
+signal 随 Stop 等取消；预览仍受模块时限和 Host 关闭约束。Memory 是当前 profile
+下的普通 Markdown 文件，位于 `memory/personal` 和 `memory/projects/<projectId>`。
+根与子 Agent 的提示词只提供这些目录位置，不自动加载文件正文；Agent 按需使用
+普通文件工具或 Bash 读写，并遵守现有执行策略。模块化不增加自动更新 Memory、
 自动提取记忆或后台维护接口。
 
 ## 强制审查
