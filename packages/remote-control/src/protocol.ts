@@ -28,6 +28,7 @@ export const REMOTE_CONTROL_CAPABILITIES = [
   "sessions.read",
   "sessions.send",
   "sessions.stop",
+  "sessions.input",
 ] as const;
 
 export type RemoteControlCapability = (typeof REMOTE_CONTROL_CAPABILITIES)[number];
@@ -37,6 +38,7 @@ export const REMOTE_CONTROL_OPERATIONS = [
   "session.snapshot",
   "session.send",
   "session.stop",
+  "session.answerInput",
 ] as const;
 
 export type RemoteControlOperation = (typeof REMOTE_CONTROL_OPERATIONS)[number];
@@ -47,6 +49,7 @@ export const REMOTE_CONTROL_REQUIRED_CAPABILITY = Object.freeze({
   "session.snapshot": "sessions.read",
   "session.send": "sessions.send",
   "session.stop": "sessions.stop",
+  "session.answerInput": "sessions.input",
 } as const satisfies Record<RemoteControlOperation, RemoteControlCapability>);
 
 export type RemoteControlCapabilityForOperation<Operation extends RemoteControlOperation> =
@@ -122,11 +125,18 @@ export interface RemoteControlSessionStopPayload {
   sessionId: string;
 }
 
+export interface RemoteControlSessionAnswerInputPayload {
+  sessionId: string;
+  inputId: string;
+  answers: Record<string, string[]>;
+}
+
 export interface RemoteControlOperationPayloadMap {
   "sessions.list": RemoteControlSessionsListPayload;
   "session.snapshot": RemoteControlSessionSnapshotPayload;
   "session.send": RemoteControlSessionSendPayload;
   "session.stop": RemoteControlSessionStopPayload;
+  "session.answerInput": RemoteControlSessionAnswerInputPayload;
 }
 
 interface RemoteControlFrameBase {
@@ -505,6 +515,12 @@ function parseRequestFrame(
         operation,
         payload: parseSessionTargetPayload(record.payload, `${path}.payload`),
       };
+    case "session.answerInput":
+      return {
+        version, type: "request", hostId, sessionId, deviceId, credential, sequence, requestId,
+        capability: REMOTE_CONTROL_REQUIRED_CAPABILITY[operation], operation,
+        payload: parseRemoteControlAnswerInputPayload(record.payload, `${path}.payload`),
+      };
   }
 }
 
@@ -671,6 +687,39 @@ function parseSessionSendPayload(value: unknown, path: string): RemoteControlSes
     text: parseText(record.text, `${path}.text`, REMOTE_CONTROL_LIMITS.maxPromptBytes, false),
     mode: parseEnum(record.mode, ["queue", "steer"] as const, `${path}.mode`),
   };
+}
+
+/** Shape validation is browser-safe; the host also validates against the live question. */
+export function parseRemoteControlAnswerInputPayload(value: unknown, path = "payload"): RemoteControlSessionAnswerInputPayload {
+  const record = parseRecord(value, path);
+  rejectUnknownFields(record, ["sessionId", "inputId", "answers"], path);
+  const entries = Object.entries(parseRecord(record.answers, `${path}.answers`));
+  if (entries.length < 1 || entries.length > 3) throw new RemoteControlProtocolError(`${path}.answers`, "must contain between 1 and 3 question ids");
+  let totalChars = 0;
+  const answers = Object.fromEntries(entries.map(([id, values]) => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(id) || FORBIDDEN_JSON_KEYS.has(id)) {
+      throw new RemoteControlProtocolError(`${path}.answers`, "must use safe question ids");
+    }
+    if (!Array.isArray(values) || values.length < 1 || values.length > 20) {
+      throw new RemoteControlProtocolError(`${path}.answers`, "must contain between 1 and 20 answers per question");
+    }
+    return [id, values.map((value) => {
+      const text = parseText(value, `${path}.answers`, REMOTE_CONTROL_LIMITS.maxPromptBytes, false);
+      totalChars += text.length;
+      if (!text.trim() || text.length > 8_000 || totalChars > 24_000 || /[\u0000-\u001f\u007f]/u.test(text)) {
+        throw new RemoteControlProtocolError(`${path}.answers`, "must contain bounded non-empty plain text answers");
+      }
+      return text.trim();
+    })];
+  })) as Record<string, string[]>;
+  const payload = {
+    sessionId: parseIdentifier(record.sessionId, `${path}.sessionId`),
+    inputId: parseIdentifier(record.inputId, `${path}.inputId`), answers,
+  };
+  if (textEncoder.encode(JSON.stringify(payload)).byteLength > REMOTE_CONTROL_LIMITS.maxPromptBytes) {
+    throw new RemoteControlProtocolError(path, "must not exceed the remote input byte limit");
+  }
+  return payload;
 }
 
 function parseJsonValue(value: unknown, path: string): RemoteControlJsonValue {

@@ -780,6 +780,8 @@ function serviceRequest(frame: RemoteControlRequestFrame): RemoteControlServiceR
       return Object.freeze({ operation: frame.operation, payload: frame.payload });
     case "session.stop":
       return Object.freeze({ operation: frame.operation, payload: frame.payload });
+    case "session.answerInput":
+      return Object.freeze({ operation: frame.operation, payload: frame.payload });
   }
 }
 

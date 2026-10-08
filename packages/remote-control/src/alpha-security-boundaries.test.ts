@@ -25,7 +25,7 @@ const NOW = 20_000;
 // acceptance is deliberately kept in the separate end-to-end suite.
 for (let mask = 1; mask < 1 << REMOTE_CONTROL_CAPABILITIES.length; mask += 1) {
   const granted = REMOTE_CONTROL_CAPABILITIES.filter((_, index) => mask & (1 << index));
-  test(`independent capability grants ${granted.join(",")} authorize exactly their four-operation subset`, async () => {
+  test(`independent capability grants ${granted.join(",")} authorize exactly their operation subset`, async () => {
     for (const operation of REMOTE_CONTROL_OPERATIONS) {
       const fixture = setup(granted);
       const allowed = granted.includes(requiredCapabilityForOperation(operation));
@@ -125,6 +125,7 @@ function request(grant: PairingGrant, operation: RemoteControlOperation) {
     capability: requiredCapabilityForOperation(operation), operation,
     payload: operation === "sessions.list" ? {}
       : operation === "session.send" ? { sessionId: "existing_task", text: "queue exactly once", mode: "queue" }
+      : operation === "session.answerInput" ? { sessionId: "existing_task", inputId: "userinput_question", answers: { choice: ["Continue"] } }
       : { sessionId: "existing_task" },
   };
 }

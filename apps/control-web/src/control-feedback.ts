@@ -4,13 +4,14 @@ export interface OrdinaryNotice {
 }
 
 export interface UnknownMutationOutcome {
-  /** A page-local command identity, not a protocol request or replay identity. */
+  /** A local reminder identity, never a protocol request or replay identity. */
   id: string;
   sessionId: string;
   sessionTitle: string;
-  command: "Queue" | "Steer" | "Stop";
+  command: "Queue" | "Steer" | "Stop" | "Answer";
   startedAt: number;
   promptPreview?: string;
+  inputId?: string;
 }
 
 export interface ControlFeedback {

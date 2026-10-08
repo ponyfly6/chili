@@ -149,7 +149,7 @@ export function RemoteControlPanelContent({ state, draft, error, action, onEdit,
   return <>
     {onClose ? <header className="remote-panel-heading"><div><p className="eyebrow">Private connection · Alpha</p><h2 id="remote-panel-title">Phone control</h2></div><button type="button" data-remote-initial-focus="true" aria-label="Close phone control" onClick={onClose}>×</button></header> : null}
     <div className="remote-panel-scroll">
-      <p className="remote-panel-intro">Continue this workspace’s existing tasks on your phone. Approvals and questions stay on this Mac.</p>
+      <p className="remote-panel-intro">Continue this workspace’s existing tasks and answer supported questions on your phone. Approvals stay on this Mac.</p>
       {error ? <p role="alert" className="remote-panel-error">{error}</p> : null}
       {setup?.error && setup.error !== error ? <p role="alert" className="remote-panel-error">{setup.error}</p> : null}
       <section className="remote-setup" aria-labelledby="remote-connection-title">
@@ -190,7 +190,7 @@ export function RemoteControlPanelContent({ state, draft, error, action, onEdit,
         {state.pairing ? <p>One-time code: <strong className="remote-pairing-code" data-testid="remote-code">{state.pairing.code}</strong><br />Expires {new Date(state.pairing.expiresAt).toLocaleTimeString()}. Enter it only at the address above.</p> : null}
         {state.pending.map((pair) => <div className="remote-panel-device" key={pair.pairingId}>
           <strong>{pair.label}</strong><code>{pair.deviceId}</code>
-          <p>Confirm only the phone you just paired. It can read tasks, Queue, Steer and Stop.</p>
+          <p>Confirm only the phone you just paired. It can read tasks, send instructions, answer supported questions and stop work.</p>
           <button type="button" data-testid="remote-pending-confirm" disabled={working} onClick={() => onAction({ type: "pairing.approve", pairingId: pair.pairingId })}>Confirm this device</button>
           <button type="button" disabled={working} onClick={() => onAction({ type: "pairing.reject", pairingId: pair.pairingId })}>Reject</button>
         </div>)}
@@ -200,7 +200,7 @@ export function RemoteControlPanelContent({ state, draft, error, action, onEdit,
         </div>)}
         {state.devices.length === 0 ? <p className="remote-panel-hint">No paired devices.</p> : null}
       </section> : null}
-      <p className="remote-panel-footnote">Turning this off, switching workspace or restarting revokes devices. Refreshing the phone requires pairing again.</p>
+      <p className="remote-panel-footnote">Turning this off, switching workspace or restarting revokes devices. The mobile app can reconnect while this authorization remains valid. Refreshing the browser page still requires pairing again.</p>
     </div>
   </>;
 }

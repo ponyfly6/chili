@@ -20,6 +20,7 @@ import {
   parseOpaqueRelayEnvelope,
   parseRemoteControlFrame,
   type OpaqueRelayEnvelope,
+  type RemoteControlCapability,
   type RemoteControlJsonValue,
   type RemoteControlRequestFrame,
 } from "./protocol.js";
@@ -326,23 +327,47 @@ test("connect preserves an offline backlog until a compatible bridge can drain i
   });
 });
 
+test("answering a question requires its own capability and a replay cannot answer twice", async () => {
+  for (const allowed of [false, true]) {
+    const fixture = pairFixture(allowed ? ["sessions.read", "sessions.input"] : ["sessions.read"]);
+    const seen: unknown[] = [];
+    const bridge = connectedBridge(fixture, {
+      invoke: (request) => { seen.push(request); return { resolved: true }; },
+    });
+    const frame = {
+      ...request(fixture, { sequence: 1, sessionId: "control_question", requestId: "answer_request" }),
+      operation: "session.answerInput",
+      capability: "sessions.input",
+      payload: { sessionId: "task_question", inputId: "userinput_question", answers: { choice: ["Continue"] } },
+    };
+    const first = await bridge.receive(sealInner(fixture.grant, frame, "answer_attempt_1"));
+    expect(first).toMatchObject(allowed ? { status: "accepted" } : { status: "rejected", code: "forbidden" });
+    await bridge.whenIdle();
+    expect(seen).toEqual(allowed ? [{ operation: frame.operation, payload: frame.payload }] : []);
+    await bridge.receive(sealInner(fixture.grant, frame, "answer_attempt_2"));
+    await bridge.whenIdle();
+    expect(seen).toHaveLength(allowed ? 1 : 0);
+    bridge.disconnect();
+  }
+});
+
 interface Fixture {
   authority: InMemoryPairingAuthority;
   device: ReturnType<typeof generateDeviceIdentity>;
   grant: PairingGrant;
 }
 
-function pairFixture(): Fixture {
+function pairFixture(capabilities: RemoteControlCapability[] = ["sessions.read"]): Fixture {
   const authority = new InMemoryPairingAuthority({
     hostId: HOST_ID,
-    allowedCapabilities: ["sessions.read"],
+    allowedCapabilities: capabilities,
     clock: () => NOW,
   });
   const device = generateDeviceIdentity();
   const challenge = authority.beginPairing({
     deviceId: device.deviceId,
     publicKey: device.publicKey,
-    grantedCapabilities: ["sessions.read"],
+    grantedCapabilities: capabilities,
   });
   const grant = authority.completePairing(
     createPairingProof(challenge, device.privateKey),

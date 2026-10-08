@@ -76,10 +76,12 @@ export async function startModelFixture(desktopRoot: string): Promise<{
   origin: string;
   requests: ModelRequest[];
   failures: string[];
+  completeNextResponse(text: string): void;
   stop(): Promise<void>;
 }> {
   const requests: ModelRequest[] = [];
   const failures: string[] = [];
+  const completing = new Set<string>();
   const server = createServer((request, response) => {
     void handle(request, response).catch((error: unknown) => {
       failures.push(error instanceof Error ? error.message : String(error));
@@ -113,7 +115,10 @@ export async function startModelFixture(desktopRoot: string): Promise<{
     const observed: ModelRequest = { text, aborted: false, slow: text.includes("[slow]") };
     requests.push(observed);
     const id = `remote_fixture_${requests.length}`;
-    if (!observed.slow) {
+    // Explicit Resume continues the interrupted input before queued work. A
+    // test can let that next model call finish without changing the original
+    // slow request whose cancellation is under test.
+    if (!observed.slow || completing.delete(text)) {
       response.setHeader("Content-Type", "application/json");
       response.end(JSON.stringify({ id, model: "deepseek-v4-pro", choices: [{ index: 0, finish_reason: "stop",
         message: { role: "assistant", content: `Remote fixture response: ${text}` } }],
@@ -132,6 +137,11 @@ export async function startModelFixture(desktopRoot: string): Promise<{
   const address = server.address();
   assert.ok(address && typeof address !== "string");
   return { origin: `http://127.0.0.1:${address.port}`, requests, failures,
+    completeNextResponse(text) {
+      assert.ok(text.includes("[slow]"), "Only an intentionally held fixture response needs completion");
+      assert.equal(completing.has(text), false, "A fixture completion must be consumed once");
+      completing.add(text);
+    },
     async stop() { server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())); },
   };
 }

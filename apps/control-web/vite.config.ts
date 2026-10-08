@@ -2,7 +2,7 @@ import { defineConfig } from "vite";
 import { resolve } from "node:path";
 
 // This build is served by the desktop's private HTTPS host, never a second
-// development HTTP origin. No service worker or persistent client storage.
+// development HTTP origin. No service worker or persistent browser credentials.
 export default defineConfig({
   base: "/",
   build: {

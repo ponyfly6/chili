@@ -1,0 +1,86 @@
+.chili-sheet {
+  --sheet-bg: var(--ui-bg, var(--p-bg, #fff));
+  --sheet-panel: var(--ui-panel, var(--p-panel, #f5f5f3));
+  --sheet-soft: var(--ui-soft, var(--p-soft, #eeefed));
+  --sheet-text: var(--ui-text, var(--p-text, #242522));
+  --sheet-muted: var(--ui-muted, var(--p-muted, #73766f));
+  --sheet-line: var(--ui-line, var(--p-line, #e9e9e5));
+  --sheet-accent: var(--ui-accent, var(--p-accent, #b95e48));
+  --sheet-accent-bg: var(--ui-accent-bg, var(--p-accent-bg, #fbf0ec));
+  --sheet-primary: var(--ui-primary, var(--p-primary, #252723));
+  --sheet-on-primary: var(--ui-on-primary, var(--p-on-primary, #fff));
+  width: min(520px, calc(100vw - 48px));
+  position: fixed;
+  inset: calc(var(--app-top, 0px) + var(--app-height, 100dvh) / 2) 0 auto;
+  transform: translateY(-50%);
+  max-width: none;
+  max-height: calc(var(--app-height, 100dvh) - 48px);
+  margin: 0 auto;
+  padding: 0;
+  border: 1px solid var(--sheet-line);
+  border-radius: 24px;
+  background: var(--sheet-bg);
+  color: var(--sheet-text);
+  color-scheme: light;
+  box-shadow: 0 20px 70px #00000026;
+  overflow: hidden;
+}
+
+.chili-sheet::backdrop { background: #16171466; }
+body:has(.chili-sheet[open]) { overflow: hidden; }
+.chili-sheet-panel { display: flex; flex-direction: column; max-height: calc(var(--app-height, 100dvh) - 48px); }
+.chili-sheet-handle { display: none; }
+.chili-sheet-heading { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 20px 10px 24px; }
+.chili-sheet-title { font-size: 18px; font-weight: 600; letter-spacing: -.4px; line-height: 1.5; margin: 0; overflow-wrap: anywhere; }
+.chili-sheet-close { display: grid; place-items: center; flex: 0 0 44px; width: 44px; height: 44px; min-height: 44px; padding: 0; border: 0; border-radius: 50%; background: var(--sheet-panel); color: var(--sheet-text); }
+.chili-sheet-content { min-height: 0; padding: 0 24px 24px; overflow: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+.chili-sheet button:focus-visible, .chili-sheet input:focus-visible, .chili-sheet textarea:focus-visible, .chili-sheet a:focus-visible { outline: 2px solid var(--sheet-accent); outline-offset: 3px; }
+
+.question-sheet-intro { color: var(--sheet-muted); font-size: 12px; line-height: 1.75; margin: 0 0 21px; }
+.question-sheet-notice { color: var(--sheet-accent); background: var(--sheet-accent-bg); border-radius: 12px; padding: 12px 14px; font-size: 12px; line-height: 1.75; margin: 0 0 20px; }
+.question-sheet .input-request-card { margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; overflow-wrap: anywhere; }
+.question-sheet .input-request-heading { display: none; }
+.question-sheet .input-question { min-width: 0; margin: 0 0 24px; padding: 0; border: 0; }
+.question-sheet .input-question legend { width: 100%; padding: 0; }
+.question-sheet .input-question-header { display: block; color: var(--sheet-accent); font-size: 11px; margin-bottom: 7px; }
+.question-sheet .input-question-text { display: block; color: var(--sheet-text); font-size: 18px; font-weight: 550; line-height: 1.55; white-space: pre-wrap; }
+.question-sheet .input-question-hint { color: var(--sheet-muted); font-size: 12px; margin: 9px 0 12px; }
+.question-sheet .input-options { display: grid; gap: 9px; }
+.question-sheet .input-option { display: flex; align-items: flex-start; min-height: 56px; padding: 14px; gap: 11px; border: 1px solid var(--sheet-line); border-radius: 15px; background: var(--sheet-bg); color: var(--sheet-text); cursor: pointer; }
+.question-sheet .input-option.is-selected { border-color: var(--sheet-accent); background: var(--sheet-accent-bg); }
+.question-sheet .input-option input { flex: 0 0 20px; width: 20px; height: 20px; min-height: 20px; margin: 2px 0 0; padding: 0; accent-color: var(--sheet-accent); }
+.question-sheet .input-option-content { display: flex; flex-direction: column; min-width: 0; font-size: 14px; line-height: 1.6; gap: 4px; }
+.question-sheet .input-option-description { color: var(--sheet-muted); font-size: 12px; }
+.question-sheet .input-question:disabled { opacity: .65; }
+.question-sheet .input-question:disabled .input-option { cursor: default; }
+.question-sheet .input-text-answer { width: 100%; height: 50px; padding: 0 14px; border: 1px solid var(--sheet-line); border-radius: 13px; background: var(--sheet-panel); color: var(--sheet-text); font-size: 16px; }
+.question-sheet .input-text-answer::placeholder { color: var(--sheet-muted); }
+.question-sheet .input-request-error { color: var(--ui-danger, var(--p-red, #aa4c43)); font-size: 12px; line-height: 1.7; }
+.question-sheet .input-request-footer { display: flex; flex-direction: column; align-items: stretch; gap: 12px; }
+.question-sheet .input-request-status { display: block; color: var(--sheet-muted); text-align: center; font-size: 11px; line-height: 1.7; }
+.question-sheet .input-request-footer .primary-button { display: flex; align-items: center; justify-content: center; width: 100%; min-height: 48px; border: 1px solid transparent; border-radius: 26px; padding: 10px 18px; background: var(--sheet-primary); color: var(--sheet-on-primary); font-size: 14px; font-weight: 550; }
+.question-sheet .input-request-footer .primary-button:not(:disabled):hover { background: var(--sheet-primary); filter: brightness(.94); }
+
+@media (max-width: 620px) {
+  .chili-sheet { inset: calc(var(--app-top, 0px) + var(--app-height, 100dvh)) 0 auto; transform: translateY(-100%); width: 100%; max-height: calc(var(--app-height, 100dvh) - max(12px, env(safe-area-inset-top))); margin: 0; border-width: 1px 0 0; border-radius: 28px 28px 0 0; box-shadow: 0 -15px 45px #00000014; }
+  .chili-sheet-panel { max-height: calc(var(--app-height, 100dvh) - max(12px, env(safe-area-inset-top))); }
+  .chili-sheet-handle { flex-shrink: 0; display: block; width: 34px; height: 4px; border-radius: 8px; background: var(--sheet-soft); margin: 10px auto 2px; }
+  .chili-sheet-heading { padding: 4px max(16px, env(safe-area-inset-right)) 10px max(24px, env(safe-area-inset-left)); }
+  .chili-sheet-content { padding: 0 max(24px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left)); }
+}
+
+@media (prefers-color-scheme: dark) {
+  .chili-sheet {
+    --sheet-bg: var(--ui-bg, var(--p-bg, #1b1c1a));
+    --sheet-panel: var(--ui-panel, var(--p-panel, #292a27));
+    --sheet-soft: var(--ui-soft, var(--p-soft, #353632));
+    --sheet-text: var(--ui-text, var(--p-text, #efefea));
+    --sheet-muted: var(--ui-muted, var(--p-muted, #aaaea3));
+    --sheet-line: var(--ui-line, var(--p-line, #343630));
+    --sheet-accent: var(--ui-accent, var(--p-accent, #e1947c));
+    --sheet-accent-bg: var(--ui-accent-bg, var(--p-accent-bg, #3b2b25));
+    --sheet-primary: var(--ui-primary, var(--p-primary, #e6e9e0));
+    --sheet-on-primary: var(--ui-on-primary, var(--p-on-primary, #1b2119));
+    color-scheme: dark;
+  }
+}

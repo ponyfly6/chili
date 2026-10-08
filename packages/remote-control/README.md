@@ -24,6 +24,19 @@ It does not expose arbitrary paths, child task contents, raw desktop snapshots,
 permissions, approvals or credentials. Only the model may be a fixture in the
 Alpha acceptance chain. See the [setup and phone acceptance guide](../../docs/private-mobile-alpha-acceptance.md).
 
+The bundled native entry point in `apps/mobile` uses the same client through an
+explicit HTTPS/crypto platform adapter. The default browser keeps strict
+same-origin checks. Native requests have a dedicated transport marker and must
+omit browser Origin/Fetch Metadata headers; pairing proof and encrypted request
+authentication are still required.
+
+Native clients may remember an approved identity in Keychain/Keystore. Recovery
+uses a fresh signed challenge and atomically rotates the route, credential and
+encryption channel, invalidating the previous route. Device trust lasts only for
+the original authorization (at most eight hours) in the current host enable
+epoch. Disable, revocation, project switch or host restart requires pairing
+again. No old control stream or unknown mutation is replayed across app restart.
+
 The original Phase 0 executable demo remains available for protocol exploration:
 
 
@@ -33,7 +46,8 @@ fake mobile client -> in-memory relay -> host bridge
 ```
 
 The demo below is not Alpha acceptance evidence. This package contains no public
-relay, native mobile client, account system or persistent credentials.
+relay or account system. Native recovery stores device identity, not session
+credentials; host trust is not persisted across desktop restarts.
 
 ## Run it
 
@@ -92,6 +106,7 @@ The complete threat model and accepted Phase 0 residual risks are documented in
 | `session.snapshot` | `sessions.read` |
 | `session.send` | `sessions.send` |
 | `session.stop` | `sessions.stop` |
+| `session.answerInput` | `sessions.input` |
 
 There are no wildcard scopes or implicit capability inheritance.
 
@@ -127,4 +142,5 @@ their ordinary errors.
 The in-memory relay, fake client and mock service remain protocol test/demo
 fixtures only. They are not used by the private HTTPS/desktop/browser acceptance
 chain. Public relay, account, multi-host and persistent authorization support
-remain outside this Alpha.
+remain outside this Alpha. The native client adds local secure identity storage
+and cold-start recovery within the current desktop authorization epoch.

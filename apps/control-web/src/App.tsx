@@ -1,37 +1,47 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { BrowserControlClient } from "@chili/remote-control/browser";
+import { BrowserControlClient, parseDeviceRecoveryRecord, type DeviceRecoveryRecord } from "@chili/remote-control/browser";
 import { INITIAL_CONTROL_FEEDBACK, promptPreview, reduceControlFeedback, type OrdinaryNotice, type UnknownMutationOutcome } from "./control-feedback.js";
 import { OutcomeWarnings } from "./OutcomeWarnings.js";
+import { Workspace } from "./Workspace.js";
+import { PairingView } from "./PairingView.js";
+import { QuestionSheets } from "./QuestionSheets.js";
+import { useAppViewport } from "./use-app-viewport.js";
+import { clearSubmittedDraft, forgetRememberedTask, readRememberedTask, rememberTask } from "./conversation-state.js";
+import { browserOutcomeStore, journaledMutation, OutcomeJournal } from "./outcome-journal.js";
+import type { ControlAppPlatform } from "./platform.js";
 import {
-  MAX_PROMPT_BYTES,
   canSendPrompt,
   errorCode,
   errorMessage,
-  promptByteLength,
   readSendReceipt,
   readStopReceipt,
+  readAnswerReceipt,
+  recoveryNeedsPairing,
   readTaskList,
   readTaskSnapshot,
-  runStatusLabel,
-  visibleMobilePanel,
   type RemoteSnapshot,
   type RemoteTask,
 } from "./view-model.js";
 
-type ConnectionState = "unpaired" | "connected" | "disconnected" | "reconnecting" | "expired" | "closed";
+type ConnectionState = "unpaired" | "connected" | "disconnected" | "reconnecting" | "expired" | "closed" | "restoring";
 type PairingStatus = "creating_identity" | "waiting_for_desktop" | "approved";
 
 const LIST_POLL_MS = 5_000;
 const SNAPSHOT_POLL_MS = 2_500;
 
-/** The complete authorization and replay stream lives in this page's memory. */
-export function App() {
+/** Web credentials stay in memory; the native shell supplies secure device storage. */
+export function App({ platform }: { platform?: ControlAppPlatform } = {}) {
   const [client, setClient] = useState<BrowserControlClient | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("unpaired");
   const [pairingStatus, setPairingStatus] = useState<PairingStatus | null>(null);
   const [pairingCode, setPairingCode] = useState("");
   const [deviceLabel, setDeviceLabel] = useState("我的手机");
+  const [computerAddress, setComputerAddress] = useState("");
+  const [recoverableDevice, setRecoverableDevice] = useState<DeviceRecoveryRecord | null>(null);
+  const [storageReady, setStorageReady] = useState(false);
+  const [booting, setBooting] = useState(true);
+  const [journal] = useState(() => new OutcomeJournal(platform?.outcomeStore ?? browserOutcomeStore()));
   const [feedback, dispatchFeedback] = useReducer(reduceControlFeedback, INITIAL_CONTROL_FEEDBACK);
   const notice = feedback.notice;
   const setNotice = useCallback((value: OrdinaryNotice | null) => dispatchFeedback({ type: "notice", notice: value }), []);
@@ -43,39 +53,138 @@ export function App() {
   const [lastRead, setLastRead] = useState<Date | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [readError, setReadError] = useState<string | null>(null);
-  const [draft, setDraft] = useState("");
+  const [drafts, setDrafts] = useState<ReadonlyMap<string, string>>(() => new Map());
+  const draft = selectedId ? drafts.get(selectedId) ?? "" : "";
+  const setDraft = useCallback((text: string) => {
+    if (!selectedId) return;
+    setDrafts((previous) => { const next = new Map(previous); next.set(selectedId, text); return next; });
+  }, [selectedId]);
+  const [openRequestId, setOpenRequestId] = useState<string | null>(null);
+  const pendingRecentTask = useRef<string | null>(null);
   const [sending, setSending] = useState<"queue" | "steer" | null>(null);
   const [stopping, setStopping] = useState(false);
+  const [answeringId, setAnsweringId] = useState<string | null>(null);
   const [mobilePanel, setMobilePanel] = useState<"list" | "task">("list");
   const [readRevision, setReadRevision] = useState(0);
   const pairAttempt = useRef<AbortController | null>(null);
+  const recoveryAttempt = useRef<AbortController | null>(null);
+  const connectionGeneration = useRef(0);
+  const retryAttempt = useRef(0);
+  const recoveryWrites = useRef<Promise<void>>(Promise.resolve());
   const sendPending = useRef(false);
   const stopPending = useRef(false);
+  const answerPending = useRef(false);
   const listReadPending = useRef(false);
   const snapshotReadPending = useRef(false);
-  const mutationCounter = useRef(0);
+  const manualDisconnect = useRef(false);
+  const restorePending = useRef(false);
   const activeClientRef = useRef(client);
   activeClientRef.current = client;
   const selectedIdRef = useRef(selectedId);
   selectedIdRef.current = selectedId;
 
-  useEffect(() => () => pairAttempt.current?.abort(), []);
+  useEffect(() => () => {
+    connectionGeneration.current += 1;
+    pairAttempt.current?.abort();
+    recoveryAttempt.current?.abort();
+  }, []);
+
+  // Forget must finish after an already-started keychain write, never before it.
+  const updateRecoveryStore = useCallback((action: () => Promise<void>) => {
+    const operation = recoveryWrites.current.then(action);
+    recoveryWrites.current = operation.catch(() => undefined);
+    return operation;
+  }, []);
+
+  const expireRecovery = useCallback(async () => {
+    pendingRecentTask.current = null;
+    try { forgetRememberedTask(window.localStorage); } catch { /* Optional navigation storage. */ }
+    setConnection("expired");
+    setRecoverableDevice(null);
+    setNotice({ kind: "error", text: "此设备的授权已失效。请回电脑生成新配对码，再连接一次。" });
+    if (platform) {
+      setBooting(true);
+      try { await updateRecoveryStore(() => platform.recoveryStore.clear()); }
+      catch { setNotice({ kind: "error", text: "授权已失效，但本机记录未能清除。请在电脑撤销此设备后重新配对。" }); }
+      finally { setBooting(false); }
+    }
+  }, [platform, setNotice, updateRecoveryStore]);
 
   useEffect(() => {
-    if (feedback.unknownOutcomes.length === 0) return;
+    let cancelled = false;
+    const generation = connectionGeneration.current;
+    void (async () => {
+      try {
+        const outcomes = await journal.load();
+        if (cancelled) return;
+        for (const outcome of outcomes) dispatchFeedback({ type: "mutation_unknown", outcome });
+        setStorageReady(true);
+      } catch {
+        if (!cancelled) {
+          setStorageReady(false);
+          setNotice({ kind: "error", text: "无法读取本机保存的指令提醒。请检查手机存储后重新打开；当前不会发送指令。" });
+          setBooting(false);
+        }
+        return;
+      }
+      try {
+        if (platform) {
+          const saved = await platform.recoveryStore.load();
+          let record: DeviceRecoveryRecord | null = null;
+          try { record = saved ? parseDeviceRecoveryRecord(saved) : null; }
+          catch { throw Object.assign(new Error("Invalid saved device"), { code: "recovery_record_invalid" }); }
+          if (cancelled) return;
+          if (record) {
+            setComputerAddress(record.baseUrl);
+            setRecoverableDevice(record);
+            try { pendingRecentTask.current = readRememberedTask(window.localStorage, record); } catch { /* Fall back to list. */ }
+            setConnection("restoring");
+            restorePending.current = true;
+            const attempt = new AbortController();
+            recoveryAttempt.current = attempt;
+            try {
+              const restored = await BrowserControlClient.resume({ record, platform: platform.createClientPlatform(record.baseUrl), signal: attempt.signal });
+              if (cancelled || generation !== connectionGeneration.current || attempt.signal.aborted) { restored.dispose(); return; }
+              setClient(restored);
+              setConnection(restored.state);
+              setNotice({ kind: "success", text: "已重新连接你的电脑。此前未确认的指令仍需核对。" });
+            } catch (error) {
+              if (!cancelled && generation === connectionGeneration.current && !attempt.signal.aborted) {
+                if (recoveryNeedsPairing(error)) await expireRecovery();
+                else {
+                  setConnection("disconnected");
+                  setNotice({ kind: "error", text: errorMessage(error) });
+                }
+              }
+            } finally { if (recoveryAttempt.current === attempt) { recoveryAttempt.current = null; restorePending.current = false; } }
+          }
+        }
+      } catch (error) {
+        if (!cancelled && generation === connectionGeneration.current) {
+          if (error instanceof SyntaxError || recoveryNeedsPairing(error)) await expireRecovery();
+          else setNotice({ kind: "error", text: "未能读取已保存的电脑连接。可以重新配对；待核对的指令提醒仍会保留。" });
+        }
+      } finally { if (!cancelled) setBooting(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [journal, platform, setNotice, expireRecovery]);
+
+  useEffect(() => {
+    if (feedback.unknownOutcomes.length === 0 && !sending && !stopping && !answeringId) return;
     const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
       event.preventDefault();
       event.returnValue = "";
     };
     window.addEventListener("beforeunload", warnBeforeLeaving);
     return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
-  }, [feedback.unknownOutcomes.length]);
+  }, [feedback.unknownOutcomes.length, sending, stopping, answeringId]);
 
   useEffect(() => {
     if (!client) return;
     setConnection(client.state);
     const unsubscribe = client.onState((state) => {
       setConnection(state);
+      if (state === "connected") retryAttempt.current = 0;
       if (state === "expired") {
         setNotice({ kind: "error", text: "桌面授权已失效或被撤销，请重新配对。" });
         setClient(null);
@@ -83,10 +192,12 @@ export function App() {
         setSnapshot(null);
         setSelectedId(null);
         setMobilePanel("list");
+        setRecoverableDevice(null);
+        if (platform) void expireRecovery();
       }
     });
     return () => { unsubscribe(); client.dispose(); };
-  }, [client, setNotice]);
+  }, [client, platform, setNotice, expireRecovery]);
 
   const connected = connection === "connected";
 
@@ -108,6 +219,16 @@ export function App() {
         setListLoaded(true);
         setListError(null);
         const selected = selectedIdRef.current;
+        // A remembered id never grants access: validate against the fresh,
+        // authorized task list before restoring the conversation.
+        if (!selected && pendingRecentTask.current) {
+          const recent = pendingRecentTask.current;
+          pendingRecentTask.current = null;
+          if (result.sessions.some((item) => item.id === recent)) {
+            setSelectedId(recent);
+            setMobilePanel("task");
+          }
+        }
         if (selected && !result.sessions.some((task) => task.id === selected)) {
           setSelectedId(null);
           setSnapshot(null);
@@ -128,7 +249,7 @@ export function App() {
   useEffect(() => {
     setSnapshot(null);
     setLastRead(null);
-    setDraft("");
+    setOpenRequestId(null);
     setReadError(null);
   }, [selectedId]);
 
@@ -159,20 +280,38 @@ export function App() {
 
   const pair = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (pairAttempt.current || !pairingCode.trim() || !deviceLabel.trim()) return;
+    if (pairAttempt.current || booting || !storageReady || !pairingCode.trim() || !deviceLabel.trim()) return;
     const attempt = new AbortController();
+    connectionGeneration.current += 1;
+    const generation = connectionGeneration.current;
+    recoveryAttempt.current?.abort();
     pairAttempt.current = attempt;
     setPairingStatus("creating_identity");
     setNotice(null);
     try {
       const paired = await BrowserControlClient.pair({
+        ...(platform ? {
+          baseUrl: computerAddress.trim(),
+          platform: platform.createClientPlatform(computerAddress.trim()),
+          rememberDevice: true,
+          recoveryStore: { save: async (record: DeviceRecoveryRecord) => {
+            if (attempt.signal.aborted || generation !== connectionGeneration.current) throw new Error("Pairing cancelled");
+            await updateRecoveryStore(() => platform.recoveryStore.save(record));
+            if (attempt.signal.aborted || generation !== connectionGeneration.current) throw new Error("Pairing cancelled");
+            setRecoverableDevice(record);
+          } },
+        } : {}),
         pairingCode: pairingCode.trim(),
         deviceLabel: deviceLabel.trim(),
         signal: attempt.signal,
         onPairingStatus: (status) => { if (!attempt.signal.aborted) setPairingStatus(status); },
       });
-      if (attempt.signal.aborted) { paired.dispose(); return; }
+      if (attempt.signal.aborted || generation !== connectionGeneration.current) { paired.dispose(); return; }
+      setDrafts(new Map());
+      pendingRecentTask.current = null;
+      try { forgetRememberedTask(window.localStorage); } catch { /* Optional navigation storage. */ }
       setClient(paired);
+      manualDisconnect.current = false;
       setConnection(paired.state);
       setSelectedId(null);
       setSnapshot(null);
@@ -192,44 +331,112 @@ export function App() {
     }
   };
 
-  const reconnect = async () => {
-    if (!client || connection === "reconnecting") return;
-    setNotice(null);
+  const reconnect = useCallback(async (interactive = true) => {
+    if (pairAttempt.current || restorePending.current || client?.state === "reconnecting" || booting) return;
+    if (!client && (!platform || !recoverableDevice)) return;
+    if (interactive) { setNotice(null); manualDisconnect.current = false; }
+    const generation = connectionGeneration.current;
+    const attempt = new AbortController();
+    recoveryAttempt.current = attempt;
     try {
-      await client.reconnect();
+      if (client) {
+        if (client.state !== "connected") await client.reconnect();
+      } else if (platform && recoverableDevice) {
+        restorePending.current = true;
+        setConnection("restoring");
+        const restored = await BrowserControlClient.resume({ record: recoverableDevice, platform: platform.createClientPlatform(recoverableDevice.baseUrl), signal: attempt.signal });
+        if (generation !== connectionGeneration.current || attempt.signal.aborted) { restored.dispose(); return; }
+        setClient(restored);
+        setConnection(restored.state);
+      }
+      if (generation !== connectionGeneration.current || attempt.signal.aborted) return;
+      retryAttempt.current = 0;
       setReadRevision((value) => value + 1);
-      setNotice({ kind: "success", text: "连接已恢复并同步请求序号。重连不会把旧请求作为新指令再次执行。" });
+      if (interactive) setNotice({ kind: "success", text: "连接已恢复。此前未确认的指令仍需核对，不会作为新指令重复提交。" });
     } catch (error) {
-      setNotice({ kind: "error", text: errorMessage(error) });
-    }
-  };
+      if (generation !== connectionGeneration.current || attempt.signal.aborted) return;
+      if (!client && recoveryNeedsPairing(error)) await expireRecovery();
+      else {
+        if (!client) setConnection("disconnected");
+        if (interactive) setNotice({ kind: "error", text: errorMessage(error) });
+      }
+    } finally { if (recoveryAttempt.current === attempt) { recoveryAttempt.current = null; restorePending.current = false; } }
+  }, [client, platform, recoverableDevice, booting, setNotice, expireRecovery]);
 
-  const forget = useCallback(() => {
+  useEffect(() => {
+    const resume = () => {
+      if (!manualDisconnect.current && document.visibilityState !== "hidden") void reconnect(false);
+    };
+    window.addEventListener("online", resume);
+    document.addEventListener("visibilitychange", resume);
+    const unsubscribe = platform?.onResume?.(resume);
+    return () => {
+      window.removeEventListener("online", resume);
+      document.removeEventListener("visibilitychange", resume);
+      unsubscribe?.();
+    };
+  }, [platform, reconnect]);
+
+  useEffect(() => {
+    if (connection !== "disconnected" || manualDisconnect.current || booting) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const retry = async () => {
+      if (cancelled || manualDisconnect.current) return;
+      if (document.visibilityState !== "hidden" && navigator.onLine) await reconnect(false);
+      if (!cancelled) timer = setTimeout(() => void retry(), Math.min(30_000, 1_000 * 2 ** Math.min(5, retryAttempt.current++)));
+    };
+    timer = setTimeout(() => void retry(), Math.min(30_000, 1_000 * 2 ** Math.min(5, retryAttempt.current++)));
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [connection, booting, reconnect]);
+
+  const forget = useCallback(async () => {
+    setBooting(true);
+    connectionGeneration.current += 1;
+    recoveryAttempt.current?.abort();
+    pairAttempt.current?.abort();
+    manualDisconnect.current = true;
     client?.dispose();
     setClient(null);
     setConnection("unpaired");
     setTasks([]);
     setSnapshot(null);
     setSelectedId(null);
-    setDraft("");
+    setDrafts(new Map());
+    setOpenRequestId(null);
+    pendingRecentTask.current = null;
+    try { forgetRememberedTask(window.localStorage); } catch { /* Optional navigation storage. */ }
     setReadError(null);
     setListError(null);
     setMobilePanel("list");
-    setNotice({ kind: "success", text: "本页的授权已清除。如需再次连接，请回桌面生成新的配对码。设备也可在桌面撤销。" });
-  }, [client, setNotice]);
+    try {
+      if (platform) await updateRecoveryStore(() => platform.recoveryStore.clear());
+      setRecoverableDevice(null);
+      setNotice({ kind: "success", text: "此设备的连接已清除。重新连接需在电脑确认；待核对的指令提醒仍会保留。" });
+    } catch {
+      setNotice({ kind: "error", text: "已断开连接，但未能清除本机保存的设备信息。请在电脑撤销此设备后重试。" });
+    } finally { setBooting(false); }
+  }, [client, platform, setNotice, updateRecoveryStore]);
+
+  const confirmOutcome = async (id: string) => {
+    try { await journal.confirm(id); dispatchFeedback({ type: "confirm_unknown", id }); }
+    catch { setNotice({ kind: "error", text: "暂时无法清除这条提醒。核对结果仍会保留，请稍后重试。" }); }
+  };
 
   const task = snapshot?.session.id === selectedId ? snapshot.session : tasks.find((candidate) => candidate.id === selectedId);
   const taskControllable = task?.status === "active";
 
   const send = async (mode: "queue" | "steer") => {
-    if (!client || !connected || !selectedId || !taskControllable || !canSendPrompt(draft) || sendPending.current) return;
+    if (!client || !connected || !storageReady || !selectedId || !taskControllable || !canSendPrompt(draft) || sendPending.current
+      || snapshot?.session.id !== selectedId || snapshot.session.needsDesktop.approval || snapshot.session.needsDesktop.input
+      || snapshot.inputRequests.length > 0 || readError) return;
     sendPending.current = true;
     setSending(mode);
     setNotice(null);
     const sessionId = selectedId;
     const text = draft;
     const outcome: UnknownMutationOutcome = {
-      id: String(++mutationCounter.current),
+      id: crypto.randomUUID(),
       sessionId,
       sessionTitle: (snapshot?.session.id === sessionId ? snapshot.session.title : tasks.find((task) => task.id === sessionId)?.title) ?? "未命名任务",
       command: mode === "queue" ? "Queue" : "Steer",
@@ -237,21 +444,22 @@ export function App() {
       promptPreview: promptPreview(text),
     };
     try {
-      const result = await client.request("session.send", { sessionId, text, mode });
-      const queued = readSendReceipt(result) === "queued";
-      if (activeClientRef.current !== client || selectedIdRef.current !== sessionId) return;
-      setDraft((current) => current === text ? "" : current);
-      setNotice({ kind: "success", text: queued ? "Queue 已入队，等待任务处理。" : `${mode === "queue" ? "Queue" : "Steer"} 请求已由桌面接受。` });
+      const queued = await journaledMutation(journal, outcome, () => client.request("session.send", { sessionId, text, mode }), readSendReceipt) === "queued";
+      if (activeClientRef.current !== client) return;
+      setDrafts((current) => clearSubmittedDraft(current, sessionId, text));
+      if (selectedIdRef.current !== sessionId) return;
+      setNotice({ kind: "success", text: queued ? "指令已排队，等待任务处理。" : "电脑已收到你的指令。" });
       setReadRevision((value) => value + 1);
     } catch (error) {
       const unknown = errorCode(error) === "outcome_unknown";
       // Preserve an old task's outcome even after selection/connection changes.
       // Ordinary connection and action notices cannot replace this record.
       if (unknown) dispatchFeedback({ type: "mutation_unknown", outcome });
-      if (activeClientRef.current !== client || selectedIdRef.current !== sessionId) return;
+      if (activeClientRef.current !== client) return;
       // An uncertain request is never presented as a safe retry. Remove its
       // unchanged draft so a second tap cannot accidentally enqueue it again.
-      if (unknown) setDraft((current) => current === text ? "" : current);
+      if (unknown) setDrafts((current) => clearSubmittedDraft(current, sessionId, text));
+      if (selectedIdRef.current !== sessionId) return;
       if (!unknown) setNotice({ kind: "error", text: errorMessage(error) });
     } finally {
       sendPending.current = false;
@@ -260,23 +468,22 @@ export function App() {
   };
 
   const stop = async () => {
-    if (!client || !connected || !selectedId || !taskControllable || stopPending.current) return;
+    if (!client || !connected || !storageReady || !selectedId || !taskControllable || stopPending.current) return;
     stopPending.current = true;
     setStopping(true);
     setNotice(null);
     const sessionId = selectedId;
     const outcome: UnknownMutationOutcome = {
-      id: String(++mutationCounter.current),
+      id: crypto.randomUUID(),
       sessionId,
       sessionTitle: (snapshot?.session.id === sessionId ? snapshot.session.title : tasks.find((task) => task.id === sessionId)?.title) ?? "未命名任务",
       command: "Stop",
       startedAt: Date.now(),
     };
     try {
-      const result = await client.request("session.stop", { sessionId });
-      const interrupted = readStopReceipt(result);
+      const interrupted = await journaledMutation(journal, outcome, () => client.request("session.stop", { sessionId }), readStopReceipt);
       if (activeClientRef.current !== client || selectedIdRef.current !== sessionId) return;
-      setNotice({ kind: "success", text: interrupted ? "Stop 已由桌面接受，正在停止任务。" : "Stop 已处理，当前没有运行中的任务。" });
+      setNotice({ kind: "success", text: interrupted ? "正在停止任务。" : "当前没有运行中的任务。" });
       setReadRevision((value) => value + 1);
     } catch (error) {
       const unknown = errorCode(error) === "outcome_unknown";
@@ -289,114 +496,89 @@ export function App() {
     }
   };
 
+  const answerInput = async (inputId: string, answers: Record<string, string[]>) => {
+    if (!client || !connected || !storageReady || !selectedId || !taskControllable || answerPending.current || readError
+      || snapshot?.session.id !== selectedId || snapshot.session.needsDesktop.approval || snapshot.session.needsDesktop.input
+      || !snapshot.inputRequests.some((request) => request.id === inputId)
+      || feedback.unknownOutcomes.some((outcome) => outcome.inputId === inputId && outcome.sessionId === selectedId)) return;
+    answerPending.current = true;
+    setAnsweringId(inputId);
+    setNotice(null);
+    const sessionId = selectedId;
+    const outcome: UnknownMutationOutcome = {
+      id: crypto.randomUUID(), sessionId, sessionTitle: task?.title ?? "未命名任务", command: "Answer", inputId, startedAt: Date.now(),
+    };
+    try {
+      const resolved = await journaledMutation(journal, outcome,
+        () => client.request("session.answerInput", { sessionId, inputId, answers }), readAnswerReceipt);
+      if (activeClientRef.current !== client || selectedIdRef.current !== sessionId) return;
+      setSnapshot((current) => current?.session.id === sessionId
+        ? { ...current, inputRequests: current.inputRequests.filter((request) => request.id !== inputId) } : current);
+      setOpenRequestId(null);
+      setNotice({ kind: "success", text: resolved ? "回答已送达，正在更新任务进展。" : "这条问题已不再等待回答，正在更新任务。" });
+      setReadRevision((value) => value + 1);
+    } catch (error) {
+      if (errorCode(error) === "outcome_unknown") dispatchFeedback({ type: "mutation_unknown", outcome });
+      else if (activeClientRef.current === client && selectedIdRef.current === sessionId) setNotice({ kind: "error", text: errorMessage(error) });
+    } finally { answerPending.current = false; setAnsweringId(null); }
+  };
+
   const needsDesktop = snapshot?.session.needsDesktop.approval || snapshot?.session.needsDesktop.input;
-  const sendDisabled = !connected || !selectedId || !!sending || !canSendPrompt(draft) || !!needsDesktop;
-  const byteLength = promptByteLength(draft);
+  const waitingForInput = (snapshot?.inputRequests.length ?? 0) > 0;
+  const sendDisabled = !connected || !storageReady || !taskControllable || !snapshot || !!readError || !!sending || !canSendPrompt(draft) || !!needsDesktop || waitingForInput;
+  const computerLabel = computerName(recoverableDevice?.baseUrl ?? (platform ? computerAddress : typeof window === "undefined" ? "" : window.location.origin));
+  const selectTask = (id: string) => {
+    if (!tasks.some((item) => item.id === id)) return;
+    selectedIdRef.current = id;
+    setSelectedId(id);
+    setMobilePanel("task");
+    setOpenRequestId(null);
+    if (platform && recoverableDevice) {
+      try { rememberTask(window.localStorage, recoverableDevice, id); } catch { /* Navigation remains available without storage. */ }
+    }
+  };
+  const alerts = notice || feedback.unknownOutcomes.length > 0 ? <>
+    {notice && <div className={`notice notice-${notice.kind}`} role={notice.kind === "success" ? "status" : "alert"} data-testid="notice">
+      <span>{notice.text}</span><button type="button" aria-label="关闭提示" onClick={() => setNotice(null)}>×</button>
+    </div>}
+    <OutcomeWarnings outcomes={feedback.unknownOutcomes} onConfirm={(id) => void confirmOutcome(id)} />
+  </> : undefined;
+
+  useAppViewport();
 
   return (
-    <div className="control-app">
-      <header className="site-header">
-        <div className="brand" aria-label="Chili 私网控制">
-          <span className="brand-mark" aria-hidden="true">c<span>·</span></span>
-          <span>Chili <span className="brand-product">Control</span></span>
-        </div>
-        <span className="alpha-badge">私网 Alpha</span>
-      </header>
-
-      <main>
-        <section className="connection-bar" aria-label="连接状态">
-          <div className="connection-summary" role="status" data-testid="connection-status">
-            <span className={`status-dot ${connected ? "is-connected" : ""}`} aria-hidden="true" />
-            <strong>{connectionLabel(connection, pairingStatus)}</strong>
-          </div>
-          {client ? (
-            <div className="connection-actions">
-              <button type="button" className="text-button" data-testid="reconnect" onClick={() => void reconnect()} disabled={connection === "reconnecting"}>重新连接</button>
-              {connected && <button type="button" className="text-button" data-testid="disconnect" onClick={() => client.disconnect()}>断开</button>}
-              {!connected && <button type="button" className="text-button" data-testid="forget-device" onClick={forget}>重新配对</button>}
-            </div>
-          ) : <span className="connection-note">端到端加密 · 仅限当前工作区</span>}
-        </section>
-
-        {notice && (
-          <div className={`notice notice-${notice.kind}`} role={notice.kind === "success" ? "status" : "alert"} data-testid="notice">
-            <span>{notice.text}</span>
-            <button type="button" aria-label="关闭提示" onClick={() => setNotice(null)}>×</button>
-          </div>
-        )}
-
-        <OutcomeWarnings outcomes={feedback.unknownOutcomes} onConfirm={(id) => dispatchFeedback({ type: "confirm_unknown", id })} />
-
-        {!client ? (
-          <section className="pairing-layout">
-            <div className="pairing-intro">
-              <div className="eyebrow">YOUR DESKTOP, WITHIN REACH</div>
-              <h1>离开桌面，<br />任务仍在掌握。</h1>
-              <p>连接正在运行的 Chili 桌面，查看进展、补充指令，或停止当前任务。</p>
-              <div className="scope-note"><span aria-hidden="true">↳</span><span>只控制当前工作区的既有任务。<br />审批、提问、权限与新建任务，请回桌面处理。</span></div>
-            </div>
-            <form className="pairing-card" onSubmit={(event) => void pair(event)}>
-              <span className="step-label">01 / 配对你的手机</span>
-              <h2>从桌面获取配对码</h2>
-              <p className="muted">在 Chili 桌面开启私网控制，并生成一次性短期配对码。提交后仍需在桌面本地确认。</p>
-              <label htmlFor="device-label">设备名称</label>
-              <input id="device-label" name="device-label" data-testid="device-label" value={deviceLabel} onChange={(event) => setDeviceLabel(event.target.value)} maxLength={64} autoComplete="off" spellCheck={false} required disabled={!!pairingStatus} />
-              <label htmlFor="pairing-code">一次性配对码</label>
-              <input id="pairing-code" name="pairing-code" className="pairing-code" data-testid="pairing-code" value={pairingCode} onChange={(event) => setPairingCode(event.target.value)} placeholder="输入桌面显示的配对码" autoComplete="off" autoCapitalize="characters" spellCheck={false} maxLength={64} required disabled={!!pairingStatus} />
-              <button className="primary-button pair-submit" type="submit" data-testid="pair-submit" disabled={!!pairingStatus || !pairingCode.trim() || !deviceLabel.trim()}>
-                {pairingStatus ? pairingLabel(pairingStatus) : "安全配对"}<span aria-hidden="true">↗</span>
-              </button>
-              {pairingStatus === "waiting_for_desktop" && <p className="pairing-wait" role="status" data-testid="pairing-wait">请回桌面核对设备名称，并确认本次配对。手机不能自行批准。</p>}
-              <div className="session-warning" data-testid="refresh-warning"><strong>刷新后需要重新配对</strong><span>授权和请求序号仅保存在本页内存。刷新、关闭页面或桌面重启后，请重新生成配对码；不会恢复旧授权。</span></div>
-            </form>
-          </section>
-        ) : (
-          <>
-            <div className="workspace-heading"><div><div className="eyebrow">CONNECTED WORKSPACE</div><h1>你的任务</h1></div><span className="read-only-note">既有任务 · 桌面与手机同步</span></div>
-            {(listError || readError) && <div className="read-error global-read-error" role="alert">{readError ?? listError}</div>}
-            <div className={`workspace mobile-${visibleMobilePanel(mobilePanel, selectedId)}`}>
-              <aside className="task-sidebar" aria-label="任务列表" data-testid="task-list">
-                <div className="panel-heading"><h2>任务列表</h2><span className="count">{tasks.length}</span></div>
-                {!listLoaded && <div className="empty compact" role="status">正在读取桌面任务…</div>}
-                {listLoaded && tasks.length === 0 && <div className="empty compact"><strong>暂时没有可访问的任务</strong><p>请先在当前桌面工作区创建任务。手机不能新建任务。</p></div>}
-                <ul>
-                  {tasks.map((item) => <li key={item.id}><button type="button" className={`task-item ${item.id === selectedId ? "selected" : ""}`} data-testid={`task-item-${item.id}`} aria-pressed={item.id === selectedId} onClick={() => { setSelectedId(item.id); setMobilePanel("task"); }}><span className="task-item-title">{item.title || "未命名任务"}</span><span className="task-item-meta"><span>{item.id === snapshot?.session.id ? runStatusLabel(snapshot.session.runStatus) : "既有任务"}</span><span aria-hidden="true">↗</span></span></button></li>)}
-                </ul>
-                {tasksTruncated && <p className="limit-note">仅显示部分任务，请在桌面查看完整列表。</p>}
-                <p className="sidebar-footnote">不会显示子智能体内部任务。<br />切换工作区将使手机授权失效。</p>
-              </aside>
-
-              <section className="task-panel" aria-label="当前任务">
-                {!selectedId ? <div className="empty choose-task"><span aria-hidden="true">↖</span><h2>选择一个既有任务</h2><p>查看最近消息，并向桌面发送 Queue、Steer 或 Stop。</p></div> : <>
-                  <header className="task-heading">
-                    <button type="button" className="back-button" aria-label="返回任务列表" onClick={() => setMobilePanel("list")}>← 任务</button>
-                    <div className="task-title"><h2>{task?.title || "正在读取任务…"}</h2><div className="task-state"><span className={`run-badge ${snapshot?.session.runStatus === "running" ? "running" : ""}`} data-testid="task-run-status">{snapshot ? runStatusLabel(snapshot.session.runStatus) : "读取中"}</span>{snapshot && snapshot.session.queuedCount > 0 && <span data-testid="queued-count">{snapshot.session.queuedCount} 条排队中</span>}<span className="last-read">{lastRead ? `${connected ? "更新于" : "上次读取"} ${lastRead.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : ""}</span></div></div>
-                    <button type="button" className="refresh-button" aria-label="刷新任务" onClick={() => setReadRevision((value) => value + 1)} disabled={!connected}>↻</button>
-                  </header>
-                  {needsDesktop && <div className="desktop-needed" role="status" data-testid="needs-desktop"><strong>请回桌面处理</strong><p>{snapshot?.session.needsDesktop.approval ? "任务正在等待审批。手机不能批准或修改权限。" : "任务正在等待你的回答。请在桌面完成提问流程。"}</p></div>}
-                  {snapshot?.session.deliveryUnknown && <div className="desktop-needed" role="alert" data-testid="delivery-unknown"><strong>排队消息的执行结果未知</strong><p>可能已经执行，请先读取任务或回桌面核对，不要直接重发。Stop 仍可使用。</p></div>}
-                  {!connected && <div className="stale-warning" role="status">当前显示上次读取的内容。连接恢复前无法发送指令。</div>}
-                  <div className="transcript" data-testid="transcript" aria-label="最近消息" aria-busy={connected && !snapshot}>
-                    {!snapshot && <div className="empty compact">正在读取最近消息…</div>}
-                    {snapshot && snapshot.messages.length === 0 && <div className="empty compact">暂无可显示的用户或助手消息。工具输出和内部事件不会在手机显示。</div>}
-                    {snapshot?.truncated && <p className="limit-note">已省略部分较早或较长的内容。完整记录请回桌面查看。</p>}
-                    {snapshot?.messages.map((message) => <article className={`message message-${message.role}`} key={message.id}><div className="message-heading"><strong>{message.role === "user" ? "你" : "Chili"}</strong><span>{formatMessageTime(message.createdAt)}</span></div><p>{message.text}</p></article>)}
-                  </div>
-                  {!taskControllable ? <p className="limit-note">此会话仅供查看历史。</p> : <section className="composer" aria-label="任务控制">
-                    <label htmlFor="message-input">补充一条指令</label>
-                    <textarea id="message-input" data-testid="message-input" value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={needsDesktop ? "请先回桌面处理待审批或提问" : "让 Chili 接下来做什么？"} rows={3} disabled={!connected || !!needsDesktop} aria-describedby="composer-help composer-bytes" />
-                    <div className="composer-help"><span id="composer-help">Queue 排队执行 · Steer 引导当前任务</span><span id="composer-bytes" className={byteLength > MAX_PROMPT_BYTES ? "over-limit" : ""}>{byteLength.toLocaleString()} / {MAX_PROMPT_BYTES.toLocaleString()} B</span></div>
-                    <div className="composer-actions"><button type="button" className="secondary-button" data-testid="queue-send" disabled={sendDisabled} onClick={() => void send("queue")}>{sending === "queue" ? "正在发送…" : "Queue"}</button><button type="button" className="primary-button" data-testid="steer-send" disabled={sendDisabled} onClick={() => void send("steer")}>{sending === "steer" ? "正在发送…" : "Steer"}<span aria-hidden="true">↗</span></button><button type="button" className="stop-button" data-testid="stop-task" disabled={!connected || stopping} onClick={() => void stop()}><span aria-hidden="true">■</span>{stopping ? "停止中…" : "Stop"}</button></div>
-                  </section>}
-                </>}
-              </section>
-            </div>
-            <footer className="page-footer"><span data-testid="refresh-warning">刷新或关闭此页后需要重新配对。</span><button type="button" className="text-button" onClick={forget}>清除此页授权</button></footer>
-          </>
-        )}
-      </main>
+    <div className={`control-app${platform ? " control-app-native" : ""}`}>
+      {!client ? <PairingView native={!!platform} booting={booting} storageReady={storageReady}
+        pairingStatus={pairingStatus} connection={connection} connectionLabel={connectionLabel(connection, pairingStatus)}
+        computerAddress={computerAddress} onComputerAddressChange={setComputerAddress}
+        deviceLabel={deviceLabel} onDeviceLabelChange={setDeviceLabel} pairingCode={pairingCode} onPairingCodeChange={setPairingCode}
+        recoverableAddress={recoverableDevice?.baseUrl ?? null} onPair={(event) => void pair(event)}
+        onReconnect={() => void reconnect()} onForget={() => void forget()} alerts={alerts} /> : <>
+        <Workspace tasks={tasks} tasksTruncated={tasksTruncated} listLoaded={listLoaded} selectedId={selectedId}
+          snapshot={snapshot?.session.id === selectedId ? snapshot : null} lastRead={lastRead}
+          connected={connected} connectionLabel={connectionLabel(connection, pairingStatus)} computerLabel={computerLabel}
+          deviceLabel={deviceLabel} remembersDevice={!!platform} listError={listError} readError={readError}
+          draft={draft} onDraftChange={setDraft} sending={sending} stopping={stopping}
+          sendDisabled={sendDisabled} stopDisabled={!connected || !storageReady || !taskControllable || stopping}
+          answerDisabled={!connected || !storageReady || !!readError || !!needsDesktop || !!answeringId}
+          onSelectTask={selectTask} onSend={(mode) => void send(mode)} onStop={() => void stop()}
+          onRefresh={() => setReadRevision((value) => value + 1)} onReconnect={() => void reconnect()}
+          onDisconnect={() => { manualDisconnect.current = true; client.disconnect(); }} onForget={() => void forget()}
+          reconnectDisabled={booting || connection === "reconnecting" || connection === "restoring"}
+          disconnectDisabled={!connected} forgetDisabled={booting} onOpenQuestion={setOpenRequestId}
+          mobilePanel={mobilePanel} onMobilePanelChange={setMobilePanel} alerts={alerts} />
+        <QuestionSheets sessionId={selectedId} requests={snapshot?.session.id === selectedId ? snapshot.inputRequests : []}
+          openRequestId={openRequestId} onOpenChange={setOpenRequestId}
+          disabled={!connected || !storageReady || !taskControllable || !!readError || !!needsDesktop || !!answeringId}
+          pendingId={answeringId} unknownInputIds={feedback.unknownOutcomes.filter((outcome) => outcome.sessionId === selectedId && outcome.inputId).map((outcome) => outcome.inputId!)}
+          onAnswer={answerInput} />
+      </>}
     </div>
   );
+}
+
+function computerName(address: string): string {
+  try { return new URL(address).hostname || "已连接的电脑"; } catch { return "你的电脑"; }
 }
 
 function pairingLabel(status: PairingStatus): string {
@@ -406,6 +588,7 @@ function pairingLabel(status: PairingStatus): string {
 function connectionLabel(connection: ConnectionState, pairingStatus: PairingStatus | null): string {
   if (pairingStatus) return pairingLabel(pairingStatus);
   switch (connection) {
+    case "restoring": return "正在恢复电脑连接…";
     case "connected": return "已安全连接";
     case "reconnecting": return "正在重新连接…";
     case "disconnected": return "连接已断开";
@@ -413,9 +596,4 @@ function connectionLabel(connection: ConnectionState, pairingStatus: PairingStat
     case "closed": return "连接已关闭";
     default: return "尚未配对";
   }
-}
-
-function formatMessageTime(timestamp: string): string {
-  const date = new Date(timestamp);
-  return Number.isFinite(date.getTime()) ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
 }
