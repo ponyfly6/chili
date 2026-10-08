@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { MAX_PROMPT_BYTES, canSendPrompt, errorMessage, promptByteLength, readSendReceipt, readStopReceipt, readTaskList, readTaskSnapshot, visibleMobilePanel } from "./view-model.js";
+import { MAX_PROMPT_BYTES, canSendPrompt, errorMessage, promptByteLength, readAnswerReceipt, readSendReceipt, readStopReceipt, readTaskList, readTaskSnapshot, recoveryNeedsPairing, runStatusLabel, visibleMobilePanel } from "./view-model.js";
 
 const task = { id: "session_1", title: "Existing task", status: "active", updatedAt: 1_700_000_000_000 };
 const snapshot = {
@@ -9,6 +9,29 @@ const snapshot = {
 };
 
 describe("mobile public projection", () => {
+  test("desktop input is the only desktop prompt flag and retired approval states stay historical", () => {
+    expect(readTaskSnapshot(snapshot).session.needsDesktop).toEqual({ input: false });
+    const legacy = readTaskSnapshot({ ...snapshot, session: { ...snapshot.session, runStatus: "waiting_for_approval", needsDesktop: { input: false, approval: true } } });
+    expect(legacy.session.needsDesktop).toEqual({ input: false });
+    expect(runStatusLabel(legacy.session.runStatus)).toBe("旧审批已停止");
+    expect(runStatusLabel("waiting_for_input")).toBe("等待你的回答");
+  });
+
+  test("mobile questions keep their complete choices and omit unrelated tool fields", () => {
+    const input = { id: "input-1", createdAt: 1_700_000_000_000, questions: [{ id: "q1", header: "方向", question: "先做哪一项？", options: [{ label: "连接", description: "连接电脑" }, { label: "通知", description: "接收提醒" }], multiple: true }], toolInput: "secret" };
+    const parsed = readTaskSnapshot({ ...snapshot, inputRequests: [input] });
+    expect(parsed.inputRequests[0]?.questions[0]?.options).toEqual(input.questions[0]?.options);
+    expect(parsed.inputRequests[0]?.createdAt).toBe("2023-11-14T22:13:20.000Z");
+    expect(JSON.stringify(parsed.inputRequests)).not.toContain("secret");
+    expect(readTaskSnapshot(snapshot).inputRequests).toEqual([]);
+    for (const invalid of [
+      [input, input],
+      [{ ...input, questions: [{ ...input.questions[0], options: [{ label: "一项", description: "" }] }] }],
+      [{ ...input, questions: [{ ...input.questions[0], id: "__proto__" }] }],
+      [{ ...input, questions: [{ ...input.questions[0], question: "长".repeat(2001) }] }],
+      [{ ...input, questions: [{ ...input.questions[0], options: [{ label: "重复", description: "" }, { label: "重复", description: "" }] }] }],
+    ]) expect(() => readTaskSnapshot({ ...snapshot, inputRequests: invalid })).toThrow();
+  });
   test("only copies allowlisted summary and snapshot fields for display", () => {
     const list = readTaskList({ sessions: [{ ...task, cwd: "/private/workspace", children: ["child_1"] }], truncated: true });
     expect(list).toEqual({ sessions: [{ id: task.id, title: task.title, status: "active", updatedAt: "2023-11-14T22:13:20.000Z" }], truncated: true });
@@ -72,15 +95,28 @@ describe("mobile command safety", () => {
     expect(errorMessage({ code: "outcome_unknown" })).toContain("可能已经执行");
     expect(errorMessage({ code: "outcome_unknown" })).toContain("不会自动重发");
     expect(errorMessage({ code: "credential_revoked" })).toContain("重新配对");
+    expect(errorMessage({ code: "pairing_invalid" })).toContain("配对码已失效");
+    expect(errorMessage({ code: "pairing_invalid" })).toContain("新配对码");
   });
 
   test("malformed mutation receipts remain unknown rather than claiming success or no operation", () => {
     expect(readSendReceipt({ status: "queued", position: 1 })).toBe("queued");
     expect(readStopReceipt({ interrupted: false })).toBe(false);
-    for (const read of [readSendReceipt, readStopReceipt]) {
+    expect(readAnswerReceipt({ resolved: false })).toBe(false);
+    expect(readAnswerReceipt({ resolved: true })).toBe(true);
+    for (const read of [readSendReceipt, readStopReceipt, readAnswerReceipt]) {
       try { read({}); throw new Error("Expected outcome to remain unknown"); }
       catch (error) { expect(error).toMatchObject({ code: "outcome_unknown" }); }
     }
+  });
+
+  test("expired or revoked recovery stops retries but temporary network failures do not", () => {
+    for (const code of ["PAIRING_REQUIRED", "recovery_invalid", "RECOVERY_CONTEXT_MISMATCH", "RECOVERY_IDENTITY_INVALID", "RECOVERY_RECORD_INVALID", "credential_revoked"]) {
+      expect(recoveryNeedsPairing({ code })).toBe(true);
+      expect(errorMessage({ code })).toContain("重新配对");
+    }
+    for (const code of ["network_error", "unavailable", "HTTP_REQUEST_CANCELLED"]) expect(recoveryNeedsPairing({ code })).toBe(false);
+    expect(errorMessage({ code: "RECOVERY_STORAGE_FAILED" })).toContain("手机未能保存连接");
   });
 
   test("unsupported encryption and untrusted HTTPS never suggest plaintext fallback", () => {

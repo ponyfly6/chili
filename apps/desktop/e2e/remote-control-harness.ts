@@ -12,6 +12,7 @@ import { decodeWireEnvelope } from "../../../packages/remote-control/src/http-wi
 import type { RemoteControlFrame, RemoteControlRequestFrame } from "../../../packages/remote-control/src/protocol.js";
 import type { ChiliRemoteDesktopApi, RemoteDesktopState } from "../src/shared/remote-control-contracts.js";
 import { proveRemoteProjectIsolation } from "./remote-control-projects.js";
+import { disconnectPhone, reconnectPhone, refreshPhoneTask, returnToPhoneTask, selectPhoneSendMode, selectPhoneTask } from "./phone-navigation.js";
 
 const temporaryRoot = process.env.CHILI_REMOTE_E2E_ROOT;
 assert.ok(temporaryRoot && isAbsolute(temporaryRoot));
@@ -171,13 +172,14 @@ try {
   assert.equal(await mobile.evaluate(() => window.isSecureContext), true);
   await pairThroughUi(desktopPage, mobile);
   evidence.pairingRequiresLocalConfirmation = true;
-  await mobile.getByTestId("task-list").getByText("Phone Alpha real runtime", { exact: true }).click();
+  await selectPhoneTask(mobile, "Phone Alpha real runtime");
   await waitUntil("real remote snapshot text", async () => (await mobile!.getByTestId("transcript").innerText()).includes("[slow] initial desktop task"));
   evidence.listAndSnapshot = true;
   await assertNarrowLayout(mobile);
   await mobile.screenshot({ path: join(artifacts, "mobile-390.png"), fullPage: true });
   process.stdout.write("[remote-e2e] Queue, local concurrent operation, Steer and Stop\n");
   await mobile.getByTestId("message-input").fill("phone queued once");
+  await selectPhoneSendMode(mobile, "queue");
   await mobile.getByTestId("queue-send").click();
   await desktopPage.getByRole("button", { name: "关闭设置", exact: true }).click();
   await desktopPage.getByRole("list", { name: "待处理消息", exact: true })
@@ -187,6 +189,7 @@ try {
   await desktopPage.getByLabel("Message composer", { exact: true }).fill("desktop queued concurrently");
   await desktopPage.getByRole("button", { name: "Queue message", exact: true }).click();
   await mobile.getByTestId("message-input").fill("phone steer replacement");
+  await selectPhoneSendMode(mobile, "steer");
   await mobile.getByTestId("steer-send").click();
   await waitUntil("steer aborts the real provider request", () => fixture.requests.some((request) => request.text === "[slow] initial desktop task" && request.aborted));
   await waitUntil("steer and shared queues drain", () => ["phone steer replacement", "phone queued once", "desktop queued concurrently"]
@@ -194,6 +197,7 @@ try {
   await waitUntil("phone displays queue response", async () => (await mobile!.getByTestId("transcript").innerText()).includes("Remote fixture response: desktop queued concurrently"));
   evidence.queueSteerAndConcurrentDesktop = true;
   await mobile.getByTestId("message-input").fill("[slow] phone stop target");
+  await selectPhoneSendMode(mobile, "queue");
   await mobile.getByTestId("queue-send").click();
   await waitUntil("phone started a real runtime turn", () => fixture.requests.some((request) => request.text === "[slow] phone stop target"));
   const stopStarted = Date.now();
@@ -206,14 +210,21 @@ try {
   await finishRecoveredModelInput("[slow] phone stop target");
 
   process.stdout.write("[remote-e2e] Disconnect/reconnect, refresh requires fresh pairing, device revocation\n");
-  await mobile.getByTestId("disconnect").click();
-  await mobile.getByTestId("reconnect").click();
+  await disconnectPhone(mobile);
+  await reconnectPhone(mobile);
   await waitUntil("mobile reconnects with existing in-memory replay state", async () => /已安全连接/u.test(await mobile!.getByTestId("connection-status").innerText()));
+  await returnToPhoneTask(mobile);
   await mobile.getByTestId("message-input").fill("after transport reconnect");
   await mobile.getByTestId("queue-send").click();
   await waitUntil("reconnected request reaches runtime once", () => fixture.requests.filter((request) => request.text === "after transport reconnect").length === 1);
+  // This is a successful-send case. Disconnecting after provider admission but
+  // before the encrypted receipt would correctly leave a durable uncertainty
+  // marker for the next page, contaminating the deliberate lost-result case.
+  await waitUntil("reconnected send receives its terminal receipt", async () =>
+    await mobile!.getByTestId("message-input").inputValue() === ""
+      && /指令已排队|电脑已收到你的指令/u.test(await mobile!.getByTestId("notice").innerText()));
   evidence.reconnect = true;
-  await mobile.getByTestId("disconnect").click();
+  await disconnectPhone(mobile);
   await openPhoneSettings(desktopPage);
   evidence.unknownOutcomeUi = await proveStickyUnknownOutcomeUi(browser, desktopPage, remoteOrigin);
   evidence.wireLoss = await proveWireLoss(browser, desktopPage, remoteOrigin, desktop);
@@ -223,7 +234,7 @@ try {
   evidence.refreshRequiresPairing = true;
   await desktopPage.getByTestId("remote-revoke").first().click();
   await pairThroughUi(desktopPage, mobile);
-  await mobile.getByTestId("task-list").getByText("Phone Alpha real runtime", { exact: true }).click();
+  await selectPhoneTask(mobile, "Phone Alpha real runtime");
   await desktopPage.getByTestId("remote-revoke").first().click();
   await waitUntil("revoked phone becomes unavailable", async () => !/已安全连接/u.test((await mobile!.getByTestId("connection-status").innerText()).trim()));
   await mobile.getByTestId("pairing-code").waitFor();
@@ -234,7 +245,7 @@ try {
   await waitUntil("turning remote off disconnects a live phone", async () => !/已安全连接/u.test(await mobile!.getByTestId("connection-status").innerText()));
   await desktopPage.getByTestId("remote-enable").click();
   await desktopPage.getByTestId("remote-status").waitFor();
-  await mobile.getByTestId("reconnect").click();
+  await reconnectPhone(mobile);
   await mobile.getByTestId("pairing-code").waitFor();
   assert.equal(await mobile.getByTestId("task-list").count(), 0, "Re-enabling remote must not revive old authorization");
   await desktopPage.getByTestId("remote-disable").click();
@@ -273,7 +284,7 @@ try {
   evidence.desktopRestartPreservesNativeSetupWithoutAuthorization = true;
   await desktopPage.getByTestId("remote-enable").click();
   await desktopPage.getByTestId("remote-status").waitFor();
-  await mobile.getByTestId("reconnect").click();
+  await reconnectPhone(mobile);
   await mobile.getByTestId("pairing-code").waitFor();
   assert.equal(await mobile.getByTestId("task-list").count(), 0);
   evidence.desktopRestartRevokesOldGrant = true;
@@ -287,7 +298,7 @@ try {
   assert.deepEqual(errors, [], "Desktop renderer errors");
   assert.deepEqual(browserErrors, [], "Real browser errors");
   assert.deepEqual(fixture.failures, [], "Local model fixture failures");
-  for (const text of ["phone queued once", "desktop queued concurrently", "queue once after lost ack", "queue once after lost result", "queue once after lost both"]) {
+  for (const text of ["phone queued once", "desktop queued concurrently", "after transport reconnect", "queue once after lost ack", "queue once after lost result", "queue once after lost both"]) {
     assert.equal(fixture.requests.filter((request) => request.text === text).length, 1, `${text} must execute exactly once after all reconnects`);
   }
   const rows = JSON.parse(await runCommand("/usr/bin/sqlite3", ["-readonly", "-json", join(workspace, ".chili/chili.sqlite"),
@@ -574,10 +585,17 @@ async function assertNarrowLayout(page: Page): Promise<void> {
   }));
   assert.equal(metrics.width, 390);
   assert.ok(metrics.documentWidth <= 390 && metrics.bodyWidth <= 390, `Horizontal overflow: ${JSON.stringify(metrics)}`);
-  for (const testId of ["message-input", "queue-send", "steer-send", "stop-task"]) {
+  for (const testId of ["message-input", "stop-task"]) {
     const bounds = await page.getByTestId(testId).boundingBox();
     assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 390, `${testId} exceeds 390px viewport`);
   }
+  for (const mode of ["queue", "steer"] as const) {
+    await selectPhoneSendMode(page, mode);
+    const testId = mode === "queue" ? "queue-send" : "steer-send";
+    const bounds = await page.getByTestId(testId).boundingBox();
+    assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 390, `${testId} exceeds 390px viewport`);
+  }
+  await selectPhoneSendMode(page, "queue");
 }
 
 interface BrowserFaultWindow extends Window {
@@ -680,12 +698,12 @@ async function proveStickyUnknownOutcomeUi(context: BrowserContext, local: Page,
     assert.equal(await unknownItems.count(), 1, message);
     const content = await unknown.innerText();
     assert.match(content, /结果未知/u, message);
-    assert.ok(content.includes("Queue") && content.includes(title) && content.includes(lostSend), message);
+    assert.ok(content.includes("排队指令结果未知") && content.includes(title) && content.includes(lostSend), message);
   };
   try {
     await page.goto(origin);
     await pairThroughUi(local, page, label);
-    await page.getByTestId("task-list").getByText(title, { exact: true }).click();
+    await selectPhoneTask(page, title);
     await page.getByTestId("message-input").fill(lostSend);
     await page.getByTestId("queue-send").click();
     await waitUntil("production UI send reached real runtime exactly once", () => fixture.requests.filter((request) => request.text === lostSend).length === 1);
@@ -694,22 +712,23 @@ async function proveStickyUnknownOutcomeUi(context: BrowserContext, local: Page,
     // in for App.tsx's catch/state/notification behavior.
     await assertOneWarning("The timed-out Queue must create a persistent, identified warning");
     assert.equal(await page.getByTestId("message-input").inputValue(), "", "An unknown command must not leave a draft ready for accidental resend");
-    await page.getByTestId("reconnect").click();
+    await reconnectPhone(page);
     await waitUntil("production UI reconnect succeeds", async () => /已安全连接/u.test(await page.getByTestId("connection-status").innerText()));
+    await returnToPhoneTask(page);
     await page.getByTestId("notice").getByText(/连接已恢复/u).waitFor();
     await assertOneWarning("Successful reconnect must not replace an unknown-command warning");
     const readsBeforeRefresh = completedSnapshotReads;
-    await page.getByRole("button", { name: "刷新任务", exact: true }).click();
+    await refreshPhoneTask(page);
     await waitUntil("explicit refresh reads the real task again", () => completedSnapshotReads > readsBeforeRefresh);
     await waitUntil("recovered snapshot displays executed but unacknowledged text", async () => (await page.getByTestId("transcript").innerText()).includes(lostSend));
     await assertOneWarning("A successful snapshot cannot infer an unknown command's terminal result");
     await page.getByTestId("message-input").fill(successfulSend);
     await page.getByTestId("queue-send").click();
     await waitUntil("another production UI command succeeds", () => fixture.requests.filter((request) => request.text === successfulSend).length === 1);
-    await page.getByTestId("notice").getByText(/Queue.*接受|Queue.*入队/u).waitFor();
+    await page.getByTestId("notice").getByText(/指令已排队|电脑已收到你的指令/u).waitFor();
     await assertOneWarning("A different successful Queue must not clear the prior unknown outcome");
     await page.getByTestId("stop-task").click();
-    await page.getByTestId("notice").getByText(/Stop.*已/u).waitFor();
+    await page.getByTestId("notice").getByText(/正在停止任务|当前没有运行中的任务/u).waitFor();
     await assertOneWarning("A successful Stop notification must not clear the prior unknown outcome");
     await page.screenshot({ path: join(artifacts, "mobile-unknown-after-success.png"), fullPage: true });
     await confirmations.click();
@@ -725,10 +744,11 @@ async function proveStickyUnknownOutcomeUi(context: BrowserContext, local: Page,
     await waitUntil("concurrent lost-result Stop aborts real runtime", () => fixture.requests.some((request) => request.text === concurrentSend && request.aborted));
     await waitUntil("both concurrent terminal results discarded", () => droppedResults.length === 3);
     await waitUntil("production UI records both unknown commands", async () => await unknownItems.count() === 2);
-    assert.match(await unknown.innerText(), /Queue/u);
-    assert.match(await unknown.innerText(), /Stop/u);
-    await page.getByTestId("reconnect").click();
+    assert.match(await unknown.innerText(), /排队指令结果未知/u);
+    assert.match(await unknown.innerText(), /停止任务结果未知/u);
+    await reconnectPhone(page);
     await waitUntil("concurrent-unknown UI reconnect succeeds", async () => /已安全连接/u.test(await page.getByTestId("connection-status").innerText()));
+    await returnToPhoneTask(page);
     await page.getByTestId("notice").getByText(/连接已恢复/u).waitFor();
     assert.equal(await unknownItems.count(), 2, "Resync must preserve both unresolved UI command records");
     await page.screenshot({ path: join(artifacts, "mobile-unknown-concurrent.png"), fullPage: true });
@@ -758,7 +778,7 @@ async function proveStickyUnknownOutcomeUi(context: BrowserContext, local: Page,
     await unknown.waitFor();
     assert.equal(await unknownItems.count(), 1, "Revocation must preserve the admitted command's unknown result");
     const revokedWarning = await unknown.innerText();
-    assert.ok(revokedWarning.includes(revokedSend) && revokedWarning.includes(title) && revokedWarning.includes("Queue"));
+    assert.ok(revokedWarning.includes(revokedSend) && revokedWarning.includes(title) && revokedWarning.includes("排队指令结果未知"));
     await page.screenshot({ path: join(artifacts, "mobile-unknown-after-revoke.png"), fullPage: true });
     await confirmations.click();
     await unknown.waitFor({ state: "detached" });

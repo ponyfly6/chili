@@ -252,7 +252,7 @@ test("one-use short pairing code and key proof cannot bypass local confirmation"
   const grantResponse = await http(origin, "/api/pairing/poll", identifiers);
   const grant = (grantResponse.body as { grant: PairingGrant }).grant;
   expect(grant.deviceId).toBe(pending.identity.deviceId);
-  expect(grant.capabilities).toEqual(["sessions.read", "sessions.send", "sessions.stop"]);
+  expect(grant.capabilities).toEqual(["sessions.read", "sessions.send", "sessions.stop", "sessions.input"]);
   expect(value.snapshot().devices).toHaveLength(1);
   expect(JSON.stringify(value.snapshot())).not.toContain(grant.credential);
   expect(JSON.stringify(value.snapshot())).not.toContain(grant.channel.key);

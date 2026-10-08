@@ -21,7 +21,7 @@ export interface BrowserDeviceIdentity {
   readonly algorithm: "Ed25519";
   readonly deviceId: string;
   readonly publicKey: string;
-  /** Nonextractable, memory-only. No secret is persisted independently of replay state. */
+  /** Nonextractable operational key. Native recovery stores a separate identity backup. */
   readonly privateKey: CryptoKey;
 }
 
@@ -39,13 +39,12 @@ export function requireSecureBrowserCrypto(): Crypto {
   return globalThis.crypto;
 }
 
-export function browserRandomIdentifier(prefix: string): string {
-  const bytes = requireSecureBrowserCrypto().getRandomValues(new Uint8Array(16));
+export function browserRandomIdentifier(prefix: string, crypto: Crypto = requireSecureBrowserCrypto()): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
   return `${prefix}_${encodeBase64Url(bytes)}`;
 }
 
-export async function generateBrowserDeviceIdentity(): Promise<BrowserDeviceIdentity> {
-  const crypto = requireSecureBrowserCrypto();
+export async function generateBrowserDeviceIdentity(crypto: Crypto = requireSecureBrowserCrypto()): Promise<BrowserDeviceIdentity> {
   try {
     const keys = await crypto.subtle.generateKey("Ed25519", false, ["sign", "verify"]);
     const pair = keys as CryptoKeyPair;
@@ -53,7 +52,7 @@ export async function generateBrowserDeviceIdentity(): Promise<BrowserDeviceIden
     const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", publicKeyBytes));
     // Probe the complete required suite now, before consuming a one-time pairing code.
     const probe = { hostId: "browser_probe", routeId: "route_probe", key: encodeBase64Url(crypto.getRandomValues(new Uint8Array(32))) };
-    await directionalKey(probe, "device_to_host");
+    await directionalKey(probe, "device_to_host", crypto);
     return Object.freeze({
       algorithm: "Ed25519",
       deviceId: `device_${encodeBase64Url(digest)}`,
@@ -82,9 +81,9 @@ export function validateBrowserPairingChallenge(value: unknown, identity: Browse
   return challenge;
 }
 
-export async function createBrowserPairingProof(challenge: PairingChallenge, identity: BrowserDeviceIdentity): Promise<PairingProof> {
+export async function createBrowserPairingProof(challenge: PairingChallenge, identity: BrowserDeviceIdentity, crypto: Crypto = requireSecureBrowserCrypto()): Promise<PairingProof> {
   validateBrowserPairingChallenge(challenge, identity);
-  const signature = await requireSecureBrowserCrypto().subtle.sign("Ed25519", identity.privateKey, pairingProofBytes(challenge));
+  const signature = await crypto.subtle.sign("Ed25519", identity.privateKey, pairingProofBytes(challenge));
   return { version: 1, nonce: challenge.nonce, signature: encodeBase64Url(new Uint8Array(signature)) };
 }
 
@@ -122,8 +121,8 @@ export async function sealBrowserRelayEnvelope(
   channel: RelayChannelKey,
   direction: RemoteControlRelayDirection,
   inner: unknown,
+  crypto: Crypto = requireSecureBrowserCrypto(),
 ): Promise<OpaqueRelayEnvelope> {
-  const crypto = requireSecureBrowserCrypto();
   const serialized = JSON.stringify(inner);
   if (serialized === undefined) throw new BrowserSecurityError("RELAY_ENVELOPE_INVALID");
   const plaintext = encoder.encode(serialized);
@@ -132,12 +131,12 @@ export async function sealBrowserRelayEnvelope(
     version: 1 as const,
     routeId: channel.routeId,
     direction,
-    messageId: browserRandomIdentifier("message"),
+    messageId: browserRandomIdentifier("message", crypto),
     byteLength: plaintext.byteLength + 28,
     createdAt: Date.now(),
   };
   const nonce = crypto.getRandomValues(new Uint8Array(12));
-  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: relayAadBytes(channel, metadata), tagLength: 128 }, await directionalKey(channel, direction), plaintext);
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: relayAadBytes(channel, metadata), tagLength: 128 }, await directionalKey(channel, direction, crypto), plaintext);
   const ciphertext = new Uint8Array(metadata.byteLength);
   ciphertext.set(nonce);
   ciphertext.set(new Uint8Array(encrypted), nonce.byteLength);
@@ -148,6 +147,7 @@ export async function openBrowserRelayEnvelope(
   channel: RelayChannelKey,
   value: unknown,
   replayGuard: BrowserReplayGuard,
+  crypto: Crypto = requireSecureBrowserCrypto(),
 ): Promise<unknown> {
   const envelope = parseOpaqueRelayEnvelope(value);
   if (envelope.direction !== "host_to_device" || envelope.routeId !== channel.routeId || envelope.byteLength < 28) {
@@ -156,12 +156,12 @@ export async function openBrowserRelayEnvelope(
   if (replayGuard.has(envelope)) throw new BrowserSecurityError("RELAY_REPLAYED");
   let plaintext: ArrayBuffer;
   try {
-    plaintext = await requireSecureBrowserCrypto().subtle.decrypt({
+    plaintext = await crypto.subtle.decrypt({
       name: "AES-GCM",
       iv: new Uint8Array(envelope.ciphertext.slice(0, 12)),
       additionalData: relayAadBytes(channel, envelope),
       tagLength: 128,
-    }, await directionalKey(channel, envelope.direction), new Uint8Array(envelope.ciphertext.slice(12)));
+    }, await directionalKey(channel, envelope.direction, crypto), new Uint8Array(envelope.ciphertext.slice(12)));
   } catch {
     throw new BrowserSecurityError("RELAY_DECRYPTION_FAILED");
   }
@@ -172,7 +172,7 @@ export async function openBrowserRelayEnvelope(
   return inner;
 }
 
-async function directionalKey(channel: RelayChannelKey, direction: RemoteControlRelayDirection): Promise<CryptoKey> {
+async function directionalKey(channel: RelayChannelKey, direction: RemoteControlRelayDirection, crypto: Crypto): Promise<CryptoKey> {
   parseRemoteControlHostId(channel.hostId);
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(channel.routeId)
     || (direction !== "device_to_host" && direction !== "host_to_device")) {
@@ -180,7 +180,6 @@ async function directionalKey(channel: RelayChannelKey, direction: RemoteControl
   }
   const rootBytes = decodeBase64Url(channel.key, 32);
   if (rootBytes.byteLength !== 32) throw new BrowserSecurityError("RELAY_ENVELOPE_INVALID");
-  const crypto = requireSecureBrowserCrypto();
   const root = await crypto.subtle.importKey("raw", rootBytes, "HKDF", false, ["deriveKey"]);
   return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", ...relayKeyDerivationBytes(channel, direction) }, root,
     { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);

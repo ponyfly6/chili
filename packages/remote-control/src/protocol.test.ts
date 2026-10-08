@@ -15,12 +15,13 @@ import {
   requiredCapabilityForOperation,
 } from "./protocol.js";
 
-test("accepts the four minimal operations and enforces their exact capabilities", () => {
+test("accepts minimal control and input operations with their exact capabilities", () => {
   const cases = [
     ["sessions.list", "sessions.read", { query: "active", status: "active" }],
     ["session.snapshot", "sessions.read", { sessionId: "task_1" }],
     ["session.send", "sessions.send", { sessionId: "task_1", text: "continue\nnow", mode: "queue" }],
     ["session.stop", "sessions.stop", { sessionId: "task_1" }],
+    ["session.answerInput", "sessions.input", { sessionId: "task_1", inputId: "userinput_1", answers: { direction: ["Continue"] } }],
   ] as const;
 
   for (const [operation, capability, payload] of cases) {
@@ -29,6 +30,21 @@ test("accepts the four minimal operations and enforces their exact capabilities"
     expect(requiredCapabilityForOperation(operation)).toBe(capability);
     expect(REMOTE_CONTROL_REQUIRED_CAPABILITY[operation]).toBe(capability);
   }
+});
+
+test("input answers require narrow fields, bounded plain text and safe question keys", () => {
+  const answer = (payload: unknown, capability = "sessions.input") => request({ operation: "session.answerInput", capability, payload });
+  const valid = { sessionId: "task_1", inputId: "userinput_1", answers: { direction: ["Continue"] } };
+  expect(() => parseRemoteControlFrame(answer(valid, "sessions.send"))).toThrow("capability");
+  for (const payload of [
+    { ...valid, approvalId: "approval_1" }, { ...valid, path: "/repo" },
+    { ...valid, answers: {} }, { ...valid, answers: { direction: [] } },
+    { ...valid, answers: { direction: ["   "] } }, { ...valid, answers: { direction: ["line\nbreak"] } },
+    { ...valid, answers: { direction: ["a".repeat(8_001)] } },
+    { ...valid, answers: { constructor: ["unsafe"] } },
+    { ...valid, answers: { direction: Array(21).fill("Continue") } },
+    { ...valid, answers: { a: ["界".repeat(8_000)], b: ["界".repeat(8_000)] } },
+  ]) expect(() => parseRemoteControlFrame(answer(payload))).toThrow();
 });
 
 test("round trips validated frames through bounded UTF-8 JSON", () => {

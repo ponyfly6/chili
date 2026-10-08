@@ -2,6 +2,7 @@ import { reduceRuntimeEvents, type RuntimeSessionSummary } from "@chili/sdk";
 import type { RuntimeSessionStatus } from "@chili/protocol";
 import {
   REMOTE_CONTROL_LIMITS,
+  parseRemoteControlAnswerInputPayload,
   requiredCapabilityForOperation,
   type RemoteControlInvocationContext,
   type RemoteControlJsonValue,
@@ -44,6 +45,10 @@ export type RemoteDesktopSnapshot = {
     needsDesktop: { input: boolean };
   };
   messages: { id: string; role: "user" | "assistant"; text: string; createdAt: number }[];
+  inputRequests: {
+    id: string; createdAt: number;
+    questions: { id: string; header: string; question: string; options: { label: string; description: string }[]; multiple?: true }[];
+  }[];
   truncated: boolean;
 };
 
@@ -103,6 +108,10 @@ export class DesktopRemoteControlAdapter implements RemoteControlService {
         const result = await this.#controlService.invokeRemoteControl(desktopRequest, this.#scope, context.signal, context.idempotencyKey, context.deviceId);
         return { interrupted: result.interrupted };
       }
+      case "session.answerInput": {
+        const result = await this.#controlService.invokeRemoteControl(desktopRequest, this.#scope, context.signal, context.idempotencyKey, context.deviceId);
+        return { resolved: result.resolved };
+      }
     }
   }
 }
@@ -128,7 +137,8 @@ export function projectRemoteSessionList(rows: readonly RuntimeSessionSummary[])
 
 /**
  * Independently projects a root task: no event payload, reasoning, tool input or
- * output, child transcript, approval body, input question, path, or configuration.
+ * output, child transcript, approval body, raw input metadata, path, or configuration.
+ * Ordinary model questions arrive through the separate bounded input allowlist.
  */
 export function projectRemoteSnapshot(snapshot: DesktopRemoteRootSnapshot): RemoteDesktopSnapshot {
   const sessionId = String(snapshot.session.id);
@@ -147,6 +157,14 @@ export function projectRemoteSnapshot(snapshot: DesktopRemoteRootSnapshot): Remo
       },
     },
     messages: [],
+    inputRequests: (snapshot.inputRequests ?? []).map((input) => ({
+      id: input.id, createdAt: input.createdAt,
+      questions: input.questions.map((question) => ({
+        id: question.id, header: question.header, question: question.question,
+        options: question.options.map((option) => ({ label: option.label, description: option.description })),
+        ...(question.multiple === true ? { multiple: true } : {}),
+      })),
+    })),
     truncated: snapshot.truncated || summary.title !== (snapshot.session.title || "Untitled task"),
   };
   const messages = (runtimeSession?.messageIds ?? []).flatMap((messageId) => {
@@ -172,6 +190,11 @@ export function projectRemoteSnapshot(snapshot: DesktopRemoteRootSnapshot): Remo
     result.messages.shift();
     result.truncated = true;
   }
+  while (jsonBytes(result) > REMOTE_DESKTOP_RESULT_MAX_BYTES && result.inputRequests.length > 0) {
+    result.inputRequests.pop();
+    result.session.needsDesktop.input = true;
+    result.truncated = true;
+  }
   assertResultBudget(result);
   return result;
 }
@@ -193,8 +216,11 @@ function parseAdapterRequest(request: RemoteControlServiceRequest): DesktopRemot
     throw new TypeError("Invalid remote control request");
   }
   if (request.operation !== "sessions.list" && request.operation !== "session.snapshot"
-    && request.operation !== "session.send" && request.operation !== "session.stop") {
+    && request.operation !== "session.send" && request.operation !== "session.stop" && request.operation !== "session.answerInput") {
     throw new TypeError("Operation is not available for remote control");
+  }
+  if (request.operation === "session.answerInput") {
+    return { type: "session.answerInput", ...parseRemoteControlAnswerInputPayload(request.payload) };
   }
   const parsed = parseDesktopRequest({ ...request.payload, type: request.operation });
   if (parsed.type === "sessions.list") {

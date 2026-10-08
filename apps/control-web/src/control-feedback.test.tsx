@@ -37,7 +37,7 @@ describe("unresolved mutation feedback", () => {
     ] as const) {
       state = reduceControlFeedback(state, { type: "notice", notice });
       const html = rendered(state);
-      expect(html).toContain("Queue 结果未知");
+      expect(html).toContain("排队指令结果未知");
       expect(html).toContain("先运行测试，再检查差异");
       expect(html).toContain("session_old");
       expect(html).toContain('data-testid="unknown-confirm-1"');
@@ -55,13 +55,13 @@ describe("unresolved mutation feedback", () => {
     // A duplicated delivery of the same outcome cannot duplicate its warning.
     state = reduceControlFeedback(state, { type: "mutation_unknown", outcome: send });
     expect(state.unknownOutcomes).toHaveLength(2);
-    expect(rendered(state)).toContain("Queue 结果未知");
-    expect(rendered(state)).toContain("Stop 结果未知");
+    expect(rendered(state)).toContain("排队指令结果未知");
+    expect(rendered(state)).toContain("停止任务结果未知");
     state = reduceControlFeedback(state, { type: "confirm_unknown", id: "missing-command" });
     expect(state.unknownOutcomes).toHaveLength(2);
     state = reduceControlFeedback(state, { type: "confirm_unknown", id: send.id });
-    expect(rendered(state)).not.toContain("Queue 结果未知");
-    expect(rendered(state)).toContain("Stop 结果未知");
+    expect(rendered(state)).not.toContain("排队指令结果未知");
+    expect(rendered(state)).toContain("停止任务结果未知");
   });
 
   test("late outcomes keep their original task context through a different task or a new pairing", () => {

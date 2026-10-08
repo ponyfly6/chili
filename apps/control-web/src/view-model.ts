@@ -12,6 +12,18 @@ export interface RemoteMessage {
   createdAt: string;
 }
 
+export interface RemoteInputRequest {
+  id: string;
+  createdAt: string;
+  questions: {
+    id: string;
+    header: string;
+    question: string;
+    options: { label: string; description: string }[];
+    multiple?: true;
+  }[];
+}
+
 export interface RemoteSnapshot {
   session: RemoteTask & {
     runStatus: string;
@@ -20,6 +32,7 @@ export interface RemoteSnapshot {
     needsDesktop: { input: boolean };
   };
   messages: RemoteMessage[];
+  inputRequests: RemoteInputRequest[];
   truncated: boolean;
 }
 
@@ -44,6 +57,7 @@ export function readTaskSnapshot(value: unknown): RemoteSnapshot {
   if (typeof needsDesktop.input !== "boolean") invalidResult();
   if ("deliveryUnknown" in session && typeof session.deliveryUnknown !== "boolean") invalidResult();
   if (!Array.isArray(result.messages) || result.messages.length > 40) invalidResult();
+  const inputRequests = readInputRequests("inputRequests" in result ? result.inputRequests : []);
   const messages = result.messages.map((value): RemoteMessage => {
     const message = record(value);
     if (message.role !== "user" && message.role !== "assistant") invalidResult();
@@ -65,8 +79,43 @@ export function readTaskSnapshot(value: unknown): RemoteSnapshot {
       needsDesktop: { input: needsDesktop.input === true },
     },
     messages,
+    inputRequests,
     truncated: result.truncated === true,
   };
+}
+
+function readInputRequests(value: unknown): RemoteInputRequest[] {
+  if (!Array.isArray(value) || value.length > 3 || promptByteLength(JSON.stringify(value)) > 24_576) invalidResult();
+  const ids = new Set<string>();
+  return value.map((value: unknown) => {
+    const request = record(value);
+    const id = boundedString(request.id, 128);
+    if (!id || ids.has(id)) invalidResult();
+    ids.add(id);
+    if (promptByteLength(JSON.stringify(value)) > 12_288 || !Array.isArray(request.questions) || request.questions.length === 0 || request.questions.length > 3) invalidResult();
+    const questionIds = new Set<string>();
+    const questions = request.questions.map((value: unknown) => {
+      const question = record(value);
+      const id = boundedString(question.id, 64);
+      if (!/^[A-Za-z0-9._-]+$/.test(id) || ["__proto__", "prototype", "constructor"].includes(id) || questionIds.has(id)) invalidResult();
+      questionIds.add(id);
+      if (!Array.isArray(question.options) || question.options.length > 3 || question.options.length === 1
+        || (question.multiple !== undefined && question.multiple !== true)) invalidResult();
+      const labels = new Set<string>();
+      const options = question.options.map((value: unknown) => {
+        const option = record(value);
+        const label = boundedString(option.label, 120);
+        if (!label || labels.has(label)) invalidResult();
+        labels.add(label);
+        return { label, description: boundedString(option.description, 1000) };
+      });
+      return {
+        id, header: boundedString(question.header, 12), question: boundedString(question.question, 2000), options,
+        ...(question.multiple === true ? { multiple: true as const } : {}),
+      };
+    });
+    return { id, createdAt: timestamp(request.createdAt), questions };
+  });
 }
 
 export function promptByteLength(text: string): number {
@@ -90,12 +139,17 @@ export function readStopReceipt(value: unknown): boolean {
   throw Object.assign(new Error("Unknown stop outcome"), { code: "outcome_unknown" });
 }
 
+export function readAnswerReceipt(value: unknown): boolean {
+  if (value && typeof value === "object" && "resolved" in value && typeof value.resolved === "boolean") return value.resolved;
+  throw Object.assign(new Error("Unknown answer outcome"), { code: "outcome_unknown" });
+}
+
 export function runStatusLabel(status: string): string {
   const labels: Record<string, string> = {
     idle: "空闲",
     running: "运行中",
     waiting_for_approval: "旧审批已停止",
-    waiting_for_input: "等待桌面回答",
+    waiting_for_input: "等待你的回答",
     cancelling: "正在停止",
     completed: "已完成",
     failed: "已失败",
@@ -110,8 +164,23 @@ export function errorCode(error: unknown): string {
   return typeof error.code === "string" ? error.code.toLowerCase() : "unknown";
 }
 
+export function recoveryNeedsPairing(error: unknown): boolean {
+  return ["pairing_required", "recovery_invalid", "recovery_record_invalid", "recovery_identity_invalid",
+    "recovery_metadata_invalid", "recovery_context_mismatch", "credential_expired", "credential_revoked",
+    "device_revoked", "authentication_failed", "pairing_challenge_invalid", "pairing_grant_invalid"].includes(errorCode(error));
+}
+
 export function errorMessage(error: unknown): string {
+  if (recoveryNeedsPairing(error)) return "此设备的授权已失效或被撤销。请回桌面生成新配对码，然后重新配对。";
   switch (errorCode(error)) {
+    case "recovery_storage_failed":
+      return "电脑已确认，但手机未能保存连接。请在电脑撤销本次设备后重新配对。";
+    case "outcome_storage_unavailable":
+      return "暂时无法保存指令提醒，本次操作没有发送。请检查手机存储后重试。";
+    case "invalid_recovery_record":
+    case "recovery_expired":
+    case "device_revoked":
+      return "此设备的授权已失效，请回桌面生成新配对码。";
     case "outcome_unknown":
       return "结果未知：请求可能已经执行。请读取任务或回桌面确认；不会自动重发。";
     case "unsupported_browser":
@@ -129,6 +198,7 @@ export function errorMessage(error: unknown): string {
     case "sequence_exhausted":
       return "授权已失效或被撤销。请回桌面生成新的配对码，然后重新配对。";
     case "pairing_expired":
+    case "pairing_invalid":
     case "pairing_rejected":
     case "invalid_pairing_code":
     case "invalid_pairing_response":

@@ -1,6 +1,6 @@
 import { acceptedInput, emptyInputQueue } from "./testing/input-receipts.js";
 import { describe, expect, test } from "bun:test";
-import type { ChiliEvent, SessionId } from "@chili/protocol";
+import type { ChiliEvent, PendingUserInputRequest, SessionId } from "@chili/protocol";
 import type { RuntimeClient, RuntimeSessionSummary } from "@chili/sdk";
 import {
   parseRemoteControlFrame,
@@ -8,7 +8,7 @@ import {
   type RemoteControlInvocationContext,
   type RemoteControlServiceRequest,
 } from "@chili/remote-control";
-import { DesktopControlService, type DesktopRemoteRootSnapshot } from "./control-service.js";
+import { DesktopControlService, projectRemoteInputRequests, REMOTE_INPUT_LIMITS, type DesktopRemoteRootSnapshot } from "./control-service.js";
 import {
   DesktopRemoteControlAdapter,
   projectRemoteSessionList,
@@ -504,7 +504,7 @@ describe("remote snapshot whitelist and complete serialization budget", () => {
     const json = JSON.stringify(projected);
     expect(json).not.toContain("SECRET");
     expect(json).not.toContain("/repo");
-    expect(Object.keys(projected).sort()).toEqual(["messages", "session", "truncated"]);
+    expect(Object.keys(projected).sort()).toEqual(["inputRequests", "messages", "session", "truncated"]);
     expect(Object.keys(projected.session).sort()).toEqual([
       "deliveryUnknown", "id", "needsDesktop", "queuedCount", "runStatus", "status", "title", "updatedAt",
     ]);
@@ -694,3 +694,143 @@ test("failed durable revocation remains retryable and cannot admit more device w
   await fixture.adapter.invoke({ operation: "session.send", payload: { sessionId: "root", text: "other device", mode: "queue" } }, { ...context("session.send"), deviceId: "other" });
   await fixture.adapter.revoke();
 });
+
+describe("phone answers to ordinary pending root input", () => {
+  test("limits complete input requests by count and UTF-8 bytes without changing question text", () => {
+    const inputs = Array.from({ length: 5 }, (_, index) => ({ ...ordinaryInput(), id: `userinput_${index}` as never, callId: `call_${index}` as never }));
+    const events = inputs.flatMap(ordinaryInputEvents);
+    expect(projectRemoteInputRequests(inputs, events, "root")).toHaveLength(REMOTE_INPUT_LIMITS.requests);
+    for (const input of inputs) input.questions = [{ id: "text", header: "Question", question: "界".repeat(2_000), options: [] }];
+    const selected = projectRemoteInputRequests(inputs, inputs.flatMap(ordinaryInputEvents), "root");
+    expect(Buffer.byteLength(JSON.stringify(selected), "utf8")).toBeLessThanOrEqual(REMOTE_INPUT_LIMITS.totalBytes);
+    expect(selected.every((input) => input.questions[0]!.question === "界".repeat(2_000))).toBe(true);
+    const foreignEvents = inputs.flatMap(ordinaryInputEvents).map((event) => ({ ...event, sessionId: "other" as never }));
+    expect(projectRemoteInputRequests(inputs, foreignEvents, "root")).toEqual([]);
+  });
+
+  test("projects complete first-party questions and consumes the same live input once", async () => {
+    const input = ordinaryInput();
+    let pending = [input];
+    const resolved: unknown[] = [];
+    const fixture = harness({
+      sessionEvents: async () => ordinaryInputEvents(input),
+      listUserInputs: async () => pending,
+      resolveUserInput: async (request) => { resolved.push(request.answers); pending = []; return { resolved: true }; },
+    });
+    const snapshot = await invoke(fixture.adapter, { operation: "session.snapshot", payload: { sessionId: "root" } });
+    expect(snapshot).toMatchObject({ inputRequests: [{ id: input.id, questions: input.questions }], session: { needsDesktop: { input: false } } });
+    expect(JSON.stringify(snapshot)).not.toContain("callId");
+    expect(await invoke(fixture.adapter, answerRequest(input))).toEqual({ resolved: true });
+    await expect(invoke(fixture.adapter, answerRequest(input))).rejects.toThrow("no longer available");
+    expect(resolved).toEqual([{ direction: ["Continue"] }]);
+    expect(await fixture.service.invoke({ type: "user-input.resolve", inputId: input.id, answers: { direction: ["local"] } })).toEqual({ resolved: true });
+    expect(resolved).toHaveLength(2);
+    await fixture.adapter.revoke();
+  });
+
+  test.each(["mcp", "unknown-source", "foreign-input", "child", "archived", "oversized"] as const)("keeps %s input off the phone and rejects answers", async (kind) => {
+    const input = ordinaryInput();
+    if (kind === "mcp") input.id = "mcpinput_1" as never;
+    if (kind === "foreign-input") input.sessionId = "other" as never;
+    if (kind === "oversized") input.questions = Array.from({ length: 3 }, (_, index) => ({
+      id: `q${index}`, header: "Choice", question: "界".repeat(2_000), options: [],
+    }));
+    let writes = 0;
+    const fixture = harness({
+      listSessions: async () => [{ ...summary("root"), ...(kind === "archived" ? { status: "archived" as const } : {}),
+        ...(kind === "child" ? { agent: { parentSessionId: "parent" as never, name: "child", path: "/root/child" as never, policy: {} } } : {}) }],
+      sessionEvents: async () => kind === "unknown-source" ? [] : ordinaryInputEvents(input),
+      listUserInputs: async () => [input],
+      resolveUserInput: async () => { writes += 1; return { resolved: true }; },
+    });
+    if (kind !== "child" && kind !== "archived") {
+      expect(await invoke(fixture.adapter, { operation: "session.snapshot", payload: { sessionId: "root" } }))
+        .toMatchObject({ inputRequests: [], session: { needsDesktop: { input: true } } });
+    }
+    await expect(invoke(fixture.adapter, answerRequest(input))).rejects.toThrow();
+    expect(writes).toBe(0);
+    await fixture.adapter.revoke();
+  });
+
+  test("rejects wrong question ids, unoffered choices and extra single-choice answers before writing", async () => {
+    const input = ordinaryInput();
+    let writes = 0;
+    const fixture = harness({ sessionEvents: async () => ordinaryInputEvents(input), listUserInputs: async () => [input],
+      resolveUserInput: async () => { writes += 1; return { resolved: true }; } });
+    for (const answers of [{ wrong: ["Continue"] }, { direction: ["Other"] }, { direction: ["Continue", "Cancel"] }]) {
+      await expect(invoke(fixture.adapter, { ...answerRequest(input), payload: { ...answerRequest(input).payload, answers } } as RemoteControlServiceRequest)).rejects.toThrow();
+    }
+    await expect(fixture.adapter.invoke(answerRequest(input), { ...context("session.answerInput"), capability: "sessions.send" })).rejects.toThrow("capability");
+    expect(writes).toBe(0);
+    await fixture.adapter.revoke();
+  });
+
+  test("supports bounded free text and declared multiple choice through the local resolver", async () => {
+    const input = ordinaryInput();
+    input.questions.push({ id: "explain", header: "Reason", question: "What should change?", options: [] });
+    input.questions[0]!.multiple = true;
+    let answered: unknown;
+    const fixture = harness({ sessionEvents: async () => ordinaryInputEvents(input), listUserInputs: async () => [input],
+      resolveUserInput: async ({ answers }) => { answered = answers; return { resolved: true }; } });
+    const answers = { direction: ["Continue", "Cancel"], explain: ["Use the smaller design"] };
+    expect(await invoke(fixture.adapter, { operation: "session.answerInput", payload: { sessionId: "root", inputId: input.id, answers } })).toEqual({ resolved: true });
+    expect(answered).toEqual(answers);
+    await fixture.adapter.revoke();
+  });
+
+  test.each(["device", "workspace", "scope"] as const)("rechecks %s revocation after pending-input IO before resolving", async (kind) => {
+    const input = ordinaryInput();
+    const gate = deferred<PendingUserInputRequest[]>();
+    let reading = false;
+    let writes = 0;
+    const fixture = harness({ sessionEvents: async () => ordinaryInputEvents(input),
+      listUserInputs: async () => { reading = true; return gate.promise; },
+      resolveUserInput: async () => { writes += 1; return { resolved: true }; } });
+    const answer = invoke(fixture.adapter, answerRequest(input)).then(() => null, (error: unknown) => error);
+    await until(() => reading);
+    if (kind === "device") await fixture.adapter.revokeDevice("device-test");
+    else if (kind === "workspace") fixture.replaceWorkspace("/different");
+    else await fixture.adapter.revoke();
+    gate.resolve([input]);
+    expect(await answer).toBeInstanceOf(Error);
+    expect(writes).toBe(0);
+    await fixture.adapter.revoke();
+  });
+
+  test("reserves the shared actor before membership and resolves before a later Stop", async () => {
+    const input = ordinaryInput();
+    const membership = deferred<RuntimeSessionSummary[]>();
+    const order: string[] = [];
+    let reads = 0;
+    const fixture = harness({
+      listSessions: async () => ++reads === 1 ? membership.promise : [summary("root")],
+      sessionEvents: async () => ordinaryInputEvents(input), listUserInputs: async () => [input],
+      resolveUserInput: async () => { order.push("answer"); return { resolved: true }; },
+      interruptSession: async () => { order.push("stop"); return { interrupted: true }; },
+    });
+    const answer = invoke(fixture.adapter, answerRequest(input));
+    await until(() => reads === 1);
+    const stop = invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } });
+    membership.resolve([summary("root")]);
+    await answer;
+    await stop;
+    expect(order).toEqual(["answer", "stop"]);
+    await fixture.adapter.revoke();
+  });
+});
+
+function ordinaryInput(): PendingUserInputRequest {
+  return { id: "userinput_1" as never, sessionId: "root" as never, callId: "call_question" as never, createdAt: 1,
+    questions: [{ id: "direction", header: "Next", question: "How should we continue?", options: [
+      { label: "Continue", description: "Finish this work" }, { label: "Cancel", description: "Leave this task" },
+    ] }] };
+}
+
+function ordinaryInputEvents(input: PendingUserInputRequest): ChiliEvent[] {
+  return [event("tool.call_started", { callId: input.callId, turnId: "turn_input", toolName: "request_user_input", input: { questions: input.questions } }),
+    event("user_input.requested", { inputId: input.id, callId: input.callId, questions: input.questions })];
+}
+
+function answerRequest(input: PendingUserInputRequest): Extract<RemoteControlServiceRequest, { operation: "session.answerInput" }> {
+  return { operation: "session.answerInput", payload: { sessionId: "root", inputId: input.id, answers: { direction: ["Continue"] } } };
+}

@@ -15,10 +15,11 @@ import {
   type PairingGrant,
   type PairingProof,
 } from "./pairing-security.js";
-import { REMOTE_CONTROL_CAPABILITIES, REMOTE_CONTROL_LIMITS, type OpaqueRelayEnvelope } from "./protocol.js";
+import { REMOTE_CONTROL_CAPABILITIES, REMOTE_CONTROL_LIMITS, type OpaqueRelayEnvelope, type RemoteControlCapability } from "./protocol.js";
 
 const PAIRING_TTL_MS = 120_000;
 const CREDENTIAL_TTL_MS = 8 * 60 * 60 * 1_000;
+const REMEMBERED_DEVICE_TTL_MS = 8 * 60 * 60 * 1_000;
 const MAX_PAIRINGS = 8;
 const MAX_DEVICES = 8;
 const MAX_CONNECTIONS = 32;
@@ -86,6 +87,15 @@ export interface PrivateControlDevice {
   readonly expiresAt: number;
 }
 
+/** Public recovery locator; possession alone never authorizes a new channel. */
+export interface PrivateControlRecovery {
+  readonly version: 1;
+  readonly hostId: string;
+  readonly deviceId: string;
+  readonly publicKey: string;
+  readonly expiresAt: number;
+}
+
 export interface PrivateControlHttpsSnapshot {
   readonly enabled: boolean;
   readonly starting: boolean;
@@ -111,6 +121,8 @@ export class PrivateControlHttpsError extends Error {
 
 interface Invitation { hash: Buffer; expiresAt: number; attempts: number }
 interface PendingPairing {
+  kind: "pairing" | "recovery";
+  rememberDevice: boolean;
   pairingId: string;
   tokenHash: Buffer;
   challenge: PairingChallenge;
@@ -119,6 +131,12 @@ interface PendingPairing {
   expiresAt: number;
   state: "awaiting_proof" | "pending_confirmation" | "approved" | "rejected";
   grant?: PairingGrant;
+  trustedDevice?: RememberedDevice;
+}
+interface RememberedDevice {
+  device: PrivateControlDevice;
+  publicKey: string;
+  capabilities: readonly RemoteControlCapability[];
 }
 interface ActiveRoute {
   authority: InMemoryPairingAuthority;
@@ -137,6 +155,7 @@ interface EnabledState {
   readonly assets: ReadonlyMap<string, Asset>;
   readonly pending: Map<string, PendingPairing>;
   readonly routes: Map<string, ActiveRoute>;
+  readonly trustedDevices: Map<string, RememberedDevice>;
   readonly rates: Map<string, RateBucket>;
   readonly sockets: Set<Socket>;
   invitation?: Invitation;
@@ -178,7 +197,11 @@ export class PrivateControlHttpsHost {
           label: pending.label,
           expiresAt: pending.expiresAt,
         })),
-      devices: [...state.routes.values()].map((route) => ({ ...route.device })),
+      // A remembered device remains visible/revocable even when its channel has expired.
+      devices: [...new Map([
+        ...[...state.routes.values()].map((route) => [route.device.deviceId, route.device] as const),
+        ...[...state.trustedDevices.values()].map((trusted) => [trusted.device.deviceId, trusted.device] as const),
+      ]).values()].map((device) => ({ ...device })),
     };
   }
 
@@ -234,7 +257,7 @@ export class PrivateControlHttpsHost {
       const state: EnabledState = {
         generation, hostId: `host_${randomBytes(18).toString("base64url")}`, server,
         origin: origin.origin, host: origin.host, assets,
-        pending: new Map(), routes: new Map(), rates: new Map(), sockets: new Set(), active: true,
+        pending: new Map(), routes: new Map(), trustedDevices: new Map(), rates: new Map(), sockets: new Set(), active: true,
       };
       this.#state = state;
       server.on("connection", (socket: Socket) => {
@@ -285,6 +308,7 @@ export class PrivateControlHttpsHost {
     for (const pending of state.pending.values()) this.#discardPending(pending);
     state.routes.clear();
     state.pending.clear();
+    state.trustedDevices.clear();
     state.rates.clear();
     this.#notify();
     for (const socket of state.sockets) socket.destroy();
@@ -296,7 +320,7 @@ export class PrivateControlHttpsHost {
   createPairing(): PrivateControlPairingInvitation {
     const state = this.#enabled();
     this.#purge(state);
-    if (state.routes.size >= MAX_DEVICES || state.pending.size >= MAX_PAIRINGS) {
+    if (this.#deviceCount(state) >= MAX_DEVICES || state.pending.size >= MAX_PAIRINGS) {
       fail("limit_exceeded", "Revoke an old device or wait for pending pairings to expire.", 429);
     }
     const code = randomBytes(8).toString("hex").toUpperCase();
@@ -310,23 +334,24 @@ export class PrivateControlHttpsHost {
     const state = this.#enabled();
     this.#purge(state);
     const pending = state.pending.get(pairingId);
-    if (!pending || pending.state !== "pending_confirmation" || !pending.grant) {
+    if (!pending || pending.kind !== "pairing" || pending.state !== "pending_confirmation" || !pending.grant) {
       fail("pairing_invalid", "The pairing request expired or is no longer awaiting approval.");
     }
-    if (state.routes.size >= MAX_DEVICES) fail("limit_exceeded", "Revoke an old device before approving another.", 429);
+    if (state.routes.size >= MAX_DEVICES || (this.#deviceCount(state) >= MAX_DEVICES
+      && !this.#hasDevice(state, pending.challenge.deviceId))) fail("limit_exceeded", "Revoke an old device before approving another.", 429);
     const grant = pending.grant;
     // The desktop confirmation binds exactly the proved key/device, never caller-supplied capabilities.
-    const outbox = new HttpRouteOutbox(grant.channel.routeId);
-    const bridge = new HostBridge({
-      hostId: state.hostId, routeId: grant.channel.routeId,
-      credentials: pending.authority, codec: pending.authority,
-      controlService: this.#options.controlService, now: this.#now,
-    });
-    bridge.connect(outbox);
-    state.routes.set(grant.channel.routeId, {
-      authority: pending.authority, bridge, outbox,
-      device: { deviceId: grant.deviceId, label: pending.label, issuedAt: grant.issuedAt, expiresAt: grant.expiresAt },
-    });
+    state.routes.set(grant.channel.routeId, this.#prepareRoute(state, pending, grant));
+    if (pending.rememberDevice) {
+      const approvedAt = this.#now();
+      const trusted: RememberedDevice = {
+        device: { deviceId: grant.deviceId, label: pending.label, issuedAt: approvedAt, expiresAt: approvedAt + REMEMBERED_DEVICE_TTL_MS },
+        publicKey: pending.challenge.publicKey,
+        capabilities: [...grant.capabilities],
+      };
+      state.trustedDevices.set(grant.deviceId, trusted);
+      pending.trustedDevice = trusted;
+    }
     pending.state = "approved";
     this.#notify();
   }
@@ -334,7 +359,7 @@ export class PrivateControlHttpsHost {
   rejectPairing(pairingId: string): void {
     const state = this.#enabled();
     const pending = state.pending.get(pairingId);
-    if (!pending || pending.state === "approved") fail("pairing_invalid", "The pairing request is no longer awaiting approval.");
+    if (!pending || pending.kind !== "pairing" || pending.state === "approved") fail("pairing_invalid", "The pairing request is no longer awaiting approval.");
     this.#discardPending(pending);
     pending.state = "rejected";
     this.#notify();
@@ -342,6 +367,11 @@ export class PrivateControlHttpsHost {
 
   revokeDevice(deviceId: string): void {
     const state = this.#enabled();
+    this.#revokeDevice(state, deviceId);
+    this.#notify();
+  }
+
+  #revokeRoutes(state: EnabledState, deviceId: string): void {
     for (const [routeId, route] of state.routes) {
       if (route.device.deviceId !== deviceId) continue;
       route.authority.revokeDevice(deviceId);
@@ -349,12 +379,46 @@ export class PrivateControlHttpsHost {
       route.outbox.clear();
       state.routes.delete(routeId);
     }
+  }
+
+  #revokeDevice(state: EnabledState, deviceId: string): void {
+    state.trustedDevices.delete(deviceId);
+    this.#revokeRoutes(state, deviceId);
     for (const [pairingId, pending] of state.pending) {
       if (pending.challenge.deviceId !== deviceId) continue;
       this.#discardPending(pending);
       state.pending.delete(pairingId);
     }
-    this.#notify();
+  }
+
+  #hasDevice(state: EnabledState, deviceId: string): boolean {
+    return state.trustedDevices.has(deviceId) || [...state.routes.values()].some((route) => route.device.deviceId === deviceId);
+  }
+
+  #deviceCount(state: EnabledState): number {
+    return new Set([...state.trustedDevices.keys(), ...[...state.routes.values()].map((route) => route.device.deviceId)]).size;
+  }
+
+  #prepareRoute(state: EnabledState, pending: PendingPairing, grant: PairingGrant): ActiveRoute {
+    const expiresAt = Math.min(grant.expiresAt, pending.trustedDevice?.device.expiresAt ?? grant.expiresAt);
+    const outbox = new HttpRouteOutbox(grant.channel.routeId);
+    const bridge = new HostBridge({
+      hostId: state.hostId, routeId: grant.channel.routeId,
+      // A recovery challenge's relative credential TTL begins when its proof
+      // completes. Bound every bridge reauthorization to the original absolute
+      // deadline as well, including envelopes waiting for asynchronous admission.
+      credentials: { authenticate: (input) => {
+        if (this.#now() >= expiresAt) throw new PairingSecurityError("CREDENTIAL_EXPIRED");
+        return { ...pending.authority.authenticate(input), expiresAt };
+      } },
+      codec: pending.authority,
+      controlService: this.#options.controlService, now: this.#now,
+    });
+    bridge.connect(outbox);
+    return {
+      authority: pending.authority, bridge, outbox,
+      device: { deviceId: grant.deviceId, label: pending.label, issuedAt: grant.issuedAt, expiresAt },
+    };
   }
 
   #enabled(): EnabledState {
@@ -374,6 +438,9 @@ export class PrivateControlHttpsHost {
   #purge(state: EnabledState): void {
     const now = this.#now();
     if (state.invitation && now >= state.invitation.expiresAt) delete state.invitation;
+    for (const [deviceId, trusted] of state.trustedDevices) {
+      if (now >= trusted.device.expiresAt) this.#revokeDevice(state, deviceId);
+    }
     for (const [id, pending] of state.pending) {
       if (now < pending.expiresAt) continue;
       const route = state.routes.get(pending.challenge.routeId);
@@ -404,7 +471,7 @@ export class PrivateControlHttpsHost {
     response.setHeader("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'; worker-src 'none'");
     try {
       this.#assertCurrent(state);
-      assertRequestOrigin(request, state);
+      const client = assertRequestOrigin(request, state);
       const path = request.url;
       if (!path || path.length > 1_024 || path.includes("?") || path.includes("#")) fail("invalid_request", "Unknown request path.", 404);
       if (!path.startsWith("/api/")) {
@@ -418,14 +485,16 @@ export class PrivateControlHttpsHost {
         return;
       }
       if (request.method !== "POST") fail("invalid_request", "API requests require POST.", 405);
-      if (request.headers.origin !== state.origin) fail("origin_forbidden", "The request origin is not allowed.", 403);
+      if (client === "browser" && request.headers.origin !== state.origin) fail("origin_forbidden", "The request origin is not allowed.", 403);
       this.#rateLimit(state, request, !path.startsWith(CONTROL_PREFIX));
       this.#purge(state);
       const body = await readJsonBody(request, path.startsWith(CONTROL_PREFIX) ? API_BODY_BYTES : PAIRING_BODY_BYTES);
       this.#assertCurrent(state);
+      this.#purge(state);
       switch (path) {
         case "/api/pairing/begin": {
-          fields(body, ["pairingCode", "deviceId", "publicKey", "label"]);
+          fields(body, ["pairingCode", "deviceId", "publicKey", "label", "rememberDevice"]);
+          if (body.rememberDevice !== undefined && typeof body.rememberDevice !== "boolean") fail("invalid_request", "rememberDevice must be a boolean.");
           const invitation = state.invitation;
           if (!invitation || this.#now() >= invitation.expiresAt) fail("pairing_expired", "Create a new pairing code on the desktop.", 410);
           const pairingCode = textField(body.pairingCode, 32).replace(/[ -]/gu, "").toUpperCase();
@@ -434,7 +503,7 @@ export class PrivateControlHttpsHost {
             if (invitation.attempts >= 5) delete state.invitation;
             fail("pairing_invalid", "The pairing code is invalid or expired.", 403);
           }
-          if (state.pending.size >= MAX_PAIRINGS || state.routes.size >= MAX_DEVICES) fail("limit_exceeded", "Too many paired devices or pending pairings.", 429);
+          if (state.pending.size >= MAX_PAIRINGS || state.routes.size >= MAX_DEVICES || this.#deviceCount(state) >= MAX_DEVICES) fail("limit_exceeded", "Too many paired devices or pending pairings.", 429);
           const authority = new InMemoryPairingAuthority({
             hostId: state.hostId, allowedCapabilities: REMOTE_CONTROL_CAPABILITIES, clock: this.#now,
             pairingNonceTtlMs: PAIRING_TTL_MS, credentialTtlMs: CREDENTIAL_TTL_MS,
@@ -448,6 +517,7 @@ export class PrivateControlHttpsHost {
           const pairingToken = randomBytes(32).toString("base64url");
           const label = body.label === undefined ? "Phone browser" : textField(body.label, 48);
           state.pending.set(pairingId, {
+            kind: "pairing", rememberDevice: body.rememberDevice === true,
             pairingId, tokenHash: digest(pairingToken), challenge, authority, label,
             expiresAt: challenge.expiresAt, state: "awaiting_proof",
           });
@@ -458,7 +528,7 @@ export class PrivateControlHttpsHost {
         }
         case "/api/pairing/prove": {
           fields(body, ["pairingId", "pairingToken", "proof"]);
-          const pending = this.#pending(state, body);
+          const pending = this.#pending(state, body, "pairing");
           if (pending.state !== "awaiting_proof") fail("pairing_invalid", "The pairing proof was already submitted.");
           const proof = record(body.proof);
           fields(proof, ["version", "nonce", "signature"]);
@@ -473,18 +543,76 @@ export class PrivateControlHttpsHost {
         }
         case "/api/pairing/poll": {
           fields(body, ["pairingId", "pairingToken"]);
-          const pending = this.#pending(state, body);
+          const pending = this.#pending(state, body, "pairing");
           if (pending.state === "rejected") fail("pairing_rejected", "The desktop rejected this pairing request.", 403);
           if (pending.state === "approved" && pending.grant) {
             const grant = pending.grant;
-            // Delivery is intentionally once-only. Lost delivery/page refresh requires a new pairing.
+            // Delivery is intentionally once-only. Remembered devices can prove a fresh channel.
             delete pending.grant;
             state.pending.delete(pending.pairingId);
-            json(response, 200, { status: "approved", grant });
+            json(response, 200, { status: "approved", grant,
+              ...(pending.trustedDevice ? { recovery: recoveryLocator(state, pending.trustedDevice) } : {}),
+            });
             return;
           }
           if (pending.state !== "pending_confirmation") fail("pairing_invalid", "Submit a valid pairing proof first.");
           json(response, 200, { status: "pending_confirmation" });
+          return;
+        }
+        case "/api/recovery/begin": {
+          fields(body, ["hostId", "deviceId", "publicKey"]);
+          const hostId = textField(body.hostId, 128);
+          const deviceId = textField(body.deviceId, 128);
+          const publicKey = textField(body.publicKey, 128);
+          const trusted = state.trustedDevices.get(deviceId);
+          if (hostId !== state.hostId || !trusted || trusted.publicKey !== publicKey) {
+            fail("recovery_invalid", "The remembered device expired or was revoked. Pair again on the desktop.", 403);
+          }
+          if (state.pending.size >= MAX_PAIRINGS) fail("limit_exceeded", "Too many pending connections. Try again later.", 429);
+          const remaining = trusted.device.expiresAt - this.#now();
+          if (remaining <= 0) fail("recovery_invalid", "The remembered device expired. Pair again on the desktop.", 403);
+          const authority = new InMemoryPairingAuthority({
+            hostId: state.hostId, allowedCapabilities: trusted.capabilities, clock: this.#now,
+            pairingNonceTtlMs: Math.min(PAIRING_TTL_MS, remaining),
+            credentialTtlMs: Math.min(CREDENTIAL_TTL_MS, remaining),
+            maxPendingPairings: 1, maxActiveChannels: 1, maxCredentialRecords: 1,
+          });
+          const challenge = authority.beginPairing({ deviceId, publicKey: trusted.publicKey, grantedCapabilities: trusted.capabilities });
+          const pairingId = `pairing_${randomBytes(18).toString("base64url")}`;
+          const pairingToken = randomBytes(32).toString("base64url");
+          state.pending.set(pairingId, {
+            kind: "recovery", rememberDevice: true, trustedDevice: trusted,
+            pairingId, tokenHash: digest(pairingToken), challenge, authority, label: trusted.device.label,
+            expiresAt: challenge.expiresAt, state: "awaiting_proof",
+          });
+          json(response, 200, { pairingId, pairingToken, challenge, expiresAt: challenge.expiresAt });
+          return;
+        }
+        case "/api/recovery/prove": {
+          fields(body, ["pairingId", "pairingToken", "proof"]);
+          const pending = this.#pending(state, body, "recovery");
+          const trusted = state.trustedDevices.get(pending.challenge.deviceId);
+          if (pending.state !== "awaiting_proof" || !trusted || trusted !== pending.trustedDevice
+            || this.#now() >= trusted.device.expiresAt) fail("recovery_invalid", "The remembered device expired or was revoked. Pair again on the desktop.", 403);
+          const proof = record(body.proof);
+          fields(proof, ["version", "nonce", "signature"]);
+          if (proof.version !== 1) fail("invalid_request", "Unsupported pairing proof version.");
+          const grant = pending.authority.completePairing({
+            version: 1, nonce: textField(proof.nonce, 128), signature: textField(proof.signature, 128),
+          } satisfies PairingProof);
+          // Credential TTL starts at proof time; enforce the original trust deadline too.
+          const route = this.#prepareRoute(state, pending, grant);
+          // This synchronous commit invalidates every competing challenge before publishing
+          // the new route. Failed signatures above leave the working channel untouched.
+          this.#revokeRoutes(state, grant.deviceId);
+          for (const [id, other] of state.pending) {
+            if (other.challenge.deviceId !== grant.deviceId) continue;
+            if (other !== pending) this.#discardPending(other);
+            state.pending.delete(id);
+          }
+          state.routes.set(grant.channel.routeId, route);
+          this.#notify();
+          json(response, 200, { status: "approved", grant: { ...grant, expiresAt: route.device.expiresAt }, recovery: recoveryLocator(state, trusted) });
           return;
         }
         case "/api/control/send": {
@@ -524,11 +652,11 @@ export class PrivateControlHttpsHost {
     if (!state.active || this.#state !== state || state.generation !== this.#generation) fail("remote_disabled", "Remote control was disabled. Pair again on the desktop.", 410);
   }
 
-  #pending(state: EnabledState, body: Record<string, unknown>): PendingPairing {
+  #pending(state: EnabledState, body: Record<string, unknown>, kind: PendingPairing["kind"]): PendingPairing {
     const id = textField(body.pairingId, 128);
     const token = textField(body.pairingToken, 128);
     const pending = state.pending.get(id);
-    if (!pending || !safeDigestEqual(pending.tokenHash, token)) fail("pairing_invalid", "The pairing request is invalid or expired.", 403);
+    if (!pending || pending.kind !== kind || !safeDigestEqual(pending.tokenHash, token)) fail("pairing_invalid", "The pairing request is invalid or expired.", 403);
     if (this.#now() >= pending.expiresAt) fail("pairing_expired", "Create a new pairing code on the desktop.", 410);
     return pending;
   }
@@ -539,7 +667,7 @@ export class PrivateControlHttpsHost {
     const authorization = request.headers.authorization;
     if (typeof authorization !== "string" || !/^Bearer [A-Za-z0-9_-]{1,512}$/u.test(authorization)) fail("authentication_failed", "Pair this browser with the desktop again.", 401);
     const route = state.routes.get(routeId);
-    if (!route || route.device.deviceId !== deviceId) fail("authentication_failed", "This device was revoked or remote control restarted. Pair again.", 401);
+    if (!route || route.device.deviceId !== deviceId || this.#now() >= route.device.expiresAt) fail("authentication_failed", "This device was revoked or remote control restarted. Pair again.", 401);
     route.authority.authenticate({
       credential: authorization.slice(7), hostId: state.hostId, deviceId, routeId, capability: "sessions.read",
     });
@@ -647,15 +775,34 @@ function isPrivateAddress(address: string): boolean {
   return false;
 }
 
-function assertRequestOrigin(request: IncomingMessage, state: EnabledState): void {
+function assertRequestOrigin(request: IncomingMessage, state: EnabledState): "browser" | "native" {
   const names = request.rawHeaders.filter((_value, index) => index % 2 === 0).map((name) => name.toLowerCase());
   if (names.filter((name) => name === "host").length !== 1
     || names.filter((name) => name === "origin").length > 1
     || names.filter((name) => name === "authorization").length > 1
+    || names.filter((name) => name === "x-chili-control-client").length > 1
     || request.headers.host !== state.host) fail("host_forbidden", "The request host is not allowed.", 403);
+  const native = request.headers["x-chili-control-client"];
+  if (native !== undefined) {
+    // Only a native networking adapter can use this classification. It is not
+    // authorization: pairing proofs and per-route bearer credentials still apply.
+    if (native !== "native-v1" || request.headers.origin !== undefined
+      || names.some((name) => name.startsWith("sec-fetch-")) || !request.url?.startsWith("/api/")) {
+      fail("origin_forbidden", "Native requests cannot include browser origin or fetch headers.", 403);
+    }
+    return "native";
+  }
   if (request.headers.origin !== undefined && request.headers.origin !== state.origin) fail("origin_forbidden", "The request origin is not allowed.", 403);
   const site = request.headers["sec-fetch-site"];
   if (site !== undefined && site !== "same-origin" && site !== "none") fail("origin_forbidden", "Cross-origin requests are not allowed.", 403);
+  return "browser";
+}
+
+function recoveryLocator(state: EnabledState, trusted: RememberedDevice): PrivateControlRecovery {
+  return {
+    version: 1, hostId: state.hostId, deviceId: trusted.device.deviceId,
+    publicKey: trusted.publicKey, expiresAt: trusted.device.expiresAt,
+  };
 }
 
 async function loadAssets(rootInput: string): Promise<ReadonlyMap<string, Asset>> {

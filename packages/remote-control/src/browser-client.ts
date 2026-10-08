@@ -21,6 +21,9 @@ import {
   type RemoteControlRequestFrame,
 } from "./protocol.js";
 import type { PairingGrant } from "./pairing-security.js";
+import { assertNativeControlPlatform, type ControlClientPlatform } from "./client-platform.js";
+import { createRecoverableDeviceIdentity, parseDeviceRecoveryRecord, restoreDeviceIdentity, validateDeviceRecoveryMetadata,
+  type DeviceRecoveryRecord, type DeviceRecoveryStore } from "./device-recovery.js";
 
 export type BrowserControlState = "connected" | "disconnected" | "reconnecting" | "expired" | "closed";
 export type BrowserPairingStatus = "creating_identity" | "waiting_for_desktop" | "approved";
@@ -38,6 +41,15 @@ export interface BrowserPairOptions {
   deviceLabel?: string;
   onPairingStatus?: (status: BrowserPairingStatus) => void;
   signal?: AbortSignal;
+  platform?: ControlClientPlatform;
+  rememberDevice?: boolean;
+  recoveryStore?: DeviceRecoveryStore;
+}
+
+export interface BrowserResumeOptions {
+  record: DeviceRecoveryRecord;
+  platform: ControlClientPlatform;
+  signal?: AbortSignal;
 }
 
 export interface BrowserControlClientOptions {
@@ -46,6 +58,7 @@ export interface BrowserControlClientOptions {
   /** Bounded requests retain their sequence after timeout until explicit resync. */
   requestTimeoutMs?: number;
   pollIntervalMs?: number;
+  platform?: ControlClientPlatform;
 }
 
 interface Deferred<T> {
@@ -63,15 +76,18 @@ interface PendingRequest {
 }
 
 /**
- * Production HTTPS client. All identity, credential, sequence and replay state
- * share this page lifetime; reconnect retains all of them, refresh retains none.
+ * Production HTTPS client. Credential, sequence and replay state share this
+ * instance lifetime. Native recovery proves a remembered device identity to
+ * establish a new channel; it never restores a prior stream or its commands.
  * Admission is ordered, execution/results are concurrent so Stop does not wait
  * for a slow snapshot. The only retry is an explicit same-sequence resync probe.
  */
 export class BrowserControlClient {
   readonly #baseUrl: string;
   readonly #pairing: PairingGrant;
-  readonly #sessionId = browserRandomIdentifier("session");
+  readonly #sessionId: string;
+  readonly #platform: ControlClientPlatform | undefined;
+  readonly #crypto: Crypto;
   readonly #requestTimeoutMs: number;
   readonly #pollIntervalMs: number;
   readonly #listeners = new Set<(state: BrowserControlState) => void>();
@@ -89,16 +105,21 @@ export class BrowserControlClient {
   #synchronizingSequence: number | undefined;
 
   static async pair(options: BrowserPairOptions): Promise<BrowserControlClient> {
-    const baseUrl = secureBaseUrl(options.baseUrl);
-    requireSecureBrowserCrypto();
+    const baseUrl = secureBaseUrl(options.baseUrl, options.platform);
+    const crypto = options.platform?.crypto ?? requireSecureBrowserCrypto();
+    if (options.rememberDevice && (!options.platform || !options.recoveryStore)) {
+      throw new BrowserControlClientError("NATIVE_RECOVERY_STORE_REQUIRED");
+    }
     options.onPairingStatus?.("creating_identity");
-    const identity = await generateBrowserDeviceIdentity();
+    const recoverable = options.rememberDevice ? await createRecoverableDeviceIdentity(crypto) : undefined;
+    const identity = recoverable?.identity ?? await generateBrowserDeviceIdentity(crypto);
     const begin = await postJson(baseUrl, "/api/pairing/begin", {
       pairingCode: options.pairingCode.trim(),
       deviceId: identity.deviceId,
       publicKey: identity.publicKey,
       ...(options.deviceLabel ? { label: options.deviceLabel.slice(0, 48) } : {}),
-    }, undefined, options.signal);
+      ...(options.rememberDevice ? { rememberDevice: true } : {}),
+    }, undefined, options.signal, options.platform);
     const challenge = validateBrowserPairingChallenge(begin.challenge, identity);
     if (typeof begin.pairingId !== "string" || typeof begin.pairingToken !== "string") {
       throw new BrowserControlClientError("INVALID_PAIRING_RESPONSE");
@@ -106,15 +127,22 @@ export class BrowserControlClient {
     const pairingHandle = { pairingId: begin.pairingId, pairingToken: begin.pairingToken };
     await postJson(baseUrl, "/api/pairing/prove", {
       ...pairingHandle,
-      proof: await createBrowserPairingProof(challenge, identity),
-    }, undefined, options.signal);
+      proof: await createBrowserPairingProof(challenge, identity, crypto),
+    }, undefined, options.signal, options.platform);
     options.onPairingStatus?.("waiting_for_desktop");
     while (Date.now() < challenge.expiresAt) {
-      const status = await postJson(baseUrl, "/api/pairing/poll", pairingHandle, undefined, options.signal);
+      const status = await postJson(baseUrl, "/api/pairing/poll", pairingHandle, undefined, options.signal, options.platform);
       if (status.status === "approved") {
         const pairing = validateBrowserPairingGrant(status.grant, challenge);
+        if (recoverable && options.recoveryStore) {
+          // Approval must happen before this challenge expires. The host starts
+          // at most eight hours of trust then; compare timestamps from that host.
+          const metadata = validateDeviceRecoveryMetadata(status.recovery, challenge, challenge.expiresAt + 8 * 60 * 60 * 1_000);
+          try { await options.recoveryStore.save({ ...metadata, baseUrl, privateKeyPkcs8: recoverable.privateKeyPkcs8 }); }
+          catch { throw new BrowserControlClientError("RECOVERY_STORAGE_FAILED"); }
+        }
         options.onPairingStatus?.("approved");
-        return new BrowserControlClient({ baseUrl, pairing });
+        return new BrowserControlClient({ baseUrl, pairing, ...(options.platform ? { platform: options.platform } : {}) });
       }
       if (status.status !== "pending_confirmation") throw new BrowserControlClientError("INVALID_PAIRING_RESPONSE");
       await delay(1_000, options.signal);
@@ -122,9 +150,36 @@ export class BrowserControlClient {
     throw new BrowserControlClientError("pairing_expired");
   }
 
+  /** Fresh signed handshake only. No previous command or channel is ever restored. */
+  static async resume(options: BrowserResumeOptions): Promise<BrowserControlClient> {
+    const record = parseDeviceRecoveryRecord(options.record);
+    const baseUrl = secureBaseUrl(record.baseUrl, options.platform);
+    if (Date.now() >= record.expiresAt) throw new BrowserControlClientError("PAIRING_REQUIRED");
+    const identity = await restoreDeviceIdentity(record, options.platform.crypto);
+    const begin = await postJson(baseUrl, "/api/recovery/begin", {
+      hostId: record.hostId, deviceId: record.deviceId, publicKey: record.publicKey,
+    }, undefined, options.signal, options.platform);
+    const challenge = validateBrowserPairingChallenge(begin.challenge, identity);
+    if (challenge.hostId !== record.hostId || typeof begin.pairingId !== "string" || typeof begin.pairingToken !== "string") {
+      throw new BrowserControlClientError("RECOVERY_CONTEXT_MISMATCH");
+    }
+    const response = await postJson(baseUrl, "/api/recovery/prove", {
+      pairingId: begin.pairingId, pairingToken: begin.pairingToken,
+      proof: await createBrowserPairingProof(challenge, identity, options.platform.crypto),
+    }, undefined, options.signal, options.platform);
+    if (response.status !== "approved") throw new BrowserControlClientError("INVALID_PAIRING_RESPONSE");
+    const metadata = validateDeviceRecoveryMetadata(response.recovery, record, record.expiresAt);
+    if (metadata.expiresAt !== record.expiresAt) throw new BrowserControlClientError("RECOVERY_CONTEXT_MISMATCH");
+    const pairing = validateBrowserPairingGrant(response.grant, challenge);
+    if (pairing.expiresAt > record.expiresAt) throw new BrowserControlClientError("RECOVERY_CONTEXT_MISMATCH");
+    return new BrowserControlClient({ baseUrl, pairing, platform: options.platform });
+  }
+
   constructor(options: BrowserControlClientOptions) {
-    this.#baseUrl = secureBaseUrl(options.baseUrl);
-    requireSecureBrowserCrypto();
+    this.#baseUrl = secureBaseUrl(options.baseUrl, options.platform);
+    this.#platform = options.platform;
+    this.#crypto = options.platform?.crypto ?? requireSecureBrowserCrypto();
+    this.#sessionId = browserRandomIdentifier("session", this.#crypto);
     this.#pairing = Object.freeze({ ...options.pairing, capabilities: Object.freeze([...options.pairing.capabilities]), channel: Object.freeze({ ...options.pairing.channel }) });
     this.#requestTimeoutMs = boundedInteger(options.requestTimeoutMs ?? 15_000, 100, 60_000);
     this.#pollIntervalMs = boundedInteger(options.pollIntervalMs ?? 250, 20, 5_000);
@@ -160,14 +215,14 @@ export class BrowserControlClient {
         deviceId: this.#pairing.deviceId,
         credential: this.#pairing.credential,
         sequence: this.#nextSequence,
-        requestId: browserRandomIdentifier("request"),
+        requestId: browserRandomIdentifier("request", this.#crypto),
         operation,
         capability: requiredCapabilityForOperation(operation),
         payload,
       });
       if (parsed.type !== "request") throw new BrowserControlClientError("INVALID_REQUEST");
       // Crypto/validation failure before transmission does not consume a sequence.
-      const envelope = await sealBrowserRelayEnvelope(this.#pairing.channel, "device_to_host", parsed);
+      const envelope = await sealBrowserRelayEnvelope(this.#pairing.channel, "device_to_host", parsed, this.#crypto);
       if (this.#state !== "connected" && this.#state !== "reconnecting") throw new BrowserControlClientError("NOT_CONNECTED");
       const pending: PendingRequest = {
         frame: parsed,
@@ -238,7 +293,7 @@ export class BrowserControlClient {
       try {
         // Same request id + sequence, fresh authenticated envelope, exactly once
         // per explicit reconnect. Never retry as a new queue command.
-        const envelope = await sealBrowserRelayEnvelope(this.#pairing.channel, "device_to_host", earliest.frame);
+        const envelope = await sealBrowserRelayEnvelope(this.#pairing.channel, "device_to_host", earliest.frame, this.#crypto);
         await this.#post("/api/control/send", { ...this.#routeIdentity(), envelope: encodeWireEnvelope(envelope) });
         await sync.promise;
       } catch (error) {
@@ -263,7 +318,7 @@ export class BrowserControlClient {
   }
 
   #post(path: string, body: unknown): Promise<Record<string, unknown>> {
-    return postJson(this.#baseUrl, path, body, this.#pairing.credential);
+    return postJson(this.#baseUrl, path, body, this.#pairing.credential, undefined, this.#platform);
   }
 
   #schedulePoll(wait: number): void {
@@ -284,7 +339,7 @@ export class BrowserControlClient {
         throw new BrowserControlClientError("INVALID_POLL_RESPONSE");
       }
       for (const wire of result.envelopes) {
-        const inner = await openBrowserRelayEnvelope(this.#pairing.channel, decodeWireEnvelope(wire), this.#replay);
+        const inner = await openBrowserRelayEnvelope(this.#pairing.channel, decodeWireEnvelope(wire), this.#replay, this.#crypto);
         this.#acceptFrame(parseRemoteControlFrame(inner));
       }
     } finally { this.#polling = false; }
@@ -334,7 +389,7 @@ export class BrowserControlClient {
       this.#admit(pending);
       // Admission precedes runtime execution. A failed/oversized/timed-out
       // response cannot prove that a send or Stop had no side effect.
-      const mutating = pending.frame.operation === "session.send" || pending.frame.operation === "session.stop";
+      const mutating = isMutation(pending.frame.operation);
       this.#settle(pending, new BrowserControlClientError(mutating ? "outcome_unknown" : frame.error.code));
       this.#resolveSynchronization(frame.sequence);
     } else if (pending.admitted || frame.sequence !== this.#acknowledgedSequence + 1) {
@@ -388,7 +443,7 @@ export class BrowserControlClient {
     // mutation, even if its ACK was lost. Requests still waiting for admission
     // live outside this map and retain their ordinary never-sent rejection.
     for (const pending of this.#pending.values()) {
-      const mutating = pending.frame.operation === "session.send" || pending.frame.operation === "session.stop";
+      const mutating = isMutation(pending.frame.operation);
       this.#settle(pending, new BrowserControlClientError(mutating ? "outcome_unknown" : code));
     }
     this.#synchronized?.reject(new BrowserControlClientError(code));
@@ -405,22 +460,37 @@ export class BrowserControlClient {
   }
 }
 
-function secureBaseUrl(value?: string): string {
+function secureBaseUrl(value?: string, platform?: ControlClientPlatform): string {
   const url = new URL(value ?? (typeof location === "undefined" ? "https://invalid.invalid" : location.origin));
   if (url.protocol !== "https:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
     throw new BrowserControlClientError("TRUSTED_HTTPS_REQUIRED");
   }
-  if (typeof location !== "undefined" && url.origin !== location.origin) throw new BrowserControlClientError("SAME_ORIGIN_REQUIRED");
+  if (platform) assertNativeControlPlatform(platform, url.origin);
+  else if (typeof location !== "undefined" && url.origin !== location.origin) throw new BrowserControlClientError("SAME_ORIGIN_REQUIRED");
   return url.origin;
 }
 
-async function postJson(baseUrl: string, path: string, body: unknown, credential?: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+async function postJson(baseUrl: string, path: string, body: unknown, credential?: string, signal?: AbortSignal, platform?: ControlClientPlatform): Promise<Record<string, unknown>> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
   const cancel = () => controller.abort();
   if (signal?.aborted) controller.abort();
   else signal?.addEventListener("abort", cancel, { once: true });
   try {
+    if (platform) {
+      assertNativeControlPlatform(platform, baseUrl);
+      if (!/^\/api\/(pairing|recovery|control)\/[a-z]+$/.test(path)) throw new BrowserControlClientError("INVALID_REQUEST");
+      const response = await platform.postJson({ url: `${baseUrl}${path}`,
+        headers: { "Content-Type": "application/json", "X-Chili-Control-Client": "native-v1",
+          ...(credential ? { Authorization: `Bearer ${credential}` } : {}) },
+        body: JSON.stringify(body), signal: controller.signal, maxResponseBytes: MAX_HTTP_RESPONSE_BYTES });
+      if (controller.signal.aborted) throw new BrowserControlClientError("HTTP_REQUEST_CANCELLED");
+      if (typeof response.body !== "string" || !Number.isInteger(response.status) || response.status < 200 || response.status >= 600) {
+        throw new BrowserControlClientError("INVALID_HTTP_RESPONSE");
+      }
+      if (new TextEncoder().encode(response.body).byteLength > MAX_HTTP_RESPONSE_BYTES) throw new BrowserControlClientError("RESPONSE_TOO_LARGE");
+      return parseJsonResponse(response.body, response.status >= 200 && response.status < 300);
+    }
     const response = await fetch(`${baseUrl}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(credential ? { Authorization: `Bearer ${credential}` } : {}) },
@@ -461,17 +531,28 @@ async function readJsonResponse(response: Response): Promise<Record<string, unkn
   const combined = new Uint8Array(bytes);
   let offset = 0;
   for (const chunk of chunks) { combined.set(chunk, offset); offset += chunk.byteLength; }
+  let text: string;
+  try { text = new TextDecoder("utf-8", { fatal: true }).decode(combined); }
+  catch { throw new BrowserControlClientError("INVALID_HTTP_RESPONSE"); }
+  return parseJsonResponse(text, response.ok);
+}
+
+function parseJsonResponse(text: string, ok: boolean): Record<string, unknown> {
   let parsed: unknown;
-  try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(combined)); }
+  try { parsed = JSON.parse(text); }
   catch { throw new BrowserControlClientError("INVALID_HTTP_RESPONSE"); }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new BrowserControlClientError("INVALID_HTTP_RESPONSE");
   const result = parsed as Record<string, unknown>;
-  if (!response.ok) {
+  if (!ok) {
     const error = result.error as { code?: unknown } | undefined;
     const code = typeof error?.code === "string" && /^[A-Za-z_]{1,64}$/.test(error.code) ? error.code : "HTTP_REQUEST_FAILED";
     throw new BrowserControlClientError(code);
   }
   return result;
+}
+
+function isMutation(operation: RemoteControlOperation): boolean {
+  return operation !== "sessions.list" && operation !== "session.snapshot";
 }
 
 function deferred<T>(): Deferred<T> {

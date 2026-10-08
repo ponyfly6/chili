@@ -90,6 +90,8 @@ export class MockControlService implements RemoteControlService {
           accepted: true,
           status: "stopping",
         };
+      case "session.answerInput":
+        return { resolved: true };
     }
   }
 }

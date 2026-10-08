@@ -1,0 +1,6 @@
+/* The shared app owns safe-area padding and the keyboard-aware viewport.
+   Keep the native shell from adding a second horizontal inset. */
+html, body, #root { height: 100%; min-height: 0; }
+body { overscroll-behavior: none; }
+input, textarea, select { font-size: max(16px, 1em); }
+button, a { touch-action: manipulation; }

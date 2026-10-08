@@ -1,4 +1,7 @@
-import { normalizeSessionTitle, type ChiliEvent, type RuntimeInputQueue, type SessionId } from "@chili/protocol";
+import {
+  normalizeSessionTitle, parseUserInputAnswers, parseUserInputQuestions,
+  type ChiliEvent, type PendingUserInputRequest, type UserInputQuestion, type RuntimeInputQueue, type SessionId,
+} from "@chili/protocol";
 import { resolve } from "node:path";
 import { reduceRuntimeEvents, ReplayableRuntimeEventWindowAccumulator, RuntimeHttpError } from "@chili/sdk";
 import type {
@@ -61,9 +64,49 @@ export interface DesktopRemoteControlScope {
 
 export type DesktopRemoteControlRequest = Extract<DesktopRequest, {
   type: "sessions.list" | "session.snapshot" | "session.send" | "session.stop";
-}>;
+}> | { type: "session.answerInput"; sessionId: string; inputId: string; answers: Record<string, string[]> };
 
-type DesktopRemoteMutationRequest = Extract<DesktopRemoteControlRequest, { type: "session.send" | "session.stop" }>;
+type DesktopRemoteMutationRequest = Extract<DesktopRemoteControlRequest, { type: "session.send" | "session.stop" | "session.answerInput" }>;
+
+export interface DesktopRemoteInputRequest {
+  id: string;
+  createdAt: number;
+  questions: UserInputQuestion[];
+}
+
+export const REMOTE_INPUT_LIMITS = Object.freeze({ requests: 3, requestBytes: 12 * 1024, totalBytes: 24 * 1024 });
+
+/**
+ * Only first-party request_user_input prompts are phone-answerable. MCP elicitation
+ * and unknown/truncated provenance stay on desktop. This is a source allowlist,
+ * not a claim that arbitrary model-written question text is free of secrets.
+ * Never truncate a question: the answer must refer to exactly what was shown.
+ */
+export function projectRemoteInputRequests(
+  inputs: readonly PendingUserInputRequest[], events: readonly ChiliEvent[], sessionId: string,
+): DesktopRemoteInputRequest[] {
+  const result: DesktopRemoteInputRequest[] = [];
+  let totalBytes = 2;
+  for (const input of inputs) {
+    if (result.length >= REMOTE_INPUT_LIMITS.requests) break;
+    if (String(input.sessionId) !== sessionId || !/^userinput_[A-Za-z0-9._:-]{1,118}$/u.test(String(input.id))
+      || !Number.isSafeInteger(input.createdAt) || input.createdAt < 0) continue;
+    const tool = events.find((event) => event.type === "tool.call_started" && String(event.sessionId) === sessionId
+      && event.payload.callId === input.callId && event.payload.toolName === "request_user_input");
+    const requested = events.find((event) => event.type === "user_input.requested" && String(event.sessionId) === sessionId
+      && event.payload.inputId === input.id && event.payload.callId === input.callId);
+    if (!tool || !requested) continue;
+    try {
+      const questions = parseUserInputQuestions(input.questions);
+      const item = { id: String(input.id), createdAt: input.createdAt, questions };
+      const bytes = Buffer.byteLength(JSON.stringify(item), "utf8");
+      if (bytes > REMOTE_INPUT_LIMITS.requestBytes || totalBytes + bytes + 1 > REMOTE_INPUT_LIMITS.totalBytes) continue;
+      totalBytes += bytes + 1;
+      result.push(item);
+    } catch { /* Malformed or extended input forms require the desktop. */ }
+  }
+  return result;
+}
 
 /** Internal input to the separate remote whitelist projector, never a wire response. */
 export interface DesktopRemoteRootSnapshot {
@@ -72,11 +115,14 @@ export interface DesktopRemoteRootSnapshot {
   queuedCount: number;
   deliveryUnknown: boolean;
   needsDesktop: { input: boolean };
+  inputRequests?: DesktopRemoteInputRequest[];
   truncated: boolean;
 }
 
 export type DesktopRemoteControlResponse<Request extends DesktopRemoteControlRequest> =
-  Request extends { type: "session.snapshot" } ? DesktopRemoteRootSnapshot : DesktopResponse<Request>;
+  Request extends { type: "session.snapshot" } ? DesktopRemoteRootSnapshot
+    : Request extends { type: "session.answerInput" } ? { resolved: boolean }
+    : Request extends DesktopRequest ? DesktopResponse<Request> : never;
 
 const MAX_PENDING_SENDS_PER_SESSION = 8;
 const MAX_PENDING_SENDS_GLOBAL = 64;
@@ -189,7 +235,7 @@ export class DesktopControlService {
 
   /**
    * Every remote operation resolves membership using the original workspace lease.
-   * Sends and stops use the local window's service actors and the runtime queue.
+   * Mutations share the local window's service actors and runtime write paths.
    * Snapshot reads never enter those actors or fetch child Agent session contents.
    */
   async invokeRemoteControl<Request extends DesktopRemoteControlRequest>(
@@ -203,7 +249,7 @@ export class DesktopControlService {
     const scopedLease = this.remoteScopes.get(scope)!.lease;
     const lease = signal ? { ...scopedLease, signal: AbortSignal.any([scopedLease.signal, signal]) } : scopedLease;
     this.assertClientLease(lease);
-    if (request.type === "session.send" || request.type === "session.stop") {
+    if (request.type === "session.send" || request.type === "session.stop" || request.type === "session.answerInput") {
       return await this.invokeRemoteMutation(request, scope, lease, submissionId, deviceId) as DesktopRemoteControlResponse<Request>;
     }
     const sessions = await this.readRemoteSessions(scope, lease);
@@ -239,10 +285,10 @@ export class DesktopControlService {
     lease: ClientLease,
     submissionId?: string,
     deviceId?: string,
-  ): Promise<DesktopResponse<DesktopRemoteMutationRequest>> {
+  ): Promise<DesktopRemoteControlResponse<DesktopRemoteMutationRequest>> {
     // Reserve capacity and actor order before the first await. Membership reads
     // may finish out of order; local and remote writes must not do so.
-    const releaseAdmission = this.admitSessionOperation(request.sessionId, request.type === "session.send" ? "send" : "stop");
+    const releaseAdmission = this.admitSessionOperation(request.sessionId, request.type === "session.stop" ? "stop" : "send");
     try {
       const readLease = { ...lease, readDeadlineAt: performance.now() + lease.readTimeoutMs };
       const membership = this.readRemoteSessions(scope, readLease);
@@ -266,9 +312,24 @@ export class DesktopControlService {
         }
         // send's remaining preflight uses the same read budget. Neither this
         // budget nor waiting for an earlier write expires an authorized Stop.
-        return request.type === "session.send"
-          ? this.send(request.sessionId, request.text, request.mode, readLease, source, submissionId)
-          : this.stop(request.sessionId, lease);
+        if (request.type === "session.send") return this.send(request.sessionId, request.text, request.mode, readLease, source, submissionId);
+        if (request.type === "session.stop") return this.stop(request.sessionId, lease);
+        // Re-read inside the actor: a stale phone snapshot never authorizes an answer.
+        const snapshot = await this.remoteRootSnapshot(session, readLease);
+        const pending = snapshot.inputRequests?.find((input) => input.id === request.inputId);
+        if (!pending) throw new Error("Input is no longer available for phone answers; refresh or return to desktop");
+        const answers = parseUserInputAnswers(request.answers, pending.questions);
+        for (const question of pending.questions) {
+          const values = answers[question.id]!;
+          if (new Set(values).size !== values.length || (question.options.length > 0
+            && values.some((value) => !question.options.some((option) => option.label === value)))) {
+            throw new Error("Choose only the offered input options");
+          }
+        }
+        this.assertRemoteControlScope(scope);
+        this.assertClientLease(lease);
+        if (remote.revokedSources.has(source)) throw new Error("Remote device authorization was revoked");
+        return this.resolveUserInput(request.inputId, answers, lease);
       });
       this.assertRemoteControlScope(scope);
       this.assertClientLease(lease);
@@ -295,14 +356,16 @@ export class DesktopControlService {
       lease.client.inputQueue({ sessionId, signal }),
     ]));
     this.assertClientLease(lease);
+    const inputRequests = projectRemoteInputRequests(inputs, eventWindow.events, String(sessionId));
     return {
       session,
       events: eventWindow.events,
       queuedCount: queue.pendingCount,
       deliveryUnknown: this.remoteDeliveryUnknown.has(String(sessionId)),
       needsDesktop: {
-        input: inputs.length > 0,
+        input: inputs.length > inputRequests.length,
       },
+      inputRequests,
       truncated: eventWindow.truncated,
     };
   }
@@ -700,13 +763,7 @@ export class DesktopControlService {
     }
     if (request.type === "user-input.resolve") {
       const lease = this.captureClientLease();
-      const result = await lease.client.resolveUserInput({
-        inputId: request.inputId as never,
-        answers: request.answers,
-        signal: lease.signal,
-      });
-      this.assertClientLease(lease);
-      return result;
+      return this.resolveUserInput(request.inputId, request.answers, lease);
     }
     if (request.type === "diff.get") {
       const lease = this.captureClientLease();
@@ -725,6 +782,14 @@ export class DesktopControlService {
       return result;
     }
     throw new Error("Unsupported desktop request");
+  }
+
+  /** Shared local/remote write; runtime atomically consumes the pending input once. */
+  private async resolveUserInput(inputId: string, answers: Record<string, string[]>, lease: ClientLease): Promise<{ resolved: boolean }> {
+    this.assertClientLease(lease);
+    const result = await lease.client.resolveUserInput({ inputId: inputId as never, answers, signal: lease.signal });
+    this.assertClientLease(lease);
+    return { resolved: result.resolved };
   }
 
   private async createConfiguredSession(

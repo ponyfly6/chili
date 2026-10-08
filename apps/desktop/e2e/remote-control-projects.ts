@@ -6,6 +6,7 @@ import type { ElectronApplication, Page, Route } from "playwright-core";
 import type { ChiliDesktopApi, DesktopState } from "../src/shared/contracts.js";
 import type { PairingGrant } from "../../../packages/remote-control/src/pairing-security.js";
 import { runCommand, waitUntil, type ModelRequest } from "./remote-control-fixtures.js";
+import { openPhoneTaskList, reconnectPhone, selectPhoneSendMode, selectPhoneTask } from "./phone-navigation.js";
 
 interface ProjectProbeWindow extends Window { chiliDesktop: ChiliDesktopApi }
 
@@ -57,7 +58,7 @@ export async function proveRemoteProjectIsolation(options: ProjectScenarioOption
     const ownerA = await taskOwner(desktop, titleA);
     await openPhoneSettings(desktop);
     await options.pair(desktop, phone, "Project A scope E2E");
-    await phone.getByTestId("task-list").getByText(titleA, { exact: true }).click();
+    await selectPhoneTask(phone, titleA);
     await waitUntil("project A phone snapshot", async () => (await phone.getByTestId("transcript").innerText()).includes(promptA));
     const grantA = grants[0];
     assert.ok(grantA, "Observe the actual grant delivered after desktop confirmation");
@@ -92,10 +93,11 @@ export async function proveRemoteProjectIsolation(options: ProjectScenarioOption
     assert.ok(grantB);
     assert.notEqual(grantA.hostId, grantB.hostId, "Enabling remote for another project starts a new host epoch");
     await assertPhoneTaskScope(phone, titleB, [titleA, "Phone Alpha real runtime"]);
-    await phone.getByTestId("task-list").getByText(titleB, { exact: true }).click();
+    await selectPhoneTask(phone, titleB);
     await waitUntil("project B phone snapshot", async () => (await phone.getByTestId("transcript").innerText()).includes(promptB));
     assert.equal((await phone.getByTestId("transcript").innerText()).includes(promptA), false);
     await phone.getByTestId("message-input").fill(queuedB);
+    await selectPhoneSendMode(phone, "queue");
     await phone.getByTestId("queue-send").click();
     await waitUntil("only project B accepts its phone queue", async () => {
       const state = await desktopState(desktop);
@@ -120,7 +122,7 @@ export async function proveRemoteProjectIsolation(options: ProjectScenarioOption
     assert.ok(newGrantA);
     assert.notEqual(newGrantA.hostId, grantA.hostId, "Returning to A cannot revive its original host epoch");
     await assertPhoneTaskScope(phone, titleA, [titleB]);
-    await phone.getByTestId("task-list").getByText(titleA, { exact: true }).click();
+    await selectPhoneTask(phone, titleA);
     await waitUntil("restored A phone snapshot", async () => (await phone.getByTestId("transcript").innerText()).includes(promptA));
     await phone.getByTestId("stop-task").click();
     await waitUntil("fresh A phone grant stops only A", () => stream(promptA).aborted);
@@ -194,12 +196,13 @@ async function enableAfterProjectSwitch(local: Page, phone: Page, options: Proje
   assert.equal(await options.readSavedSetup(), options.savedSetup);
   await local.getByTestId("remote-enable").click();
   await local.getByTestId("remote-status").waitFor();
-  await phone.getByTestId("reconnect").click();
+  await reconnectPhone(phone);
   await phone.getByTestId("pairing-code").waitFor();
   assert.equal(await phone.getByTestId("task-list").count(), 0, "Re-enabling remote cannot revive a previous grant or task list");
 }
 
 async function assertPhoneTaskScope(phone: Page, included: string, excluded: string[]): Promise<void> {
+  await openPhoneTaskList(phone);
   const list = phone.getByTestId("task-list");
   await list.getByText(included, { exact: true }).waitFor();
   for (const title of excluded) assert.equal(await list.getByText(title, { exact: true }).count(), 0, "Other projects must not enter the phone task list");

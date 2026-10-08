@@ -1,5 +1,17 @@
 import assert from "node:assert/strict";
 import type { ServerResponse } from "node:http";
+import { REVIEWER_SYSTEM_INSTRUCTIONS } from "../../../packages/host/src/approval.js";
+
+/** Recognize the real host reviewer by its fixed system contract, never user text. */
+export function responsesFixtureReviewAction(body: unknown): { toolName: string; cwd: string; input: unknown } | null {
+  if (!body || typeof body !== "object" || !("instructions" in body)
+    || typeof body.instructions !== "string" || !body.instructions.includes(REVIEWER_SYSTEM_INSTRUCTIONS)) return null;
+  assert.ok(!("tools" in body) || (Array.isArray(body.tools) && body.tools.length === 0), "The independent reviewer has no tools");
+  const payload = JSON.parse(responsesFixtureUserText(body)) as { action?: { toolName?: unknown; cwd?: unknown; input?: unknown } };
+  assert.ok(payload.action && typeof payload.action.toolName === "string" && typeof payload.action.cwd === "string",
+    "The reviewer must receive an exact prepared tool action");
+  return { toolName: payload.action.toolName, cwd: payload.action.cwd, input: payload.action.input };
+}
 
 export function responsesFixtureUserText(body: unknown): string {
   assert.ok(body && typeof body === "object" && "input" in body && Array.isArray(body.input));
@@ -28,9 +40,9 @@ export function writeResponsesFixtureText(response: ServerResponse, id: string, 
   return completeResponse;
 }
 
-export function writeResponsesFixtureTool(response: ServerResponse, id: string, name: string, input: Record<string, unknown>): void {
+export function writeResponsesFixtureTool(response: ServerResponse, id: string, name: string, input: Record<string, unknown>, callId = `${id}-${name}`): void {
   begin(response, id);
-  const item = { id: `${id}_function`, type: "function_call", call_id: `${id}-${name}`, name,
+  const item = { id: `${id}_function`, type: "function_call", call_id: callId, name,
     arguments: JSON.stringify(input), status: "completed" };
   event(response, { type: "response.output_item.added", output_index: 0,
     item: { ...item, arguments: "", status: "in_progress" } });

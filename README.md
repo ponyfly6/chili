@@ -82,9 +82,9 @@ bun run smoke:desktop
 
 桌面端支持选择工作区、创建/恢复 session、实时 timeline、Queue/Steer/Stop、Agent 层级与输入回执、Agent 暂停/恢复、审批、用户输入和 turn/workspace diff。详细运行说明与安全边界见 [apps/desktop/README.md](apps/desktop/README.md)，架构说明见 [docs/desktop-architecture.md](docs/desktop-architecture.md)。
 
-私网手机 Alpha 使用独立的 `apps/control-web` 页面，通过受信任的私网 HTTPS、HostBridge 和桌面窗口共用的 `DesktopControlService` 操作真实 sidecar/runtime。远控默认关闭；在桌面开启后，手机使用短期一次性配对码申请授权，再由桌面本地确认。手机仅能查看当前工作区已有的顶层任务及有限消息，并执行 Queue、Steer、Stop；任务创建、工作区选择、审批、用户输入答复和权限设置仍在桌面完成。关闭远控、撤销设备、切换工作区或重启桌面会使对应授权失效。
+私网手机 Alpha 使用独立的 `apps/control-web` 页面，以及共享该界面的 [Chili 手机 App](apps/mobile/README.md)。两者通过受信任的私网 HTTPS、HostBridge 和桌面窗口共用的 `DesktopControlService` 操作真实 sidecar/runtime。远控默认关闭；在桌面开启后，手机使用短期一次性配对码申请授权，再由桌面本地确认。手机能查看当前工作区已有的顶层任务及有限消息，执行 Queue、Steer、Stop，并回答当前任务里可远程展示的普通模型提问；任务创建、工作区选择、MCP 表单和权限设置仍在桌面完成。关闭远控、撤销设备、切换工作区或重启桌面会使对应授权失效。
 
-在桌面 Phone 面板选择本机私网地址和端口，再通过原生对话框选择证书及私钥；保存后单独开启，无需启动环境变量。配置会保留，启用状态与手机授权不会保留。网络与证书配置、浏览器自动化入口和五分钟手机检查清单见 [私网手机 Alpha 验收指南](docs/private-mobile-alpha-acceptance.md)。当前已有真实浏览器到桌面/runtime 的自动化验证，**iPhone / Android 真机验收尚未执行**。此 Alpha 不包含公网 relay、账号、原生手机 App 或后台 daemon。
+在桌面 Phone 面板选择本机私网地址和端口，再通过原生对话框选择证书及私钥；保存后单独开启，无需启动环境变量。App 将恢复身份保存在手机安全存储中，在本次桌面授权的有效期内，关闭后重开会建立新的加密会话；不延长授权有效期，也不自动重发结果未知的命令。普通网页的连接凭据仍只保存在内存，刷新须重新配对；未确认命令的最小核对提醒会保留。网络与证书配置见 [私网手机 Alpha 验收指南](docs/private-mobile-alpha-acceptance.md)；App 构建与更新后的验收边界见 [手机 App 说明](apps/mobile/README.md)。**模拟器及浏览器验证不等于 iPhone / Android 真机验收。** 此 Alpha 不包含公网 relay、账号、系统推送或后台 daemon。
 
 运行时会话使用 `session-id` 标识；旧的 `--thread` 参数不再支持。`--resume` 只接受已存在且活跃的交互式 session。每个 Agent 的 `agentId` 就是其会话身份，`inputId` 标识提交给它的一次持久输入；消息、等待和恢复都沿用这套身份。
 
