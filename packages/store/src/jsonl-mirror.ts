@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { mkdir, appendFile } from "node:fs/promises";
+import { mkdir, appendFile, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { ChiliEvent, MessageId, MessagePart, MessageRole, SessionId, TimestampMs, TurnId } from "@chili/protocol";
-import type { EventMirror } from "./types.js";
+import type { EventMirror, SessionRow } from "./types.js";
 
 export class JsonlMirror implements EventMirror {
   constructor(private readonly path: string) {}
@@ -26,6 +26,7 @@ export class SessionJsonlMirror implements EventMirror {
     | ((sessionId: SessionId) => Promise<string | undefined> | string | undefined)
     | undefined;
   private readonly pathsBySessionId = new Map<string, string>();
+  private readonly operations = new MirrorOperations();
 
   constructor(
     private readonly rootDir: string,
@@ -36,13 +37,29 @@ export class SessionJsonlMirror implements EventMirror {
     this.resolveSessionCwd = options.resolveSessionCwd;
   }
 
-  async write(event: ChiliEvent): Promise<void> {
-    const sessionId = sessionIdForEvent(event);
-    if (!sessionId) return;
-    const path = await this.pathForEvent(sessionId, event);
-    await appendJsonLine(path, {
-      timestamp: new Date(event.time).toISOString(),
-      ...event,
+  write(event: ChiliEvent): Promise<void> {
+    return this.operations.run(async () => {
+      const sessionId = sessionIdForEvent(event);
+      if (!sessionId) return;
+      const path = await this.pathForEvent(sessionId, event);
+      await appendJsonLine(path, {
+        timestamp: new Date(event.time).toISOString(),
+        ...event,
+      });
+    });
+  }
+
+  deleteSessions(sessions: readonly SessionRow[]): Promise<void> {
+    return this.operations.run(async () => {
+      for (const session of sessions) {
+        const fileName = `${this.filePrefix}${safePathSegment(session.id)}.jsonl`;
+        const paths = new Set([join(this.rootDir, fileName)]);
+        if (this.groupByCwd) paths.add(this.pathForCwd(session.cwd, fileName));
+        const knownPath = this.pathsBySessionId.get(session.id);
+        if (knownPath) paths.add(knownPath);
+        for (const path of paths) await rm(path, { force: true });
+        this.pathsBySessionId.delete(session.id);
+      }
     });
   }
 
@@ -71,12 +88,16 @@ export class SessionJsonlMirror implements EventMirror {
     return join(this.rootDir, projectDir, fileName);
   }
 
-  async rememberSession(event: Extract<ChiliEvent, { type: "session.created" }>): Promise<void> {
-    await this.pathForEvent(event.payload.sessionId, event);
+  rememberSession(event: Extract<ChiliEvent, { type: "session.created" }>): Promise<void> {
+    return this.operations.run(async () => {
+      await this.pathForEvent(event.payload.sessionId, event);
+    });
   }
 
-  async writeTranscriptLine(sessionId: SessionId, line: unknown): Promise<void> {
-    await appendJsonLine(await this.pathForSessionId(sessionId), line);
+  writeTranscriptLine(sessionId: SessionId, line: unknown): Promise<void> {
+    return this.operations.run(async () => {
+      await appendJsonLine(await this.pathForSessionId(sessionId), line);
+    });
   }
 
   private async pathForSessionId(sessionId: SessionId): Promise<string> {
@@ -109,12 +130,27 @@ interface TranscriptMessageState {
 export class SessionTranscriptJsonlMirror implements EventMirror {
   private readonly paths: SessionJsonlMirror;
   private readonly messages = new Map<string, TranscriptMessageState>();
+  private readonly operations = new MirrorOperations();
 
   constructor(rootDir: string, options: SessionJsonlMirrorOptions = {}) {
     this.paths = new SessionJsonlMirror(rootDir, options);
   }
 
-  async write(event: ChiliEvent): Promise<void> {
+  write(event: ChiliEvent): Promise<void> {
+    return this.operations.run(() => this.writeEvent(event));
+  }
+
+  deleteSessions(sessions: readonly SessionRow[]): Promise<void> {
+    return this.operations.run(async () => {
+      const sessionIds = new Set(sessions.map((session) => session.id));
+      for (const [messageId, message] of this.messages) {
+        if (sessionIds.has(message.sessionId)) this.messages.delete(messageId);
+      }
+      await this.paths.deleteSessions(sessions);
+    });
+  }
+
+  private async writeEvent(event: ChiliEvent): Promise<void> {
     if (event.type === "session.created") {
       await this.paths.rememberSession(event);
       return;
@@ -189,6 +225,17 @@ export class SessionTranscriptJsonlMirror implements EventMirror {
       createdAt: message.createdAt,
       updatedAt: message.updatedAt,
     });
+  }
+}
+
+/** Keep asynchronous path lookups/appends ordered with destructive cleanup. */
+class MirrorOperations {
+  private pending: Promise<void> = Promise.resolve();
+
+  run(operation: () => Promise<void>): Promise<void> {
+    const result = this.pending.then(operation);
+    this.pending = result.catch(() => {});
+    return result;
   }
 }
 

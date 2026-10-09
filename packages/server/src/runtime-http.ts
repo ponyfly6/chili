@@ -76,6 +76,7 @@ export interface RuntimeHttpService {
   cancelInputsFromSource?(sessionId: SessionId, source: string): void;
   interrupt(sessionId: SessionId, reason?: string, expectedExecutionRef?: string): Promise<boolean>;
   archiveSession(sessionId: SessionId): Promise<void>;
+  deleteSession(sessionId: SessionId): Promise<void>;
   renameSession?(sessionId: SessionId, title: string): Promise<void>;
 }
 
@@ -599,6 +600,13 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         return new Response(null, { status: 204 });
       }
 
+      if (route.name === "deleteSession") {
+        await requireSession(options.store, route.sessionId);
+        await options.service.assertSessionReadAllowed(route.sessionId);
+        await options.service.deleteSession(route.sessionId);
+        return new Response(null, { status: 204 });
+      }
+
       if (route.name === "listUserInputs") {
         if (!options.userInputs) return jsonError(501, "No user input controller is configured");
         rejectUnknownQueryParameters(url, ["sessionId"]);
@@ -856,6 +864,7 @@ type Route =
   | { name: "interrupt"; sessionId: SessionId }
   | { name: "inputQueue" | "resumeInputs" | "cancelInput" | "cancelInputSource"; sessionId: SessionId }
   | { name: "archive"; sessionId: SessionId }
+  | { name: "deleteSession"; sessionId: SessionId }
   | { name: "listUserInputs" }
   | { name: "listPendingApprovals" }
   | { name: "resolveUserInput"; inputId: string }
@@ -1010,6 +1019,11 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "GET" && path === "/mcp/status") return { name: "mcpStatus" };
   if (method === "POST" && path === "/mcp/reload") return { name: "mcpReload" };
   if (method === "POST" && path === "/sessions") return { name: "createSession" };
+
+  const deleteSessionRoute = /^\/sessions\/([^/]+)$/.exec(path);
+  if (method === "DELETE" && deleteSessionRoute) {
+    return { name: "deleteSession", sessionId: requestSessionId(decodeURIComponent(deleteSessionRoute[1] ?? "")) };
+  }
 
   const openSessionRoute = /^\/sessions\/([^/]+)\/open$/.exec(path);
   if (method === "POST" && openSessionRoute) {

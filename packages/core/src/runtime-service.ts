@@ -136,6 +136,8 @@ export interface RuntimeServiceOptions {
   onModelChanged?: (input: RuntimeModelChangedInput) => Promise<void> | void;
   /** Stop host resources owned by this session without changing its conversation. */
   stopSessionResources?: (sessionId: SessionId, reason: string) => Promise<boolean>;
+  /** Diagnostics for resource cleanup failures after a deletion has committed. */
+  onSessionDeleteCleanupError?: (error: unknown, sessionId: SessionId) => void;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
 }
@@ -1965,6 +1967,40 @@ export class RuntimeService {
         throw error;
       }
       await this.stopSessionResources(sessionId, "session_archived");
+    });
+  }
+
+  async deleteSession(sessionId: SessionId): Promise<void> {
+    return this.withMutationAdmission(async () => {
+      this.assertControlOwner(sessionId);
+      await this.assertSessionAccessAllowed(sessionId, false);
+      if (this.running.has(sessionId) || this.creatingSessions.has(sessionId)) {
+        throw new RuntimeBusyError(sessionId);
+      }
+      const store = this.options.store;
+      if (!store.deleteSession) throw new Error("Store does not support durable session deletion");
+      let deleted: SessionId[];
+      try {
+        // The store rechecks ownership and all descendant claims in the same
+        // transaction that removes the conversation and its persisted inputs.
+        deleted = await store.deleteSession(sessionId, { sessionAccess: this.options.sessionAccess ?? "root" });
+      } catch (error) {
+        if (error instanceof SessionRunClaimConflictError || error instanceof SessionCreationClaimConflictError) {
+          throw new RuntimeBusyError(sessionId);
+        }
+        if (error instanceof SessionStateConflictError) throw new RuntimeSessionNotFoundError(sessionId);
+        if (error instanceof SessionAccessError) throw new RuntimeSessionAccessError(sessionId);
+        throw error;
+      }
+      for (const id of deleted) this.sessionModelState.delete(id);
+      const cleanup = await Promise.allSettled(deleted.map((id) => this.stopSessionResources(id, "session_deleted")));
+      for (const [index, result] of cleanup.entries()) {
+        if (result.status !== "rejected") continue;
+        // The conversation is already gone. Cleanup diagnostics must not turn
+        // this success into a retry that can only return "session not found".
+        try { this.options.onSessionDeleteCleanupError?.(result.reason, deleted[index]!); }
+        catch { /* Diagnostics cannot change a committed deletion. */ }
+      }
     });
   }
 

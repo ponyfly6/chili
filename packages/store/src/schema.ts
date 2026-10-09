@@ -32,6 +32,9 @@ export const SQLITE_SCHEMA = [
   )`,
   `create index if not exists sessions_updated_idx on sessions(updated_at)`,
   `create unique index if not exists sessions_agent_name on sessions(parent_session_id, agent_name) where parent_session_id is not null`,
+  // Reserve deleted identities so delayed, unfenced writers cannot restore
+  // conversation content after deletion, including across Host restarts.
+  `create table if not exists deleted_sessions (session_id text primary key)`,
 
   `create table if not exists messages (
     id text primary key,

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 
 interface ContentReference {
@@ -16,6 +16,18 @@ export class StoredContentCodec {
 
   constructor(databasePath: string) {
     this.directory = databasePath === ":memory:" ? undefined : resolve(join(dirname(databasePath), "contents", basename(databasePath)));
+  }
+
+  /** Call only while holding the database writer lock, after checking these sessions are absent. */
+  deleteSessions(sessionIds: readonly string[]): void {
+    // The legacy unscoped format shares its key with a literal "global"
+    // Session ID. Preserve that directory rather than erase unrelated content.
+    const scopes = new Set(sessionIds.filter((id) => id !== "global").map(contentScope));
+    if (this.directory) {
+      for (const scope of scopes) rmSync(join(this.directory, scope), { recursive: true, force: true });
+    } else {
+      for (const key of this.memory.keys()) if (scopes.has(key.split("/")[0]!)) this.memory.delete(key);
+    }
   }
 
   storeText(text: string, sessionId?: string): string {
@@ -145,7 +157,7 @@ export class StoredContentCodec {
 
   private put(value: string, encoding: "text" | "json", jsonBytes: number, sessionId?: string): ContentReference {
     const bytes = Buffer.from(value);
-    const scope = createHash("sha256").update(sessionId ?? "global").digest("hex").slice(0, 24);
+    const scope = contentScope(sessionId ?? "global");
     const hash = createHash("sha256").update(encoding).update(bytes).digest("hex");
     const key = `${scope}/${hash}.${encoding === "text" ? "txt" : "json"}`;
     if (!this.directory) this.memory.set(key, bytes);
@@ -221,6 +233,10 @@ export class StoredContentCodec {
     const fd = openSync(path, "r");
     try { fsyncSync(fd); } finally { closeSync(fd); }
   }
+}
+
+function contentScope(sessionId: string): string {
+  return createHash("sha256").update(sessionId).digest("hex").slice(0, 24);
 }
 
 export function isContentReference(value: unknown): value is ContentReference {

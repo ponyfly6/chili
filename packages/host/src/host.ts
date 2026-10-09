@@ -458,6 +458,11 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       },
       maxConcurrentToolCalls: DEV_MAX_CONCURRENT_TOOL_CALLS,
     });
+    const onSessionDeleteCleanupError = (error: unknown, sessionId: SessionId): void => {
+      hooks!.diagnose({ moduleId: "chili.session-resources", point: "runtime.sessionDeleted",
+        error: new Error(`Resource cleanup failed for deleted session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`),
+      });
+    };
     const childService = new RuntimeService({
       runtime: childRuntime,
       executionContext: (operation) => withProcessOwner(owner.token, operation),
@@ -475,6 +480,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       agentLifecycle: hooks.agentLifecycle,
       sessionAccess: "child",
       stopSessionResources: (sessionId, reason) => processes.stopSession(sessionId, reason),
+      onSessionDeleteCleanupError,
       runInput: async (sessionId, signal, run) => {
         const permit = await childRunLimiter.acquireRun(sessionId, signal);
         try { return await permit.run(run); } finally { permit.release(); }
@@ -534,6 +540,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
       onModelChanged: (input) => hooks!.modelChanged(input),
       agentLifecycle: hooks.agentLifecycle,
       stopSessionResources: (sessionId, reason) => processes.stopSession(sessionId, reason),
+      onSessionDeleteCleanupError,
       ...(options.sessionClaimLeaseMs !== undefined ? { sessionClaimLeaseMs: options.sessionClaimLeaseMs } : {}),
       ...(options.sessionClaimHeartbeatMs !== undefined ? { sessionClaimHeartbeatMs: options.sessionClaimHeartbeatMs } : {}),
     });

@@ -181,6 +181,7 @@ export interface SqliteEventStoreOptions {
   hostOwnerToken?: string;
   mirror?: EventMirror;
   onMirrorError?: (error: unknown, event: RuntimeEvent) => void;
+  onSessionDeleteCleanupError?: (error: unknown, sessions: readonly SessionRow[]) => void;
   busyTimeoutMs?: number;
   writeRetryAttempts?: number;
 }
@@ -198,7 +199,7 @@ export class SqliteEventStore
   private readonly journalMode: string;
   private closed = false;
   private readonly inputs: SessionInputRepository;
-  private inputMirrors: Promise<void> = Promise.resolve();
+  private mirrorOperations: Promise<void> = Promise.resolve();
 
   constructor(path = ".chili/chili.sqlite", private readonly options: SqliteEventStoreOptions = {}) {
     this.content = new StoredContentCodec(path);
@@ -347,9 +348,9 @@ export class SqliteEventStore
 
   mutateSessionInputs(input: SessionInputMutation, options?: SessionInputMutationOptions): SessionInputMutationResult {
     const result = this.inputs.mutate(input, options);
-    this.inputMirrors = this.inputMirrors.catch(() => undefined).then(() => this.writeMirrors(result.events));
+    const mirrored = this.writeMirrors(result.events);
     // Mirror failures never change an already committed receipt.
-    void this.inputMirrors.catch(() => undefined);
+    void mirrored.catch(() => undefined);
     return result;
   }
 
@@ -442,7 +443,63 @@ export class SqliteEventStore
       .map((row) => this.readSession(row.id as SessionId)!);
   }
 
-  async flushInputMirrors(): Promise<void> { await this.inputMirrors; }
+  async deleteSession(sessionId: SessionId, options: { sessionAccess?: "root" | "child" } = {}): Promise<SessionId[]> {
+    const remove = this.db.transaction(() => {
+      const target = this.readSession(sessionId);
+      if (!target) throw new SessionStateConflictError(sessionId);
+      if (!!target.agent !== (options.sessionAccess === "child")) throw new SessionAccessError(sessionId);
+      this.acquireSessionOwnershipInTransaction(sessionId);
+      const ids = this.db.query<{ id: string }, [string]>(`with recursive tree(id) as (
+        select ? union select session.id from sessions session join tree on session.parent_session_id = tree.id
+      ) select id from tree`).all(sessionId).map((row) => row.id as SessionId);
+      const sessions = ids.map((id) => this.readSession(id)!);
+      const now = Date.now();
+      for (const id of ids) {
+        const liveRun = this.db.query<{ found: number }, [string, number]>(
+          "select 1 as found from session_run_claims where session_id = ? and lease_expires_at > ?",
+        ).get(id, now);
+        if (liveRun) throw new SessionRunClaimConflictError(id);
+        const liveCreation = this.db.query<{ found: number }, [string, number]>(
+          "select 1 as found from session_creation_claims where session_id = ? and lease_expires_at > ?",
+        ).get(id, now);
+        if (liveCreation) throw new SessionCreationClaimConflictError(id);
+      }
+      for (const table of ["events", "message_parts", "messages", "tool_calls", "approvals", "session_inputs",
+        "session_dispatch", "session_input_revocations", "session_creation_claims", "session_run_claims"] as const) {
+        const statement = this.db.query(`delete from ${table} where session_id = ?`);
+        for (const id of ids) statement.run(id);
+      }
+      for (const id of ids) this.db.query("delete from session_host_owners where root_session_id = ?").run(id);
+      for (const id of ids) this.db.query("insert or ignore into deleted_sessions(session_id) values (?)").run(id);
+      for (const id of ids) this.db.query("delete from sessions where id = ?").run(id);
+      // Keep connection-owned claim identities: late writes must fail their
+      // durable fence after its row is deleted, including expired operations.
+      return sessions;
+    });
+    const sessions = this.runWithWriteRetry(() => remove.immediate());
+    const ids = sessions.map((session) => session.id);
+    try {
+      // Content is written only inside SQLite write transactions. Recheck
+      // absence under that same lock so a recreated ID never loses new blobs.
+      this.runWithWriteRetry(() => this.db.transaction(() => {
+        this.content.deleteSessions(ids.filter((id) => !this.readSession(id)));
+      }).immediate());
+    } catch (error) { this.reportDeleteCleanupError(error, sessions); }
+    if (this.options.mirror) {
+      await this.queueMirrorOperation(async () => {
+        try { await this.options.mirror?.deleteSessions?.(sessions); }
+        catch (error) { this.reportDeleteCleanupError(error, sessions); }
+      });
+    }
+    return ids;
+  }
+
+  private reportDeleteCleanupError(error: unknown, sessions: readonly SessionRow[]): void {
+    try { this.options.onSessionDeleteCleanupError?.(error, sessions); }
+    catch { /* Diagnostics cannot change an already committed deletion. */ }
+  }
+
+  async flushInputMirrors(): Promise<void> { await this.mirrorOperations; }
 
   async append(event: RuntimeEvent, options?: EventAppendOptions): Promise<void> {
     await this.appendCommitted(event, options);
@@ -458,7 +515,7 @@ export class SqliteEventStore
     );
     if (durableEvents.length === 0) return true;
     if (committed.length === 0) return false;
-    await this.writeMirror(committed[0]!);
+    await this.writeMirrors(committed);
     return true;
   }
 
@@ -480,9 +537,7 @@ export class SqliteEventStore
       options?.creationClaim,
       events,
     );
-    for (const event of committed) {
-      await this.writeMirror(event);
-    }
+    await this.writeMirrors(committed);
     const committedIds = new Set(committed.map((event) => event.id));
     const accepted = events.filter((event) => isTransientEvent(event) || committedIds.has(event.id));
     return accepted;
@@ -499,7 +554,7 @@ export class SqliteEventStore
       // A store connection is the implicit fence for ordinary session-scoped
       // appends. Never replace its claim in place: doing so would let the stale
       // caller's writes pass under the replacement claim stored in this map.
-      if (this.ownedCreationClaims.has(input.sessionId)) {
+      if (this.ownedCreationClaims.has(input.sessionId) || this.sessionWasDeleted(input.sessionId)) {
         return { status: "already_exists" as const };
       }
       const existing = this.db
@@ -543,6 +598,7 @@ export class SqliteEventStore
   }): boolean {
     if (this.ownedCreationClaims.get(input.sessionId) !== input.claimId) return false;
     const renewed = this.runWithWriteRetry(() => this.db.transaction(() => {
+      if (this.sessionWasDeleted(input.sessionId)) return { changes: 0 };
       this.acquireSessionOwnershipInTransaction(input.sessionId, true);
       return this.db.query(
       `update session_creation_claims
@@ -964,6 +1020,7 @@ export class SqliteEventStore
       validateScopedEventSessionIdentity(event);
       this.assertOwnedCreationClaim(event.sessionId);
       this.assertOwnedRunClaim(event.sessionId);
+      if (event.sessionId && this.sessionWasDeleted(event.sessionId)) throw new SessionStateConflictError(event.sessionId);
     }
     const committed: RuntimeEvent[] = [];
     for (const event of events) {
@@ -972,6 +1029,10 @@ export class SqliteEventStore
       committed.push(event);
     }
     return committed;
+  }
+
+  private sessionWasDeleted(sessionId: SessionId): boolean {
+    return this.db.query<{ found: number }, [string]>("select 1 as found from deleted_sessions where session_id = ?").get(sessionId) !== null;
   }
 
   private assertCreationClaimFence(
@@ -1310,10 +1371,19 @@ export class SqliteEventStore
     }
   }
 
-  private async writeMirrors(events: readonly RuntimeEvent[]): Promise<void> {
-    for (const event of events) {
-      await this.writeMirror(event);
-    }
+  private queueMirrorOperation(operation: () => Promise<void>): Promise<void> {
+    const pending = this.mirrorOperations.catch(() => undefined).then(operation);
+    this.mirrorOperations = pending;
+    return pending;
+  }
+
+  private writeMirrors(events: readonly RuntimeEvent[]): Promise<void> {
+    // Only actual exports need serialization. Queuing empty work delays event
+    // publication in ordinary Hosts, which do not configure a mirror.
+    if (!this.options.mirror || events.length === 0) return Promise.resolve();
+    return this.queueMirrorOperation(async () => {
+      for (const event of events) await this.writeMirror(event);
+    });
   }
 
   private insertEvent(event: RuntimeEvent): number {

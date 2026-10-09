@@ -453,6 +453,57 @@ test("explicit open acquires the existing session and reports ownership conflict
   acquire.mockRestore();
 });
 
+test("DELETE session accepts both active and archived conversations", async () => {
+  for (const archived of [false, true]) {
+    const store = new ObservableEventStore(new MemoryEventStore());
+    const service = new FakeRuntimeService(store);
+    const { sessionId } = await service.createSession();
+    if (archived) await service.archiveSession(sessionId);
+    const handler = createRuntimeHttpHandler({ service, store });
+
+    const response = await handler(new Request(`http://chili.test/sessions/${sessionId}`, { method: "DELETE" }));
+
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+    expect(service.deletedSessionIds).toEqual([sessionId]);
+  }
+});
+
+test("DELETE session validates existence and access before invoking deletion", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const service = new FakeRuntimeService(store);
+  const { sessionId } = await service.createSession();
+  service.blockedSessionAccess.add(sessionId);
+  const handler = createRuntimeHttpHandler({ service, store });
+
+  const missing = await handler(new Request("http://chili.test/sessions/session_missing", { method: "DELETE" }));
+  const forbidden = await handler(new Request(`http://chili.test/sessions/${sessionId}`, { method: "DELETE" }));
+  const browser = await handler(new Request(`http://chili.test/sessions/${sessionId}`, {
+    method: "DELETE", headers: { origin: "https://evil.example" },
+  }));
+
+  expect(missing.status).toBe(404);
+  expect(forbidden.status).toBe(403);
+  expect(browser.status).toBe(403);
+  expect(service.deletedSessionIds).toEqual([]);
+});
+
+test("DELETE session reports lifecycle conflicts from the runtime service", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const service = new FakeRuntimeService(store);
+  const { sessionId } = await service.createSession();
+  service.deleteSession = async () => {
+    const error = new Error(`Session is already running: ${sessionId}`);
+    error.name = "RuntimeBusyError";
+    throw error;
+  };
+  const handler = createRuntimeHttpHandler({ service, store });
+
+  const response = await handler(new Request(`http://chili.test/sessions/${sessionId}`, { method: "DELETE" }));
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ error: { message: `Session is already running: ${sessionId}` } });
+});
+
 test("keeps runtime HTTP routes unauthenticated when no auth token is configured", async () => {
   const store = new ObservableEventStore(new MemoryEventStore());
   const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
@@ -3335,6 +3386,7 @@ class FakeRuntimeService implements RuntimeHttpService {
   readonly blockedSessionAccess = new Set<SessionId>();
   readonly busySessionOperations = new Set<SessionId>();
   readonly sessionOperationIds: SessionId[] = [];
+  readonly deletedSessionIds: SessionId[] = [];
 
   constructor(protected readonly store: EventStore & EventPublisher) {}
 
@@ -3469,6 +3521,10 @@ class FakeRuntimeService implements RuntimeHttpService {
       sessionId,
       payload: { sessionId },
     });
+  }
+
+  async deleteSession(sessionId: SessionId): Promise<void> {
+    this.deletedSessionIds.push(sessionId);
   }
 
   async renameSession(sessionId: SessionId, title: string): Promise<void> {

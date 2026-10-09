@@ -42,6 +42,7 @@ export class ObservableEventStore
   readonly assertSessionOwnership?: NonNullable<EventStore["assertSessionOwnership"]>;
   readonly canRecoverSession?: NonNullable<EventStore["canRecoverSession"]>;
   readonly sessionInputForMessage?: NonNullable<EventStore["sessionInputForMessage"]>;
+  readonly deleteSession?: NonNullable<EventStore["deleteSession"]>;
 
   constructor(
     private readonly inner: EventStore,
@@ -50,6 +51,14 @@ export class ObservableEventStore
     if (inner.acquireSessionOwnership) this.acquireSessionOwnership = (sessionId) => inner.acquireSessionOwnership!(sessionId);
     if (inner.assertSessionOwnership) this.assertSessionOwnership = (sessionId) => inner.assertSessionOwnership!(sessionId);
     if (inner.canRecoverSession) this.canRecoverSession = (sessionId) => inner.canRecoverSession!(sessionId);
+    if (inner.deleteSession) this.deleteSession = async (sessionId, options) => {
+      const deleted = await inner.deleteSession!(sessionId, options);
+      const deletedIds = new Set(deleted);
+      for (const [partId, event] of this.activeParts) {
+        if (event.sessionId && deletedIds.has(event.sessionId)) this.activeParts.delete(partId);
+      }
+      return deleted;
+    };
     // Preserve capability absence across wrapper chains so callers can fail
     // explicitly instead of fabricating an incomplete recovery snapshot.
     if (inner.eventReplayBoundary) this.eventReplayBoundary = (query) => inner.eventReplayBoundary!(query);

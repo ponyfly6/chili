@@ -560,6 +560,10 @@ test("RuntimeService rejects every public mutation after shutdown", async () => 
       invoke: () => service.archiveSession(sessionId),
     },
     {
+      name: "deleteSession",
+      invoke: () => service.deleteSession(sessionId),
+    },
+    {
       name: "renameSession",
       invoke: () => service.renameSession(sessionId, "blocked"),
     },

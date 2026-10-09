@@ -123,6 +123,7 @@ export interface RuntimeClient {
   pendingUserInputs(input?: ListUserInputsRequest): Promise<RuntimeUserInputRequest[]>;
   resolveUserInput(input: ResolveUserInputRequest): Promise<RuntimeUserInputResolveResult>;
   archiveSession(sessionId: SessionId): Promise<void>;
+  deleteSession(sessionId: SessionId): Promise<void>;
   listSessions(input?: { signal?: AbortSignal }): Promise<RuntimeSessionSummary[]>;
   sessionEvents(input: SessionEventsRequest): Promise<ChiliEvent[]>;
   /** Dependency-complete bounded replay window with explicit truncation metadata. */
@@ -674,6 +675,10 @@ export class HttpRuntimeClient implements RuntimeClient {
     await this.post(`sessions/${encodeURIComponent(sessionId)}/archive`, {}, undefined, undefined, true);
   }
 
+  async deleteSession(sessionId: SessionId): Promise<void> {
+    await this.delete(`sessions/${encodeURIComponent(sessionId)}`, undefined, undefined, true);
+  }
+
   listSessions(input: { signal?: AbortSignal } = {}): Promise<RuntimeSessionSummary[]> {
     return this.get("sessions", input.signal, parseRuntimeSessionSummaryArray);
   }
@@ -840,10 +845,10 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.request(path, init, parser, allowNoContent);
   }
 
-  private delete<T>(path: string, signal?: AbortSignal, parser?: RuntimeParser<T>): Promise<T> {
+  private delete<T>(path: string, signal?: AbortSignal, parser?: RuntimeParser<T>, allowNoContent = false): Promise<T> {
     const init: RequestInit = { method: "DELETE" };
     if (signal) init.signal = signal;
-    return this.request(path, init, parser);
+    return this.request(path, init, parser, allowNoContent);
   }
 
   private async request<T>(

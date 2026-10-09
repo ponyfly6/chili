@@ -8,6 +8,33 @@ import {
 } from "./client.js";
 import { RUNTIME_STATE_SNAPSHOT_MAX_BYTES, type SessionId, type UserInputId } from "@chili/protocol";
 
+test("deleteSession sends an authenticated DELETE and accepts an empty success response", async () => {
+  const requests: Request[] = [];
+  const client = new HttpRuntimeClient({
+    baseUrl: "https://chili.test/api",
+    authToken: "delete-test-token",
+    fetch: (async (url, init) => {
+      requests.push(new Request(url, init));
+      return new Response(null, { status: 204 });
+    }) as typeof fetch,
+  });
+
+  await expect(client.deleteSession("session/path" as SessionId)).resolves.toBeUndefined();
+  expect(requests).toHaveLength(1);
+  expect(requests[0]?.method).toBe("DELETE");
+  expect(requests[0]?.url).toBe("https://chili.test/api/sessions/session%2Fpath");
+  expect(requests[0]?.headers.get("authorization")).toBe("Bearer delete-test-token");
+  expect(await requests[0]?.text()).toBe("");
+});
+
+test("deleteSession propagates runtime rejection", async () => {
+  const client = new HttpRuntimeClient({
+    baseUrl: "http://chili.test",
+    fetch: (async () => Response.json({ error: { message: "Session is already running" } }, { status: 409 })) as unknown as typeof fetch,
+  });
+  await expect(client.deleteSession("session_busy" as SessionId)).rejects.toThrow("Session is already running");
+});
+
 test("listSessions aborts a stalled real HTTP read", async () => {
   let received = false;
   let release!: () => void;

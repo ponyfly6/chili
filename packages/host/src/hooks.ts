@@ -33,7 +33,7 @@ export interface HostModule {
 
 export type HostHookPoint = "prompt.collect" | "tools.review" | "tools.processResult" | "tools.ended"
   | "model.started" | "model.event" | "model.ended" | "agent.started" | "agent.ended"
-  | "runtime.event" | "model.context" | "modelSelection.changed";
+  | "runtime.event" | "runtime.sessionDeleted" | "model.context" | "modelSelection.changed";
 
 export interface HostHookDiagnostic {
   moduleId: string;

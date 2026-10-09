@@ -181,6 +181,8 @@ export interface EventStore {
    */
   activeMessageParts?(query?: { sessionId?: SessionId; maxBytes?: number }): ChiliEvent[];
   sessions(): Promise<SessionRow[]>;
+  /** Atomically remove a conversation and all descendants, rejecting live runtime claims. */
+  deleteSession?(sessionId: SessionId, options?: { sessionAccess?: "root" | "child" }): Promise<SessionId[]>;
   messages(sessionId: SessionId): Promise<Message[]>;
   /** Message role/text never establishes provenance; consult its durable accepted input. */
   sessionInputForMessage?(sessionId: SessionId, messageId: MessageId): StoredSessionInput | undefined;
@@ -213,4 +215,6 @@ export interface StaleTurnRecoveryStore {
 
 export interface EventMirror {
   write(event: RuntimeEvent): Promise<void>;
+  /** Remove session-specific exports using metadata captured before their durable deletion. */
+  deleteSessions?(sessions: readonly SessionRow[]): Promise<void>;
 }
