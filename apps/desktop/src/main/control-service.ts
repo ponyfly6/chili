@@ -623,6 +623,21 @@ export class DesktopControlService {
         return { archived: true };
       });
     }
+    if (request.type === "session.delete") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        if (await this.isBusy(request.sessionId, lease)) {
+          throw new Error("Stop the current run before deleting this task");
+        }
+        await lease.client.deleteSession(request.sessionId as SessionId);
+        this.assertClientLease(lease);
+        this.clearSessionQueue(request.sessionId);
+        this.busySessions.delete(request.sessionId);
+        this.observedEventIds.delete(request.sessionId);
+        this.remoteDeliveryUnknown.delete(request.sessionId);
+        return { deleted: true };
+      });
+    }
     if (request.type === "session.config.get") {
       const lease = this.captureClientLease();
       const sessionId = request.sessionId as SessionId;

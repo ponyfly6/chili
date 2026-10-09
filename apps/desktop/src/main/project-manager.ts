@@ -18,6 +18,7 @@ interface ProjectEntry {
   runtime?: DesktopProjectRuntime;
   tasks: DesktopProject["recentTasks"];
   tasksLoaded: boolean;
+  tasksRevision: number;
   running: Set<string>;
   inputs: Map<string, string>;
   refresh?: ReturnType<typeof setTimeout>;
@@ -85,11 +86,28 @@ export class DesktopProjectManager {
     }
     if (request.type === "workspace.activate") return this.activate(request.id) as Promise<DesktopResponse<Request>>;
     const id = request.projectId ?? this.activeId;
-    const runtime = id ? this.entries.get(id)?.runtime : undefined;
+    const owner = id ? this.entries.get(id) : undefined;
+    const runtime = owner?.runtime;
     if (!runtime) throw new Error("Open the project before using its tasks");
     // Capture the owner before awaiting; a later UI selection cannot redirect this request.
+    const tasksRevision = owner!.tasksRevision;
     const result = await runtime.control.invoke(request);
-    if (request.type === "sessions.list") this.updateTasks(id!, result as RuntimeSessionSummary[]);
+    if (request.type === "sessions.list" && owner!.tasksRevision === tasksRevision) {
+      this.updateTasks(id!, result as RuntimeSessionSummary[]);
+    }
+    if (request.type === "session.archive" || request.type === "session.delete") {
+      const entry = this.entries.get(id!);
+      if (entry) {
+        entry.tasksRevision += 1;
+        entry.tasks = entry.tasks.filter((task) => task.id !== request.sessionId);
+        entry.running.delete(request.sessionId);
+        for (const [inputId, sessionId] of entry.inputs) {
+          if (sessionId === request.sessionId) entry.inputs.delete(inputId);
+        }
+        this.publishState();
+        this.scheduleTasks(id!);
+      }
+    }
     return result;
   }
 
@@ -216,7 +234,7 @@ export class DesktopProjectManager {
 
   private assertOpen(): void { if (this.closing) throw new Error("Desktop is closing"); }
   private entry(saved: SavedDesktopProject): ProjectEntry {
-    return { saved, tasks: [], tasksLoaded: false, running: new Set(), inputs: new Map(), refreshing: false, refreshAgain: false };
+    return { saved, tasks: [], tasksLoaded: false, tasksRevision: 0, running: new Set(), inputs: new Map(), refreshing: false, refreshAgain: false };
   }
   private publishState(): void { if (!this.closing) this.options.publish({ type: "state.changed", state: this.state() }); }
 
@@ -228,8 +246,9 @@ export class DesktopProjectManager {
       delete entry.refresh;
       if (!entry.runtime || this.closing || entry.runtime.sidecar.state().sidecar.phase !== "healthy") return;
       entry.refreshing = true;
+      const tasksRevision = entry.tasksRevision;
       void entry.runtime.control.invoke({ type: "sessions.list", status: "all" })
-        .then((sessions) => this.updateTasks(id, sessions))
+        .then((sessions) => { if (entry.tasksRevision === tasksRevision) this.updateTasks(id, sessions); })
         .catch(() => undefined)
         .finally(() => {
           entry.refreshing = false;
@@ -241,7 +260,7 @@ export class DesktopProjectManager {
   private updateTasks(id: string, sessions: RuntimeSessionSummary[]): void {
     const entry = this.entries.get(id);
     if (!entry || this.closing) return;
-    const tasks = sessions.filter((session) => !session.agent)
+    const tasks = sessions.filter((session) => !session.agent && session.status === "active")
       .sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 8)
       .map((session) => ({ id: String(session.id), title: (session.title || session.preview || "Untitled task").slice(0, 160),
         status: session.status, updatedAt: session.updatedAt }));

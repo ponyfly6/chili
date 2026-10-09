@@ -1,4 +1,8 @@
 import { expect, test } from "bun:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { ProjectSidebar } from "./ProjectSidebar.js";
+import { SessionActivityBadge } from "./SessionList.js";
 import { sessionActivity } from "./sidebar-status.js";
 
 test("actionable requests take precedence over processing and queued follow-ups", () => {
@@ -34,4 +38,30 @@ test("keeps idle, unknown and archived conversations quiet", () => {
   expect(sessionActivity({ status: "unknown" })).toBeUndefined();
   expect(sessionActivity({})).toBeUndefined();
   expect(sessionActivity({ status: "running", pendingInput: true, queuedCount: 2, archived: true })).toBeUndefined();
+});
+
+test("active work uses a spinner with accessible details and no visible status text", () => {
+  for (const status of ["running", "waiting_for_approval"] as const) {
+    const html = renderToStaticMarkup(createElement(SessionActivityBadge, { status, queuedCount: 3 }));
+    expect(html).toContain('class="activity-spinner"');
+    expect(html).toContain('role="img"');
+    expect(html).toContain(`aria-label="${sessionActivity({ status, queuedCount: 3 })!.description}"`);
+    expect(html.replace(/<[^>]*>/gu, "").trim()).toBe("");
+  }
+  const attention = renderToStaticMarkup(createElement(SessionActivityBadge, { status: "running", pendingInput: true }));
+  expect(attention).toContain("待补充");
+  expect(attention).not.toContain("activity-spinner");
+  expect(renderToStaticMarkup(createElement(SessionActivityBadge, { status: "idle" }))).toBe("");
+});
+
+test("project activity also uses a spinner and retains the running count for accessibility", () => {
+  const html = renderToStaticMarkup(createElement(ProjectSidebar, {
+    projects: [{ id: "project", path: "/work/project", phase: "healthy", runningCount: 2, attentionCount: 0,
+      tasksLoaded: true, recentTasks: [] }],
+    activeId: "project", selectedSessionId: undefined, revealKey: "", disabled: false,
+    onActivate: () => {}, onNewSession: () => {}, children: () => null,
+  }));
+  expect(html).toContain('class="activity-spinner"');
+  expect(html).toContain('aria-label="2 个会话正在处理"');
+  expect(html).not.toContain("处理中");
 });

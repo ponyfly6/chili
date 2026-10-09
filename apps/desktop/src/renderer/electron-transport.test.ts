@@ -194,6 +194,7 @@ test("maps daily-driver task controls to explicit validated IPC requests", async
   await transport.resumeSession("session_work");
   await transport.renameSession("session_work", "Renamed");
   await transport.archiveSession("session_work");
+  await transport.deleteSession("session_work");
   await transport.reloadMcp("session_work");
 
   expect(calls).toEqual([
@@ -212,6 +213,7 @@ test("maps daily-driver task controls to explicit validated IPC requests", async
     { type: "session.resume", sessionId: "session_work" },
     { type: "session.rename", sessionId: "session_work", title: "Renamed" },
     { type: "session.archive", sessionId: "session_work" },
+    { type: "session.delete", sessionId: "session_work" },
     { type: "mcp.reload", sessionId: "session_work" },
   ]);
 });

@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { ConversationActivityBar } from "./ConversationActivity.js";
 import { conversationActivity, pendingConversationInputs } from "./conversation-activity.js";
 import type { RuntimeInputQueue } from "@chili/protocol";
 
@@ -19,6 +22,20 @@ test("requests for information outrank running, and automatic review stays disti
   expect(reviewing.kind).toBe("reviewing");
   expect(reviewing.canStop).toBe(true);
   expect(conversationActivity({ status: "running", paused: false, pendingQuestions: 1, readOnly: true }).canStop).toBe(false);
+});
+
+test("the running activity bar shows a spinner while keeping stop and actionable labels", () => {
+  const activity = conversationActivity({ status: "running", paused: false, pendingQuestions: 0, readOnly: false });
+  const props = { activity, disabled: false, canResume: false, onStop: () => {}, onResume: () => {} };
+  const html = renderToStaticMarkup(createElement(ConversationActivityBar, props));
+  expect(html).toContain('class="activity-spinner"');
+  expect(html).toContain('aria-label="处理中"');
+  expect(html).not.toContain(">处理中<");
+  expect(html).toContain('aria-label="Stop current turn"');
+  const question = conversationActivity({ status: "running", paused: false, pendingQuestions: 1, readOnly: false });
+  const waiting = renderToStaticMarkup(createElement(ConversationActivityBar, { ...props, activity: question }));
+  expect(waiting).toContain("等你补充信息");
+  expect(waiting).not.toContain("activity-spinner");
 });
 
 test("only pending inputs appear in sequence order, without mutating the runtime queue", () => {

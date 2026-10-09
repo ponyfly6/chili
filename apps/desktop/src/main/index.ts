@@ -93,6 +93,10 @@ if (!app.requestSingleInstanceLock()) {
 async function bootstrap(): Promise<void> {
   await app.whenReady();
   if (!bootstrapLifecycle.canContinue()) return;
+  // Development runs use Electron.app, so supply the same icon as packaged Chili.
+  if (process.platform === "darwin" && !app.isPackaged) {
+    app.dock?.setIcon(resolve(repositoryRoot, "assets/brand/chili-icon-512.png"));
+  }
   smokeStage("app-ready");
   configureSessionSecurity();
   await installRendererProtocol();

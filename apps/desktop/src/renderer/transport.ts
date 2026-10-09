@@ -35,6 +35,7 @@ export interface ControlTransport {
   resumeSession(sessionId: string): Promise<RuntimeSnapshot>;
   renameSession(sessionId: string, title: string): Promise<DesktopResponseMap["session.rename"]>;
   archiveSession(sessionId: string): Promise<DesktopResponseMap["session.archive"]>;
+  deleteSession(sessionId: string): Promise<DesktopResponseMap["session.delete"]>;
   sessionConfig(sessionId: string): Promise<DesktopResponseMap["session.config.get"]>;
   setModel(sessionId: string, modelSelection: ModelSelection): Promise<DesktopResponseMap["session.model.set"]>;
   setReasoning(sessionId: string, reasoningLevel: ReasoningLevel): Promise<DesktopResponseMap["session.reasoning.set"]>;

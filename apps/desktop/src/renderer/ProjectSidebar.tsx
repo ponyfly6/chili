@@ -50,7 +50,10 @@ function ProjectGroup({ project, active, selectedSessionId, revealKey, disabled,
         disabled={disabled} title={project.path} onClick={() => { if (active) toggle(); else { setInitialLimit(SESSION_PAGE_SIZE); activate(); } }}>
         <span className="project-name"><strong>{name}</strong></span>
         {project.attentionCount > 0 ? <span className="project-badge attention" title={`${project.attentionCount} 个会话需要你处理`}>待处理 {project.attentionCount}</span>
-          : project.runningCount > 0 ? <span className="project-badge running" title={`${project.runningCount} 个会话正在处理`}>处理中 {project.runningCount}</span>
+          : project.runningCount > 0 ? <span className="project-badge running" role="img"
+            aria-label={`${project.runningCount} 个会话正在处理`} title={`${project.runningCount} 个会话正在处理`}>
+            <span className="activity-spinner" aria-hidden="true" />
+          </span>
             : <span className={`mini-status phase-${project.phase}`} aria-label={project.phase} />}
       </button>
       {active ? <button className="icon-button directory-new" type="button" aria-label={`在 ${name} 新建会话`} disabled={disabled}

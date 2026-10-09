@@ -21,8 +21,11 @@ export function ConversationActivityBar({ activity, disabled, canResume, onStop,
   onResume: () => void;
 }) {
   if (activity.kind === "idle") return null;
+  const spinning = activity.kind === "running" || activity.kind === "reviewing";
   return <div className={`conversation-activity activity-${activity.kind}`}>
-    <span className="conversation-activity-label" role="status"><span aria-hidden="true" />{activity.label}</span>
+    <span className="conversation-activity-label" role="status" aria-label={spinning ? activity.label : undefined}>
+      {spinning ? <span className="activity-spinner" aria-hidden="true" /> : <><span aria-hidden="true" />{activity.label}</>}
+    </span>
     {canResume ? <button type="button" disabled={disabled} onClick={onResume}>继续处理 <span aria-hidden="true">→</span></button> : null}
     {activity.canStop ? <button type="button" aria-label="Stop current turn" disabled={disabled} onClick={onStop}>停止</button> : null}
   </div>;

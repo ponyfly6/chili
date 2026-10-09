@@ -16,6 +16,17 @@ test("retains each session independently and isolates equal IDs in different pro
   expect(memory.read(undefined, "same")).toEqual({});
 });
 
+test("forgetting a deleted session removes its activity without touching other sessions or projects", () => {
+  const memory = new SidebarActivityMemory();
+  memory.ingest("project-a", status("same", "running", "a-running"));
+  memory.ingest("project-a", status("other", "idle", "other-idle"));
+  memory.ingest("project-b", status("same", "idle", "b-idle"));
+  memory.forgetSession("project-a", "same");
+  expect(memory.read("project-a", "same")).toEqual({});
+  expect(memory.read("project-a", "other").status).toBe("idle");
+  expect(memory.read("project-b", "same").status).toBe("idle");
+});
+
 test("tracks simultaneous input requests and prevents settled requests from returning", () => {
   const memory = new SidebarActivityMemory();
   memory.ingest("a", requested("s", "one"));

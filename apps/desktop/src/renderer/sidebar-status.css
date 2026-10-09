@@ -4,7 +4,8 @@
 }
 
 .sidebar .session-row > .session-activity {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
   flex: none;
   max-width: 76px;
   overflow: hidden;
@@ -14,6 +15,26 @@
   line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.activity-spinner {
+  display: inline-block;
+  flex: none;
+  width: 12px;
+  height: 12px;
+  box-sizing: border-box;
+  border: 1.5px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: sidebar-activity-spin .8s linear infinite;
+}
+
+@keyframes sidebar-activity-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-spinner { animation: none; }
 }
 
 .sidebar .session-activity[data-tone="working"],

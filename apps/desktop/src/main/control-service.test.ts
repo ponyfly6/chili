@@ -562,6 +562,43 @@ describe("desktop task controls", () => {
     expect(archives).toBe(0);
   });
 
+  test.each(["active", "archived"] as const)("deletes an idle %s conversation", async (status) => {
+    const deleted: string[] = [];
+    const client = {
+      sessionEvents: async () => status === "archived" ? [{
+        id: "event_deleted_archive", type: "session.archived", time: 1,
+        sessionId: "session_delete", payload: { sessionId: "session_delete" },
+      }] : [],
+      deleteSession: async (sessionId: string) => { deleted.push(sessionId); },
+    } as unknown as RuntimeClient;
+    expect(await serviceFor(client).invoke({ type: "session.delete", sessionId: "session_delete" }))
+      .toEqual({ deleted: true });
+    expect(deleted).toEqual(["session_delete"]);
+  });
+
+  test("rejects deleting a running conversation before calling the runtime", async () => {
+    let deletions = 0;
+    const client = {
+      sessionEvents: async () => [{
+        id: "event_delete_running", type: "session.status_changed", time: 1,
+        sessionId: "session_delete", payload: { sessionId: "session_delete", status: "running" },
+      }],
+      deleteSession: async () => { deletions += 1; },
+    } as unknown as RuntimeClient;
+    await expect(serviceFor(client).invoke({ type: "session.delete", sessionId: "session_delete" }))
+      .rejects.toThrow("Stop the current run before deleting");
+    expect(deletions).toBe(0);
+  });
+
+  test("surfaces deletion failures without claiming success", async () => {
+    const client = {
+      sessionEvents: async () => [],
+      deleteSession: async () => { throw new Error("Saved task not found"); },
+    } as unknown as RuntimeClient;
+    await expect(serviceFor(client).invoke({ type: "session.delete", sessionId: "session_missing" }))
+      .rejects.toThrow("Saved task not found");
+  });
+
   test("resumes the input queue and rejects archived tasks", async () => {
     const resumedSessions: string[] = [];
     const openedSessions: string[] = [];

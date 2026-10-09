@@ -16,6 +16,7 @@ import { assertResponsiveNavigation } from "./responsive-navigation.js";
 import { assertTimelineFollowStream, TIMELINE_FOLLOW_PROMPT, TimelineFollowFixture } from "./timeline-follow-stream.js";
 import { assertTimelineNavigation } from "./timeline-navigation.js";
 import { assertDesktopResults, isExpectedResultPreviewDiagnostic } from "./results-preview.js";
+import { assertConversationDeletion, assertDeletedConversationsStayRemoved, DELETED_CONVERSATION_TITLES } from "./session-lifecycle.js";
 import {
   _electron as electron,
   type ElectronApplication,
@@ -200,7 +201,7 @@ try {
     await closeDesktop(currentLaunch);
     currentLaunch = undefined;
 
-    logStep("launch 2/4: reload the conversation and exercise automatic review, input, rename, search, and archive");
+    logStep("launch 2/4: reload the conversation and exercise automatic review, input, rename, search, archive, and delete");
     currentLaunch = await launchDesktop("conversation-recovery", "fake");
     await assertDesktopAppearanceRestored(currentLaunch.page);
     await waitForTaskTitle(currentLaunch.page, CONVERSATION_TITLE);
@@ -209,12 +210,14 @@ try {
     await assertAutomaticReviewThroughUi(currentLaunch.page);
     await resolveUserInputThroughUi(currentLaunch.page);
     await renameSearchAndArchiveThroughUi(currentLaunch.page);
+    await assertConversationDeletion(currentLaunch.page, workspace, artifacts);
     await assertDelegatedConversation(currentLaunch.page, workspace, artifacts);
     await closeDesktop(currentLaunch);
     currentLaunch = undefined;
 
     logStep("launch 3/4: persist an in-flight streamed input for explicit recovery");
     currentLaunch = await launchDesktop("stream-controls", "deepseek");
+    await assertDeletedConversationsStayRemoved(currentLaunch.page, workspace);
     const interruptedInputId = await createSlowProviderTaskThroughUi(currentLaunch.page);
     await assertProgressDismissalDuringWork(currentLaunch.page);
     await assertMultipleProjects(currentLaunch);
@@ -283,7 +286,7 @@ try {
 
 process.stdout.write(
   "electron desktop E2E passed: conversation create/reload, input recovery, automatic review, input, steer, stop, "
-  + "rename/search/archive, delegated conversations and settings, background projects and isolated drafts, "
+  + "rename/search/archive hiding, confirmed deletion and persistence, delegated conversations and settings, background projects and isolated drafts, "
   + "theme switching/system tracking/restart persistence, nine native widths from 390 to 1440, keyboard panel navigation, and live timeline following\n",
 );
 
@@ -718,17 +721,27 @@ async function renameSearchAndArchiveThroughUi(page: Page): Promise<void> {
   await archiveDialog.getByRole("button", { name: "归档会话", exact: true }).click();
   await archiveDialog.waitFor({ state: "hidden" });
   const statusTabs = page.getByRole("tablist", { name: "Task status", exact: true });
+  const activeTab = statusTabs.getByRole("tab", { name: /^会话/u });
   const archivedTab = statusTabs.getByRole("tab", { name: /^已归档/u });
-  await waitUntil("Archived tasks tab selection after archive", async () => (
-    await archivedTab.getAttribute("aria-selected") === "true"
-  ));
+  await renamedTaskRow.waitFor({ state: "hidden" });
+  await page.getByRole("heading", { name: RENAMED_REVIEW_TITLE, exact: true }).waitFor({ state: "hidden" });
+  assert.equal(await activeTab.getAttribute("aria-selected"), "true", "Archiving keeps the active conversation list selected");
+  assert.equal(await archivedTab.getAttribute("aria-selected"), "false", "Archiving never opens archived history automatically");
+  await page.screenshot({ path: join(artifacts, "conversation-archived-hidden.png") });
+  await archivedTab.click();
   await expectVisible(renamedTaskRow);
+  await renamedTaskRow.click();
+  await waitForTaskTitle(page, RENAMED_REVIEW_TITLE);
+  assert.equal(await activeComposer(page).isDisabled(), true, "Archived history remains read-only");
+  await page.getByRole("button", { name: `Task actions for ${RENAMED_REVIEW_TITLE}`, exact: true }).click();
   assert.equal(
-    await page.getByRole("button", { name: `Task actions for ${RENAMED_REVIEW_TITLE}`, exact: true }).count(),
+    await renamedMenu.getByRole("menuitem", { name: /^(重命名|归档会话)$/u }).count(),
     0,
-    "Archived tasks must not expose mutation actions",
+    "Archived tasks must not offer rename or archive",
   );
-  await statusTabs.getByRole("tab", { name: /^会话/u }).click();
+  await expectVisible(renamedMenu.getByRole("menuitem", { name: "删除会话", exact: true }));
+  await page.keyboard.press("Escape");
+  await activeTab.click();
   await renamedTaskRow.waitFor({ state: "hidden" });
   await search.fill("");
 }
@@ -754,6 +767,27 @@ async function createSlowProviderTaskThroughUi(page: Page): Promise<string> {
 async function assertProgressDismissalDuringWork(page: Page): Promise<void> {
   const request = provider.requests.findLast((candidate) => candidate.text.includes(SLOW_STEER_PROMPT));
   assert.ok(request && !request.aborted, "The progress check starts with a real running provider request");
+  const runningRow = page.locator(".project-active .session-row").filter({ has: page.getByText(SLOW_TITLE, { exact: true }) });
+  const runningBadge = runningRow.locator('.session-activity[data-tone="working"]');
+  await runningBadge.waitFor();
+  const spinner = runningBadge.locator(".activity-spinner");
+  await spinner.waitFor();
+  assert.equal((await runningBadge.innerText()).trim(), "", "Running sidebar status shows a spinner without visible processing text");
+  assert.match(await runningBadge.getAttribute("aria-label") ?? "", /正在处理/u,
+    "The icon-only status retains an accessible running label");
+  const animation = await spinner.evaluate((element) => ({
+    name: getComputedStyle(element).animationName,
+    playState: getComputedStyle(element).animationPlayState,
+    reducedMotion: matchMedia("(prefers-reduced-motion: reduce)").matches,
+  }));
+  if (!animation.reducedMotion) {
+    assert.notEqual(animation.name, "none", "The running spinner has a CSS animation");
+    assert.equal(animation.playState, "running", "The running spinner animation is active");
+  }
+  const headerStatus = page.locator(".conversation-heading .conversation-state.state-running");
+  await headerStatus.locator(".activity-spinner").waitFor();
+  assert.equal((await headerStatus.innerText()).trim(), "", "The conversation header also uses the running spinner without processing text");
+  await page.screenshot({ path: join(artifacts, "conversation-running-spinner.png") });
   const panel = page.getByRole("complementary", { name: "会话侧栏", exact: true });
   await page.getByRole("button", { name: "进展", exact: true }).click();
   await panel.waitFor();
@@ -1402,6 +1436,8 @@ async function assertDurablePostconditions(): Promise<void> {
   assert.ok(sessions.some((session) => session.title === CONVERSATION_TITLE && session.status === "active"));
   assert.ok(sessions.some((session) => session.title === RENAMED_REVIEW_TITLE && session.status === "archived"));
   assert.ok(sessions.some((session) => session.title === SLOW_TITLE && session.status === "active"));
+  assert.ok(sessions.every((session) => !DELETED_CONVERSATION_TITLES.some((title) => title === session.title)),
+    "Confirmed deletions remain absent from durable session storage");
 
   const inputs = await querySqliteRows<{ title: string; text: string; outcome: string; resumed: number }>(
     `select sessions.title, session_inputs.text, session_inputs.outcome, session_inputs.resumed

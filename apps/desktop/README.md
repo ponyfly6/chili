@@ -11,6 +11,8 @@ bun install
 bun run desktop
 ```
 
+macOS 开发启动时会自动将 Dock 图标设为 Chili；通过 `bun run desktop` 重启也会保留这一品牌图标。
+
 `electron-vite` 会启动 renderer dev server；Electron main 随所选工作区启动 Bun sidecar。首次进入应用后选择项目并创建 session。也可以用环境变量直接指定开发工作区和 fake model：
 
 ```bash
@@ -34,7 +36,7 @@ bun run desktop:package:dir
 bun run smoke:desktop
 ```
 
-`test:e2e:desktop` 仅支持 macOS；它会先构建真实 Electron 应用和 sidecar，再点击完成 New Task、自动审查、输入、Steer、Stop、恢复、rename/search/archive、多项目后台运行、队列与草稿隔离、重启后项目恢复，并检查原生 1440/820/390 宽度。已经构建时可用 `CHILI_DESKTOP_E2E_SKIP_BUILD=1 bun run test:e2e:desktop` 跳过重复构建。
+`test:e2e:desktop` 仅支持 macOS；它会先构建真实 Electron 应用和 sidecar，再点击完成 New Task、自动审查、输入、Steer、Stop、恢复、rename/search、归档后立即隐藏、删除取消与确认、刷新和重启后删除持久化、多项目后台运行、队列与草稿隔离、重启后项目恢复，并检查原生 1440/820/390 宽度。删除验收还会检查工作区交付文件仍保留。已经构建时可用 `CHILI_DESKTOP_E2E_SKIP_BUILD=1 bun run test:e2e:desktop` 跳过重复构建。
 
 `smoke:desktop` 在每轮 `mkdtemp` 目录中独立构建 sidecar、桌面与手机页面，以及当前主机架构的 macOS `.app`，不读写共享 `apps/desktop/release`、`out` 或 `resources` 构建产物。它核验签名、完整 Electron 42 fuse wire、最小 ASAR 与其 header integrity，再实际启动应用内的 `Contents/Resources/chili-sidecar`。它会用同一个隔离 user-data 连续启动两次，通过 preload 创建 session、发送 fake-model 消息并等待 SSE assistant/idle 事件，并走原生 `app.quit()` 路径；两个正常启动都拒绝 forced stage、stderr、源码路径或秘密 canary 泄漏。blocked-Git fixture 通过仓库本地 `include.path` FIFO 阻塞 Git，并验证退出会中止 diff、清理登记的 Git process group。另有独立 fixture 会对 Electron 父进程发送 `SIGKILL`，验证 hard-crash containment。每个场景结束后都会检查 sidecar、登记的 Git/tool process group、继承子进程和 Electron helper 全部消失。
 
@@ -66,8 +68,9 @@ Preview 使用本地 ad-hoc 签名，不是已公证的正式发布包。打包�
 
 - **设置 → 通用** 提供跟随系统 / 浅色 / 深色主题。默认跟随 macOS 外观并随系统切换即时更新；手动选择立即生效，由主进程保存到当前应用配置目录的 `appearance-settings.json`，跨任务、刷新和重启保留。启动时先恢复原生窗口外观，再渲染界面；主题独立于工作区与 TUI 配置。
 - 左侧 **目录 +** 添加本地目录，侧边栏按项目展示任务及后台运行/待处理数量；点击项目或其任务切换。已打开项目各自保留 runtime，切换不会中断会话运行或消息队列。当前窗口内记住各项目选中的任务与未发送草稿。
+- 侧边栏和对话标题旁通过旋转图标显示运行状态，不显示“处理中”文字；图标保留无障碍状态说明，并遵循系统的减少动态效果设置。
 - 每个目录可通过名称前的箭头独立收起，当前目录也可点击名称折叠。展开时默认显示最近 5 条会话，“展开更多会话”每次增加 5 条，“收起更多会话”恢复精简列表；正在查看的较早会话也会保留在这 5 条中。搜索涵盖整个目录，切换目录或新建会话会展开对应列表。
-- 搜索 active/archived task，创建、重新载入或继续未归档 task，并对 active task 执行 rename/archive；具有 Agent 身份的子会话在 Agent 层级中展示，也不支持 unarchive。
+- 搜索 active/archived task，创建、重新载入或继续未归档 task，并对 active task 执行 rename/archive。归档后会话立即从当前列表和正在查看的对话中隐藏；需要回看时，通过 **搜索会话 → 已归档** 打开历史。active/archived task 的操作菜单均提供 **删除会话**，确认后永久移除会话记录，保留工作区文件。具有 Agent 身份的子会话在 Agent 层级中展示，也不支持 unarchive。
 - **设置** 按通用、模型与账号、权限与协作、工具与技能、偏好与记忆、手机连接分类；模型、思考深度与响应速度按模型能力展示，权限标明影响此目录的所有会话，协作方式属于当前会话。工具设置读取 MCP 状态并支持重新加载；不支持显式 tier 的模型使用 provider default，Desktop 不会提交伪造 tier。
 - 在对话中实时查看消息、执行步骤、工具结果和自动审查状态。
 - 发送消息；忙碌时 Queue，或 Steer（中断当前 turn 后优先发送）。
@@ -96,12 +99,13 @@ Preview 使用本地 ad-hoc 签名，不是已公证的正式发布包。打包�
 
 Permission profile 属于个人默认设置，保存到当前 Chili profile 的 `review-settings.json`，同时立即应用于当前目录 runtime 的所有会话。其他已经运行的目录保留当前设置，重启后读取新的个人默认。Desktop 会串行化 New Task 与 permission 写入。
 
-## Stop、Steer、恢复与 archive
+## Stop、Steer、恢复、归档与删除
 
 - Stop 会中断当前 turn 并暂停持久化输入队列；待处理消息仍会保留。终止完成后点击 **继续处理** 恢复；仍在 cancelling/running 时会拒绝抢跑。
 - Steer 会中断当前 turn，优先处理新输入，再处理已有排队消息；被替代的输入不会自动重新执行。
 - 暂停后发送的新消息进入待处理队列。点击 **继续处理** 先恢复原来已中断的输入，再处理待处理消息，沿用原 Session 和 inputId。session、事件和输入队列由 runtime/store 持久化；Desktop 或 sidecar 重启后，未完成的执行保持暂停，需显式恢复。
-- Archive 在当前 Desktop 中是单向操作：没有 unarchive；busy task 必须先 Stop。archived task 只读，不能 Resume、发送或改配置，其历史记录仍保留用于查看。
+- 归档后保持在未归档会话列表，立即隐藏该会话；归档当前对话时切换到其他可用会话，或回到空白输入界面。归档在当前 Desktop 中是单向操作：没有 unarchive；busy task 必须先 Stop。通过 **搜索会话 → 已归档** 查看保留的历史；archived task 只读，不能 Resume、发送或改配置。
+- **删除会话** 适用于未归档或已归档会话，需在确认对话框中再次确认；取消会保留会话和草稿。删除后记录无法恢复，当前会话的草稿和预览状态一并清理，刷新或重启不会重新出现；工作区中的源码、交付文件和其他本地文件继续保留。正在运行的会话需先停止。
 
 MCP 面板读取当前 session scope 的 server 状态与汇总，并提供 reload。Desktop 当前不暴露 add/remove/auth 配置流程；这些仍由现有 CLI/TUI/runtime 配置完成。
 

@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parseChiliEvent, type ChiliEvent } from "@chili/protocol";
+import type { RuntimeSessionSummary } from "@chili/sdk";
 import type { DesktopEvent, DesktopRequest, DesktopResponse, DesktopState } from "../shared/contracts.js";
 import { DesktopProjectManager, type DesktopProjectRuntime } from "./project-manager.js";
 import { DesktopProjectSettings } from "./project-settings.js";
@@ -29,6 +30,24 @@ test("keeps both project runtimes alive and routes captured requests to their ow
   } finally { await f.close(); }
 });
 
+test("recent project conversations exclude archives before applying the display limit", async () => {
+  const f = await fixture();
+  try {
+    const a = await f.manager.add(f.a);
+    const runtime = f.runtimes.get(a.projectId!)!;
+    runtime.sessions = Array.from({ length: 10 }, (_, index) => ({
+      id: `session_${index}` as RuntimeSessionSummary["id"], cwd: f.a,
+      status: index < 8 ? "archived" as const : "active" as const,
+      createdAt: 1 as RuntimeSessionSummary["createdAt"],
+      updatedAt: (10 - index) as RuntimeSessionSummary["updatedAt"],
+    }));
+    await f.manager.invoke({ type: "sessions.list", projectId: a.projectId! });
+    await f.manager.add(f.b);
+    expect(f.manager.state().projects?.find((project) => project.id === a.projectId)?.recentTasks.map((task) => task.id))
+      .toEqual(["session_8", "session_9"]);
+  } finally { await f.close(); }
+});
+
 test("background status appears in the project list without entering the active timeline", async () => {
   const f = await fixture();
   try {
@@ -44,6 +63,31 @@ test("background status appears in the project list without entering the active 
     expect(f.events.filter((event) => event.type === "runtime.event")).toMatchObject([{ projectId: b.projectId }]);
     f.manager.observeEvent(a.projectId!, statusEvent("session-a", "idle"));
     expect(f.manager.state().projects?.find((project) => project.id === a.projectId)).toMatchObject({ runningCount: 0, attentionCount: 0 });
+  } finally { await f.close(); }
+});
+
+test.each(["session.archive", "session.delete"] as const)("%s removes the cached project row and rejects stale list updates", async (type) => {
+  const f = await fixture();
+  try {
+    const a = await f.manager.add(f.a);
+    const runtime = f.runtimes.get(a.projectId!)!;
+    runtime.sessions = [{
+      id: "session_remove" as RuntimeSessionSummary["id"], cwd: f.a, status: "active",
+      createdAt: 1 as RuntimeSessionSummary["createdAt"], updatedAt: 1 as RuntimeSessionSummary["updatedAt"],
+    }];
+    await f.manager.invoke({ type: "sessions.list", projectId: a.projectId! });
+    const recentTasks = () => f.manager.state().projects?.find((project) => project.id === a.projectId)?.recentTasks;
+    expect(recentTasks()).toHaveLength(1);
+    const pending = runtime.holdNextRequest();
+    const staleList = f.manager.invoke({ type: "sessions.list", projectId: a.projectId! });
+    await f.manager.add(f.b);
+    runtime.sessions = [];
+    await f.manager.invoke({ type, projectId: a.projectId!, sessionId: "session_remove" });
+    expect(recentTasks()).toEqual([]);
+    expect(f.manager.activeProjectId()).not.toBe(a.projectId);
+    pending.resolve();
+    expect(await staleList).toHaveLength(1);
+    expect(recentTasks()).toEqual([]);
   } finally { await f.close(); }
 });
 
@@ -221,6 +265,7 @@ class FakeRuntime implements DesktopProjectRuntime {
   stops = 0;
   containments = 0;
   calls: DesktopRequest[] = [];
+  sessions: RuntimeSessionSummary[] = [];
   private state: DesktopState = { sidecar: { phase: "idle", attempt: 0 }, queuedBySession: {} };
   private held: Promise<void> | undefined;
   constructor(private readonly fail: boolean) {}
@@ -238,8 +283,9 @@ class FakeRuntime implements DesktopProjectRuntime {
   control = {
     invoke: async <Request extends DesktopRequest>(request: Request): Promise<DesktopResponse<Request>> => {
       this.calls.push(request);
+      const response = request.type === "sessions.list" ? this.sessions : { status: "accepted" };
       if (this.held) { const held = this.held; this.held = undefined; await held; }
-      return (request.type === "sessions.list" ? [] : { status: "accepted" }) as DesktopResponse<Request>;
+      return response as DesktopResponse<Request>;
     },
     beginShutdown: () => undefined,
     containMainProcesses: async () => { this.containments += 1; },

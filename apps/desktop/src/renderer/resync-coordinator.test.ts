@@ -12,6 +12,7 @@ import {
   type SequencedProjectionFrame,
 } from "./resync-coordinator.js";
 import { serializedJsonUtf8Bytes } from "./json-bytes.js";
+import { PendingSessionSelection } from "./project-view-state.js";
 
 interface State {
   workspace?: string;
@@ -43,6 +44,22 @@ type Frame =
 type Projection = CoordinatedProjection<State, Session, Snapshot>;
 
 describe("resync coordinator", () => {
+  test("a background list refresh superseding creation retains the explicit selected conversation", () => {
+    const coordinator = createCoordinator();
+    const selection = new PendingSessionSelection();
+    let selectedId = "previous";
+    selection.request("project", "created");
+    const createRefresh = coordinator.beginRequest("sessions");
+    const backgroundRefresh = coordinator.beginRequest("sessions");
+    expect(() => coordinator.acceptResponse(createRefresh)).toThrow(SupersededProjectionRequestError);
+    coordinator.acceptResponse(backgroundRefresh);
+    const preferredId = selection.read("project");
+    selectedId = preferredId ?? selectedId;
+    if (preferredId) selection.consume("project", preferredId);
+    expect(selectedId).toBe("created");
+    expect(selection.read("project")).toBeUndefined();
+  });
+
   test("binds hydration reads and remembered selection to the state returned for that recovery", async () => {
     const calls: string[] = [];
     const published: Projection[] = [];

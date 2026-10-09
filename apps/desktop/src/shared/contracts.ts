@@ -190,6 +190,7 @@ type DesktopOperation =
   | { type: "session.resume"; sessionId: string }
   | { type: "session.rename"; sessionId: string; title: string }
   | { type: "session.archive"; sessionId: string }
+  | { type: "session.delete"; sessionId: string }
   | { type: "session.config.get"; sessionId: string }
   | { type: "session.model.set"; sessionId: string; modelSelection: ModelSelection }
   | { type: "session.reasoning.set"; sessionId: string; reasoningLevel: ReasoningLevel }
@@ -230,6 +231,7 @@ export interface DesktopResponseMap {
   "session.resume": RuntimeSnapshot;
   "session.rename": RuntimeSessionSummary;
   "session.archive": { archived: boolean };
+  "session.delete": { deleted: boolean };
   "session.config.get": DesktopSessionConfig;
   "session.model.set": RuntimeModelConfig;
   "session.reasoning.set": RuntimeModelConfig;
@@ -342,7 +344,7 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
       title: normalizeSessionTitle(requireString(record.title, "title", 2_000)),
     };
   }
-  if (type === "session.archive") {
+  if (type === "session.archive" || type === "session.delete") {
     return { type, sessionId: requireIdentifier(record.sessionId, "sessionId") };
   }
   if (type === "session.model.set") {
@@ -602,6 +604,10 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
     const record = requireRecord(value, "archive response");
     assertOnlyKeys(record, ["archived"]);
     response = { archived: requireBoolean(record.archived, "archived") };
+  } else if (request.type === "session.delete") {
+    const record = requireRecord(value, "delete response");
+    assertOnlyKeys(record, ["deleted"]);
+    response = { deleted: requireBoolean(record.deleted, "deleted") };
   } else if (request.type === "session.config.get") {
     response = parseDesktopSessionConfig(value);
   } else if (
@@ -1128,6 +1134,7 @@ function requestKeys(type: string): readonly string[] {
     || type === "session.resume"
     || type === "session.stop"
     || type === "session.archive"
+    || type === "session.delete"
     || type === "session.config.get"
     || type === "session.delegation.get"
   ) return ["type", "sessionId"];

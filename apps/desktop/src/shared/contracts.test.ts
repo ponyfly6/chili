@@ -160,6 +160,16 @@ describe("desktop IPC contracts", () => {
     expect(SESSION_TITLE_MAX_CHARS).toBe(120);
   });
 
+  test("validates project-scoped conversation deletion requests and responses", () => {
+    const request = { type: "session.delete", sessionId: "session_1", projectId: "project_1" } as const;
+    expect(parseDesktopRequest(request)).toEqual(request);
+    expect(parseDesktopResponse(request, { deleted: true })).toEqual({ deleted: true });
+    expect(() => parseDesktopRequest({ ...request, sessionId: "" })).toThrow();
+    expect(() => parseDesktopRequest({ ...request, path: "/repo" })).toThrow();
+    expect(() => parseDesktopResponse(request, { deleted: "true" })).toThrow();
+    expect(() => parseDesktopResponse(request, { deleted: true, path: "/repo" })).toThrow();
+  });
+
   test("enforces the runtime's canonical 120-character session title limit", () => {
     const maximumTitle = "x".repeat(SESSION_TITLE_MAX_CHARS);
     const overLimitTitle = `${maximumTitle}x`;

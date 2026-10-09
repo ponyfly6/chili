@@ -20,7 +20,7 @@ import { discoverDesktopResults } from "./result-model.js";
 import { TimelineViewport } from "./TimelineViewport.js";
 import { sessionDescendantAgents } from "./agent-details-model.js";
 import { formatWorkDuration, workCurrentDetail, workHeadline, workStages, workToolStatus, workToolSubject, workToolTitle, type WorkStage } from "./work-presentation.js";
-import { eventMatchesProject, ProjectViewMemory } from "./project-view-state.js";
+import { eventMatchesProject, PendingSessionSelection, ProjectViewMemory } from "./project-view-state.js";
 import { useDesktopTheme } from "./useDesktopTheme.js";
 import { getDesktopBuildInfo } from "../shared/build-info.js";
 import { RESULT_PREVIEW_ESCAPE_EVENT } from "../shared/result-preview.js";
@@ -96,6 +96,7 @@ import {
   modelKey,
   newTaskSubmission,
   reconcileNewTaskModel,
+  sessionAfterListRefresh,
   sessionModelSettingsMutations,
   validateNewTaskDraft,
   validateSessionModelSettingsDraft,
@@ -137,7 +138,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     ? hostTransport.forProject(projection.state.projectId) : hostTransport, [hostTransport, projection.state.projectId]);
   const projectViews = useRef(new ProjectViewMemory());
   const sidebarActivity = useRef(new SidebarActivityMemory());
-  const requestedProjectSession = useRef<{ projectId: string; sessionId: string } | undefined>(undefined);
+  const requestedProjectSession = useRef(new PendingSessionSelection());
   const [error, setError] = useState<string>();
   const [working, setWorking] = useState(false);
   const [loadingSession, setLoadingSession] = useState(false);
@@ -146,6 +147,8 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const [resyncRetryAvailable, setResyncRetryAvailable] = useState(false);
   const [sessionQuery, setSessionQuery] = useState("");
   const [sessionListStatus, setSessionListStatus] = useState<SessionListStatus>("active");
+  const sessionListStatusRef = useRef(sessionListStatus);
+  sessionListStatusRef.current = sessionListStatus;
   const [taskMenuId, setTaskMenuId] = useState<string>();
   const [newTaskOpen, setNewTaskOpen] = useState(false);
   const [newTaskChoicesLoading, setNewTaskChoicesLoading] = useState(false);
@@ -157,6 +160,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<RuntimeSessionSummary>();
   const [archiveTarget, setArchiveTarget] = useState<RuntimeSessionSummary>();
+  const [deleteTarget, setDeleteTarget] = useState<RuntimeSessionSummary>();
   const taskMenuButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const taskMenuRef = useRef<HTMLDivElement | null>(null);
   const dialogReturnFocusRef = useRef<HTMLElement | null>(null);
@@ -228,10 +232,9 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     listSessions: (state) => projectTransport(state).listSessions(),
     loadSnapshot: (sessionId, state) => projectTransport(state).snapshot(sessionId),
     preferredSessionId: (state) => {
-      const requested = requestedProjectSession.current;
-      return requested?.projectId === state.projectId ? requested?.sessionId
-        : state.workspace === workspaceRef.current ? selectedRef.current ?? projectViews.current.read(state.workspace)?.sessionId
-          : projectViews.current.read(state.workspace)?.sessionId;
+      return requestedProjectSession.current.read(state.projectId)
+        ?? (state.workspace === workspaceRef.current ? selectedRef.current ?? projectViews.current.read(state.workspace)?.sessionId
+          : projectViews.current.read(state.workspace)?.sessionId);
     },
     canListSessions: (state) => Boolean(state.workspace) && state.sidecar.phase === "healthy",
     authorityKey: (state) => state.workspace,
@@ -262,6 +265,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       sidecarPhaseRef.current = published.state.sidecar.phase;
       const previousSelectedId = selectedRef.current;
       selectedRef.current = published.selectedId;
+      if (published.selectedId) requestedProjectSession.current.consume(published.state.projectId, published.selectedId);
       setSessionConfig((current) => projectChanged ? undefined : sessionConfigAfterSelectionChange(
         previousSelectedId,
         published.selectedId,
@@ -466,6 +470,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   }, [coordinator, setSelectedId, setSnapshot, projectTransport]);
 
   const refreshSessions = useCallback(async (preferredId?: string) => {
+    if (preferredId) requestedProjectSession.current.request(projectionRef.current.state.projectId, preferredId);
     if (sidecarPhaseRef.current !== "healthy") return;
     let token;
     try {
@@ -475,15 +480,11 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       coordinator.acceptResponse(token);
       setSessions(next);
       const current = selectedRef.current;
-      const requested = requestedProjectSession.current;
-      preferredId ??= requested && requested.projectId === projectionRef.current.state.projectId
-        ? requested.sessionId : !current ? projectViews.current.read(workspaceRef.current)?.sessionId : undefined;
-      if (requested && requested.projectId === projectionRef.current.state.projectId) requestedProjectSession.current = undefined;
-      const target = preferredId && next.some((session) => session.id === preferredId)
-        ? preferredId
-        : current && next.some((session) => session.id === current)
-          ? current
-          : next.find((session) => session.status === "active")?.id ?? next[0]?.id;
+      const projectId = projectionRef.current.state.projectId;
+      const requested = requestedProjectSession.current.read(projectId);
+      preferredId = requested ?? (!current ? projectViews.current.read(workspaceRef.current)?.sessionId : undefined);
+      const target = sessionAfterListRefresh(next, current, preferredId, sessionListStatusRef.current);
+      if (requested) requestedProjectSession.current.consume(projectId, requested);
       if (!target) {
         setComposer(projectViews.current.readDraft(workspaceRef.current, undefined) ?? "");
         setSelectedId(undefined);
@@ -614,8 +615,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       coordinator.recordFrame({ sequence: envelope.sequence, frame: envelope.event });
       const event = envelope.event;
       if (event.type === "runtime.resync") {
-        const requested = requestedProjectSession.current;
-        const preferred = (requested?.projectId === projectionRef.current.state.projectId ? requested?.sessionId : undefined)
+        const preferred = requestedProjectSession.current.read(projectionRef.current.state.projectId)
           ?? selectedRef.current ?? projectViews.current.read(workspaceRef.current)?.sessionId;
         startResync({
           sequence: envelope.sequence,
@@ -641,6 +641,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           setSettingsOpen(false);
           setRenameTarget(undefined);
           setArchiveTarget(undefined);
+          setDeleteTarget(undefined);
           setTaskMenuId(undefined);
           workspaceRef.current = event.state.workspace;
           coordinator.invalidateRequests("sessions", "snapshot", "diff");
@@ -738,7 +739,8 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   }, [coordinator, projectionRefreshes, refreshSessions, reloadSelected, reloadSessionConfig, setDesktop, setSnapshot, hostTransport]);
 
   const chooseWorkspace = async (projectId?: string, sessionId?: string) => runAction(async () => {
-    requestedProjectSession.current = projectId && sessionId ? { projectId, sessionId } : undefined;
+    if (projectId && sessionId) requestedProjectSession.current.request(projectId, sessionId);
+    else requestedProjectSession.current.clear();
     coordinator.invalidateRequests();
     const previousWorkspace = workspaceRef.current;
     let stateToken;
@@ -866,11 +868,51 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const archiveSession = async (session: RuntimeSessionSummary) => {
     if (isSessionReadOnly(session)) return;
     await runAction(async () => {
+      const owner = projectionRef.current.state;
       await transport.archiveSession(String(session.id));
       setArchiveTarget(undefined);
-      setSessionListStatus("archived");
-      await refreshSessions(String(session.id));
+      if (removeSessionFromView(String(session.id), "archive", owner)) await refreshSessions();
     });
+  };
+
+  const deleteSession = async (session: RuntimeSessionSummary) => {
+    await runAction(async () => {
+      const owner = projectionRef.current.state;
+      await transport.deleteSession(String(session.id));
+      setDeleteTarget(undefined);
+      if (removeSessionFromView(String(session.id), "delete", owner)) await refreshSessions();
+    });
+  };
+
+  const removeSessionFromView = (sessionId: string, action: "archive" | "delete", owner: DesktopState): boolean => {
+    requestedProjectSession.current.consume(owner.projectId, sessionId);
+    projectViews.current.forgetSession(owner.workspace, sessionId);
+    sidebarActivity.current.forgetSession(owner.projectId ?? owner.workspace, sessionId);
+    const draftPrefix = `${JSON.stringify([owner.workspace, sessionId]).slice(0, -1)},`;
+    setInputDrafts((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(draftPrefix))));
+    const scope = JSON.stringify([owner.projectId, owner.workspace, sessionId]);
+    setResultTargets((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== scope)));
+    if (projectionRef.current.state.workspace !== owner.workspace) return false;
+    coordinator.invalidateRequests("sessions", "snapshot", "diff");
+    projectionRefreshes.cancel();
+    setSessions(projectionRef.current.sessions.flatMap((session) => session.id !== sessionId ? [session]
+      : action === "archive" ? [{ ...session, status: "archived" as const }] : []));
+    setDesktop((current) => ({
+      ...current,
+      queuedBySession: Object.fromEntries(Object.entries(current.queuedBySession).filter(([id]) => id !== sessionId)),
+      ...(current.projects ? { projects: current.projects.map((project) => project.id === owner.projectId
+        ? { ...project, recentTasks: project.recentTasks.filter((task) => task.id !== sessionId) } : project) } : {}),
+    }));
+    if (selectedRef.current !== sessionId) return true;
+    configRequestGate.current.invalidate();
+    setSelectedId(undefined);
+    setSnapshot(undefined);
+    setComposer(projectViews.current.readDraft(owner.workspace, undefined) ?? "");
+    setSidePanel(undefined);
+    setCommandsOpen(false);
+    setSettingsOpen(false);
+    setLoadingSession(false);
+    return true;
   };
 
   const resumeSession = async () => {
@@ -1182,7 +1224,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                             items[nextIndex]?.focus();
                           }}
                         >
-                          <button role="menuitem" onClick={() => {
+                          {!isSessionReadOnly(session) ? <><button role="menuitem" onClick={() => {
                             dialogReturnFocusRef.current = taskMenuButtonRefs.current.get(String(session.id)) ?? null;
                             setRenameTarget(session);
                             setTaskMenuId(undefined);
@@ -1191,7 +1233,12 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                             dialogReturnFocusRef.current = taskMenuButtonRefs.current.get(String(session.id)) ?? null;
                             setArchiveTarget(session);
                             setTaskMenuId(undefined);
-                          }}>归档会话</button>
+                          }}>归档会话</button></> : null}
+                          <button className="danger-menu-item" role="menuitem" onClick={() => {
+                            dialogReturnFocusRef.current = taskMenuButtonRefs.current.get(String(session.id)) ?? null;
+                            setDeleteTarget(session);
+                            setTaskMenuId(undefined);
+                          }}>删除会话</button>
                         </div>
                       ) : null}
                     </>
@@ -1216,7 +1263,10 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           <div className="conversation-heading">
             <div className="conversation-title"><h1>{selectedId ? selectedTitle : "新会话"}</h1></div>
             <div className="conversation-heading-actions">
-              {activity.kind !== "idle" && !selectedReadOnly ? <span className={`conversation-state state-${activity.kind}`}><span />{activity.label}</span> : null}
+              {activity.kind !== "idle" && !selectedReadOnly ? <span className={`conversation-state state-${activity.kind}`}
+                {...(activity.kind === "running" ? { role: "img", "aria-label": activity.label } : {})}>
+                {activity.kind === "running" ? <span className="activity-spinner" aria-hidden="true" /> : <><span />{activity.label}</>}
+              </span> : null}
               {selectedId ? <button type="button" className="conversation-panel-trigger" aria-pressed={activePanel?.view === "progress"} onClick={() => activePanel?.view === "progress" ? closePanel() : openPanel("progress")}><Icon name="activity" />进展</button> : null}
               {hasResults ? <button type="button" className="conversation-panel-trigger" aria-pressed={activePanel?.view === "files"} onClick={() => activePanel?.view === "files" ? closePanel() : openPanel("files")}>交付文件</button> : null}
               {changeTarget ? <button type="button" className="conversation-panel-trigger" aria-pressed={activePanel?.view === "changes"} onClick={() => activePanel?.view === "changes" ? closePanel() : openPanel("changes")}>改动</button> : null}
@@ -1391,6 +1441,17 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           returnFocus={dialogReturnFocusRef.current}
           onClose={() => !working && setArchiveTarget(undefined)}
           onArchive={() => void archiveSession(archiveTarget)}
+        />
+      ) : null}
+
+      {deleteTarget ? (
+        <DeleteTaskDialog
+          session={deleteTarget}
+          disabled={working}
+          deleteDisabled={String(deleteTarget.id) === selectedId && Boolean(sessionBusy)}
+          returnFocus={dialogReturnFocusRef.current}
+          onClose={() => !working && setDeleteTarget(undefined)}
+          onDelete={() => void deleteSession(deleteTarget)}
         />
       ) : null}
 
@@ -1590,8 +1651,35 @@ function ArchiveTaskDialog({
     <ModalFrame labelId="archive-task-title" className="compact-dialog" onClose={onClose} closeDisabled={disabled} returnFocus={returnFocus}>
       <div>
         <header className="modal-heading"><div><p className="eyebrow">Archive</p><h2 id="archive-task-title">Archive task?</h2><p>{session.title || session.preview || "新会话"}</p></div></header>
-        <div className="compact-dialog-body archive-warning"><Icon name="archive" /><p>This removes the task from Active tasks. Archived tasks remain inspectable but are read-only and cannot be restored in this milestone.</p>{archiveDisabled ? <small>Stop the running task before archiving it.</small> : null}</div>
+        <div className="compact-dialog-body archive-warning"><Icon name="archive" /><p>归档后会话将从当前列表隐藏。可以在搜索中的“已归档”查看历史记录。</p>{archiveDisabled ? <small>Stop the running task before archiving it.</small> : null}</div>
         <footer className="modal-actions"><span /><div><button autoFocus data-modal-initial-focus="true" className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="danger" type="button" disabled={disabled || archiveDisabled} onClick={onArchive}>归档会话</button></div></footer>
+      </div>
+    </ModalFrame>
+  );
+}
+
+function DeleteTaskDialog({
+  session,
+  disabled,
+  deleteDisabled,
+  returnFocus,
+  onClose,
+  onDelete,
+}: {
+  session: RuntimeSessionSummary;
+  disabled: boolean;
+  deleteDisabled: boolean;
+  returnFocus: HTMLElement | null;
+  onClose: () => void;
+  onDelete: () => void;
+}) {
+  useDialogEscape(onClose, disabled);
+  return (
+    <ModalFrame labelId="delete-task-title" className="compact-dialog" onClose={onClose} closeDisabled={disabled} returnFocus={returnFocus}>
+      <div>
+        <header className="modal-heading"><div><h2 id="delete-task-title">删除会话？</h2><p>{session.title || session.preview || "新会话"}</p></div></header>
+        <div className="compact-dialog-body archive-warning"><Icon name="trash" /><p>会话及其历史记录将永久删除，无法恢复。工作区中的文件会保留。</p>{deleteDisabled ? <small>请先停止正在处理的会话，再删除。</small> : null}</div>
+        <footer className="modal-actions"><span /><div><button autoFocus data-modal-initial-focus="true" className="secondary" type="button" disabled={disabled} onClick={onClose}>取消</button><button className="danger" type="button" disabled={disabled || deleteDisabled} onClick={onDelete}>删除会话</button></div></footer>
       </div>
     </ModalFrame>
   );
@@ -2058,7 +2146,7 @@ function inlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
   return nodes;
 }
 
-type IconName = "activity" | "archive" | "chevron" | "close" | "folder" | "message" | "more"
+type IconName = "activity" | "archive" | "trash" | "chevron" | "close" | "folder" | "message" | "more"
   | "appearance" | "pause" | "plus" | "queue" | "resume" | "search" | "send" | "settings" | "shield" | "sidebar"
   | "steer" | "stop" | "terminal";
 
@@ -2079,6 +2167,7 @@ function Icon({ name }: { name: IconName }) {
       case "sidebar": return <><rect x="3" y="3" width="18" height="18" rx="3" /><path d="M9 3v18" /></>;
       case "activity": return <><path d="M4 12h3l2-5 4 10 2-5h5" /><path d="M4 4v16h16" /></>;
       case "archive": return <><path d="M4 7h16v13H4V7Zm-1-3h18v4H3V4Z" /><path d="M9 12h6" /></>;
+      case "trash": return <><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7" /></>;
       case "plus": return <path d="M12 5v14M5 12h14" />;
       case "message": return <path d="M5 5h14v10H9l-4 4V5Z" />;
       case "more": return <><circle cx="6" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="18" cy="12" r="1" fill="currentColor" stroke="none" /></>;

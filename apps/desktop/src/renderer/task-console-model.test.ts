@@ -20,6 +20,7 @@ import {
   preferredServiceTier,
   reconcileNewTaskModel,
   reconcileSessionModelSettingsModel,
+  sessionAfterListRefresh,
   sessionModelSettingsMutations,
   serviceTierMutationValue,
   validateNewTaskDraft,
@@ -368,12 +369,12 @@ test("filters active and archived tasks across title, preview, path, and id", ()
   expect(filterSessions(sessions, "AUTH", "archived").map(StringId)).toEqual(["session_archived"]);
 });
 
-test("keeps archived sessions visible without offering execution controls", () => {
+test("keeps archived sessions discoverable and deletable without offering execution controls", () => {
   const archived = session("session_archived", "archived", 40, "Archived work", "Previous result");
   expect(filterSessions([archived], "archived", "archived")).toEqual([archived]);
   const readOnly = isSessionReadOnly(archived);
   expect(readOnly).toBe(true);
-  expect(canExposeTaskActions(archived)).toBe(false);
+  expect(canExposeTaskActions(archived)).toBe(true);
   expect(canReloadSessionMcp(archived.id, readOnly, false)).toBe(false);
   expect(canResumeTask("cancelled", readOnly, true)).toBe(false);
   expect(canResumeTask("failed", readOnly, true)).toBe(false);
@@ -398,13 +399,40 @@ test("only offers resume for a paused input queue after execution settles", () =
   }
 });
 
-test("keeps archived task menus and MCP mutations fail closed", () => {
+test("allows archived task management while blocking MCP mutations", () => {
   expect(canExposeTaskActions({ status: "active" })).toBe(true);
-  expect(canExposeTaskActions({ status: "archived" })).toBe(false);
+  expect(canExposeTaskActions({ status: "archived" })).toBe(true);
   expect(canReloadSessionMcp("session_active", false, false)).toBe(true);
   expect(canReloadSessionMcp("session_archived", true, false)).toBe(false);
   expect(canReloadSessionMcp(undefined, false, false)).toBe(false);
   expect(canReloadSessionMcp("session_busy", false, true)).toBe(false);
+});
+
+test("archiving the selected session selects another active session and preserves other selections", () => {
+  const sessions = [
+    session("selected", "archived", 30, "Archived", ""),
+    session("other", "active", 20, "Other", ""),
+    session("older", "active", 10, "Older", ""),
+  ];
+  expect(sessionAfterListRefresh(sessions, "selected", undefined, "active")).toBe("other");
+  expect(sessionAfterListRefresh(sessions, "older", undefined, "active")).toBe("older");
+  expect(sessionAfterListRefresh(sessions, undefined, "selected", "active")).toBe("other");
+});
+
+test("deleting the selected session falls back to active history and never auto-opens archives", () => {
+  const archived = session("archived", "archived", 30, "Archived", "");
+  const active = session("active", "active", 20, "Active", "");
+  expect(sessionAfterListRefresh([archived, active], "deleted", undefined, "active")).toBe("active");
+  expect(sessionAfterListRefresh([archived], "deleted", undefined, "active")).toBeUndefined();
+  expect(sessionAfterListRefresh([archived], undefined, "archived", "active")).toBeUndefined();
+  expect(sessionAfterListRefresh([archived], undefined, undefined, "archived")).toBeUndefined();
+});
+
+test("retains archived selection only after deliberate access through the archived list", () => {
+  const archived = session("archived", "archived", 30, "Archived", "");
+  expect(sessionAfterListRefresh([archived], "archived", undefined, "archived")).toBe("archived");
+  expect(sessionAfterListRefresh([archived], undefined, "archived", "archived")).toBe("archived");
+  expect(sessionAfterListRefresh([archived], "archived", undefined, "active")).toBeUndefined();
 });
 
 function session(

@@ -8,8 +8,11 @@ export const SESSION_PAGE_SIZE = 5;
 export function SessionActivityBadge(props: SessionActivityInput) {
   const activity = sessionActivity(props);
   if (!activity) return null;
+  const spinning = activity.tone === "working";
   return <span className="session-activity" data-tone={activity.tone} title={activity.description}
-    aria-label={activity.description}>{activity.label}</span>;
+    role={spinning ? "img" : undefined} aria-label={activity.description}>
+    {spinning ? <span className="activity-spinner" aria-hidden="true" /> : activity.label}
+  </span>;
 }
 
 export function SessionList({ sessions, selectedId, initialLimit = SESSION_PAGE_SIZE, children }: {

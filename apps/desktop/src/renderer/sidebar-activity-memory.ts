@@ -99,6 +99,10 @@ export class SidebarActivityMemory {
     };
   }
 
+  forgetSession(projectKey: string | undefined, sessionId: string): void {
+    if (projectKey) this.projects.get(projectKey)?.delete(sessionId);
+  }
+
   private session(projectKey: string, sessionId: string): SessionActivityRecord {
     let project = this.projects.get(projectKey);
     if (!project) {

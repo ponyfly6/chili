@@ -185,6 +185,19 @@ export function filterSessions(
     .sort((left, right) => right.updatedAt - left.updatedAt || String(left.id).localeCompare(String(right.id)));
 }
 
+export function sessionAfterListRefresh(
+  sessions: readonly RuntimeSessionSummary[],
+  currentId: string | undefined,
+  preferredId: string | undefined,
+  listStatus: SessionListStatus,
+): string | undefined {
+  const selectable = (id: string | undefined) => id && sessions.some((session) => session.id === id
+    && (session.status === "active" || listStatus === "archived"));
+  if (selectable(preferredId)) return preferredId;
+  if (selectable(currentId)) return currentId;
+  return filterSessions(sessions, "", "active")[0]?.id;
+}
+
 export function canResumeTask(
   sessionStatus: RuntimeSessionStatus | "unknown" | undefined,
   readOnly: boolean,
@@ -203,7 +216,7 @@ export function isSessionReadOnly(
 }
 
 export function canExposeTaskActions(session: Pick<RuntimeSessionSummary, "status">): boolean {
-  return session.status === "active";
+  return session.status === "active" || session.status === "archived";
 }
 
 export function canReloadSessionMcp(
