@@ -27,10 +27,12 @@ export async function assertTimelineNavigation(page: Page): Promise<void> {
     }, { id: fixtureId, height: Math.max(1_200, viewportHeight * 3) });
     await waitForBottom(page);
 
-    await timeline.evaluate((element) => {
-      element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight - Math.max(240, element.clientHeight));
-    });
+    // Exercise the user's upward intent before any pending layout follow runs.
+    // A direct scrollTop write can race the ResizeObserver from the fixture above.
+    await timeline.hover();
+    await page.mouse.wheel(0, -Math.max(240, viewportHeight));
     await latest.waitFor({ state: "visible" });
+    await waitForLayout(page);
     const paused = await timeline.evaluate((element) => ({ top: element.scrollTop, height: element.scrollHeight }));
 
     await growFixture(page, fixtureId, Math.max(600, viewportHeight));
