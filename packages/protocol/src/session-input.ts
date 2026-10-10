@@ -1,6 +1,6 @@
 import type { MessageId, SessionId, TurnId } from "./ids.js";
 
-export type RuntimeInputMode = "start" | "queue" | "steer";
+export type RuntimeInputMode = "start" | "queue" | "steer" | "followup";
 export type RuntimeInputOutcome = "completed" | "failed" | "cancelled" | "interrupted";
 
 /** A receipt is an acknowledgement of committed input, not of execution. */
@@ -15,6 +15,10 @@ export interface RuntimeSessionInput {
   text: string;
   acceptedAt: number;
   updatedAt: number;
+  /** Included in a prepared task request; acceptance alone does not imply reading. */
+  readAt?: number;
+  /** Supplement delivered within this original input's execution. */
+  parentInputId?: string;
   executionRef?: string;
   messageId?: MessageId;
   /** Final assistant response for this input, which may be in a later turn. */

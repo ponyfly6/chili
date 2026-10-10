@@ -9,16 +9,18 @@ import { SessionActivityBadge, SessionList } from "./SessionList.js";
 import { SidebarActivityMemory } from "./sidebar-activity-memory.js";
 import { UserInputCard } from "./UserInputCard.js";
 import { createUserInputDraft, type UserInputDraft } from "./user-input-drafts.js";
-import { ConversationActivityBar, ConversationQueue } from "./ConversationActivity.js";
+import { ConversationActivityBar } from "./ConversationActivity.js";
 import { conversationActivity } from "./conversation-activity.js";
 import { ResultsPanel } from "./ResultsPanel.js";
 import { DeliveryCard } from "./DeliveryCard.js";
+import { agentProgressSummary } from "./progress-model.js";
 import { ProgressPanel } from "./ProgressPanel.js";
 import { ChangesPanel } from "./ChangesPanel.js";
 import { latestFileChange } from "./latest-file-change.js";
 import { discoverDesktopResults } from "./result-model.js";
 import { TimelineViewport } from "./TimelineViewport.js";
 import { ConversationTimeline } from "./ConversationTimeline.js";
+import { conversationStatusNote } from "./conversation-timeline-model.js";
 import { HistoryNavigation, type HistoryNavigationState } from "./history-navigation.js";
 import { sessionDescendantAgents } from "./agent-details-model.js";
 import { formatWorkDuration, workCurrentDetail, workHeadline, workStages, workToolStatus, workToolSubject, workToolTitle, type WorkStage } from "./work-presentation.js";
@@ -1020,7 +1022,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     }
   };
 
-  const submit = async (mode: "queue" | "steer") => {
+  const submit = async () => {
     const draft = composer.trim();
     if (!draft || !composerEditable || actionInFlightRef.current) return;
     const localCommand = matchingDesktopCommands(draft).find((command) => `/${command.id}` === draft.toLowerCase());
@@ -1040,7 +1042,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         if (selectedSession?.title === "新会话" && !presentation?.chat.items.some((item) => item.kind === "message" && item.role === "user")) {
           await transport.renameSession(selectedId, conversationTitle(text));
         }
-        await transport.send(selectedId, text, mode);
+        await transport.send(selectedId, text, "followup");
         projectViews.current.remember(desktop.workspace, selectedId, "");
         setResultTargets((current) => {
           if (current[conversationScope] !== resultTarget) return current;
@@ -1299,7 +1301,10 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           <div className="conversation-dialogue">
           <div className="conversation-body">
           <div className="chat-surface">
-          {transport.conversationPage && selectedId && !emptyConversation ? <ConversationTimeline key={conversationScope} transport={projectTransport(desktop)} sessionId={selectedId} revision={snapshot} workspace={desktop.workspace} onOpenResult={(path) => openPanel("files", path)} /> : <>
+          {transport.conversationPage && selectedId && !emptyConversation ? <ConversationTimeline key={conversationScope} transport={projectTransport(desktop)} sessionId={selectedId} revision={snapshot} workspace={desktop.workspace} projectId={desktop.projectId}
+            inputQueue={snapshot?.inputQueue} statusNote={conversationStatusNote(snapshot?.events ?? [], selectedId, presentation?.chat.status, presentation?.chat.statusReason)}
+            agentSummary={agentProgressSummary(descendantAgents)} onOpenAgents={() => openPanel("progress")}
+            onOpenResult={(path) => openPanel("files", path)} /> : <>
             {historyPage ? <div className="conversation-history" role="navigation" aria-label="会话历史">
               <span>正在查看主会话历史。</span>
               <button className="secondary" disabled={historyState.loading || !historyPage.nextBeforeEventId} onClick={() => void history.older()}>更早的记录</button>
@@ -1352,7 +1357,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           ) : null}
 
           <div className="composer-wrap">
-            <ConversationQueue queue={snapshot?.inputQueue} pendingCount={desktop.queuedBySession[selectedId ?? ""] ?? 0} />
             {resultTarget ? <div className="composer-result-target"><span>正在修改：{resultTarget}</span><button type="button" aria-label="取消修改对象" onClick={() => setResultTargets((current) => { const next = { ...current }; delete next[conversationScope]; return next; })}><Icon name="close" /></button></div> : null}
             <div className="composer">
               {commandsOpen && commands.length > 0 ? <div id="composer-commands" className="composer-command-menu" role="listbox" aria-label="斜杠命令">
@@ -1379,10 +1383,10 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
                     if (commands.length) chooseCommand(commands[commandIndex % commands.length]!);
-                    else if (composerEditable) void submit("queue");
+                    else if (composerEditable) void submit();
                   }
                 }}
-                placeholder={selectedReadOnly ? "已归档的会话仅供查看" : resultTarget ? "想怎么修改这个文件？" : activity.queueInput ? "补充想法，或告诉 Chili 调整方向…" : emptyConversation ? "说说你想做什么…" : "继续说说你想改哪里…"}
+                placeholder={selectedReadOnly ? "已归档的会话仅供查看" : resultTarget ? "想怎么修改这个文件？" : emptyConversation ? "说说你想做什么…" : "继续说，随时补充…"}
                 aria-expanded={commandsOpen && commands.length > 0}
                 aria-controls={commandsOpen && commands.length > 0 ? "composer-commands" : undefined}
                 aria-activedescendant={commandsOpen && commands.length > 0 ? `command-${commands[commandIndex % commands.length]!.id}` : undefined}
@@ -1396,13 +1400,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                   <button className="slash-trigger" aria-label="更多命令" disabled={!composerEditable} onClick={() => { setCommandsOpen((open) => !open); setCommandIndex(0); composerRef.current?.focus(); }}>/ <span>更多</span></button>
                 </div>
                 <div className="composer-buttons">
-                  {sessionBusy && presentation?.chat.status !== "cancelling" && composer.trim() ? (
-                    <button className="steer-button" disabled={!composer.trim() || !selectedId || runtimeActionsDisabled} onClick={() => void submit("steer")}>
-                      <Icon name="steer" />调整方向
-                    </button>
-                  ) : null}
-                  {activity.queueInput ? <span className="composer-send-hint">稍后处理</span> : null}
-                  <button className="send-button" title={activity.queueInput ? "Queue message" : "Send message"} aria-label={activity.queueInput ? "Queue message" : "Send message"} disabled={!composer.trim() || runtimeActionsDisabled} onClick={() => void submit("queue")}>
+                  <button className="send-button" title="发送" aria-label="Send message" disabled={!composer.trim() || runtimeActionsDisabled} onClick={() => void submit()}>
                     <Icon name="send" />
                   </button>
                 </div>

@@ -283,3 +283,49 @@ test("recovery closes abandoned turns, tools and legacy approvals without replay
   expect((await store.events({ sessionId, type: "tool.call_started" }))).toHaveLength(1);
   expect((await store.events({ sessionId, type: "approval.requested" }))).toHaveLength(1);
 });
+
+
+test("unread joined supplements recover with their original execution and revoked sources stay revoked", async () => {
+  const { store, path } = await fixture();
+  const original = accept(store, "original").input!;
+  const active = claim(store).input!;
+  store.mutateSessionInputs({ kind: "promote", sessionId, inputId: original.inputId, claimId: "claim_1", text: "original" });
+  for (const source of ["local", "remote:test"]) {
+    const input = store.mutateSessionInputs({ kind: "accept", sessionId, inputId: `extra_${source}`, submissionId: source, mode: "followup", source, text: source, payload: JSON.stringify({ text: source }) }).input!;
+    store.mutateSessionInputs({ kind: "join", sessionId, inputId: input.inputId, expectedRevision: input.revision, claimId: "claim_1", executionRef: active.executionRef!, parentInputId: original.inputId, turnId: active.turnId!, text: source });
+    store.mutateSessionInputs({ kind: "settle", sessionId, inputId: input.inputId, claimId: "claim_1", outcome: "interrupted" });
+  }
+  store.mutateSessionInputs({ kind: "pause", sessionId });
+  store.mutateSessionInputs({ kind: "settle", sessionId, inputId: original.inputId, claimId: "claim_1", outcome: "interrupted" });
+  store.releaseSessionRun({ sessionId, claimId: "claim_1" });
+  store.mutateSessionInputs({ kind: "cancel-source", sessionId, source: "remote:test" });
+  const reopened = new SqliteEventStore(path);
+  try {
+    const queue = reopened.sessionInputQueue(sessionId);
+    const interrupted = queue.items.find((input) => input.state === "settled")!;
+    expect(interrupted.inputId).toBe(original.inputId);
+    reopened.mutateSessionInputs({ kind: "resume", sessionId, inputId: interrupted.inputId, expectedRevision: queue.revision, expectedInputRevision: interrupted.revision });
+    expect(reopened.sessionInputQueue(sessionId).items.filter((item) => item.state === "pending").map((item) => item.inputId)).toEqual([original.inputId, "extra_local"]);
+    expect(reopened.sessionInput(sessionId, "remote:test")?.state).toBe("settled");
+    const next = claim(reopened, "next").input!;
+    const extra = reopened.sessionInput(sessionId, "local")!;
+    reopened.mutateSessionInputs({ kind: "join", sessionId, inputId: extra.inputId, expectedRevision: extra.revision, claimId: "next", executionRef: next.executionRef!, parentInputId: original.inputId, turnId: next.turnId!, text: "local" });
+    reopened.mutateSessionInputs({ kind: "read", sessionId, claimId: "next" });
+    expect(reopened.sessionInput(sessionId, "local")?.readAt).toBeNumber();
+    expect((await reopened.messages(sessionId)).filter((m) => m.id === extra.messageId)).toHaveLength(1);
+  } finally { reopened.close(); }
+});
+
+test("Agent work summaries retain durable failures and completion after reopening without replaying history", async () => {
+  const { store, path } = await fixture();
+  const input = accept(store, "work").input!;
+  claim(store);
+  store.mutateSessionInputs({ kind: "settle", sessionId, inputId: input.inputId, claimId: "claim_1", outcome: "failed", error: "Provider response ended unexpectedly" });
+  store.releaseSessionRun({ sessionId, claimId: "claim_1" });
+  const reopened = new SqliteEventStore(path);
+  try {
+    const wrapped = new ObservableEventStore(reopened);
+    expect(wrapped.agentProgress(sessionId)).toMatchObject({ state: "failed", task: "first", detail: "Provider response ended unexpectedly" });
+    expect(JSON.stringify(wrapped.agentProgress(sessionId)).length).toBeLessThan(1000);
+  } finally { reopened.close(); }
+});

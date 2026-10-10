@@ -1,4 +1,4 @@
-import type { RuntimeSessionInput } from "@chili/protocol";
+import type { RuntimeSessionInput, RuntimeAgentRecord } from "@chili/protocol";
 import type { ChiliToolExecutionContext } from "./types.js";
 
 export interface AgentSpawnToolInput { name: string; prompt: string; cwd?: string; }
@@ -10,13 +10,7 @@ export type AgentStopToolInput = AgentTargetToolInput;
 export type AgentResumeToolInput = AgentTargetToolInput;
 export type AgentInputToolRecord = RuntimeSessionInput;
 
-export interface AgentToolRecord {
-  agentId: string;
-  name: string;
-  path: string;
-  parentAgentId?: string;
-  state: "idle" | "running" | "paused";
-}
+export type AgentToolRecord = RuntimeAgentRecord;
 
 export interface AgentInputToolReceipt { agentId: string; inputId: string; }
 export interface AgentWaitToolResult { input: RuntimeSessionInput; result?: unknown; timedOut: boolean; }

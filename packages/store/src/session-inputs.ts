@@ -27,6 +27,8 @@ export type SessionInputMutation =
   | SessionInputAccept
   | { kind: "claim"; sessionId: SessionId; claimId: string; executionRef: string; leaseDurationMs: number }
   | { kind: "promote"; sessionId: SessionId; inputId: string; claimId: string; text: string; displayText?: string; images?: readonly MessageImageContent[] }
+  | { kind: "join"; sessionId: SessionId; inputId: string; expectedRevision: number; claimId: string; executionRef: string; parentInputId: string; turnId: TurnId; text: string; displayText?: string; images?: readonly MessageImageContent[] }
+  | { kind: "read"; sessionId: SessionId; claimId: string }
   | { kind: "settle"; sessionId: SessionId; inputId: string; claimId: string; outcome: RuntimeInputOutcome; error?: string; resultMessageId?: MessageId }
   | { kind: "pause"; sessionId: SessionId }
   | { kind: "resume"; sessionId: SessionId; expectedRevision?: number; inputId?: string; expectedInputRevision?: number }
@@ -63,6 +65,7 @@ interface InputRow {
   execution_ref: string | null; message_id: string | null; turn_id: string | null;
   outcome: RuntimeInputOutcome | null; error: string | null;
   result_message_id: string | null; resumed: number;
+  read_at: number | null; parent_input_id: string | null;
 }
 
 interface InputRepositoryOptions {
@@ -113,7 +116,7 @@ export class SessionInputRepository {
     // Steer can finish newer submissions before older queued work. Recovery
     // follows settlement revisions, not the admission sequence.
     const interrupted = this.db.query<InputRow, [string, string]>(
-      "select * from session_inputs where session_id = ? and state = 'settled' and outcome != 'completed' and claim_id is not null and settled_revision > coalesce((select max(settled_revision) from session_inputs where session_id = ? and outcome = 'completed'), 0) order by settled_revision desc limit 1",
+      "select * from session_inputs where session_id = ? and state = 'settled' and outcome != 'completed' and claim_id is not null and parent_input_id is null and settled_revision > coalesce((select max(settled_revision) from session_inputs where session_id = ? and outcome = 'completed' and parent_input_id is null), 0) order by settled_revision desc limit 1",
     ).get(sessionId, sessionId);
     const count = this.db.query<{ count: number }, [string, string]>(
       "select count(*) as count from session_inputs where session_id = ? and outcome = 'interrupted' and settled_revision > coalesce((select max(settled_revision) from session_inputs where session_id = ? and outcome = 'completed'), 0)",
@@ -173,6 +176,13 @@ export class SessionInputRepository {
           ? payload
           : this.options.content?.storeText(command.identity, sessionId) ?? command.identity;
         this.db.query("insert or ignore into session_dispatch(session_id) values (?)").run(sessionId);
+        // A newly sent conversational message deliberately continues paused work.
+        // Duplicate delivery returned above must never undo a later Stop.
+        if (command.mode === "followup" && queue.paused) {
+          const interrupted = queue.items.find((item) => item.state === "settled" && !item.parentInputId);
+          if (!activeClaim && interrupted) this.resumeInput(sessionId, interrupted.inputId, time);
+          this.db.query("update session_dispatch set paused = 0 where session_id = ?").run(sessionId);
+        }
         // A deliberate fresh start can begin an idle session. It cannot resume
         // older queued work implicitly: pending inputs were rejected above.
         if (command.mode === "start") this.db.query("update session_dispatch set paused = 0 where session_id = ?").run(sessionId);
@@ -202,11 +212,25 @@ export class SessionInputRepository {
         );
         input = this.get(sessionId, row.submission_id);
         changed = true;
-      } else if (command.kind === "promote" || command.kind === "settle") {
-        const row = this.db.query<InputRow, [string, string]>("select * from session_inputs where session_id = ? and input_id = ?").get(sessionId, command.inputId);
+      } else if (command.kind === "read") {
+        fence = { sessionId, claimId: command.claimId };
+        changed = this.db.query("update session_inputs set read_at = ?, updated_at = ?, revision = revision + 1 where session_id = ? and claim_id = ? and state = 'claimed' and read_at is null")
+          .run(time, time, sessionId, command.claimId).changes > 0;
+      } else if (command.kind === "promote" || command.kind === "join" || command.kind === "settle") {
+        let row = this.db.query<InputRow, [string, string]>("select * from session_inputs where session_id = ? and input_id = ?").get(sessionId, command.inputId);
+        if (command.kind === "join") {
+          const parent = this.getById(sessionId, command.parentInputId);
+          if (!row || row.state !== "pending" || row.mode !== "followup" || row.revision !== command.expectedRevision
+            || !parent || parent.state !== "claimed" || parent.claimId !== command.claimId || parent.executionRef !== command.executionRef
+            || this.queue(sessionId).paused) throw new SessionInputConflictError("Supplement or execution changed before reading");
+          this.db.query("update session_inputs set state = 'claimed', revision = revision + 1, updated_at = ?, claim_id = ?, execution_ref = ?, message_id = ?, turn_id = ?, parent_input_id = ? where input_id = ?")
+            .run(time, command.claimId, command.executionRef, `msg_input_${row.input_id}`, command.turnId, command.parentInputId, row.input_id);
+          row = this.db.query<InputRow, [string, string]>("select * from session_inputs where session_id = ? and input_id = ?").get(sessionId, command.inputId);
+          changed = true;
+        }
         if (!row || row.state !== "claimed" || row.claim_id !== command.claimId) throw new SessionInputConflictError("Input execution no longer owns its claim");
         fence = { sessionId, claimId: command.claimId };
-        if (command.kind === "promote") {
+        if (command.kind === "promote" || command.kind === "join") {
           const found = this.db.query<{ found: number }, [string]>("select 1 as found from messages where id = ?").get(row.message_id!);
           if (!found) {
             const messageId = row.message_id as MessageId;
@@ -230,13 +254,14 @@ export class SessionInputRepository {
           if (command.resultMessageId) {
             // The receipt points at this execution's response, never a later
             // Session response or an earlier run's last assistant message.
-            const result = this.db.query<{ found: number }, [string, string, string, string, number]>(`select 1 as found from messages m
+            const result = this.db.query<{ found: number }, [string, string, string, string, string, number]>(`select 1 as found from messages m
               where m.id = ? and m.session_id = ? and m.role = 'assistant'
               and m.created_event_seq > (select min(e.seq) from events e, json_each(e.payload_json, '$.items') item
                 where e.type = 'session.input_queue_changed' and e.session_id = m.session_id
                 and json_extract(item.value, '$.inputId') = ? and json_extract(item.value, '$.executionRef') = ?
                 and json_extract(item.value, '$.state') = 'claimed'
-                and json_extract(item.value, '$.revision') = ?)`).get(command.resultMessageId, sessionId, row.input_id, row.execution_ref!, row.revision);
+                and json_extract(item.value, '$.turnId') = ?
+                and json_extract(item.value, '$.revision') <= ?)`).get(command.resultMessageId, sessionId, row.input_id, row.execution_ref!, row.turn_id!, row.revision);
             if (!result) throw new SessionInputConflictError("Result message does not belong to this input execution");
           }
           this.db.query("update session_inputs set state = 'settled', outcome = ?, error = ?, result_message_id = ?, revision = revision + 1, updated_at = ?, settled_revision = (select revision + 1 from session_dispatch where session_id = session_inputs.session_id) where input_id = ?").run(
@@ -257,7 +282,7 @@ export class SessionInputRepository {
           }
           const revoked = this.db.query<{ found: number }, [string, string]>("select 1 as found from session_input_revocations where session_id = ? and source = ?").get(sessionId, row.source);
           if (revoked) throw new SessionInputConflictError("Input authorization was revoked");
-          this.db.query("update session_inputs set state = 'pending', outcome = null, error = null, result_message_id = null, claim_id = null, execution_ref = null, resumed = 1, revision = revision + 1, updated_at = ? where input_id = ?").run(time, row.inputId);
+          this.resumeInput(sessionId, row.inputId, time);
           input = this.getById(sessionId, row.inputId);
           changed = true;
         }
@@ -318,6 +343,17 @@ export class SessionInputRepository {
       }
     });
   }
+
+  private resumeInput(sessionId: SessionId, inputId: string, time: number): void {
+    const revoked = this.db.query("select 1 from session_inputs i join session_input_revocations r on r.session_id = i.session_id and r.source = i.source where i.session_id = ? and i.input_id = ?").get(sessionId, inputId);
+    if (revoked) throw new SessionInputConflictError("Input authorization was revoked");
+    this.db.query("update session_inputs set state = 'pending', outcome = null, error = null, result_message_id = null, claim_id = null, execution_ref = null, read_at = null, resumed = 1, revision = revision + 1, updated_at = ? where session_id = ? and input_id = ?")
+      .run(time, sessionId, inputId);
+    // Intake can commit just before a crash. Unread supplements rejoin the
+    // recovered execution; their stable message IDs prevent duplicate history.
+    this.db.query("update session_inputs set state = 'pending', outcome = null, error = null, claim_id = null, execution_ref = null, revision = revision + 1, updated_at = ? where session_id = ? and parent_input_id = ? and read_at is null and state = 'settled' and not exists (select 1 from session_input_revocations r where r.session_id = session_inputs.session_id and r.source = session_inputs.source)")
+      .run(time, sessionId, inputId);
+  }
 }
 
 function publicInput(row: InputRow): RuntimeSessionInput {
@@ -325,6 +361,8 @@ function publicInput(row: InputRow): RuntimeSessionInput {
     inputId: row.input_id, submissionId: row.submission_id, sessionId: row.session_id as SessionId,
     mode: row.mode, state: row.state, revision: row.revision, sequence: row.sequence,
     text: row.text.slice(0, 2000), acceptedAt: row.accepted_at, updatedAt: row.updated_at,
+    ...(row.read_at !== null && row.read_at !== undefined ? { readAt: row.read_at } : {}),
+    ...(row.parent_input_id ? { parentInputId: row.parent_input_id } : {}),
     ...(row.execution_ref ? { executionRef: row.execution_ref } : {}),
     ...(row.message_id ? { messageId: row.message_id as MessageId } : {}),
     ...(row.turn_id ? { turnId: row.turn_id as TurnId } : {}),

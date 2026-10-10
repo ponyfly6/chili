@@ -40,8 +40,10 @@ export async function assertHistoryPagination(page: Page, workspace: string, rep
     await page.waitForTimeout(100);
   }
   assert.equal(await timeline.locator("[data-message-id]").count(), 61, "Every message remains reachable across the oversized middle row");
-  await timeline.getByText("history_probe · completed · 查看详情", { exact: true }).click();
-  const tool = timeline.locator("details.tool-details").filter({ has: page.getByText("history_probe · completed · 查看详情", { exact: true }) });
+  const processGroup = timeline.locator(".conversation-process").filter({ has: page.getByText("history_probe", { exact: true }) });
+  await processGroup.locator(":scope > summary").click();
+  const tool = timeline.locator("details.tool-details").filter({ has: page.getByText("history_probe", { exact: true }) });
+  await tool.locator(":scope > summary").click();
   await tool.getByText("调用参数", { exact: true }).click();
   await tool.getByText(/ARGUMENT_START/u).waitFor();
   const input = tool.locator("details").filter({ has: page.getByText("调用参数", { exact: true }) });

@@ -13,6 +13,7 @@ import type {
   PersistedToolPolicy,
   ExecutionIdentity,
   RuntimeInputQueue,
+  RuntimeAgentProgress,
   RuntimeStateSnapshot,
   ChiliEvent,
 } from "@chili/protocol";
@@ -98,6 +99,7 @@ export interface CreateChildSessionResult {
 }
 
 export interface AgentSessionStore {
+  agentProgress?(sessionId: SessionId): RuntimeAgentProgress | undefined;
   session(sessionId: SessionId): Promise<SessionRow | undefined>;
   childSessions(parentSessionId: SessionId): Promise<SessionRow[]>;
   createChildSession(input: CreateChildSessionInput): Promise<CreateChildSessionResult>;

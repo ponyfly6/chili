@@ -54,8 +54,12 @@ export async function assertDelegatedConversation(page: Page, workspace: string,
   assert.doesNotMatch(details, /Agent ID|Parent agent ID|Nested agents|Queue|Steer|\/root\/|Agent message:|collaborator-provided/u,
     "Progress describes work without exposing runtime identifiers or delegation controls");
   assert.equal(await panel.locator(".agent-history-timeline").count(), 0, "Child history waits for an explicit selection");
-  await panel.getByLabel("查看 Agent 对话").selectOption({ label: "reader" });
+  assert.equal(await panel.locator("select").count(), 0, "Task rows are the only child navigation");
+  assert.match(details, /已完成/u, "Durable child outcome appears without loading child history");
+  await page.screenshot({ path: join(artifacts, "delegated-task-list.png") });
+  await panel.locator(".progress-entry").filter({ hasText: "reader" }).click();
   await panel.locator(".agent-history-timeline").getByText("I read the file and the tool loop works.", { exact: true }).waitFor();
+  await panel.getByRole("button", { name: "‹ 返回子任务", exact: true }).waitFor();
   await page.locator(".conversation-body").waitFor({ state: "visible" });
   await page.screenshot({ path: join(artifacts, "delegated-conversation.png") });
   await page.getByRole("button", { name: "关闭侧栏", exact: true }).click();

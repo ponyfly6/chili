@@ -5,10 +5,7 @@ import type {
   DesktopState,
 } from "../shared/contracts.js";
 import type { ControlTransport } from "./transport.js";
-
-// An uncertain delivery retains its identity even if the user presses Send again.
-// Project-specific transport views share these pending receipts.
-const pendingSubmissions = new Map<string, { text: string; submissionId: string }>();
+import { submissionOutbox } from "./submission-outbox.js";
 
 export function createElectronTransport(api: ChiliDesktopApi, projectId?: string): ControlTransport {
   const invoke = <Request extends DesktopRequest>(request: Request) => api.invoke({
@@ -66,17 +63,23 @@ export function createElectronTransport(api: ChiliDesktopApi, projectId?: string
     connectMcp: (server, sessionId) => invoke({ type: "mcp.connect", server, ...(sessionId ? { sessionId } : {}) }),
     disconnectMcp: (server, sessionId) => invoke({ type: "mcp.disconnect", server, ...(sessionId ? { sessionId } : {}) }),
     send: async (sessionId, text, mode) => {
-      const key = JSON.stringify([projectId, sessionId, mode]);
-      let pending = pendingSubmissions.get(key);
-      if (!pending || pending.text !== text) {
-        pending = { text, submissionId: crypto.randomUUID() };
-        pendingSubmissions.set(key, pending);
+      const outbox = submissionOutbox();
+      const pending = outbox.reserve({ ...(projectId ? { projectId } : {}), sessionId, text, mode });
+      try {
+        const result = await invoke({ type: "session.send", sessionId, text, mode, submissionId: pending.submissionId });
+        outbox.accepted(pending.submissionId);
+        return result;
+      } catch (error) {
+        if (outbox.snapshot().find((entry) => entry.submissionId === pending.submissionId)?.state === "confirmed") {
+          outbox.accepted(pending.submissionId);
+          return { status: "accepted" };
+        }
+        outbox.uncertain(pending.submissionId);
+        throw error;
       }
-      const result = await invoke({ type: "session.send", sessionId, text, mode, submissionId: pending.submissionId });
-      if (pendingSubmissions.get(key) === pending) pendingSubmissions.delete(key);
-      return result;
     },
     stop: (sessionId) => invoke({ type: "session.stop", sessionId }),
+    cancelInput: (sessionId, inputId, expectedRevision) => invoke({ type: "session.input.cancel", sessionId, inputId, expectedRevision }),
     sendAgent: (sessionId, agentId, text, mode) => invoke({ type: "agent.send", sessionId, agentId, text, ...(mode === undefined ? {} : { mode }) }),
     stopAgent: (sessionId, agentId) => invoke({ type: "agent.stop", sessionId, agentId }),
     resumeAgent: (sessionId, agentId) => invoke({ type: "agent.resume", sessionId, agentId }),

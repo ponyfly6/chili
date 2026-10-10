@@ -224,11 +224,11 @@ return the existing receipt; changing content, mode, or trusted source conflicts
 Callers that need retries must keep that ID. Omitting it creates a new submission.
 `accepted` means saved; it does not mean the model ran or external work completed.
 
-Modes are `start` (require an idle queue), `queue` (FIFO), and `steer` (priority at
+Modes are `start` (require an idle queue), `queue` (FIFO), `followup` (supplement the current execution at its next model request), and `steer` (priority at
 the next turn boundary, interrupting the current turn without stopping managed
 processes). `RuntimeService` dispatches these inputs through the session queue.
 Synchronous `submitPrompt()` accepts only `start`; HTTP synchronous routes reject
-queue/steer before admission. Root and child Sessions use the same durable input
+queue/steer/followup before admission. Root and child Sessions use the same durable input
 queue. Agent creation commits its child Session and first input together.
 
 An input is `pending`, `claimed`, or `settled`. Claiming atomically acquires the

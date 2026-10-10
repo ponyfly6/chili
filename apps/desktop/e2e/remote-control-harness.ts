@@ -182,19 +182,26 @@ try {
   await selectPhoneSendMode(mobile, "queue");
   await mobile.getByTestId("queue-send").click();
   await desktopPage.getByRole("button", { name: "关闭设置", exact: true }).click();
-  await desktopPage.getByRole("list", { name: "待处理消息", exact: true })
+  await desktopPage.locator(".pending-message")
     .getByText("phone queued once", { exact: true }).waitFor();
   assert.equal(fixture.requests.filter((request) => request.text === "phone queued once").length, 0, "Queue must not preempt running task");
   // A real local window and a real phone share the service's queue simultaneously.
   await desktopPage.getByLabel("Message composer", { exact: true }).fill("desktop queued concurrently");
-  await desktopPage.getByRole("button", { name: "Queue message", exact: true }).click();
+  await desktopPage.getByRole("button", { name: "Send message", exact: true }).click();
   await mobile.getByTestId("message-input").fill("phone steer replacement");
   await selectPhoneSendMode(mobile, "steer");
   await mobile.getByTestId("steer-send").click();
   await waitUntil("steer aborts the real provider request", () => fixture.requests.some((request) => request.text === "[slow] initial desktop task" && request.aborted));
-  await waitUntil("steer and shared queues drain", () => ["phone steer replacement", "phone queued once", "desktop queued concurrently"]
+  await waitUntil("steer and shared queues drain", () => ["phone queued once", "desktop queued concurrently"]
     .every((text) => fixture.requests.filter((request) => request.text === text).length === 1));
   await waitUntil("phone displays queue response", async () => (await mobile!.getByTestId("transcript").innerText()).includes("Remote fixture response: desktop queued concurrently"));
+  const sharedInputs = JSON.parse(await runCommand("/usr/bin/sqlite3", ["-readonly", "-json", join(workspace, ".chili/chili.sqlite"),
+    "select input_id,text,mode,outcome,parent_input_id from session_inputs where text in ('phone steer replacement','desktop queued concurrently')"])) as Array<{ input_id: string; text: string; mode: string; outcome: string; parent_input_id: string | null }>;
+  const steering = sharedInputs.find((input) => input.text === "phone steer replacement")!;
+  const supplement = sharedInputs.find((input) => input.text === "desktop queued concurrently")!;
+  assert.equal(steering.outcome, "completed", "Legacy phone steering still executes");
+  assert.equal(supplement.parent_input_id, steering.input_id, "Desktop supplements join the next request without a second queued run");
+  assert.equal(supplement.mode, "followup");
   evidence.queueSteerAndConcurrentDesktop = true;
   await mobile.getByTestId("message-input").fill("[slow] phone stop target");
   await selectPhoneSendMode(mobile, "queue");

@@ -42,7 +42,7 @@ test("HTTP Agent API uses real session receipts and lists the root separately fr
     const client = new HttpRuntimeClient({ baseUrl: "http://chili.test",
       fetch: ((input, init) => handler(new Request(input, init))) as typeof fetch });
 
-    expect(await client.listAgents({ sessionId: rootId })).toEqual([
+    expect((await client.listAgents({ sessionId: rootId })).map(({ progress, ...agent }) => agent)).toEqual([
       { agentId: rootId, name: "root", path: "/root", state: "idle" },
     ]);
     const first = await client.spawnAgent({ sessionId: rootId, name: "first", prompt: "first job" });

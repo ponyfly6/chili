@@ -316,14 +316,14 @@ export function readRuntimeStateSnapshot(
       const dispatch = db.query<Row, [string]>("select paused, revision from session_dispatch where session_id = ?").get(sessionId);
       const inputColumns = `input_id, submission_id, session_id, mode, state, revision, sequence,
         substr(text, 1, ${FIELD_CHARS}) as text, length(text) as text_length, accepted_at, updated_at,
-        execution_ref, message_id, result_message_id, turn_id, outcome,
+        execution_ref, message_id, result_message_id, turn_id, outcome, read_at, parent_input_id,
         substr(error, 1, ${FIELD_CHARS}) as error, length(error) as error_length`;
       const activeInputs = queryRows<Row>(db, `select ${inputColumns} from session_inputs
         where session_id = ? and state != 'settled'
         order by resumed desc, case mode when 'steer' then 0 else 1 end, sequence limit ${MAX_REQUIRED_ROWS + 1}`, sessionId);
       const interrupted = db.query<Row, [string, string]>(`select ${inputColumns} from session_inputs
-        where session_id = ? and state = 'settled' and outcome != 'completed' and claim_id is not null
-          and settled_revision > coalesce((select max(settled_revision) from session_inputs where session_id = ? and outcome = 'completed'), 0)
+        where session_id = ? and state = 'settled' and outcome != 'completed' and claim_id is not null and parent_input_id is null
+          and settled_revision > coalesce((select max(settled_revision) from session_inputs where session_id = ? and outcome = 'completed' and parent_input_id is null), 0)
         order by settled_revision desc limit 1`).get(sessionId, sessionId);
       const items: Record<string, unknown>[] = [];
       let queueBytes = 0;
@@ -332,6 +332,8 @@ export function readRuntimeStateSnapshot(
           mode: row.mode, state: row.state, revision: row.revision, sequence: row.sequence,
           text: text(row.text, row.text_length), acceptedAt: row.accepted_at, updatedAt: row.updated_at,
           ...(row.execution_ref ? { executionRef: row.execution_ref } : {}),
+          ...(row.read_at !== null && row.read_at !== undefined ? { readAt: row.read_at } : {}),
+          ...(row.parent_input_id ? { parentInputId: row.parent_input_id } : {}),
           ...(row.message_id ? { messageId: row.message_id } : {}),
           ...(row.result_message_id ? { resultMessageId: row.result_message_id } : {}),
           ...(row.turn_id ? { turnId: row.turn_id } : {}), ...(row.outcome ? { outcome: row.outcome } : {}),

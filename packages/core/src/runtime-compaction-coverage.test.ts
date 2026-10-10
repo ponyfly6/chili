@@ -38,6 +38,42 @@ async function committedSummaries(store: SqliteEventStore, sessionId: SessionId)
   return (await store.messages(sessionId)).filter((message) => message.parts.some((part) => part.type === "compaction"));
 }
 
+test("supplements saved during compaction appear in the very next task request without cancelling compaction", async () => {
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const requests: string[] = [];
+  const { runtime, store } = fixture({ async *stream(input) {
+    if (isCompaction(input)) {
+      entered(); await held;
+      expect(input.signal?.aborted).toBe(false);
+      yield { type: "text_delta", text: "<context_summary>Preserve the original software task.</context_summary>" };
+    } else {
+      requests.push(requestText(input));
+      yield { type: "text_delta", text: "Done with both supplements", phase: "final_answer" };
+    }
+    yield { type: "finish", reason: "stop" };
+  } }, { contextBudget: { maxInputChars: 2_000, compactionThresholdRatio: 0.5, preserveRecentMessages: 0 }, contextCompaction: { verifySummary: false } });
+  const service = new RuntimeService({ runtime, store, cwd: "/repo" });
+  try {
+    const { sessionId } = await service.createSession({ cwd: "/repo" });
+    await runtime.appendUserMessage({ sessionId, text: "Old context ".repeat(150) });
+    service.submitPromptAsync({ sessionId, text: "Finish the software", submissionId: "original", mode: "followup" });
+    await started;
+    service.submitPromptAsync({ sessionId, text: "FIRST_SUPPLEMENT", submissionId: "one", mode: "followup" });
+    service.submitPromptAsync({ sessionId, text: "SECOND_SUPPLEMENT", submissionId: "two", mode: "followup" });
+    expect(service.getInput(sessionId, "one")?.readAt).toBeUndefined();
+    release(); await service.waitForIdle();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toContain("FIRST_SUPPLEMENT");
+    expect(requests[0]).toContain("SECOND_SUPPLEMENT");
+    expect(requests[0]!.indexOf("FIRST_SUPPLEMENT")).toBeLessThan(requests[0]!.indexOf("SECOND_SUPPLEMENT"));
+    expect(service.getInput(sessionId, "one")).toMatchObject({ readAt: expect.any(Number), outcome: "completed" });
+    expect(await store.events({ sessionId, type: "turn.compaction_failed" })).toHaveLength(0);
+  } finally { release(); await service.shutdown(); }
+});
+
 test("failed automatic compaction never sends the budget-evicted history and leaves the original usable", async () => {
   let mainRequests = 0;
   const failed = fixture({
@@ -418,4 +454,33 @@ test("saved compaction requests identify the complete source of each draft and r
     expect(request.sources.find((source) => source.id === (index < 2 ? second : first)))
       .toMatchObject({ status: "omitted", reason: "outside_compaction_batch" });
   });
+});
+
+test("supplements received during reactive recovery get a later response and settle under the same execution", async () => {
+  let entered!: () => void; let release!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let requests = 0;
+  const { runtime, store } = fixture({ async *stream(input) {
+    if (isCompaction(input)) { entered(); await held; yield { type: "text_delta", text: "<context_summary>Continue the original task.</context_summary>" }; }
+    else {
+      if (++requests === 1) throw new Error("context window exceeded");
+      expect(requestText(input)).toContain("RECOVERY_SUPPLEMENT");
+      yield { type: "text_delta", text: "Recovered answer", phase: "final_answer" };
+    }
+    yield { type: "finish", reason: "stop" };
+  } }, { contextBudget: { maxInputChars: 10_000, compactionThresholdRatio: 1, preserveRecentMessages: 0 }, contextCompaction: { verifySummary: false } });
+  const service = new RuntimeService({ runtime, store, cwd: "/repo" });
+  try {
+    const { sessionId } = await service.createSession({ cwd: "/repo" });
+    service.submitPromptAsync({ sessionId, text: "Complete work", submissionId: "original" });
+    await started;
+    service.submitPromptAsync({ sessionId, text: "RECOVERY_SUPPLEMENT", submissionId: "extra", mode: "followup" });
+    release(); await service.waitForIdle();
+    const extra = service.getInput(sessionId, "extra")!;
+    expect(extra).toMatchObject({ state: "settled", outcome: "completed", readAt: expect.any(Number) });
+    const messages = await store.messages(sessionId);
+    expect(messages.findIndex((message) => message.id === extra.resultMessageId)).toBeGreaterThan(messages.findIndex((message) => message.id === extra.messageId));
+    expect(requests).toBe(2);
+  } finally { release(); await service.shutdown(); }
 });

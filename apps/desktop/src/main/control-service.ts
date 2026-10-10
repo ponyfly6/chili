@@ -801,6 +801,16 @@ export class DesktopControlService {
       };
       return request.sessionId ? this.withSessionActor(request.sessionId, run) : this.withWorkspaceActor(run);
     }
+    if (request.type === "session.input.cancel") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        const queue = await lease.client.cancelInput({ sessionId: request.sessionId as SessionId, inputId: request.inputId,
+          expectedRevision: request.expectedRevision, signal: lease.signal });
+        this.assertClientLease(lease);
+        this.observeInputQueue(queue);
+        return queue;
+      });
+    }
     if (request.type === "session.send") {
       const lease = this.captureClientLease();
       return this.withSessionActor(
@@ -1216,7 +1226,7 @@ export class DesktopControlService {
   }
 
   private async send(
-    sessionId: string, text: string, mode: SendMode, lease: ClientLease,
+    sessionId: string, text: string, mode: SendMode | "followup", lease: ClientLease,
     origin: string = "local", submissionId: string = crypto.randomUUID(),
   ): Promise<{ status: "accepted" | "queued"; position?: number }> {
     this.assertClientLease(lease);

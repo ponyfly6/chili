@@ -348,6 +348,8 @@ export class SingleAgentRuntime implements AgentRunner {
         contextualUser: input.contextualUser ?? [],
         tools: modelTools,
       };
+      throwIfTurnAborted(input.signal);
+      input.beforeModelRequest?.(turnId);
       const rawMessages = await messagesForContext(this.options.store, input.sessionId);
       let contextMessages = rawMessages;
       let context = this.contextBuilder().build(rawMessages, contextSurface);
@@ -369,6 +371,22 @@ export class SingleAgentRuntime implements AgentRunner {
           assertCompleteContext(compactedMessages, context);
           contextUsage = context.usage;
         }
+      }
+      // Compaction may take minutes. Read supplements after it completes so
+      // the very next task request sees them without aborting tools or compacting.
+      throwIfTurnAborted(input.signal);
+      while (input.beforeModelRequest?.(turnId)) {
+        contextMessages = await messagesForContext(this.options.store, input.sessionId);
+        context = this.contextBuilder().build(contextMessages, contextSurface);
+        contextUsage = context.usage;
+        if (!context.compactionBoundary) break;
+        const compacted = await this.tryCompactMessages(input, turnId, contextMessages, context.compactionBoundary, contextSurface);
+        turnUsage = addModelUsage(turnUsage, compacted.usage);
+        if (!compacted.completed) break;
+        contextMessages = await messagesForContext(this.options.store, input.sessionId);
+        context = this.contextBuilder().build(contextMessages, contextSurface);
+        contextUsage = context.usage;
+        throwIfTurnAborted(input.signal);
       }
       assertCompleteContext(contextMessages, context);
 
@@ -417,6 +435,8 @@ export class SingleAgentRuntime implements AgentRunner {
         const recovered = await this.tryCompactMessages(input, turnId, recoveryMessages, recoveryBoundary, contextSurface);
         turnUsage = addModelUsage(turnUsage, recovered.usage);
         if (!recovered.completed) throw err;
+        throwIfTurnAborted(input.signal);
+        const receivedFollowups = input.beforeModelRequest?.(turnId);
         const recoveredMessages = await messagesForContext(this.options.store, input.sessionId);
         const recoveredContext = this.contextBuilder().build(recoveredMessages, contextSurface);
         assertCompleteContext(recoveredMessages, recoveredContext);
@@ -433,6 +453,14 @@ export class SingleAgentRuntime implements AgentRunner {
             ? { contextualUser: recoveredContext.surface.contextualUser }
             : {}),
         };
+        if (receivedFollowups) {
+          // A supplement follows the failed attempt in durable history. Its
+          // response must have its own later identity, including after recovery.
+          this.assistantPartOrdinals.delete(assistantMessageId);
+          assistantMessageId = this.id<MessageId>("msg");
+          this.assistantPartOrdinals.set(assistantMessageId, 0);
+          await this.append(input, "message.created", { messageId: assistantMessageId, role: "assistant", turnId });
+        }
         request = await this.prepareRequest(modelInput, contextSurface, contextUsage, "turn", advertisedCatalogRevision);
         streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard, request);
       }
@@ -621,6 +649,8 @@ export class SingleAgentRuntime implements AgentRunner {
       try {
         throwIfTurnAborted(input.signal);
         await this.append(input, "model.request_prepared", { turnId, requestId, attempt, contentVersion: request.contentVersion, request });
+        throwIfTurnAborted(input.signal);
+        input.onModelRequestPrepared?.();
         const executionInput: ModelStreamInput = {
           ...modelInput,
           onRequestIdentity: async (identity) => {

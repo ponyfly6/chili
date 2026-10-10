@@ -51,7 +51,8 @@ export interface ControlTransport {
   reloadMcp(sessionId?: string): Promise<DesktopResponseMap["mcp.reload"]>;
   connectMcp?(server: string, sessionId?: string): Promise<DesktopResponseMap["mcp.connect"]>;
   disconnectMcp?(server: string, sessionId?: string): Promise<DesktopResponseMap["mcp.disconnect"]>;
-  send(sessionId: string, text: string, mode: SendMode): Promise<DesktopResponseMap["session.send"]>;
+  send(sessionId: string, text: string, mode: SendMode | "followup"): Promise<DesktopResponseMap["session.send"]>;
+  cancelInput?(sessionId: string, inputId: string, expectedRevision: number): Promise<DesktopResponseMap["session.input.cancel"]>;
   stop(sessionId: string): Promise<DesktopResponseMap["session.stop"]>;
   sendAgent(sessionId: string, agentId: string, text: string, mode?: SendMode): Promise<DesktopResponseMap["agent.send"]>;
   stopAgent(sessionId: string, agentId: string): Promise<DesktopResponseMap["agent.stop"]>;

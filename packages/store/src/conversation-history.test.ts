@@ -135,3 +135,17 @@ test("in-progress streamed text appears in message previews before the durable c
   expect((await live.conversationPage!({ sessionId: sid })).messages[0]?.parts[0]?.text).toBe("streamed text");
   expect((await live.historyContent!({ sessionId: sid, kind: "part", id: "stream", field: "text" })).text).toBe("streamed text");
 }));
+
+
+test("compaction stays within its original task and all summary content is process metadata", async () => fixture(async (store) => {
+  await store.append(event("u", "message.created", { messageId: "original", role: "user" }));
+  await store.append(event("up", "message.part_added", { messageId: "original", part: { id: "original_part", messageId: "original", sessionId: sid, type: "text", text: "Work" } }));
+  await store.append(event("c", "message.created", { messageId: "compact", role: "user" }));
+  for (const part of [{ id: "compact_text", type: "text", text: "Synthetic context", synthetic: true }, { id: "compact_meta", type: "compaction", summary: "Summary", boundaryMessageId: "original", reason: "budget" }])
+    await store.append(event(part.id, "message.part_added", { messageId: "compact", part: { ...part, messageId: "compact", sessionId: sid } }));
+  await message(store, "response", "Finished");
+  const page = await store.conversationPage({ sessionId: sid, limit: 2 });
+  expect(page.messages.map((m) => m.workId)).toEqual(["original", "original"]);
+  expect(page.messages[0]?.parts.every((part) => part.process)).toBe(true);
+  expect(page.messages[1]?.parts[0]?.process).toBeUndefined();
+}));

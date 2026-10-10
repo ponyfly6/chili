@@ -75,6 +75,8 @@ export const SQLITE_SCHEMA = [
     input_json text,
     input_content_version integer not null default 0,
     output_content_version integer not null default 0,
+    display_subject text,
+    display_error text,
     output text,
     error text,
     synthetic integer not null default 0,
@@ -149,6 +151,8 @@ export const SQLITE_SCHEMA = [
     outcome text,
     error text,
     result_message_id text,
+    read_at integer,
+    parent_input_id text,
     resumed integer not null default 0,
     unique(session_id, submission_id)
   )`,

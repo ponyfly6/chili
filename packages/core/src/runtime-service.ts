@@ -948,7 +948,7 @@ export class RuntimeService {
       const submissionId = input.submissionId ?? this.id("submission");
       if (!/^[^\u0000-\u0020\u007f]{1,512}$/u.test(submissionId)) throw new TypeError("Invalid submissionId");
       const mode = input.mode ?? "start";
-      if (!["start", "queue", "steer"].includes(mode)) throw new TypeError("Invalid input mode");
+      if (!["start", "queue", "steer", "followup"].includes(mode)) throw new TypeError("Invalid input mode");
       this.assertControlOwner(input.sessionId);
       const previous = store.sessionInput(input.sessionId, submissionId);
       if (!previous && mode === "steer" && input.expectedExecutionRef !== undefined) {
@@ -1275,7 +1275,7 @@ export class RuntimeService {
           return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
         }
 
-        if (!isToolUseFinishReason(result.finishReason)) {
+        if (!isToolUseFinishReason(result.finishReason) && !this.hasPendingFollowups(input.sessionId)) {
           return await this.completedPrompt(promptInput, turns, result);
         }
       }
@@ -1370,6 +1370,13 @@ export class RuntimeService {
       cwd: input.cwd,
       system: input.prompt.system,
       signal: input.signal,
+      beforeModelRequest: (turnId) => this.readFollowups(input.input.sessionId, input.signal, turnId),
+      onModelRequestPrepared: () => {
+        const run = this.running.get(input.input.sessionId);
+        if (!input.signal.aborted && run?.controller.signal === input.signal && run.input?.claimId) {
+          this.mutateSessionInputs({ kind: "read", sessionId: input.input.sessionId, claimId: run.input.claimId });
+        }
+      },
     };
     if (input.turnId) runInput.turnId = input.turnId;
     if (input.prompt.developer.length > 0) runInput.developer = input.prompt.developer;
@@ -1385,6 +1392,29 @@ export class RuntimeService {
     if (input.modelState.reasoningLevel !== undefined) runInput.reasoningLevel = input.modelState.reasoningLevel;
     if (input.modelState.serviceTier !== undefined) runInput.serviceTier = input.modelState.serviceTier;
     return runInput;
+  }
+
+  private hasPendingFollowups(sessionId: SessionId): boolean {
+    return this.inputQueue(sessionId).items.some((item) => item.mode === "followup" && item.state === "pending");
+  }
+
+  private readFollowups(sessionId: SessionId, signal: AbortSignal, turnId: TurnId): boolean {
+    const run = this.running.get(sessionId);
+    if (signal.aborted || !run?.input?.claimId || run.controller.signal !== signal) return false;
+    const store = this.inputStore()!;
+    const queue = this.inputQueue(sessionId);
+    if (queue.paused) return false;
+    const pending = queue.items.filter((item) => item.mode === "followup" && item.state === "pending")
+      .sort((left, right) => left.sequence - right.sequence);
+    for (const receipt of pending) {
+      const saved = store.sessionInputById(sessionId, receipt.inputId)!;
+      const payload = JSON.parse(saved.payload) as SubmitPromptInput;
+      this.mutateSessionInputs({ kind: "join", sessionId, inputId: receipt.inputId, expectedRevision: receipt.revision,
+        claimId: run.input.claimId, executionRef: run.executionRef, parentInputId: run.input.inputId, turnId,
+        text: payload.text, ...(payload.displayText ? { displayText: payload.displayText } : {}),
+        ...(payload.images ? { images: payload.images } : {}) });
+    }
+    return pending.length > 0;
   }
 
   private async publishTurnProgress(input: SubmitPromptInput, result: RunTurnResult): Promise<void> {
@@ -2209,8 +2239,9 @@ export class RuntimeService {
               const finalTurn = outcome === "completed" && result?.status === "completed" ? result.turns.at(-1) : undefined;
               const finalMessage = finalTurn?.status === "completed" && !isToolUseFinishReason(finalTurn.finishReason)
                 ? await this.assistantMessage(sessionId, finalTurn.assistantMessageId) : undefined;
-              this.mutateSessionInputs({ kind: "settle", sessionId,
-                inputId: run.input.inputId, claimId: run.input.claimId, outcome,
+              const executionInputs = this.inputQueue(sessionId).items.filter((item) => item.state === "claimed" && item.executionRef === run.executionRef);
+              for (const receipt of executionInputs) this.mutateSessionInputs({ kind: "settle", sessionId,
+                inputId: receipt.inputId, claimId: run.input.claimId, outcome,
                 ...(finalMessage?.role === "assistant" ? { resultMessageId: finalMessage.id } : {}),
                 ...(resourceFailure ? { error: normalizePersistedError(resourceFailure.error).message }
                   : result && "error" in result && result.error ? { error: result.error.message } : {}),

@@ -12,6 +12,10 @@ export interface HistoryPart {
   completion?: "completed" | "cancelled" | "failed";
   filename?: string;
   mimeType?: string;
+  phase?: "commentary" | "final_answer";
+  process?: boolean;
+  subject?: string;
+  errorSummary?: string;
 }
 export interface HistoryMessage {
   id: string;
@@ -19,7 +23,12 @@ export interface HistoryMessage {
   role: MessageRole;
   createdAt: number;
   turnId?: string;
+  workId?: string;
+  inputId?: string;
+  submissionId?: string;
+  readAt?: number;
   parts: HistoryPart[];
+  partCount?: number;
   nextPartOffset?: number;
 }
 export interface ConversationPage {
@@ -33,6 +42,8 @@ export interface HistoryTool {
   status: string;
   startedAt: number;
   updatedAt: number;
+  subject?: string;
+  errorSummary?: string;
 }
 export interface HistoryToolPage {
   sessionId: string;
@@ -65,13 +76,20 @@ export function parseHistoryMessage(value: unknown): HistoryMessage {
   string(message.id); string(message.sessionId); number(message.createdAt);
   if (!["user", "assistant", "tool", "system"].includes(String(message.role))) throw new TypeError("Invalid history role");
   if (message.turnId !== undefined) string(message.turnId);
+  if (message.workId !== undefined) string(message.workId);
+  if (message.inputId !== undefined) string(message.inputId);
+  if (message.submissionId !== undefined) string(message.submissionId);
+  if (message.readAt !== undefined) number(message.readAt);
+  if (message.partCount !== undefined) number(message.partCount);
   if (message.nextPartOffset !== undefined) number(message.nextPartOffset);
   if (!Array.isArray(message.parts) || message.parts.length > 32) throw new TypeError("Invalid history parts");
   for (const value of message.parts) {
     const part = record(value);
     string(part.id); string(part.type); string(part.text, 8000, true);
     if (typeof part.hasMore !== "boolean") throw new TypeError("Invalid history part completeness");
-    for (const name of ["callId", "toolName", "status", "filename", "mimeType"]) if (part[name] !== undefined) string(part[name]);
+    for (const name of ["callId", "toolName", "status", "filename", "mimeType", "subject", "errorSummary"]) if (part[name] !== undefined) string(part[name]);
+    if (part.process !== undefined && typeof part.process !== "boolean") throw new TypeError("Invalid history process flag");
+    if (part.phase !== undefined && !["commentary", "final_answer"].includes(String(part.phase))) throw new TypeError("Invalid history phase");
     if (part.completion !== undefined && !["completed", "cancelled", "failed"].includes(String(part.completion))) throw new TypeError("Invalid part completion");
   }
   return value as HistoryMessage;
@@ -94,6 +112,7 @@ export function parseHistoryToolPage(value: unknown): HistoryToolPage {
   for (const value of page.tools) {
     const tool = record(value);
     string(tool.id); string(tool.name); string(tool.status); number(tool.startedAt); number(tool.updatedAt);
+    for (const name of ["subject", "errorSummary"]) if (tool[name] !== undefined) string(tool[name]);
   }
   if (page.nextAfterToolId !== undefined) string(page.nextAfterToolId);
   return value as HistoryToolPage;

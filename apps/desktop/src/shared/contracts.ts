@@ -2,7 +2,7 @@ import type { ReadingPreferences } from "./reading-preferences.js";
 import type { DesktopTheme } from "./appearance.js";
 import { isResultPreviewUrl, MAX_RESULT_IMAGE_BYTES, MAX_RESULT_TEXT_BYTES, resultFileType, type DesktopResultRead } from "./result-preview.js";
 import {
-  parseConversationPage, parseHistoryMessage, parseHistoryContent, parseHistoryToolPage,
+  parseRuntimeAgentProgress, parseConversationPage, parseHistoryMessage, parseHistoryContent, parseHistoryToolPage,
   type ConversationPage, type HistoryMessage, type HistoryContent, type HistoryToolPage,
   normalizeSessionTitle,
   parseChiliEvent,
@@ -211,7 +211,8 @@ type DesktopOperation =
   | { type: "mcp.status"; sessionId?: string }
   | { type: "mcp.reload"; sessionId?: string }
   | { type: "mcp.connect" | "mcp.disconnect"; server: string; sessionId?: string }
-  | { type: "session.send"; sessionId: string; text: string; mode: SendMode; submissionId?: string }
+  | { type: "session.send"; sessionId: string; text: string; mode: SendMode | "followup"; submissionId?: string }
+  | { type: "session.input.cancel"; sessionId: string; inputId: string; expectedRevision: number }
   | { type: "session.stop"; sessionId: string }
   | { type: "agent.send"; sessionId: string; agentId: string; text: string; mode?: SendMode }
   | { type: "agent.stop"; sessionId: string; agentId: string }
@@ -260,6 +261,7 @@ export interface DesktopResponseMap {
   "mcp.disconnect": DesktopMcpConnectionState;
   "session.send": { status: "accepted" | "queued"; position?: number };
   "session.stop": { interrupted: boolean };
+  "session.input.cancel": RuntimeInputQueue;
   "agent.send": { agentId: string; inputId: string };
   "agent.stop": { agentId: string };
   "agent.resume": { agentId: string; inputId?: string };
@@ -434,7 +436,7 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
   }
   if (type === "session.send") {
     const mode = record.mode;
-    if (mode !== "queue" && mode !== "steer") throw new TypeError("mode must be queue or steer");
+    if (mode !== "queue" && mode !== "steer" && mode !== "followup") throw new TypeError("Invalid delivery mode");
     return {
       type,
       sessionId: requireIdentifier(record.sessionId, "sessionId"),
@@ -443,6 +445,8 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
       ...(record.submissionId !== undefined ? { submissionId: requireIdentifier(record.submissionId, "submissionId") } : {}),
     };
   }
+  if (type === "session.input.cancel") return { type, sessionId: requireIdentifier(record.sessionId, "sessionId"),
+    inputId: requireIdentifier(record.inputId, "inputId"), expectedRevision: requireNonNegativeInteger(record.expectedRevision, "expectedRevision") };
   if (type === "agent.send") {
     return {
       type,
@@ -679,6 +683,9 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
     const result: DesktopResponseMap["session.send"] = { status: record.status };
     if (record.position !== undefined) result.position = requireNonNegativeInteger(record.position, "position");
     response = result;
+  } else if (request.type === "session.input.cancel") {
+    response = parseRuntimeInputQueue(value);
+    if ((response as RuntimeInputQueue).sessionId !== request.sessionId) throw new TypeError("Input belongs to another session");
   } else if (request.type === "session.stop") {
     response = { interrupted: requireBoolean(requireRecord(value, "stop response").interrupted, "interrupted") };
   } else if (request.type === "agent.send" || request.type === "agent.stop" || request.type === "agent.resume") {
@@ -1116,9 +1123,10 @@ function parseRuntimeMcpReload(value: unknown, field: string): RuntimeMcpReloadR
 
 function parseAgentRecord(value: unknown): RuntimeAgentRecord {
   const agent = requireRecord(value, "agent");
-  assertOnlyKeys(agent, ["agentId", "name", "path", "parentAgentId", "state"]);
+  assertOnlyKeys(agent, ["agentId", "name", "path", "parentAgentId", "state", "progress"]);
   return {
     agentId: requireIdentifier(agent.agentId, "agent.agentId"),
+    ...(agent.progress !== undefined ? { progress: parseRuntimeAgentProgress(agent.progress) } : {}),
     name: requireString(agent.name, "agent.name", 2_000),
     path: requireString(agent.path, "agent.path", 4_096),
     state: requireEnum(agent.state, ["idle", "running", "paused"], "agent.state") as RuntimeAgentRecord["state"],
@@ -1204,6 +1212,7 @@ function requestKeys(type: string): readonly string[] {
   if (type === "mcp.status" || type === "mcp.reload") return ["type", "sessionId"];
   if (type === "mcp.connect" || type === "mcp.disconnect") return ["type", "server", "sessionId"];
   if (type === "session.send") return ["type", "sessionId", "text", "mode", "submissionId"];
+  if (type === "session.input.cancel") return ["type", "sessionId", "inputId", "expectedRevision"];
   if (type === "agent.send") return ["type", "sessionId", "agentId", "text", "mode"];
   if (type === "agent.stop" || type === "agent.resume") return ["type", "sessionId", "agentId"];
   if (type === "user-input.resolve") return ["type", "inputId", "answers"];

@@ -1,3 +1,4 @@
+import { parseRuntimeAgentProgress } from "@chili/protocol";
 import { parseConversationPage, parseHistoryMessage, parseHistoryContent, parseHistoryToolPage,
   type ConversationPage, type HistoryMessage, type HistoryContent, type HistoryToolPage } from "@chili/protocol";
 import type {
@@ -1030,7 +1031,7 @@ function parseAgentRecord(value: unknown, path = "agent"): RuntimeAgentRecord {
   parseRuntimeString(record.path, `${path}.path`);
   optionalIdentifier(record.parentAgentId, `${path}.parentAgentId`);
   parseRuntimeEnum(record.state, ["idle", "running", "paused"] as const, `${path}.state`);
-  return record as unknown as RuntimeAgentRecord;
+  return { ...record, ...(record.progress !== undefined ? { progress: parseRuntimeAgentProgress(record.progress) } : {}) } as unknown as RuntimeAgentRecord;
 }
 
 function parseAgentTarget(value: unknown, path = "response"): { agentId: string } {

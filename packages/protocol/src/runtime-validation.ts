@@ -360,7 +360,7 @@ export function parseRuntimeSessionInput(value: unknown, path = "input"): Runtim
     inputId: parseRuntimeIdentifier(row.inputId, `${path}.inputId`),
     submissionId: parseRuntimeIdentifier(row.submissionId, `${path}.submissionId`),
     sessionId: parseRuntimeIdentifier(row.sessionId, `${path}.sessionId`) as RuntimeSessionInput["sessionId"],
-    mode: parseRuntimeEnum(row.mode, ["start", "queue", "steer"] as const, `${path}.mode`),
+    mode: parseRuntimeEnum(row.mode, ["start", "queue", "steer", "followup"] as const, `${path}.mode`),
     state: parseRuntimeEnum(row.state, ["pending", "claimed", "settled"] as const, `${path}.state`),
     revision: parseRuntimeNonNegativeInteger(row.revision, `${path}.revision`),
     sequence: parseRuntimeNonNegativeInteger(row.sequence, `${path}.sequence`),
@@ -369,6 +369,8 @@ export function parseRuntimeSessionInput(value: unknown, path = "input"): Runtim
     updatedAt: parseRuntimeNonNegativeInteger(row.updatedAt, `${path}.updatedAt`),
   };
   assignOptionalString(input, "executionRef", row.executionRef, path);
+  assignOptionalString(input, "parentInputId", row.parentInputId, path);
+  if (row.readAt !== undefined) input.readAt = parseRuntimeNonNegativeInteger(row.readAt, `${path}.readAt`);
   assignOptionalString(input, "messageId", row.messageId, path);
   if (row.resultMessageId !== undefined) {
     input.resultMessageId = parseRuntimeIdentifier(row.resultMessageId, `${path}.resultMessageId`) as MessageId;

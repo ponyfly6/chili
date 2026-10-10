@@ -164,6 +164,8 @@ export class ObservableEventStore
     return store.session ? store.session(sessionId) : (await store.sessions()).find((session) => session.id === sessionId);
   }
 
+  agentProgress(sessionId: SessionId) { return (this.inner as EventStore & Partial<AgentSessionStore>).agentProgress?.(sessionId); }
+
   async childSessions(parentSessionId: SessionId): Promise<SessionRow[]> {
     const store = this.inner as EventStore & Partial<AgentSessionStore>;
     return store.childSessions ? store.childSessions(parentSessionId) : (await store.sessions()).filter((session) => session.agent?.parentSessionId === parentSessionId);

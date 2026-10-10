@@ -95,7 +95,7 @@ test("Agent creation and followup use one Session and wait returns the requested
   expect((original.result as Message).parts[0]).toMatchObject({ text: "answer 1" });
   expect((latest.result as Message).parts[0]).toMatchObject({ text: "answer 2" });
   expect((await f.store.sessions()).filter((row) => row.agent)).toHaveLength(1);
-  expect(await f.control.listAgents({})).toEqual([
+  expect((await f.control.listAgents({})).map(({ progress, ...agent }) => agent)).toEqual([
     { agentId: rootId, name: "root", path: "/root", state: "idle" },
     { agentId: first.agentId, name: "worker", path: "/root/worker", parentAgentId: rootId, state: "idle" },
   ]);

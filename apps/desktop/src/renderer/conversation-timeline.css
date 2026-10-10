@@ -1,0 +1,20 @@
+.conversation-task { min-width: 0; }
+.conversation-task + .conversation-task { margin-top: 30px; }
+.conversation-process { margin: 8px 0 20px; color: var(--muted); }
+.conversation-process > summary { cursor: pointer; font-size: 12px; line-height: 1.7; padding: 5px 0; }
+.conversation-process > div { border-left: 1px solid var(--line); margin: 10px 0 0 4px; padding-left: 16px; }
+.conversation-process .message { margin: 8px 0; }
+.conversation-process .message-content { width: 100%; max-width: 100%; }
+.conversation-process .message-body details { background: transparent; border: 0; padding: 5px 0; margin: 0; }
+.conversation-process .message-body .tool-details > summary { display: flex; align-items: baseline; gap: 10px; font-size: 12px; }
+.history-tool-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); flex: 1; }
+.conversation-process .tool-details > summary small { white-space: nowrap; color: var(--muted); font-size: 11px; }
+.history-tool-error { font-size: 12px; overflow-wrap: anywhere; }
+.conversation-status-note { font-size: 12px; color: var(--muted); line-height: 1.7; margin: 12px 0; }
+.message-receipt { display: flex; gap: 8px; align-items: center; font-size: 11px; color: var(--muted); margin: 6px 0 0; }
+.message-menu { position: relative; }
+.message-menu > summary { cursor: pointer; list-style: none; padding: 0 6px; }
+.message-menu > button { position: absolute; right: 0; top: 20px; white-space: nowrap; z-index: 2; }
+.conversation-agent-link { border: 0; background: transparent; color: var(--muted); font-size: 12px; padding: 4px 0 14px; cursor: pointer; }
+.conversation-process .history-content pre { max-height: 420px; overflow: auto; }
+.pending-message .message-content { opacity: .8; }

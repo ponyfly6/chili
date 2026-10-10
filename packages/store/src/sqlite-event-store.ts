@@ -1,3 +1,4 @@
+import { readAgentProgress } from "./agent-progress.js";
 import { Database } from "bun:sqlite";
 import { ConversationHistoryReader, type ConversationQuery, type HistoryMessageQuery, type HistoryContentQuery, type HistoryToolsQuery } from "./conversation-history.js";
 import { hostOwnerBlockingPid } from "./host-owner.js";
@@ -222,8 +223,8 @@ export class SqliteEventStore
       for (const [table, columns] of Object.entries({
         events: { payload_bytes: "integer", compact_payload_bytes: "integer", content_version: "integer not null default 0" },
         message_parts: { content_version: "integer not null default 0" },
-        tool_calls: { input_content_version: "integer not null default 0", output_content_version: "integer not null default 0" },
-        session_inputs: { content_version: "integer not null default 0" },
+        tool_calls: { input_content_version: "integer not null default 0", output_content_version: "integer not null default 0", display_subject: "text", display_error: "text" },
+        session_inputs: { content_version: "integer not null default 0", read_at: "integer", parent_input_id: "text" },
       })) {
         const existing = new Set(this.db.query<{ name: string }, []>(`pragma table_info(${table})`).all().map((column) => column.name));
         for (const [column, definition] of Object.entries(columns)) {
@@ -338,6 +339,8 @@ export class SqliteEventStore
       this.db.close();
     }
   }
+
+  agentProgress(sessionId: SessionId) { return readAgentProgress(this.db, this.content, sessionId); }
 
   sessionInputQueue(sessionId: SessionId) { return this.inputs.queue(sessionId); }
 
@@ -1675,6 +1678,7 @@ export class SqliteEventStore
           event.time,
           event.time,
         );
+      this.db.query("update tool_calls set display_subject = ? where id = ?").run(toolDisplaySubject(event.payload.input), event.payload.callId);
       return;
     }
 
@@ -1685,10 +1689,12 @@ export class SqliteEventStore
           event.payload.input === undefined ? null : 1,
           event.payload.input === undefined ? null : encodeJson({ __chiliStoredValue: 1, value: this.content.jsonReference(event.payload.input, event.sessionId) }),
           event.time, event.payload.callId);
+      if (event.payload.input !== undefined) this.db.query("update tool_calls set display_subject = ? where id = ?").run(toolDisplaySubject(event.payload.input), event.payload.callId);
       return;
     }
 
     if (event.type === "tool.call_finished") {
+      this.db.query("update tool_calls set display_error = ? where id = ?").run(event.payload.error?.slice(0, 320) || null, event.payload.callId);
       this.db
         .query(
           `update tool_calls
@@ -1863,4 +1869,14 @@ function compactEventPayload(event: RuntimeEvent): unknown {
     return { ...event.payload, part };
   }
   return event.payload;
+}
+
+/** Bounded display metadata is written while the input is already in memory. */
+function toolDisplaySubject(input: unknown): string | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const value = input as Record<string, unknown>;
+  for (const key of ["description", "title", "file_path", "path", "pattern", "command", "cmd", "name"]) {
+    if (typeof value[key] === "string" && value[key].trim()) return value[key].trim().slice(0, 240).replace(/\s+/g, " ");
+  }
+  return null;
 }

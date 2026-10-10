@@ -1156,7 +1156,7 @@ function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody, parsedIm
   if (body.expectedExecutionRef !== undefined) input.expectedExecutionRef = parseRuntimeIdentifier(body.expectedExecutionRef, "body.expectedExecutionRef");
   if (body.inputSource !== undefined) input.inputSource = parseRuntimeIdentifier(body.inputSource, "body.inputSource");
   if (body.mode !== undefined) {
-    if (body.mode !== "start" && body.mode !== "queue" && body.mode !== "steer") throw badRequest("Invalid input mode");
+    if (body.mode !== "start" && body.mode !== "queue" && body.mode !== "steer" && body.mode !== "followup") throw badRequest("Invalid input mode");
     input.mode = body.mode;
   }
   if (body.displayText !== undefined) {

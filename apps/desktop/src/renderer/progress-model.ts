@@ -2,6 +2,7 @@ import type { RuntimeInputQueue, RuntimeSessionInput } from "@chili/protocol";
 import type { ChiliRuntimeView, RuntimeAgentRecord, RuntimeSessionView } from "@chili/sdk";
 import { buildAgentDetailsModel } from "./agent-details-model.js";
 import type { DesktopWorkItem } from "./view-model.js";
+import { historyToolTitle, visibleToolSubject } from "./conversation-timeline-model.js";
 import { workHeadline } from "./work-presentation.js";
 
 export type ProgressRuntime = Pick<ChiliRuntimeView, "sessions" | "turnStatuses" | "messages">;
@@ -10,6 +11,8 @@ export type ProgressState = "running" | "queued" | "waiting" | "paused" | "compl
 export interface ProgressItem {
   id: string;
   title: string;
+  agentName?: string;
+  duration?: string;
   state: ProgressState;
   detail: string;
   control?: "pause" | "resume";
@@ -48,24 +51,26 @@ export function buildProgressModel(input: ProgressModelInput): { primary?: Progr
   const descendants = (input.agents ?? []).filter((agent) => agent.agentId !== input.sessionId);
   const tree = buildAgentDetailsModel(descendants);
   const taskStates = new Map([...tree.nodes.values()].map((agent) => [agent.agentId, sessionProgressState(input, agent.agentId, agent)]));
-  const tasks = tree.roots.map((id, index): ProgressItem => {
-    const root = tree.nodes.get(id)!;
-    const branch: RuntimeAgentRecord[] = [];
-    const pending = [id];
-    while (pending.length) {
-      const node = tree.nodes.get(pending.pop()!)!;
-      branch.push(node);
-      pending.push(...node.children);
-    }
-    const state = combineProgressStates(branch.map((agent) => taskStates.get(agent.agentId)!));
+  const order: string[] = [];
+  const visit = (id: string) => { order.push(id); for (const child of tree.nodes.get(id)!.children) visit(child); };
+  for (const id of tree.roots) visit(id);
+  const tasks = order.map((id, index): ProgressItem => {
+    const agent = tree.nodes.get(id)!;
+    const state = taskStates.get(id)!;
     const session = matchingSession(input, id);
     const queue = matchingQueue(input, id);
-    const taskText = taskDisplayText(latestInput(queue)?.text) ?? latestMessageText(input, id, "user");
-    const title = usefulText(session?.title, 64) ?? usefulText(taskText, 64) ?? usefulName(root) ?? `工作 ${index + 1}`;
-    const result = latestMessageText(input, id, "assistant", true);
-    const detail = usefulText(result, 220) ?? usefulText(taskText, 220) ?? descriptions[state];
-    const control = root.state === "paused" ? "resume" : root.state === "running" ? "pause" : undefined;
-    return { id, title, state, detail, ...(control ? { control } : {}) };
+    const taskText = agent.progress?.task ?? taskDisplayText(latestInput(queue)?.text) ?? latestMessageText(input, id, "user");
+    const title = usefulText(taskText?.replace(/^\[Agent [^\]]+\]\s*/u, "").replace(/^你是[^，。\n]+子\s*Agent[，,]\s*(?:独立)?负责/u, "负责"), 76) ?? usefulText(session?.title, 76) ?? usefulName(agent) ?? `工作 ${index + 1}`;
+    const result = state === "failed" ? agent.progress?.detail ?? latestInput(queue)?.error
+      : agent.progress?.detail ?? latestMessageText(input, id, "assistant", true);
+    const action = agent.progress?.action ? `${historyToolTitle(agent.progress.action)}${visibleToolSubject(agent.progress.subject) ? ` · ${agent.progress.subject}` : ""}` : undefined;
+    const detail = usefulText(state === "running" || state === "attention" ? action : result, 220) ?? (agent.progress ? descriptions[state] : usefulText(taskText, 220)) ?? descriptions[state];
+    const control = agent.state === "paused" ? "resume" : agent.state === "running" ? "pause" : undefined;
+    const started = agent.progress?.startedAt;
+    const elapsed = started === undefined ? undefined : Math.max(0, (state === "running" ? Date.now() : agent.progress?.updatedAt ?? started) - started);
+    const duration = elapsed === undefined ? undefined : elapsed < 60_000 ? `${Math.floor(elapsed / 1000)} 秒` : `${Math.floor(elapsed / 60_000)} 分钟`;
+    const name = usefulName(agent);
+    return { id, title, state, detail, ...(name && name !== title ? { agentName: name } : {}), ...(duration ? { duration } : {}), ...(control ? { control } : {}) };
   });
 
   const root = input.agents?.find((agent) => agent.agentId === input.sessionId);
@@ -96,6 +101,7 @@ export function buildProgressModel(input: ProgressModelInput): { primary?: Progr
 function sessionProgressState(input: ProgressModelInput, id: string, agent?: RuntimeAgentRecord): ProgressState {
   const session = matchingSession(input, id);
   const queue = matchingQueue(input, id);
+  if (agent?.progress) return agent.progress.state;
   if (session?.status === "waiting_for_approval") return "attention";
   if (agent?.state === "paused" || queue?.paused) return "paused";
   if (session?.status === "failed") return "failed";
@@ -168,7 +174,7 @@ function usefulText(value: string | undefined, limit: number): string | undefine
     .replace(/!?\[([^\]]+)\]\([^)]*\)/gu, "$1")
     .replace(/<[^>]+>/gu, "")
     .replace(/^[\s#>*\-]+/gmu, "")
-    .replace(/[`*_]/gu, "")
+    .replace(/[`*]/gu, "")
     .split(/\n/gu).map((line) => line.trim()).find((line) => line.length > 0);
   if (!text || /^(?:[A-Za-z]:[\\/]|\/|\.\.?\/|agent[_-][a-f\d]{8}|session[_-][a-f\d]{8})/iu.test(text)) return undefined;
   const sentence = text.split(/(?<=[。！？])\s*/u)[0] ?? text;
@@ -207,4 +213,15 @@ function taskDisplayText(value: string | undefined): string | undefined {
 function hasWaitingQuestion(work: DesktopWorkItem | undefined): boolean {
   return Boolean(work?.active && work.items.some((item) => item.kind === "tool" && item.toolName === "request_user_input"
     && ["queued", "checking", "waiting_permission", "running"].includes(item.displayStatus)));
+}
+
+export function agentProgressSummary(agents: readonly RuntimeAgentRecord[]): string | undefined {
+  if (!agents.length) return undefined;
+  const counts = new Map<string, number>();
+  for (const agent of agents) {
+    const state = agent.progress?.state ?? (agent.state === "idle" ? "waiting" : agent.state);
+    const label = state === "failed" ? "未完成" : state === "completed" ? "已完成" : state === "attention" ? "需回应" : state === "running" || state === "queued" ? "进行中" : state === "paused" || state === "stopped" ? "已停止" : "待安排";
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  return `子任务 · ${[...counts].map(([label, count]) => `${count} ${label}`).join(" · ")}`;
 }

@@ -39,6 +39,10 @@ export interface RunTurnInput {
   reasoningLevel?: ReasoningLevel;
   serviceTier?: ServiceTier;
   signal?: AbortSignal;
+  /** Drain durable supplements after compaction, before building the task request. */
+  beforeModelRequest?: (turnId: TurnId) => boolean;
+  /** A task request containing the drained messages is now prepared. */
+  onModelRequestPrepared?: () => void;
 }
 
 export type RunTurnResult =

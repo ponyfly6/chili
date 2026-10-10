@@ -61,10 +61,11 @@ export class ConversationHistoryReader {
       if (!row) throw new Error("Unknown tool cursor");
       cursor = row.rowid;
     }
-    const rows = this.db.query<{ id: string; tool_name: string; status: string; started_at: number; updated_at: number }, [string, string, number]>(
-      "select id, tool_name, status, started_at, updated_at from tool_calls where session_id = ? and parent_call_id = ? and rowid > ? order by rowid limit 51")
+    const rows = this.db.query<{ id: string; tool_name: string; status: string; started_at: number; updated_at: number; display_subject: string | null; display_error: string | null }, [string, string, number]>(
+      "select id, tool_name, status, started_at, updated_at, display_subject, display_error from tool_calls where session_id = ? and parent_call_id = ? and rowid > ? order by rowid limit 51")
       .all(query.sessionId, query.parentCallId, cursor);
-    const tools = rows.slice(0, 50).map((row) => ({ id: row.id, name: row.tool_name, status: row.status, startedAt: row.started_at, updatedAt: row.updated_at }));
+    const tools = rows.slice(0, 50).map((row) => ({ id: row.id, name: row.tool_name, status: row.status, startedAt: row.started_at, updatedAt: row.updated_at,
+      ...(row.display_subject ? { subject: row.display_subject } : {}), ...(row.display_error ? { errorSummary: row.display_error } : {}) }));
     return { sessionId: query.sessionId, parentCallId: query.parentCallId, tools,
       ...(rows.length > 50 ? { nextAfterToolId: tools.at(-1)!.id } : {}) };
   }
@@ -126,16 +127,17 @@ export class ConversationHistoryReader {
     // must not be transferred or JSON-decoded merely to list a message.
     const fields = ["text", "displayText", "summary"].map((field) => `'${field}', case when json_type(data_json, '$.${field}') = 'text'
       then substr(json_extract(data_json, '$.${field}'), 1, 8004) else json_extract(data_json, '$.${field}') end`);
-    fields.push(...["callId", "toolName", "status", "completion", "filename", "mimeType"].map((field) => `'${field}', json_extract(data_json, '$.${field}')`));
+    fields.push(...["callId", "toolName", "status", "completion", "filename", "mimeType", "phase"].map((field) => `'${field}', json_extract(data_json, '$.${field}')`));
     const rows = this.db.query<PartRow, [string, number]>(`select id, type,
       json_patch('{}', json_object(${fields.join(",")})) as data_json, content_version, delta_event_seq
       from message_parts where message_id = ? order by ordinal, id limit 33 offset ?`).all(row.id, offset);
     let remaining = 8000;
+    const contextSummary = Boolean(this.db.query("select 1 from message_parts where message_id = ? and type = 'compaction' limit 1").get(row.id));
     const parts = rows.slice(0, 32).map((part): HistoryPart => {
       const stored = JSON.parse(part.data_json) as Record<string, unknown>;
       if (part.type === "tool_call" || part.type === "tool_result") {
         const callId = String(stored.callId);
-        const tool = this.db.query<{ tool_name: string; status: string }, [string, string]>("select tool_name, status from tool_calls where session_id = ? and id = ?").get(row.session_id, callId);
+        const tool = this.db.query<{ tool_name: string; status: string; display_subject: string | null; display_error: string | null }, [string, string]>("select tool_name, status, display_subject, display_error from tool_calls where session_id = ? and id = ?").get(row.session_id, callId);
         let delivery = "";
         if (tool?.tool_name === "present_file" && tool.status === "completed") {
           const result = this.db.query<{ output: string | null; output_content_version: number }, [string, string]>("select output, output_content_version from tool_calls where session_id = ? and id = ?").get(row.session_id, callId);
@@ -147,16 +149,30 @@ export class ConversationHistoryReader {
         }
         remaining -= Buffer.byteLength(delivery);
         return { id: part.id, type: part.type, text: delivery, hasMore: true, callId,
-          toolName: tool?.tool_name ?? String(stored.toolName ?? "tool"), status: tool?.status ?? String(stored.status ?? "completed") };
+          toolName: tool?.tool_name ?? String(stored.toolName ?? "tool"), status: tool?.status ?? String(stored.status ?? "completed"),
+          ...(tool?.display_subject ? { subject: tool.display_subject } : {}), ...(tool?.display_error ? { errorSummary: tool.display_error } : {}) };
       }
       const chunk = this.partChunk(row.session_id, part, 0, remaining);
       remaining -= Buffer.byteLength(chunk.text);
-      return { id: part.id, type: part.type, text: chunk.text, hasMore: chunk.nextOffset !== undefined,
+      return { id: part.id, type: part.type, ...(contextSummary ? { process: true } : {}), text: chunk.text, hasMore: chunk.nextOffset !== undefined,
+        ...(stored.phase === "commentary" || stored.phase === "final_answer" ? { phase: stored.phase } : {}),
         ...(["completed", "cancelled", "failed"].includes(String(stored.completion)) ? { completion: stored.completion as NonNullable<HistoryPart["completion"]> } : {}),
         ...(typeof stored.filename === "string" && stored.filename ? { filename: stored.filename.slice(0, 512) } : {}),
         ...(typeof stored.mimeType === "string" && stored.mimeType ? { mimeType: stored.mimeType.slice(0, 512) } : {}) };
     });
-    return { id: row.id, sessionId: row.session_id, role: row.role, createdAt: row.created_at,
+    // A page may start in the middle of a task. Find only its nearest user
+    // anchor using the message index; never load preceding conversation bodies.
+    const anchor = this.db.query<{ work_id: string }, [string, number, number, string]>(`select coalesce(i.parent_input_id, i.input_id, m.id) as work_id
+      from messages m left join session_inputs i on i.session_id = m.session_id and i.message_id = m.id
+      where m.session_id = ? and m.role = 'user' and not exists (select 1 from message_parts p where p.message_id = m.id and p.type = 'compaction') and (m.created_event_seq, m.created_at, m.id) <= (?, ?, ?) order by m.created_event_seq desc, m.created_at desc, m.id desc limit 1`)
+      .get(row.session_id, row.created_event_seq, row.created_at, row.id);
+    const workId = anchor?.work_id ?? this.db.query<{ id: string }, [string]>("select id from messages where session_id = ? order by created_event_seq, created_at, id limit 1").get(row.session_id)?.id;
+    const receipt = row.role === "user" ? this.db.query<{ input_id: string; submission_id: string; read_at: number | null }, [string, string]>(
+      "select input_id, submission_id, read_at from session_inputs where session_id = ? and message_id = ?").get(row.session_id, row.id) : undefined;
+    const partCount = this.db.query<{ count: number }, [string]>("select count(*) as count from message_parts where message_id = ?").get(row.id)!.count;
+    return { id: row.id, partCount, sessionId: row.session_id, role: row.role, createdAt: row.created_at,
+      ...(workId ? { workId } : {}), ...(receipt ? { inputId: receipt.input_id, submissionId: receipt.submission_id } : {}),
+      ...(receipt?.read_at != null ? { readAt: receipt.read_at } : {}),
       ...(row.turn_id ? { turnId: row.turn_id } : {}), parts,
       ...(rows.length > 32 ? { nextPartOffset: offset + 32 } : {}) };
   }

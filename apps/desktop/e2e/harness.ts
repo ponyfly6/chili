@@ -226,7 +226,7 @@ try {
     currentLaunch = undefined;
     await waitForProviderAbort(SLOW_STEER_PROMPT, 1);
 
-    logStep("launch 4/4: explicitly recover the input, then exercise steer/stop and native widths");
+    logStep("launch 4/4: recover the input, supplement without interruption, stop/resume and native widths");
     currentLaunch = await launchDesktop("stream-recovery", "deepseek");
     await recoverSlowInputThroughUi(currentLaunch.page, interruptedInputId);
     await steerSlowTurnThroughUi(currentLaunch.page);
@@ -839,16 +839,28 @@ async function steerSlowTurnThroughUi(page: Page): Promise<void> {
     request.text.includes(SLOW_STEER_PROMPT) && request.aborted
   )).length;
   const composer = activeComposer(page);
+  await composer.fill("Keep the original task and preserve keyboard access");
+  await controls.getByRole("button", { name: "Send message", exact: true }).click();
   await composer.fill(STEER_REPLACEMENT);
-  await controls.getByRole("button", { name: "调整方向", exact: true }).click();
+  await controls.getByRole("button", { name: "Send message", exact: true }).click();
+  await page.locator(".pending-message").filter({ hasText: STEER_REPLACEMENT }).waitFor();
+  assert.equal(await controls.getByRole("button", { name: "调整方向", exact: true }).count(), 0);
+  assert.equal(provider.requests.filter((request) => request.text.includes(SLOW_STEER_PROMPT) && request.aborted).length, slowAbortsBefore,
+    "Sending a supplement must not abort the active request");
+  assert.equal(provider.requests.some((request) => request.text.includes(STEER_REPLACEMENT)), false, "Saved is not read before a request boundary");
+  await page.screenshot({ path: join(artifacts, "conversation-supplements-saved.png") });
+  const running = provider.requests.findLast((request) => request.text.includes(SLOW_STEER_PROMPT) && !request.aborted);
+  assert.ok(running?.finish); running.finish();
   await waitForProviderRequest(STEER_REPLACEMENT, 1);
   await expectVisible(page.locator(".timeline").getByText(`Fixture response: ${STEER_REPLACEMENT}`, { exact: true }));
-  await waitForProviderAbort(SLOW_STEER_PROMPT, slowAbortsBefore + 1);
+  assert.equal(provider.requests.filter((request) => request.text.includes(SLOW_STEER_PROMPT) && request.aborted).length, slowAbortsBefore);
+  await page.locator(".pending-message").filter({ hasText: STEER_REPLACEMENT }).waitFor({ state: "hidden" });
+  await page.screenshot({ path: join(artifacts, "conversation-supplements-read.png") });
   await page.locator(".composer-buttons").getByRole("button", { name: "Send message", exact: true }).waitFor();
   assert.equal(
     provider.requests.filter((request) => request.text.includes(SLOW_STEER_PROMPT)).length,
     slowRequestsBefore,
-    "Steer must not automatically restart the superseded input",
+    "Supplements continue in the same work without restarting the original request",
   );
 }
 
@@ -888,21 +900,13 @@ async function sendRecoveryFollowUpThroughUi(page: Page): Promise<void> {
   const composer = activeComposer(page);
   await expectVisible(composer);
   await composer.fill(RECOVERY_PROMPT);
-  await page.locator(".composer-buttons").getByRole("button", { name: "Queue message", exact: true }).click();
-  assert.equal(provider.requests.some((request) => request.text.includes(RECOVERY_PROMPT)), false,
-    "Input submitted while paused must stay queued");
-  await page.getByRole("list", { name: "待处理消息", exact: true }).getByText(RECOVERY_PROMPT, { exact: true }).waitFor();
-  await page.screenshot({ path: join(artifacts, "conversation-paused-queue.png") });
-  await page.getByRole("button", { name: "继续处理", exact: true }).click();
-  await waitForProviderRequest(SLOW_STEER_PROMPT, slowRequestsBefore + 1);
-  assert.equal((await latestSlowInput()).input_id, inputBeforeResume.input_id);
-  assert.equal(provider.requests.some((request) => request.text.includes(RECOVERY_PROMPT)), false,
-    "Resume must finish the interrupted input before processing queued work");
-  const resumedRequest = provider.requests.findLast((request) => request.text.includes(SLOW_STEER_PROMPT));
-  assert.ok(resumedRequest?.finish, "The resumed stream must be controllable by the local fixture");
-  resumedRequest.finish();
+  await page.locator(".composer-buttons").getByRole("button", { name: "Send message", exact: true }).click();
   await waitForProviderRequest(RECOVERY_PROMPT, 1);
+  assert.equal((await latestSlowInput()).input_id, inputBeforeResume.input_id);
+  assert.equal(provider.requests.filter((request) => request.text.includes(SLOW_STEER_PROMPT)).length, slowRequestsBefore,
+    "The first resumed request must already contain the correction");
   await expectVisible(page.locator(".timeline").getByText(`Fixture response: ${RECOVERY_PROMPT}`, { exact: true }));
+  await page.screenshot({ path: join(artifacts, "conversation-send-resumes.png") });
 }
 
 interface DurableSlowInput extends Record<string, unknown> {
@@ -994,7 +998,7 @@ async function assertMultipleProjects(launch: DesktopLaunch): Promise<void> {
   const slow = provider.requests.find((request) => request.text.includes(SLOW_STEER_PROMPT));
   assert.ok(slow && !slow.aborted, "Project A should still be streaming");
   await activeComposer(page).fill("Queued message for project A");
-  await page.getByRole("button", { name: "Queue message", exact: true }).click();
+  await page.getByRole("button", { name: "Send message", exact: true }).click();
   await waitUntil("project A queued message", async () => await page.evaluate(async () => {
     const state = await (window as unknown as { chiliDesktop: ChiliDesktopApi }).chiliDesktop.invoke({ type: "app.state" });
     return Object.values(state.queuedBySession).reduce((sum, count) => sum + count, 0) === 1;
@@ -1052,6 +1056,11 @@ async function assertMultipleProjects(launch: DesktopLaunch): Promise<void> {
   assert.equal(await page.locator(".project-active .session-row").count(), 10, "Expanding a background directory loads more than its five cached previews");
   assert.equal(slow.aborted, false);
   await activeComposer(page).fill("");
+  const saved = page.locator(".pending-message").filter({ hasText: "Queued message for project A" });
+  await saved.locator(".message-menu > summary").click();
+  await saved.getByRole("button", { name: "撤回", exact: true }).click();
+  await saved.waitFor({ state: "hidden" });
+  assert.equal(slow.aborted, false, "Withdrawing unread input never aborts running work");
 }
 
 async function assertProjectsRestored(page: Page): Promise<void> {

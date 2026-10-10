@@ -282,7 +282,9 @@ export class AgentControlService implements AgentToolController {
   private record(row: SessionRow): AgentToolRecord {
     const runtime = this.runtimeFor(row);
     const queue = runtime.inputQueue(row.id);
+    const progress = this.options.store.agentProgress?.(row.id);
     return {
+      ...(progress ? { progress } : {}),
       agentId: row.id, name: row.agent?.name ?? "root", path: row.agent?.path ?? "/root",
       ...(row.agent ? { parentAgentId: row.agent.parentSessionId } : {}),
       state: queue.paused ? "paused" : runtime.isRunning(row.id) || queue.items.some((item) => item.state === "claimed") ? "running" : "idle",

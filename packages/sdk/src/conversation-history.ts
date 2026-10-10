@@ -20,7 +20,7 @@ export function conversationDisplayEvents(page: ConversationPage): ChiliEvent[] 
       } else if (part.text) {
         events.push({ ...base, id: `history:part:${part.id}`, type: "message.part_added", payload: { messageId,
           part: { id: part.id as PartId, messageId, sessionId: page.sessionId as SessionId,
-            type: part.type === "reasoning" ? "reasoning" : "text", text: part.text, ...(part.completion ? { completion: part.completion } : {}) } } });
+            type: part.type === "reasoning" ? "reasoning" : "text", text: part.text, ...(part.phase ? { phase: part.phase } : {}), ...(part.completion ? { completion: part.completion } : {}) } } });
       }
     }
   }
