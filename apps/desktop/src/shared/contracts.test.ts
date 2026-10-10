@@ -15,6 +15,19 @@ import {
 } from "./contracts.js";
 
 describe("desktop IPC contracts", () => {
+  test("validates project-scoped history cursors and rejects response scope mismatches", () => {
+    const request = { type: "session.history", sessionId: "session_1", projectId: "project_1", beforeEventId: "event_1" } as const;
+    expect(parseDesktopRequest(request)).toEqual(request);
+    const snapshot = { sessionId: "session_1", events: [], agents: [], pendingApprovals: [], pendingInputs: [], nextBeforeEventId: "event_0" };
+    expect(parseDesktopResponse(request, snapshot)).toEqual(snapshot);
+    for (const cursor of ["", "__proto__", "x".repeat(513), "event\n1", 123]) {
+      expect(() => parseDesktopRequest({ ...request, beforeEventId: cursor })).toThrow();
+      expect(() => parseDesktopResponse(request, { ...snapshot, nextBeforeEventId: cursor })).toThrow();
+    }
+    expect(() => parseDesktopResponse(request, { ...snapshot, sessionId: "other" })).toThrow("sessionId");
+    expect(() => parseDesktopRequest({ ...request, limit: 100_000 })).toThrow();
+  });
+
   test("identifies child sessions through Agent metadata", () => {
     const row = { id: "session_1", cwd: "/repo", status: "active", createdAt: 1, updatedAt: 2 };
     const agent = { parentSessionId: "root", name: "child", path: "/root/child", policy: {} };

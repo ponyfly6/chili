@@ -373,20 +373,26 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "sessionEvents") {
         await requireSession(options.store, route.sessionId);
-        rejectUnknownQueryParameters(url, ["limit", "window"]);
+        rejectUnknownQueryParameters(url, ["limit", "window", "beforeEventId"]);
+        const beforeEventId = url.searchParams.has("beforeEventId")
+          ? parseRuntimeIdentifier(url.searchParams.get("beforeEventId"), "beforeEventId")
+          : undefined;
+        const history = url.searchParams.get("window") === "history";
         const requestedLimit = Number(url.searchParams.get("limit") ?? "5000");
         const limit = Number.isFinite(requestedLimit)
           ? Math.max(1, Math.min(5_000, Math.trunc(requestedLimit)))
           : 5_000;
-        const windowKey = `${route.sessionId}\u0000${limit}`;
+        const windowKey = `${route.sessionId}\u0000${limit}\u0000${beforeEventId ?? ""}\u0000${history}`;
         let windowPromise = inFlightSessionEventWindows.get(windowKey);
         if (!windowPromise) {
           windowPromise = sessionEventWindowAdmission.run(async () => replayableSessionEventWindow({
             store: options.store,
             sessionId: route.sessionId,
             limit,
+            history,
+            ...(beforeEventId ? { beforeEventId } : {}),
             limits: sessionEventWindowLimits,
-            pendingInputs: options.userInputs
+            pendingInputs: !history && !beforeEventId && options.userInputs
               ? await options.userInputs.list({ sessionId: route.sessionId })
               : [],
           }));
@@ -398,7 +404,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           }).catch(() => undefined);
         }
         const window = await windowPromise;
-        if (url.searchParams.get("window") === "replayable") return json(window);
+        if (history || url.searchParams.get("window") === "replayable") return json(window);
         return json(window.events, 200, {
           "x-chili-event-window-truncated": String(window.truncated),
           "x-chili-event-window-bytes": String(window.bytes),
@@ -966,6 +972,8 @@ interface SessionEventWindowBuildInput {
   store: EventStore & EventPublisher;
   sessionId: SessionId;
   limit: number;
+  beforeEventId?: string;
+  history: boolean;
   limits: SessionEventWindowLimits;
   pendingInputs: readonly PendingUserInputRequest[];
 }
@@ -1370,11 +1378,14 @@ async function replayableSessionEventWindow(
   const tail = await boundedSessionEventTail(input);
   if (tail.truncated) warnings.add("durable event tail exceeded its count or byte budget");
 
-  const pendingApprovalWindow = await boundedPendingApprovalWindow(
-    input.store,
-    input.sessionId,
-    Math.max(2, Math.min(PENDING_APPROVAL_WINDOW_BYTES, Math.floor(input.limits.maxBytes / 2))),
-  );
+  // Historical pages must not import today's pending controls or future anchors.
+  const pendingApprovalWindow = input.history || input.beforeEventId
+    ? { approvals: [], truncated: false, bytes: 2 }
+    : await boundedPendingApprovalWindow(
+      input.store,
+      input.sessionId,
+      Math.max(2, Math.min(PENDING_APPROVAL_WINDOW_BYTES, Math.floor(input.limits.maxBytes / 2))),
+    );
   if (pendingApprovalWindow.truncated) warnings.add("pending approvals exceeded their validated snapshot budget");
   if (input.pendingInputs.length > SESSION_EVENT_WINDOW_ROW_LIMIT) {
     warnings.add(`pending inputs exceeded the ${SESSION_EVENT_WINDOW_ROW_LIMIT}-row event-window seed limit`);
@@ -1421,6 +1432,7 @@ async function replayableSessionEventWindow(
     compactRequests: true,
     sessionId: input.sessionId,
     type: "session.created",
+    ...(input.beforeEventId ? { beforeEventId: input.beforeEventId } : {}),
     limit: 1,
   }) as ChiliEvent[];
   for (const event of created) {
@@ -1502,6 +1514,17 @@ async function replayableSessionEventWindow(
   let pins = retained.pinnedEventIds.slice(0, SESSION_EVENT_WINDOW_PIN_LIMIT);
   if (pins.length < retained.pinnedEventIds.length) warnings.add("active event pins exceeded their metadata limit");
   let warning = boundedSessionWindowWarning(warnings);
+  const historyCursor = (events: readonly ChiliEvent[]): { nextBeforeEventId?: string } => {
+    // Dependency anchors can precede the tail by thousands of rows. They must
+    // never become paging cursors and skip the intervening conversation.
+    const retainedIds = new Set(events.map((event) => event.id));
+    // Pins can also retain an old tail event while intervening rows are evicted.
+    // Continue before the contiguous retained suffix so those rows stay readable.
+    let suffixStart = tail.events.length;
+    while (suffixStart > 0 && retainedIds.has(tail.events[suffixStart - 1]!.id)) suffixStart -= 1;
+    const cursor = tail.events[Math.min(suffixStart, tail.events.length - 1)]?.id;
+    return cursor && (tail.truncated || suffixStart > 0) ? { nextBeforeEventId: cursor } : {};
+  };
   let window: RuntimeSessionEventWindow = {
     events: retained.events,
     pendingApprovals: pendingApprovalWindow.approvals,
@@ -1509,6 +1532,7 @@ async function replayableSessionEventWindow(
     bytes: retained.bytes,
     pinnedEventIds: pins,
     ...(warning ? { warning } : {}),
+    ...historyCursor(retained.events),
   };
 
   for (let attempt = 0; attempt < 3 && utf8Bytes(JSON.stringify(window)) > input.limits.maxBytes; attempt += 1) {
@@ -1529,6 +1553,7 @@ async function replayableSessionEventWindow(
       bytes: retained.bytes,
       pinnedEventIds: pins,
       ...(warning ? { warning } : {}),
+      ...historyCursor(retained.events),
     };
   }
   if (utf8Bytes(JSON.stringify(window)) > input.limits.maxBytes) {
@@ -1550,7 +1575,7 @@ async function boundedSessionEventTail(
   const chunks: ChiliEvent[][] = [];
   let count = 0;
   let bytes = 2;
-  let beforeEventId: string | undefined;
+  let beforeEventId: string | undefined = input.beforeEventId;
   let truncated = false;
 
   while (count < input.limit + 1) {
@@ -1602,6 +1627,8 @@ async function scanSessionDependencyProviders(
 ): Promise<ScannedDependencyEvent[]> {
   const found = new Map<string, ScannedDependencyEvent>();
   let afterEventId: string | undefined;
+  let beforeEventId: string | undefined = input.beforeEventId;
+  const backwards = input.history || input.beforeEventId !== undefined;
   let discoveryOrder = 0;
 
   while (found.size < targets.size) {
@@ -1624,7 +1651,8 @@ async function scanSessionDependencyProviders(
     const batch = await input.store.events({
       compactRequests: true,
       sessionId: input.sessionId,
-      ...(afterEventId ? { afterEventId } : {}),
+      ...(backwards ? { tail: true, ...(beforeEventId ? { beforeEventId } : {}) }
+        : afterEventId ? { afterEventId } : {}),
       limit: requested,
     }) as ChiliEvent[];
     state.pages += 1;
@@ -1647,9 +1675,10 @@ async function scanSessionDependencyProviders(
       discoveryOrder += 1;
     }
     if (state.boundary || batch.length < requested) break;
-    const nextCursor = batch.at(-1)?.id;
-    if (!nextCursor || nextCursor === afterEventId) break;
-    afterEventId = nextCursor;
+    const nextCursor = backwards ? batch[0]?.id : batch.at(-1)?.id;
+    if (!nextCursor || nextCursor === (backwards ? beforeEventId : afterEventId)) break;
+    if (backwards) beforeEventId = nextCursor;
+    else afterEventId = nextCursor;
   }
   return [...new Map([...found.values()].map((row) => [row.event.id, row])).values()];
 }

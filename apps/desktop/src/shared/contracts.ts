@@ -5,6 +5,7 @@ import {
   normalizeSessionTitle,
   parseChiliEvent,
   parseRuntimeExecutionIdentity,
+  parseRuntimeIdentifier,
   parseRuntimeInputQueue,
   parseSessionAgentMetadata,
   type RuntimeInputQueue,
@@ -103,6 +104,7 @@ export interface RuntimeSnapshot {
   omittedMessageParts?: RuntimeMessagePartOmission[];
   truncated?: boolean;
   warning?: string;
+  nextBeforeEventId?: string;
 }
 
 export interface RuntimeMessagePartOmission {
@@ -186,6 +188,7 @@ type DesktopOperation =
   | ({ type: "sessions.create" } & DesktopCreateSessionOptions)
   | { type: "models.list"; provider?: string }
   | { type: "session.snapshot"; sessionId: string }
+  | { type: "session.history"; sessionId: string; beforeEventId?: string }
   | { type: "session.open"; sessionId: string }
   | { type: "session.resume"; sessionId: string }
   | { type: "session.rename"; sessionId: string; title: string }
@@ -227,6 +230,7 @@ export interface DesktopResponseMap {
   "sessions.create": DesktopCreateSessionResult;
   "models.list": RuntimeModelDescriptor[];
   "session.snapshot": RuntimeSnapshot;
+  "session.history": RuntimeSnapshot;
   "session.open": RuntimeSnapshot;
   "session.resume": RuntimeSnapshot;
   "session.rename": RuntimeSessionSummary;
@@ -320,6 +324,10 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
       request.status = requireEnum(record.status, ["active", "archived", "all"], "status") as SessionListStatus;
     }
     return request;
+  }
+  if (type === "session.history") {
+    return { type, sessionId: requireIdentifier(record.sessionId, "sessionId"),
+      ...(record.beforeEventId === undefined ? {} : { beforeEventId: requireHistoryCursor(record.beforeEventId, "beforeEventId") }) };
   }
   if (type === "sessions.create") return parseCreateSessionRequest(record);
   if (type === "models.list") {
@@ -596,7 +604,7 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
   } else if (request.type === "models.list") {
     if (!Array.isArray(value) || value.length > 1_000) throw new TypeError("Invalid model list");
     response = value.map((item, index) => parseRuntimeModelDescriptor(item, `models[${index}]`));
-  } else if (request.type === "session.snapshot" || request.type === "session.open" || request.type === "session.resume") {
+  } else if (request.type === "session.snapshot" || request.type === "session.history" || request.type === "session.open" || request.type === "session.resume") {
     response = parseRuntimeSnapshot(value);
   } else if (request.type === "session.rename") {
     response = parseSessionSummary(value);
@@ -716,7 +724,7 @@ function assertDesktopResponseScope(request: DesktopRequest, response: unknown):
     if ((response as { agentId: string }).agentId !== request.agentId) throw new TypeError("Agent response belongs to a different agentId");
     return;
   }
-  if (request.type === "session.snapshot" || request.type === "session.open" || request.type === "session.resume") {
+  if (request.type === "session.snapshot" || request.type === "session.history" || request.type === "session.open" || request.type === "session.resume") {
     requireMatchingSessionId(request.sessionId, (response as RuntimeSnapshot).sessionId, "snapshot.sessionId");
     return;
   }
@@ -806,7 +814,7 @@ export function parseDesktopState(value: unknown): DesktopState {
 
 function parseRuntimeSnapshot(value: unknown): RuntimeSnapshot {
   const record = requireRecord(value, "runtime snapshot");
-  assertOnlyKeys(record, ["sessionId", "events", "agents", "pendingApprovals", "pendingInputs", "inputQueue", "omittedMessageParts", "truncated", "warning"]);
+  assertOnlyKeys(record, ["sessionId", "events", "agents", "pendingApprovals", "pendingInputs", "inputQueue", "omittedMessageParts", "truncated", "warning", "nextBeforeEventId"]);
   if (!Array.isArray(record.events) || record.events.length > 20_000) throw new TypeError("Invalid snapshot events");
   if (!Array.isArray(record.agents) || record.agents.length > 2_000) throw new TypeError("Invalid snapshot agents");
   if (!Array.isArray(record.pendingApprovals) || record.pendingApprovals.length > 2_000) {
@@ -830,6 +838,7 @@ function parseRuntimeSnapshot(value: unknown): RuntimeSnapshot {
   }
   if (record.truncated !== undefined) snapshot.truncated = requireBoolean(record.truncated, "snapshot.truncated");
   if (record.warning !== undefined) snapshot.warning = requireString(record.warning, "snapshot.warning", 2_000);
+  if (record.nextBeforeEventId !== undefined) snapshot.nextBeforeEventId = requireHistoryCursor(record.nextBeforeEventId, "snapshot.nextBeforeEventId");
   return snapshot;
 }
 
@@ -1128,6 +1137,7 @@ function requestKeys(type: string): readonly string[] {
     ];
   }
   if (type === "models.list") return ["type", "provider"];
+  if (type === "session.history") return ["type", "sessionId", "beforeEventId"];
   if (
     type === "session.snapshot"
     || type === "session.open"
@@ -1196,6 +1206,10 @@ function requireProjectId(value: unknown, field: string): string {
 
 function requireIdentifier(value: unknown, field: string): string {
   return requireSafeMapKey(value, field);
+}
+
+function requireHistoryCursor(value: unknown, field: string): string {
+  return parseRuntimeIdentifier(requireIdentifier(value, field), field);
 }
 
 function requireSafeMapKey(value: unknown, field: string): string {

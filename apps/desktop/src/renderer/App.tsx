@@ -18,6 +18,7 @@ import { ChangesPanel } from "./ChangesPanel.js";
 import { latestFileChange } from "./latest-file-change.js";
 import { discoverDesktopResults } from "./result-model.js";
 import { TimelineViewport } from "./TimelineViewport.js";
+import { HistoryNavigation, type HistoryNavigationState } from "./history-navigation.js";
 import { sessionDescendantAgents } from "./agent-details-model.js";
 import { formatWorkDuration, workCurrentDetail, workHeadline, workStages, workToolStatus, workToolSubject, workToolTitle, type WorkStage } from "./work-presentation.js";
 import { eventMatchesProject, PendingSessionSelection, ProjectViewMemory } from "./project-view-state.js";
@@ -285,9 +286,19 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     () => snapshot && snapshot.sessionId === selectedId ? presentSession(snapshot) : undefined,
     [selectedId, snapshot],
   );
+  const historyScope = JSON.stringify([desktop.projectId, desktop.workspace, selectedId]);
+  const [historyState, setHistoryState] = useState<HistoryNavigationState>({ loading: false, canGoNewer: false });
+  const history = useMemo(() => new HistoryNavigation(setHistoryState), []);
+  useLayoutEffect(() => {
+    const scoped = projectTransport(desktop);
+    history.configure(historyScope, selectedId, scoped.history?.bind(scoped));
+    return () => history.live();
+  }, [history, historyScope, selectedId, projectTransport]);
+  const historyPage = historyState.scope === historyScope ? historyState.page : undefined;
+  const timelinePresentation = useMemo(() => historyPage ? presentSession(historyPage) : presentation, [historyPage, presentation]);
   const timelineItems = useMemo(
-    () => presentation ? desktopTimelineItems(presentation.chat, presentation.runtime) : [],
-    [presentation],
+    () => timelinePresentation ? desktopTimelineItems(timelinePresentation.chat, timelinePresentation.runtime) : [],
+    [timelinePresentation],
   );
   const sessionBusy = presentation?.chat.status === "running"
     || presentation?.chat.status === "waiting_for_approval"
@@ -307,7 +318,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     [sessionListStatus, sessionQuery, sessions],
   );
   const canResumeSession = canResumeTask(presentation?.chat.status, selectedReadOnly, snapshot?.inputQueue?.paused);
-  const emptyConversation = !loadingSession && timelineItems.length === 0;
+  const emptyConversation = !loadingSession && !historyPage && timelineItems.length === 0;
   const conversationScope = JSON.stringify([desktop.projectId, desktop.workspace, selectedId]);
   const resultTarget = resultTargets[conversationScope];
   const activity = conversationActivity({ status: presentation?.chat.status, paused: snapshot?.inputQueue?.paused ?? false,
@@ -1013,6 +1024,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     if (localCommand) { chooseCommand(localCommand); return; }
     const text = resultTarget ? `请修改文件「${resultTarget}」：\n${draft}` : draft;
     setCommandsOpen(false);
+    history.live();
     await runAction(async () => {
       if (!selectedId) {
         const created = await transport.createSession({ title: conversationTitle(text), prompt: text });
@@ -1022,7 +1034,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         setComposer(created.startState === "not_started" ? text : "");
         if (created.failure) throw new Error(createFailureMessage(created));
       } else {
-        if (selectedSession?.title === "新会话" && !timelineItems.some((item) => item.kind === "message" && item.role === "user")) {
+        if (selectedSession?.title === "新会话" && !presentation?.chat.items.some((item) => item.kind === "message" && item.role === "user")) {
           await transport.renameSession(selectedId, conversationTitle(text));
         }
         await transport.send(selectedId, text, mode);
@@ -1284,9 +1296,21 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           <div className="conversation-dialogue">
           <div className="conversation-body">
           <div className="chat-surface">
-          <TimelineViewport scopeKey={JSON.stringify([desktop.projectId, desktop.workspace, selectedId])}>
-            {snapshot?.truncated ? <p className="transcript-warning" role="status">{snapshot.warning ?? "This large session was trimmed for desktop safety."}</p> : null}
+            {historyPage ? <div className="conversation-history" role="navigation" aria-label="会话历史">
+              <span>正在查看主会话历史。</span>
+              <button className="secondary" disabled={historyState.loading || !historyPage.nextBeforeEventId} onClick={() => void history.older()}>更早的记录</button>
+              <button className="secondary" disabled={historyState.loading || !historyState.canGoNewer} onClick={() => void history.newer()}>较新的记录</button>
+              <button className="secondary" onClick={() => history.live()}>返回实时对话</button>
+            </div> : snapshot?.truncated ? <div className="conversation-history" role="status">
+              <span>当前显示最近的一段记录。</span>
+              {projectTransport(desktop).history ? <button className="secondary" disabled={historyState.loading || !healthy || resyncing} onClick={() => void history.open()}>查看主会话历史</button> : null}
+            </div> : null}
+            {historyState.scope === historyScope && historyState.loading ? <p role="status">正在读取历史记录…</p> : null}
+            {historyState.scope === historyScope && historyState.error ? <p className="transcript-warning" role="alert">{historyState.error}</p> : null}
+          <TimelineViewport scopeKey={JSON.stringify([desktop.projectId, desktop.workspace, selectedId, historyPage ? "history" : "live", historyPage?.nextBeforeEventId])}>
+            {historyPage?.truncated && !historyPage.nextBeforeEventId ? <p className="transcript-warning" role="status">部分历史记录未能完整加载。</p> : null}
             {loadingSession ? <p className="empty-copy centered">正在恢复会话…</p> : null}
+            {historyPage && !loadingSession && timelineItems.length === 0 ? <p className="empty-copy centered">此页没有可显示的对话，可以继续查看更早的记录。</p> : null}
             {!loadingSession && timelineItems.map((item) => <Fragment key={`${item.kind}:${item.id}`}>
               <TimelineItem item={item} expandWork={preferences.expandWork} />
               {transport.readResult && (deliveriesByItem.get(item.id) ?? []).map((result) => <DeliveryCard key={result.id} result={result} onOpen={(path) => openPanel("files", path)} />)}

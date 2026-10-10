@@ -1364,6 +1364,56 @@ describe("desktop session projections", () => {
   }, 10_000);
 });
 
+test("desktop history reads one bounded root page, preserves the cursor, and projects identity fields", async () => {
+  const requests: Array<{ sessionId: string; limit?: number; beforeEventId?: string; history?: boolean }> = [];
+  const events = [
+    { id: "created", type: "session.created", sessionId: "root", time: 1, payload: { sessionId: "root", cwd: "/repo",
+      identity: { profileId: "p", profilePath: "/PRIVATE_PROFILE", authPath: "/PRIVATE_PROFILE/auth.json",
+        projectId: "project", projectRoot: "/source", workspaceId: "workspace", workspaceRoot: "/repo" } } },
+    { id: "renamed", type: "session.renamed", sessionId: "root", time: 2, payload: { sessionId: "root", title: "history" } },
+  ];
+  const original = structuredClone(events);
+  const unexpected = async () => { throw new Error("History must not execute or read live controls"); };
+  const client = {
+    sessionEventWindow: async (input: { sessionId: string; limit?: number; beforeEventId?: string }) => {
+      requests.push(input);
+      return { events, pendingApprovals: [], truncated: true, bytes: 100, pinnedEventIds: [], nextBeforeEventId: "renamed" };
+    },
+    listAgents: unexpected, listUserInputs: unexpected, openSession: unexpected, prompt: unexpected,
+    inputQueue: unexpected,
+  } as unknown as RuntimeClient;
+  const request = { type: "session.history", sessionId: "root", beforeEventId: "cursor" } as const;
+  const snapshot = parseDesktopResponse(request, await serviceFor(client).invoke(request));
+  expect(requests).toMatchObject([{ sessionId: "root", limit: 500, history: true, beforeEventId: "cursor" }]);
+  expect(snapshot.nextBeforeEventId).toBe("renamed");
+  expect(snapshot.pendingApprovals).toEqual([]);
+  expect(JSON.stringify(snapshot)).not.toContain("PRIVATE_PROFILE");
+  expect(events).toEqual(original);
+});
+
+test("desktop history rejects foreign events and stale sidecar generations", async () => {
+  const foreign = { sessionEventWindow: async () => ({
+    events: [{ id: "foreign", type: "session.renamed", sessionId: "other", time: 1, payload: { sessionId: "other", title: "foreign" } }],
+    pendingApprovals: [], truncated: false, bytes: 100, pinnedEventIds: [],
+  }) } as unknown as RuntimeClient;
+  await expect(serviceFor(foreign).invoke({ type: "session.history", sessionId: "root" })).rejects.toThrow("different session");
+
+  const result = deferred<{ events: []; pendingApprovals: []; truncated: false; bytes: number; pinnedEventIds: [] }>();
+  const client = { sessionEventWindow: async () => result.promise } as unknown as RuntimeClient;
+  let generation = 1;
+  const sidecar = {
+    getClientContext: () => ({ client, generation }), currentGeneration: () => generation,
+    currentWorkspace: () => "/repo", getClient: () => client,
+  };
+  const service = new DesktopControlService({ sidecar: sidecar as never,
+    selectWorkspace: async () => undefined, persistWorkspace: async () => undefined,
+    emitQueue: () => undefined, onError: () => undefined });
+  const reading = service.invoke({ type: "session.history", sessionId: "root" });
+  generation += 1;
+  result.resolve({ events: [], pendingApprovals: [], truncated: false, bytes: 2, pinnedEventIds: [] });
+  await expect(reading).rejects.toThrow();
+});
+
 function serviceFor(client: RuntimeClient, onError: (error: Error) => void = () => undefined): DesktopControlService {
   client.openSession ??= async () => undefined;
   client.inputQueue ??= async ({ sessionId }) => emptyInputQueue(sessionId);

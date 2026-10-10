@@ -127,7 +127,7 @@ export interface RuntimeClient {
   listSessions(input?: { signal?: AbortSignal }): Promise<RuntimeSessionSummary[]>;
   sessionEvents(input: SessionEventsRequest): Promise<ChiliEvent[]>;
   /** Dependency-complete bounded replay window with explicit truncation metadata. */
-  sessionEventWindow?(input: SessionEventsRequest): Promise<RuntimeSessionEventWindow>;
+  sessionEventWindow?(input: SessionEventWindowRequest): Promise<RuntimeSessionEventWindow>;
   renameSession(input: RenameSessionRequest): Promise<RuntimeSessionSummary>;
   listAgents(input: ListAgentsRequest): Promise<RuntimeAgentRecord[]>;
   spawnAgent(input: SpawnAgentRequest): Promise<RuntimeAgentSubmission>;
@@ -320,7 +320,14 @@ export interface RuntimeSessionSummary {
 export interface SessionEventsRequest {
   sessionId: SessionId;
   limit?: number;
+  /** Exclusive durable cursor for reading an older history window. */
+  beforeEventId?: string;
   signal?: AbortSignal;
+}
+
+export interface SessionEventWindowRequest extends SessionEventsRequest {
+  /** Read a conversation page without importing current pending controls. */
+  history?: boolean;
 }
 
 export interface ListPendingApprovalsRequest {
@@ -357,6 +364,8 @@ export interface RuntimeSessionEventWindow {
   bytes: number;
   pinnedEventIds: string[];
   warning?: string;
+  /** Oldest retained tail cursor; dependency anchors are not paging cursors. */
+  nextBeforeEventId?: string;
 }
 
 export interface RenameSessionRequest {
@@ -686,13 +695,15 @@ export class HttpRuntimeClient implements RuntimeClient {
   sessionEvents(input: SessionEventsRequest): Promise<ChiliEvent[]> {
     const params = new URLSearchParams();
     if (input.limit !== undefined) params.set("limit", String(input.limit));
+    if (input.beforeEventId !== undefined) params.set("beforeEventId", input.beforeEventId);
     const query = params.toString();
     return this.get(`sessions/${encodeURIComponent(input.sessionId)}/events${query ? `?${query}` : ""}`, input.signal, parseChiliEventArray);
   }
 
-  sessionEventWindow(input: SessionEventsRequest): Promise<RuntimeSessionEventWindow> {
-    const params = new URLSearchParams({ window: "replayable" });
+  sessionEventWindow(input: SessionEventWindowRequest): Promise<RuntimeSessionEventWindow> {
+    const params = new URLSearchParams({ window: input.history ? "history" : "replayable" });
     if (input.limit !== undefined) params.set("limit", String(input.limit));
+    if (input.beforeEventId !== undefined) params.set("beforeEventId", input.beforeEventId);
     return this.get(
       `sessions/${encodeURIComponent(input.sessionId)}/events?${params.toString()}`,
       input.signal,
@@ -984,6 +995,7 @@ function parseSessionEventWindow(value: unknown, path = "response"): RuntimeSess
     `${path}.pinnedEventIds`,
   );
   optionalString(record.warning, `${path}.warning`);
+  if (record.nextBeforeEventId !== undefined) parseRuntimeIdentifier(record.nextBeforeEventId, `${path}.nextBeforeEventId`);
   return record as unknown as RuntimeSessionEventWindow;
 }
 

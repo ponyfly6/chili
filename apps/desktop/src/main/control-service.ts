@@ -549,6 +549,29 @@ export class DesktopControlService {
     if (request.type === "session.snapshot") {
       return this.sessionSnapshot(request.sessionId as SessionId, this.captureClientLease());
     }
+    if (request.type === "session.history") {
+      const lease = this.captureClientLease();
+      if (!lease.client.sessionEventWindow) throw new Error("This runtime does not support paged history");
+      const history = await boundedControlRead(lease, (signal) => lease.client.sessionEventWindow!({
+        sessionId: request.sessionId as SessionId, limit: 500, history: true, signal,
+        ...(request.beforeEventId ? { beforeEventId: request.beforeEventId } : {}),
+      }));
+      this.assertClientLease(lease);
+      if (history.events.some((event) => event.sessionId !== request.sessionId)) {
+        throw new Error("History belongs to a different session");
+      }
+      return {
+        sessionId: request.sessionId,
+        events: history.events.flatMap((event) => {
+          const projected = projectRendererRuntimeEvent(event);
+          return projected ? [projected] : [];
+        }),
+        agents: [], pendingApprovals: [], pendingInputs: [],
+        ...(history.truncated ? { truncated: true } : {}),
+        ...(history.warning ? { warning: history.warning } : {}),
+        ...(history.nextBeforeEventId ? { nextBeforeEventId: history.nextBeforeEventId } : {}),
+      };
+    }
     if (request.type === "agent.send" || request.type === "agent.stop" || request.type === "agent.resume") {
       const lease = this.captureClientLease();
       return this.withSessionActor(request.agentId, async () => {
