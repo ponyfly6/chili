@@ -3,7 +3,7 @@ import {
   type ChiliEvent, type PendingUserInputRequest, type UserInputQuestion, type RuntimeInputQueue, type SessionId,
 } from "@chili/protocol";
 import { resolve } from "node:path";
-import { reduceRuntimeEvents, ReplayableRuntimeEventWindowAccumulator, RuntimeHttpError } from "@chili/sdk";
+import { conversationDisplayEvents, reduceRuntimeEvents, ReplayableRuntimeEventWindowAccumulator, RuntimeHttpError } from "@chili/sdk";
 import type {
   RuntimeAgentRecord,
   RuntimeClient,
@@ -549,6 +549,20 @@ export class DesktopControlService {
     if (request.type === "session.snapshot") {
       return this.sessionSnapshot(request.sessionId as SessionId, this.captureClientLease());
     }
+    if (request.type === "conversation.page" || request.type === "conversation.message" || request.type === "conversation.content" || request.type === "conversation.tools") {
+      const lease = this.captureClientLease();
+      const sessionId = request.sessionId as SessionId;
+      const common = { sessionId, ...(request.targetSessionId ? { targetSessionId: request.targetSessionId } : {}) };
+      const result = await boundedControlRead<import("@chili/protocol").ConversationPage | import("@chili/protocol").HistoryMessage | import("@chili/protocol").HistoryContent | import("@chili/protocol").HistoryToolPage>(lease, (signal) => {
+        if (request.type === "conversation.page" && lease.client.conversationPage) return lease.client.conversationPage({ ...common, signal, ...(request.beforeMessageId ? { beforeMessageId: request.beforeMessageId } : {}) });
+        if (request.type === "conversation.message" && lease.client.historyMessage) return lease.client.historyMessage({ ...common, signal, messageId: request.messageId, ...(request.partOffset !== undefined ? { partOffset: request.partOffset } : {}) });
+        if (request.type === "conversation.content" && lease.client.historyContent) return lease.client.historyContent({ ...common, signal, kind: request.kind, id: request.id, field: request.field, ...(request.offset !== undefined ? { offset: request.offset } : {}) });
+        if (request.type === "conversation.tools" && lease.client.historyTools) return lease.client.historyTools({ ...common, signal, parentCallId: request.parentCallId, ...(request.afterToolId ? { afterToolId: request.afterToolId } : {}) });
+        throw new Error("Message history is unavailable");
+      });
+      this.assertClientLease(lease);
+      return result;
+    }
     if (request.type === "session.history") {
       const lease = this.captureClientLease();
       if (!lease.client.sessionEventWindow) throw new Error("This runtime does not support paged history");
@@ -989,6 +1003,43 @@ export class DesktopControlService {
     warning?: string;
     inputQueue?: RuntimeInputQueue;
   }> {
+    if (lease.client.conversationPage) {
+      const inputQueue = await boundedControlRead(lease, (signal) => lease.client.inputQueue({ sessionId, signal }));
+      this.assertClientLease(lease);
+      const [state, page, agents, [pendingApprovals, pendingInputs]] = await Promise.all([
+        boundedControlRead(lease, (signal) => lease.client.eventSnapshot({ sessionId, controlsOnly: true, signal })),
+        boundedControlRead(lease, (signal) => lease.client.conversationPage!({ sessionId, signal })),
+        boundedControlRead(lease, (signal) => lease.client.listAgents({ sessionId, signal })).catch(async (error: unknown): Promise<RuntimeAgentRecord[]> => {
+          if (error instanceof RuntimeHttpError && error.status === 403) {
+            // Archived roots cannot use Agent control, but their stored hierarchy
+            // still provides read-only entry points into each child's history.
+            const sessions = await boundedControlRead(lease, (signal) => lease.client.listSessions({ signal }));
+            if (sessions.find((session) => session.id === sessionId)?.status !== "archived") return [];
+            const descendants: RuntimeAgentRecord[] = [];
+            const parents = new Set<string>([sessionId]);
+            for (const parent of parents) for (const child of sessions) {
+              if (child.agent?.parentSessionId !== parent || parents.has(child.id)) continue;
+              parents.add(child.id);
+              descendants.push({ agentId: child.id, parentAgentId: parent, name: child.agent.name, path: child.agent.path, state: "idle" });
+            }
+            return descendants;
+          }
+          throw error;
+        }),
+        (async () => {
+          const approvals = await boundedControlRead(lease, (signal) => lease.client.listPendingApprovals?.({ signal }) ?? Promise.resolve([]));
+          const inputs = await boundedControlRead(lease, (signal) => lease.client.pendingUserInputs({ signal }));
+          return [approvals, inputs] as const;
+        })(),
+      ]);
+      this.assertClientLease(lease);
+      if (page.sessionId !== sessionId || state.events.some((event) => event.sessionId && event.sessionId !== sessionId)) throw new Error("History belongs to another session");
+      this.observeInputQueue(inputQueue);
+      const allowed = new Set([String(sessionId), ...agents.map((agent) => agent.agentId)]);
+      return { sessionId, events: [...conversationDisplayEvents(page), ...state.events].flatMap((event) => { const projected = projectRendererRuntimeEvent(event); return projected ? [projected] : []; }), agents,
+        pendingApprovals: pendingApprovals.filter((item) => item.sessionId && allowed.has(item.sessionId)),
+        pendingInputs: pendingInputs.filter((item) => allowed.has(item.sessionId)), inputQueue };
+    }
     let inputQueue = await boundedControlRead(lease, (signal) => lease.client.inputQueue({ sessionId, signal }));
     this.assertClientLease(lease);
     this.observeInputQueue(inputQueue);

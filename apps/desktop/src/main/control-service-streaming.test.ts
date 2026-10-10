@@ -8,7 +8,7 @@ import { emptyInputQueue } from "./testing/input-receipts.js";
 import { parseDesktopResponse } from "../shared/contracts.js";
 import { appendRuntimeEvent, presentSession } from "../renderer/view-model.js";
 
-test("opening an already-streaming root restores root and child prefixes before subsequent deltas", async () => {
+test("opening a streaming root restores its bounded preview and reads child prefixes only on demand", async () => {
   const fixture = await streamingFixture();
   const { base, store, service, snapshotScopes, readScopes } = fixture;
   try {
@@ -34,14 +34,15 @@ test("opening an already-streaming root restores root and child prefixes before 
     let snapshot = parseDesktopResponse(request, await service.invoke(request));
     let view = presentSession(snapshot).runtime;
     expect(view.messages.message_root?.parts[0]).toMatchObject({ text: "hello" });
-    expect(view.messages.message_child?.parts[0]).toMatchObject({ type: "reasoning", text: "思考😀" });
-    // Bounded recovery history must not replace a complete historical file read.
-    expect(view.messages.message_old?.parts[0]).toMatchObject({ text: historicalText });
-    expect(snapshot.events.filter((row) => row.type === "message.part_stream_snapshot")).toHaveLength(2);
-    expect(snapshotScopes).toEqual([null]);
+    expect(view.messages.message_child).toBeUndefined();
+    const childRequest = { type: "conversation.page", sessionId: "root", targetSessionId: "child" } as const;
+    expect((await service.invoke(childRequest)).messages[0]?.parts[0]).toMatchObject({ type: "reasoning", text: "思考😀" });
+    expect(view.messages.message_old?.parts[0]).toMatchObject({ text: historicalText.slice(0, 8000) });
+    expect((await service.invoke({ type: "conversation.content", sessionId: "root", kind: "part", id: "part_old", field: "text" })).text).toBe(historicalText);
+    expect(snapshotScopes).toEqual(["root"]);
     expect(readScopes.every((sessionId) => sessionId === "root")).toBe(true);
     expect(snapshot.events.every((row) => row.sessionId === "root" || row.sessionId === "child")).toBe(true);
-    expect(Object.keys(view.messages).sort()).toEqual(["message_child", "message_old", "message_root"]);
+    expect(Object.keys(view.messages).sort()).toEqual(["message_old", "message_root"]);
 
     const unsubscribe = store.subscribe((row) => { snapshot = appendRuntimeEvent(snapshot, row); });
     try {
@@ -50,13 +51,12 @@ test("opening an already-streaming root restores root and child prefixes before 
     } finally { unsubscribe(); }
     view = presentSession(snapshot).runtime;
     expect(view.messages.message_root?.parts[0]).toMatchObject({ text: "hello world" });
-    expect(view.messages.message_child?.parts[0]).toMatchObject({ text: "思考😀完成" });
-    expect(view.partStreamGaps).toEqual({});
+    expect((await service.invoke(childRequest)).messages[0]?.parts[0]).toMatchObject({ text: "思考😀完成" });
 
     const refreshed = parseDesktopResponse(request, await service.invoke(request));
     expect(presentSession(refreshed).runtime.messages.message_root?.parts[0]).toMatchObject({ text: "hello world" });
-    expect(presentSession(refreshed).runtime.messages.message_child?.parts[0]).toMatchObject({ text: "思考😀完成" });
-    expect(snapshotScopes).toEqual([null, null]);
+    expect(presentSession(refreshed).runtime.messages.message_child).toBeUndefined();
+    expect(snapshotScopes).toEqual(["root", "root"]);
     expect(refreshed.events.every((row) => row.sessionId === "root" || row.sessionId === "child")).toBe(true);
   } finally { base.close(); }
 });
@@ -65,9 +65,9 @@ test("a block committed between active capture and history read replaces its cap
   const { base, store, client, service } = await streamingFixture();
   try {
     await store.append(streamDelta("root_prefix", "root", "hello", 0));
-    const readHistory = client.sessionEventWindow.bind(client);
+    const readHistory = client.conversationPage.bind(client);
     let committed = false;
-    client.sessionEventWindow = async (input) => {
+    client.conversationPage = async (input) => {
       if (input.sessionId === "root" && !committed) {
         committed = true;
         await store.append(event("root_committed", "message.part_committed", "root", {
@@ -79,7 +79,7 @@ test("a block committed between active capture and history read replaces its cap
       return readHistory(input);
     };
     const snapshot = await service.invoke({ type: "session.snapshot", sessionId: "root" });
-    expect(presentSession(snapshot).runtime.messages.message_root?.parts[0]).toMatchObject({ text: "hello world", completion: "completed" });
+    expect(presentSession(snapshot).runtime.messages.message_root?.parts[0]).toMatchObject({ text: "hello world" });
     expect(snapshot.events.some((row) => row.type === "message.part_stream_snapshot" && row.sessionId === "root")).toBe(false);
   } finally { base.close(); }
 });

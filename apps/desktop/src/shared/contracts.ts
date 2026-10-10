@@ -2,6 +2,8 @@ import type { ReadingPreferences } from "./reading-preferences.js";
 import type { DesktopTheme } from "./appearance.js";
 import { isResultPreviewUrl, MAX_RESULT_IMAGE_BYTES, MAX_RESULT_TEXT_BYTES, resultFileType, type DesktopResultRead } from "./result-preview.js";
 import {
+  parseConversationPage, parseHistoryMessage, parseHistoryContent, parseHistoryToolPage,
+  type ConversationPage, type HistoryMessage, type HistoryContent, type HistoryToolPage,
   normalizeSessionTitle,
   parseChiliEvent,
   parseRuntimeExecutionIdentity,
@@ -177,6 +179,10 @@ export interface DesktopSessionConfig {
 export type DesktopMcpConnectionState = Pick<RuntimeMcpServerDescriptor, "name" | "status" | "enabled" | "transport" | "toolCount">;
 
 type DesktopOperation =
+  | { type: "conversation.page"; sessionId: string; targetSessionId?: string; beforeMessageId?: string }
+  | { type: "conversation.message"; sessionId: string; targetSessionId?: string; messageId: string; partOffset?: number }
+  | { type: "conversation.content"; sessionId: string; targetSessionId?: string; kind: "part" | "tool"; id: string; field: HistoryContent["field"]; offset?: number }
+  | { type: "conversation.tools"; sessionId: string; targetSessionId?: string; parentCallId: string; afterToolId?: string }
   | { type: "reading.get" }
   | ({ type: "reading.set" } & ReadingPreferences)
   | { type: "appearance.get" }
@@ -219,6 +225,10 @@ type DesktopOperation =
 export type DesktopRequest = DesktopOperation & { projectId?: string };
 
 export interface DesktopResponseMap {
+  "conversation.page": ConversationPage;
+  "conversation.message": HistoryMessage;
+  "conversation.content": HistoryContent;
+  "conversation.tools": HistoryToolPage;
   "reading.get": ReadingPreferences;
   "reading.set": ReadingPreferences;
   "appearance.get": { theme: DesktopTheme };
@@ -328,6 +338,23 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
   if (type === "session.history") {
     return { type, sessionId: requireIdentifier(record.sessionId, "sessionId"),
       ...(record.beforeEventId === undefined ? {} : { beforeEventId: requireHistoryCursor(record.beforeEventId, "beforeEventId") }) };
+  }
+  if (type.startsWith("conversation.")) {
+    const common = { sessionId: requireIdentifier(record.sessionId, "sessionId"),
+      ...(record.targetSessionId === undefined ? {} : { targetSessionId: requireIdentifier(record.targetSessionId, "targetSessionId") }) };
+    const offset = (key: string) => {
+      const value = record[key];
+      if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)) throw new TypeError(`Invalid ${key}`);
+      return value as number | undefined;
+    };
+    if (type === "conversation.page") return { type, ...common, ...(record.beforeMessageId === undefined ? {} : { beforeMessageId: requireIdentifier(record.beforeMessageId, "beforeMessageId") }) };
+    if (type === "conversation.message") return { type, ...common, messageId: requireIdentifier(record.messageId, "messageId"), ...(offset("partOffset") === undefined ? {} : { partOffset: offset("partOffset")! }) };
+    if (type === "conversation.tools") return { type, ...common, parentCallId: requireIdentifier(record.parentCallId, "parentCallId"), ...(record.afterToolId === undefined ? {} : { afterToolId: requireIdentifier(record.afterToolId, "afterToolId") }) };
+    if (type === "conversation.content") {
+      if (record.kind !== "part" && record.kind !== "tool") throw new TypeError("Invalid content kind");
+      if (!["text", "input", "output", "error"].includes(String(record.field))) throw new TypeError("Invalid content field");
+      return { type, ...common, kind: record.kind, id: requireIdentifier(record.id, "id"), field: record.field as HistoryContent["field"], ...(offset("offset") === undefined ? {} : { offset: offset("offset")! }) };
+    }
   }
   if (type === "sessions.create") return parseCreateSessionRequest(record);
   if (type === "models.list") {
@@ -604,6 +631,14 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
   } else if (request.type === "models.list") {
     if (!Array.isArray(value) || value.length > 1_000) throw new TypeError("Invalid model list");
     response = value.map((item, index) => parseRuntimeModelDescriptor(item, `models[${index}]`));
+  } else if (request.type === "conversation.page") {
+    response = parseConversationPage(value);
+  } else if (request.type === "conversation.message") {
+    response = parseHistoryMessage(value);
+  } else if (request.type === "conversation.content") {
+    response = parseHistoryContent(value);
+  } else if (request.type === "conversation.tools") {
+    response = parseHistoryToolPage(value);
   } else if (request.type === "session.snapshot" || request.type === "session.history" || request.type === "session.open" || request.type === "session.resume") {
     response = parseRuntimeSnapshot(value);
   } else if (request.type === "session.rename") {
@@ -720,6 +755,14 @@ export function parseDesktopInvokeResponse<Request extends DesktopRequest>(
 }
 
 function assertDesktopResponseScope(request: DesktopRequest, response: unknown): void {
+  if (request.type === "conversation.page" || request.type === "conversation.message" || request.type === "conversation.content" || request.type === "conversation.tools") {
+    const value = response as ConversationPage & HistoryMessage & HistoryContent & HistoryToolPage;
+    requireMatchingSessionId(request.targetSessionId ?? request.sessionId, value.sessionId, "history.sessionId");
+    if (request.type === "conversation.message" && value.id !== request.messageId) throw new TypeError("History belongs to another message");
+    if (request.type === "conversation.content" && (value.id !== request.id || value.field !== request.field || value.offset !== (request.offset ?? 0))) throw new TypeError("History content does not match request");
+    if (request.type === "conversation.tools" && value.parentCallId !== request.parentCallId) throw new TypeError("History belongs to another tool");
+    return;
+  }
   if (request.type === "agent.send" || request.type === "agent.stop" || request.type === "agent.resume") {
     if ((response as { agentId: string }).agentId !== request.agentId) throw new TypeError("Agent response belongs to a different agentId");
     return;
@@ -1137,6 +1180,10 @@ function requestKeys(type: string): readonly string[] {
     ];
   }
   if (type === "models.list") return ["type", "provider"];
+  if (type === "conversation.page") return ["type", "sessionId", "targetSessionId", "beforeMessageId"];
+  if (type === "conversation.message") return ["type", "sessionId", "targetSessionId", "messageId", "partOffset"];
+  if (type === "conversation.content") return ["type", "sessionId", "targetSessionId", "kind", "id", "field", "offset"];
+  if (type === "conversation.tools") return ["type", "sessionId", "targetSessionId", "parentCallId", "afterToolId"];
   if (type === "session.history") return ["type", "sessionId", "beforeEventId"];
   if (
     type === "session.snapshot"

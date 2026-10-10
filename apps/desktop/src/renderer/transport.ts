@@ -23,6 +23,10 @@ import type {
  * this interface without changing React components or importing Electron.
  */
 export interface ControlTransport {
+  conversationPage?(input: Omit<Extract<import("../shared/contracts.js").DesktopRequest, { type: "conversation.page" }>, "type">): Promise<DesktopResponseMap["conversation.page"]>;
+  historyMessage?(input: Omit<Extract<import("../shared/contracts.js").DesktopRequest, { type: "conversation.message" }>, "type">): Promise<DesktopResponseMap["conversation.message"]>;
+  historyContent?(input: Omit<Extract<import("../shared/contracts.js").DesktopRequest, { type: "conversation.content" }>, "type">): Promise<DesktopResponseMap["conversation.content"]>;
+  historyTools?(input: Omit<Extract<import("../shared/contracts.js").DesktopRequest, { type: "conversation.tools" }>, "type">): Promise<DesktopResponseMap["conversation.tools"]>;
   forProject?(projectId: string): ControlTransport;
   activateProject?(projectId: string): Promise<DesktopState>;
   state(): Promise<DesktopState>;

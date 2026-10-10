@@ -155,6 +155,10 @@ export interface EventAppendOptions {
 }
 
 export interface EventStore {
+  conversationPage?(query: import("./conversation-history.js").ConversationQuery): Promise<import("@chili/protocol").ConversationPage>;
+  historyMessage?(query: import("./conversation-history.js").HistoryMessageQuery): Promise<import("@chili/protocol").HistoryMessage>;
+  historyContent?(query: import("./conversation-history.js").HistoryContentQuery): Promise<import("@chili/protocol").HistoryContent>;
+  historyTools?(query: import("./conversation-history.js").HistoryToolsQuery): Promise<import("@chili/protocol").HistoryToolPage>;
   /** Acquire control of this root conversation until its Host closes. Reads do not acquire. */
   acquireSessionOwnership?(sessionId: SessionId): boolean;
   /** Check admission without acquiring ownership. Durable mutations check again atomically. */
@@ -173,7 +177,7 @@ export interface EventStore {
   events(query?: EventQuery): Promise<EventEnvelope[]>;
   eventReplayBoundary?(query?: EventReplayBoundaryQuery): Promise<EventReplayBoundary>;
   /** Durable state and watermark from one read transaction, plus current in-memory content when available. */
-  runtimeSnapshot?(query?: { sessionId?: SessionId; maxBytes?: number }): Promise<RuntimeStateSnapshot>;
+  runtimeSnapshot?(query?: { sessionId?: SessionId; maxBytes?: number; controlsOnly?: boolean }): Promise<RuntimeStateSnapshot>;
   /**
    * Synchronously capture complete, uncommitted text/reasoning from this process.
    * Subscribe before calling this method so subsequent deltas cannot fall into

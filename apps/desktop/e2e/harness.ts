@@ -15,6 +15,7 @@ import { assertDelegatedConversation } from "./delegated-conversation.js";
 import { assertResponsiveNavigation } from "./responsive-navigation.js";
 import { assertTimelineFollowStream, TIMELINE_FOLLOW_PROMPT, TimelineFollowFixture } from "./timeline-follow-stream.js";
 import { assertTimelineNavigation } from "./timeline-navigation.js";
+import { assertHistoryPagination } from "./history-pagination.js";
 import { assertDesktopResults, isExpectedResultPreviewDiagnostic } from "./results-preview.js";
 import { assertConversationDeletion, assertDeletedConversationsStayRemoved, DELETED_CONVERSATION_TITLES } from "./session-lifecycle.js";
 import {
@@ -238,6 +239,7 @@ try {
     await assertNativeResponsiveWidths(currentLaunch);
     await assertTimelineFollowStream(currentLaunch.page, provider.timeline, artifacts);
     await assertTimelineNavigation(currentLaunch.page);
+    await assertHistoryPagination(currentLaunch.page, workspace, repositoryRoot, artifacts);
     await closeDesktop(currentLaunch);
     currentLaunch = undefined;
 

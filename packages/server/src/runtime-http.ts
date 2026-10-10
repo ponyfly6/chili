@@ -339,7 +339,8 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "eventSnapshot") {
-        rejectUnknownQueryParameters(url, ["sessionId"]);
+        rejectUnknownQueryParameters(url, ["sessionId", "controlsOnly"]);
+        const controlsOnly = url.searchParams.get("controlsOnly") === "true";
         if (request.signal.aborted) return new Response(null, { status: 499 });
         const sessionId = asSessionId(url.searchParams.get("sessionId"));
         if (sessionId) {
@@ -352,7 +353,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         try {
           const snapshot = await eventSnapshotAdmission.run(async () => {
             if (request.signal.aborted) throw request.signal.reason;
-            return options.store.runtimeSnapshot!({ ...(sessionId ? { sessionId } : {}) });
+            return options.store.runtimeSnapshot!({ ...(sessionId ? { sessionId } : {}), ...(controlsOnly ? { controlsOnly: true } : {}) });
           });
           if (request.signal.aborted) return new Response(null, { status: 499 });
           return json(snapshot, 200, { "cache-control": "no-store" });
@@ -369,6 +370,46 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "messages") {
         return json((await options.store.messages(route.sessionId)).map(compactRuntimeMessage));
+      }
+
+      if (route.name === "conversationHistory") {
+        await options.service.assertSessionReadAllowed(route.sessionId);
+        rejectUnknownQueryParameters(url, ["targetSessionId", "beforeMessageId", "limit", "messageId", "partOffset", "kind", "id", "field", "offset", "parentCallId", "afterToolId"]);
+        const id = (name: string) => url.searchParams.has(name) ? parseRuntimeIdentifier(url.searchParams.get(name), name) : undefined;
+        const integer = (name: string, fallback: number, max: number) => {
+          const raw = url.searchParams.get(name);
+          const value = raw === null ? fallback : Number(raw);
+          if (!Number.isSafeInteger(value) || value < 0 || value > max) throw badRequest(`Invalid ${name}`);
+          return value;
+        };
+        integer("offset", 0, Number.MAX_SAFE_INTEGER);
+        integer("partOffset", 0, Number.MAX_SAFE_INTEGER);
+        const sessionId = (id("targetSessionId") ?? route.sessionId) as SessionId;
+        const sessionStore = options.store as typeof options.store & { session?: (id: SessionId) => Promise<import("@chili/store").SessionRow | undefined> };
+        const readSession = sessionStore.session ? (id: SessionId) => sessionStore.session!(id)
+          : async (id: SessionId) => (await options.store.sessions()).find((session) => session.id === id);
+        let target = await readSession(sessionId);
+        const visited = new Set<string>();
+        while (target && target.id !== route.sessionId && !visited.has(target.id)) {
+          visited.add(target.id);
+          target = target.agent?.parentSessionId ? await readSession(target.agent.parentSessionId) : undefined;
+        }
+        if (!target || target.id !== route.sessionId) return jsonError(403, "History is outside this conversation");
+        if (!options.store.conversationPage || !options.store.historyMessage || !options.store.historyContent || !options.store.historyTools) return jsonError(501, "Message history is unavailable");
+        const kind = url.searchParams.get("kind");
+        if (kind) {
+          const field = url.searchParams.get("field");
+          const contentId = id("id");
+          if (!contentId || (kind !== "part" && kind !== "tool") || !["text", "input", "output", "error"].includes(field ?? "")) throw badRequest("Invalid history content request");
+          return json(await options.store.historyContent({ sessionId, kind, id: contentId, field: field as "text" | "input" | "output" | "error", offset: integer("offset", 0, Number.MAX_SAFE_INTEGER) }));
+        }
+        const parentCallId = id("parentCallId");
+        if (parentCallId) return json(await options.store.historyTools({ sessionId, parentCallId, ...(id("afterToolId") ? { afterToolId: id("afterToolId")! } : {}) }));
+        const messageId = id("messageId");
+        if (messageId) return json(await options.store.historyMessage({ sessionId, messageId, partOffset: integer("partOffset", 0, Number.MAX_SAFE_INTEGER) }));
+        const limit = integer("limit", 20, 50);
+        if (limit < 1) throw badRequest("Invalid history limit");
+        return json(await options.store.conversationPage({ sessionId, limit, ...(id("beforeMessageId") ? { beforeMessageId: id("beforeMessageId")! } : {}) }));
       }
 
       if (route.name === "sessionEvents") {
@@ -854,6 +895,7 @@ type Route =
   | { name: "createSession" }
   | { name: "openSession"; sessionId: SessionId }
   | { name: "messages"; sessionId: SessionId }
+  | { name: "conversationHistory"; sessionId: SessionId }
   | { name: "sessionEvents"; sessionId: SessionId }
   | { name: "eventSnapshot" }
   | { name: "renameSession"; sessionId: SessionId }
@@ -1078,6 +1120,7 @@ function routeRequest(method: string, pathname: string): Route {
   const sessionId = requestSessionId(decodeURIComponent(sessionRoute[1] ?? ""));
   const action = sessionRoute[2];
   if (method === "GET" && action === "messages") return { name: "messages", sessionId };
+  if (method === "GET" && action === "history") return { name: "conversationHistory", sessionId };
   if (method === "GET" && action === "events") return { name: "sessionEvents", sessionId };
   if ((method === "POST" || method === "PATCH") && action === "rename") return { name: "renameSession", sessionId };
   if (method === "GET" && action === "model") return { name: "modelConfig", sessionId };

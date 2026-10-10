@@ -33,9 +33,11 @@ export async function assertDelegatedConversation(page: Page, workspace: string,
       const snapshot = await api.invoke({ type: "session.snapshot", sessionId: String(session.id) });
       const agent = snapshot.agents.find((candidate) => candidate.name === "reader");
       if (!agent) return undefined;
-      const completed = snapshot.events.some((event) => (event.type === "message.part_added" || event.type === "message.part_committed")
-        && event.sessionId === agent.agentId && event.payload.part.type === "text"
-        && event.payload.part.text === "I read the file and the tool loop works.");
+      if (snapshot.events.some((event) => event.sessionId === agent.agentId && event.type.startsWith("message."))) {
+        throw new Error("Opening the root eagerly loaded child history");
+      }
+      const history = await api.invoke({ type: "conversation.page", sessionId: String(session.id), targetSessionId: agent.agentId });
+      const completed = history.messages.some((message) => message.parts.some((part) => part.text === "I read the file and the tool loop works."));
       return completed && agent.state === "idle" ? agent.path : undefined;
     });
     if (!agentPath) await delay(100);
@@ -51,6 +53,9 @@ export async function assertDelegatedConversation(page: Page, workspace: string,
   const details = await panel.innerText();
   assert.doesNotMatch(details, /Agent ID|Parent agent ID|Nested agents|Queue|Steer|\/root\/|Agent message:|collaborator-provided/u,
     "Progress describes work without exposing runtime identifiers or delegation controls");
+  assert.equal(await panel.locator(".agent-history-timeline").count(), 0, "Child history waits for an explicit selection");
+  await panel.getByLabel("查看 Agent 对话").selectOption({ label: "reader" });
+  await panel.locator(".agent-history-timeline").getByText("I read the file and the tool loop works.", { exact: true }).waitFor();
   await page.locator(".conversation-body").waitFor({ state: "visible" });
   await page.screenshot({ path: join(artifacts, "delegated-conversation.png") });
   await page.getByRole("button", { name: "关闭侧栏", exact: true }).click();

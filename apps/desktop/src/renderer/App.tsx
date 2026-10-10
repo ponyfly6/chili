@@ -18,6 +18,7 @@ import { ChangesPanel } from "./ChangesPanel.js";
 import { latestFileChange } from "./latest-file-change.js";
 import { discoverDesktopResults } from "./result-model.js";
 import { TimelineViewport } from "./TimelineViewport.js";
+import { ConversationTimeline } from "./ConversationTimeline.js";
 import { HistoryNavigation, type HistoryNavigationState } from "./history-navigation.js";
 import { sessionDescendantAgents } from "./agent-details-model.js";
 import { formatWorkDuration, workCurrentDetail, workHeadline, workStages, workToolStatus, workToolSubject, workToolTitle, type WorkStage } from "./work-presentation.js";
@@ -515,7 +516,9 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     if (current) await openSession(current, { background: true });
   }, [openSession]);
 
-  const streamHasGap = presentation ? hasRuntimePartStreamGap(presentation.runtime) : false;
+  // Message-page views refresh from the store; their intentionally shortened display
+  // seeds cannot be used to infer a gap in the full legacy event-stream prefix.
+  const streamHasGap = !transport.conversationPage && presentation ? hasRuntimePartStreamGap(presentation.runtime) : false;
   useEffect(() => {
     if (streamHasGap && healthy && !resyncing) void reloadSelected();
   }, [streamHasGap, healthy, resyncing, selectedId, reloadSelected]);
@@ -1296,6 +1299,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           <div className="conversation-dialogue">
           <div className="conversation-body">
           <div className="chat-surface">
+          {transport.conversationPage && selectedId && !emptyConversation ? <ConversationTimeline key={conversationScope} transport={projectTransport(desktop)} sessionId={selectedId} revision={snapshot} workspace={desktop.workspace} onOpenResult={(path) => openPanel("files", path)} /> : <>
             {historyPage ? <div className="conversation-history" role="navigation" aria-label="会话历史">
               <span>正在查看主会话历史。</span>
               <button className="secondary" disabled={historyState.loading || !historyPage.nextBeforeEventId} onClick={() => void history.older()}>更早的记录</button>
@@ -1321,6 +1325,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
               {!desktop.workspace ? <button className="secondary" disabled={!workspaceSwitchEnabled} onClick={() => void chooseWorkspace()}><Icon name="folder" />打开一个目录</button> : null}
             </div> : null}
           </TimelineViewport>
+          </>}
           </div>
           </div>
 
@@ -1414,6 +1419,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           {activePanel && selectedId ? <ConversationSidePanel key={conversationScope} title={activePanel.view === "progress" ? "进展" : activePanel.view === "files" ? "交付文件" : "改动"}
             narrow={narrowPanel} onClose={closePanel} returnFocus={panelReturnFocus.current}>
             {activePanel.view === "progress" ? <ProgressPanel projectId={desktop.projectId} sessionId={selectedId} agents={descendantAgents}
+              renderHistory={transport.conversationPage ? (agentId) => <ConversationTimeline key={`${conversationScope}:${agentId}`} transport={projectTransport(desktop)} sessionId={selectedId} targetSessionId={agentId} revision={snapshot} /> : undefined}
               workItems={workItems} pendingQuestions={presentation?.pendingInputs.length ?? 0} {...(presentation ? { runtime: presentation.runtime } : {})}
               inputQueues={Object.fromEntries(Object.entries(presentation?.runtime.sessions ?? {})
                 .flatMap(([id, session]) => session.inputQueue ? [[id, session.inputQueue]] : []))} /> : null}

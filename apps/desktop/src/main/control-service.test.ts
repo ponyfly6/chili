@@ -6,6 +6,42 @@ import { RuntimeHttpError } from "@chili/sdk";
 import { DesktopControlService } from "./control-service.js";
 import { parseDesktopResponse } from "../shared/contracts.js";
 
+test("message history snapshot reads root previews and controls without replaying descendant events", async () => {
+  const reads: unknown[] = [];
+  const client = {
+    conversationPage: async (input: unknown) => { reads.push(input); return { sessionId: "root", messages: [{ id: "m", sessionId: "root", role: "user", createdAt: 1, parts: [{ id: "p", type: "text", text: "old prompt", hasMore: false }] }] }; },
+    eventSnapshot: async (input: unknown) => { reads.push(input); return { events: [{ id: "root_created", sessionId: "root", time: 1, type: "session.created", payload: { sessionId: "root", cwd: "/repo" } }] }; },
+    sessionEvents: async () => { throw new Error("raw history must not be read"); },
+    listAgents: async () => [{ agentId: "child", parentAgentId: "root", name: "child", path: "/root/child", state: "idle" }],
+    inputQueue: async () => emptyInputQueue("root"),
+    listPendingApprovals: async () => [], pendingUserInputs: async () => [],
+  } as unknown as RuntimeClient;
+  const snapshot = await serviceFor(client).invoke({ type: "session.snapshot", sessionId: "root" });
+  expect(snapshot.events.some((event) => event.type === "message.part_added")).toBe(true);
+  expect(snapshot.agents[0]?.agentId).toBe("child");
+  expect(reads).toMatchObject([{ sessionId: "root", controlsOnly: true }, { sessionId: "root" }]);
+});
+
+test("archived message history retains descendant entry points without Agent control or child replay", async () => {
+  const client = {
+    conversationPage: async () => ({ sessionId: "root", messages: [] }),
+    eventSnapshot: async () => ({ events: [] }),
+    sessionEvents: async () => { throw new Error("raw history must not be read"); },
+    listAgents: async () => { throw new RuntimeHttpError(403, "archived"); },
+    listSessions: async () => [
+      { id: "grandchild", agent: { parentSessionId: "child", name: "grandchild", path: "/root/child/grandchild" } },
+      { id: "foreign", agent: { parentSessionId: "other", name: "foreign", path: "/root/foreign" } },
+      { id: "root", status: "archived" },
+      { id: "child", agent: { parentSessionId: "root", name: "child", path: "/root/child" } },
+    ],
+    inputQueue: async () => emptyInputQueue("root"),
+    listPendingApprovals: async () => [], pendingUserInputs: async () => [],
+  } as unknown as RuntimeClient;
+  const snapshot = await serviceFor(client).invoke({ type: "session.snapshot", sessionId: "root" });
+  expect(snapshot.agents.map((agent) => agent.agentId)).toEqual(["child", "grandchild"]);
+  expect(snapshot.events).toEqual([]);
+});
+
 describe("desktop prompt controls", () => {
   test("Agent controls preserve caller and target identity and return input receipts", async () => {
     const calls: Array<{ operation: string; sessionId: string; agentId: string; text?: string; mode?: string }> = [];

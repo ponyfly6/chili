@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { ConversationHistoryReader, type ConversationQuery, type HistoryMessageQuery, type HistoryContentQuery, type HistoryToolsQuery } from "./conversation-history.js";
 import { hostOwnerBlockingPid } from "./host-owner.js";
 import { StoredContentCodec } from "./content-store.js";
 import { SessionInputConflictError, SessionInputRepository, type SessionInputMutation, type SessionInputMutationOptions, type SessionInputMutationResult } from "./session-inputs.js";
@@ -791,7 +792,7 @@ export class SqliteEventStore
     return { ...(afterEventId ? { afterEventId } : {}), count: Math.min(limit, rows.length) };
   }
 
-  async runtimeSnapshot(query: { sessionId?: SessionId; maxBytes?: number } = {}) {
+  async runtimeSnapshot(query: { sessionId?: SessionId; maxBytes?: number; controlsOnly?: boolean } = {}) {
     return readRuntimeStateSnapshot(this.db, query, this.content);
   }
 
@@ -979,6 +980,11 @@ export class SqliteEventStore
       return result;
     });
   }
+
+  async conversationPage(query: ConversationQuery) { return new ConversationHistoryReader(this.db, this.content).page(query); }
+  async historyMessage(query: HistoryMessageQuery) { return new ConversationHistoryReader(this.db, this.content).messagePage(query); }
+  async historyContent(query: HistoryContentQuery) { return new ConversationHistoryReader(this.db, this.content).read(query); }
+  async historyTools(query: HistoryToolsQuery) { return new ConversationHistoryReader(this.db, this.content).tools(query); }
 
   async pendingApprovals(sessionId?: ApprovalRow["sessionId"], limit?: number): Promise<ApprovalRow[]> {
     const boundedLimit = limit === undefined ? undefined : Math.max(1, Math.min(10_000, Math.trunc(limit)));

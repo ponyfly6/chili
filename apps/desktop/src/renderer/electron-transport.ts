@@ -31,6 +31,10 @@ export function createElectronTransport(api: ChiliDesktopApi, projectId?: string
     return invoke(request);
   };
   return {
+    conversationPage: (input) => invokeAfterWorkspaceSelection({ type: "conversation.page", ...input }),
+    historyMessage: (input) => invokeAfterWorkspaceSelection({ type: "conversation.message", ...input }),
+    historyContent: (input) => invokeAfterWorkspaceSelection({ type: "conversation.content", ...input }),
+    historyTools: (input) => invokeAfterWorkspaceSelection({ type: "conversation.tools", ...input }),
     forProject: (id) => createElectronTransport(api, id),
     activateProject: (id) => {
       const selection = invoke({ type: "workspace.activate", id });

@@ -1,8 +1,9 @@
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 import { buildProgressModel, progressStateLabel, type ProgressItem, type ProgressModelInput } from "./progress-model.js";
 import "./progress-panel.css";
 
 export interface ProgressPanelProps extends ProgressModelInput {
+  renderHistory?: ((agentId: string) => ReactNode) | undefined;
   projectId: string | undefined;
   onStop?: ((agentId: string) => Promise<void>) | undefined;
   onResume?: ((agentId: string) => Promise<void>) | undefined;
@@ -12,7 +13,8 @@ export function ProgressPanel(props: ProgressPanelProps) {
   return <ScopedProgressPanel key={JSON.stringify([props.projectId ?? null, props.sessionId ?? null])} {...props} />;
 }
 
-function ScopedProgressPanel({ onStop, onResume, ...input }: ProgressPanelProps) {
+function ScopedProgressPanel({ onStop, onResume, renderHistory, ...input }: ProgressPanelProps) {
+  const [historyAgent, setHistoryAgent] = useState("");
   const model = useMemo(() => buildProgressModel(input), [input.agents, input.inputQueues, input.runtime, input.sessionId, input.workItems, input.pendingQuestions]);
   return <section className="progress-panel" aria-label="工作进展">
     {model.primary ? <>
@@ -23,6 +25,13 @@ function ScopedProgressPanel({ onStop, onResume, ...input }: ProgressPanelProps)
         </li>)}</ul>
       </div> : <p className="progress-empty">工作进度会自动更新，结果可以在对话中查看。</p>}
     </> : <p className="progress-empty">选择一个对话，查看工作进展。</p>}
+    {renderHistory && input.agents?.length ? <section className="agent-history">
+      <label>查看 Agent 对话 <select value={historyAgent} onChange={(event) => setHistoryAgent(event.currentTarget.value)}>
+        <option value="">选择 Agent</option>
+        {input.agents.filter((agent) => agent.agentId !== input.sessionId).map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.name ?? agent.agentId}</option>)}
+      </select></label>
+      {historyAgent ? <div className="agent-history-timeline">{renderHistory(historyAgent)}</div> : null}
+    </section> : null}
   </section>;
 }
 

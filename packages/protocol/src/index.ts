@@ -15,3 +15,4 @@ export * from "./execution-identity.js";
 
 export * from "./runtime-agent.js";
 export * from "./runtime-snapshot.js";
+export * from "./conversation-history.js";

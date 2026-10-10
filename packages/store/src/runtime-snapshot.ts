@@ -15,7 +15,7 @@ type Row = Record<string, string | number | null>;
 interface EventRow extends Row { seq: number; id: string; type: string; time: number; payload_json: string | null; native_too_large: number; content_version: number; }
 interface Seed { seq: number; ordinal: number; event: ChiliEvent; sourceSeq?: number; }
 
-export interface RuntimeSnapshotOptions { sessionId?: SessionId; maxBytes?: number; }
+export interface RuntimeSnapshotOptions { sessionId?: SessionId; maxBytes?: number; controlsOnly?: boolean; }
 
 export class RuntimeSnapshotLimitError extends Error {
   override readonly name = "RuntimeSnapshotLimitError";
@@ -245,14 +245,14 @@ export function readRuntimeStateSnapshot(
         toolIds.add(callId);
         add("tool.call_started", {
           callId, turnId: row.turn_id ?? `snapshot-turn:${sessionId}`, toolName: row.tool_name,
-          input: boundedJson(row.input_json, { omitted: "Snapshot input exceeded display limit" }, row.input_content_version === 1),
+          input: options.controlsOnly ? {} : boundedJson(row.input_json, { omitted: "Snapshot input exceeded display limit" }, row.input_content_version === 1),
           ...(row.provider_call_id ? { providerCallId: row.provider_call_id } : {}),
           ...(row.parent_call_id ? { parentCallId: row.parent_call_id } : {}),
         }, sessionId, Number(row.started_at), Number(row.seq ?? 0));
         if (["completed", "failed", "cancelled"].includes(String(row.status))) {
           add("tool.call_finished", { callId, status: row.status,
-            ...(row.output !== null ? { output: storedText(row.output, row.output_length, row.output_content_version === 1) } : {}),
-            ...(row.error !== null ? { error: storedText(row.error, row.error_length, row.output_content_version === 1) } : {}),
+            ...(!options.controlsOnly && row.output !== null ? { output: storedText(row.output, row.output_length, row.output_content_version === 1) } : {}),
+            ...(!options.controlsOnly && row.error !== null ? { error: storedText(row.error, row.error_length, row.output_content_version === 1) } : {}),
             ...(row.synthetic ? { synthetic: true } : {}),
           }, sessionId, Number(row.updated_at), Number(row.seq ?? 0) + 0.2);
         } else if (row.status !== "running") add("tool.call_updated", { callId, status: row.status }, sessionId, Number(row.updated_at), Number(row.seq ?? 0) + 0.2);
@@ -271,17 +271,19 @@ export function readRuntimeStateSnapshot(
       const startedPayload = started ? eventPayload(started) as { turnId: string } : undefined;
       const completed = startedPayload ? latest(sessionId, "turn.completed", "and json_extract(payload_json, '$.turnId') = ?", [startedPayload.turnId]) : null;
       const activeTurnId = startedPayload && !completed ? startedPayload.turnId : undefined;
-      const requiredMessages = db.query<Row, string[]>(`select * from messages where session_id = ?
-        and (${activeTurnId ? "turn_id = ? or" : ""} id = (select id from messages where session_id = ? order by created_event_seq desc, created_at desc, id desc limit 1))
-        order by created_event_seq, created_at, id limit ${MAX_REQUIRED_ROWS + 1}`)
-        .all(sessionId, ...(activeTurnId ? [activeTurnId] : []), sessionId);
-      if (requiredMessages.length > MAX_REQUIRED_ROWS) throw new RuntimeSnapshotLimitError();
-      for (const message of requiredMessages) readMessage(message, true);
-      readTools(sessionId, activeTurnId ?? startedPayload?.turnId);
-      const recent = db.query<Row, [string]>(`select * from messages where session_id = ?
-        order by created_event_seq desc, created_at desc, id desc limit ${HISTORY_MESSAGES + 1}`).all(sessionId);
-      if (recent.length > HISTORY_MESSAGES) markTruncated();
-      history.push({ sessionId, ids: recent.slice(0, HISTORY_MESSAGES).reverse() });
+      if (!options.controlsOnly) {
+        const requiredMessages = db.query<Row, string[]>(`select * from messages where session_id = ?
+          and (${activeTurnId ? "turn_id = ? or" : ""} id = (select id from messages where session_id = ? order by created_event_seq desc, created_at desc, id desc limit 1))
+          order by created_event_seq, created_at, id limit ${MAX_REQUIRED_ROWS + 1}`)
+          .all(sessionId, ...(activeTurnId ? [activeTurnId] : []), sessionId);
+        if (requiredMessages.length > MAX_REQUIRED_ROWS) throw new RuntimeSnapshotLimitError();
+        for (const message of requiredMessages) readMessage(message, true);
+        readTools(sessionId, activeTurnId ?? startedPayload?.turnId);
+        const recent = db.query<Row, [string]>(`select * from messages where session_id = ?
+          order by created_event_seq desc, created_at desc, id desc limit ${HISTORY_MESSAGES + 1}`).all(sessionId);
+        if (recent.length > HISTORY_MESSAGES) markTruncated();
+        history.push({ sessionId, ids: recent.slice(0, HISTORY_MESSAGES).reverse() });
+      } else readTools(sessionId);
       for (const type of ["session.model_changed", "session.reasoning_changed", "session.service_tier_changed", "session.delegation_changed"]) {
         const event = latest(sessionId, type); if (event) seedEvent(event, sessionId);
       }
@@ -371,7 +373,7 @@ export function readRuntimeStateSnapshot(
       if (session.status === "archived") add("session.archived", { sessionId }, sessionId, Number(session.updated_at), (tip?.seq ?? 0) + 0.5);
     }
     for (const item of history) for (const message of item.ids) readMessage(message, false);
-    for (const [table, retained] of [["messages", messageIds.size], ["tool_calls", toolIds.size]] as const) {
+    for (const [table, retained] of (options.controlsOnly ? [] : [["messages", messageIds.size], ["tool_calls", toolIds.size]]) as Array<[string, number]>) {
       const total = db.query<{ count: number }, string[]>(`select count(*) as count from ${table} ${options.sessionId ? "where session_id = ?" : ""}`)
         .get(...(options.sessionId ? [options.sessionId] : []))?.count ?? 0;
       if (total > retained) markTruncated();

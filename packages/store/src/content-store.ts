@@ -44,6 +44,112 @@ export class StoredContentCodec {
     return wrapper ? wrapper.value.$chiliContent.bytes : Buffer.byteLength(stored);
   }
 
+  /** UTF-8 byte cursors let display readers seek large immutable text without hydrating it. */
+  displayTextBytes(value: unknown, referenceAllowed = false): number {
+    return referenceAllowed && isContentReference(value) && value.$chiliContent.encoding === "text"
+      ? value.$chiliContent.bytes : Buffer.byteLength(typeof value === "string" ? value : "");
+  }
+
+  textChunk(value: unknown, offset = 0, limit = 32768, referenceAllowed = false): { text: string; nextOffset?: number } {
+    const reference = referenceAllowed && isContentReference(value) && value.$chiliContent.encoding === "text" ? value.$chiliContent : undefined;
+    const source = reference ? undefined : Buffer.from(typeof value === "string" ? value : "");
+    const total = reference?.bytes ?? source!.length;
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > total) throw new RangeError("Invalid content offset");
+    const count = Math.min(limit + 4, total - offset);
+    let bytes: Buffer;
+    if (source) bytes = source.subarray(offset, offset + count);
+    else if (!this.directory) bytes = this.memory.get(reference!.key)!.subarray(offset, offset + count);
+    else {
+      const fd = openSync(this.path(reference!.key), "r");
+      try { bytes = Buffer.alloc(count); const read = readSync(fd, bytes, 0, count, offset); bytes = bytes.subarray(0, read); }
+      finally { closeSync(fd); }
+    }
+    if (bytes.length !== count) throw new Error("Stored content is incomplete");
+    if (bytes.length && (bytes[0]! & 0xc0) === 0x80) throw new RangeError("Content cursor is inside a UTF-8 character");
+    let end = Math.min(limit, bytes.length);
+    while (end < bytes.length && end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+    return { text: bytes.subarray(0, end).toString("utf8"), ...(offset + end < total ? { nextOffset: offset + end } : {}) };
+  }
+
+  storedTextChunk(stored: string, offset = 0): { text: string; nextOffset?: number } {
+    const wrapper = this.storedTextWrapper(stored);
+    return this.textChunk(wrapper?.value ?? stored, offset, 32768, Boolean(wrapper));
+  }
+
+  /** Serialize display JSON incrementally, including externalized long argument strings. */
+  async jsonTextChunk(value: unknown, offset = 0, trusted = false): Promise<{ text: string; nextOffset?: number }> {
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new RangeError("Invalid content offset");
+    const chunks: Buffer[] = [];
+    let skipped = 0;
+    let size = 0;
+    let visited = 0;
+    for (const text of this.jsonDisplayTokens(value, trusted)) {
+      // A late cursor may cross many argument chunks. Let other history reads run.
+      if (++visited % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+      let bytes = Buffer.from(text);
+      if (skipped + bytes.length <= offset) { skipped += bytes.length; continue; }
+      if (skipped < offset) { bytes = bytes.subarray(offset - skipped); skipped = offset; }
+      const piece = bytes.subarray(0, 32772 - size);
+      chunks.push(piece); size += piece.length;
+      if (size >= 32772) break;
+    }
+    if (skipped < offset) throw new RangeError("Invalid content offset");
+    const bytes = Buffer.concat(chunks);
+    if (bytes.length && (bytes[0]! & 0xc0) === 0x80) throw new RangeError("Content cursor is inside a UTF-8 character");
+    let end = Math.min(32768, bytes.length);
+    while (end < bytes.length && end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+    return { text: bytes.subarray(0, end).toString("utf8"), ...(end < bytes.length ? { nextOffset: offset + end } : {}) };
+  }
+
+  private *jsonDisplayTokens(value: unknown, trusted = false): Generator<string> {
+    if (trusted && isStoredValue(value)) { yield* this.jsonDisplayTokens(value.value, true); return; }
+    if (trusted && isContentReference(value)) {
+      if (value.$chiliContent.encoding === "text") {
+        yield '"';
+        let offset = 0;
+        for (;;) {
+          const chunk = this.textChunk(value, offset, 32768, true);
+          yield JSON.stringify(chunk.text).slice(1, -1);
+          if (chunk.nextOffset === undefined) break;
+          offset = chunk.nextOffset;
+        }
+        yield '"'; return;
+      }
+      const ref = value.$chiliContent;
+      const manifest = JSON.parse(this.read(ref.key, ref.bytes).toString("utf8")) as JsonContent;
+      const references = new Set(manifest.references.map((path) => JSON.stringify(path)));
+      yield* this.jsonObjectTokens(manifest.value, [], references); return;
+    }
+    if (typeof value === "string") {
+      yield '"';
+      for (let start = 0; start < value.length;) {
+        let end = Math.min(value.length, start + 8192);
+        if (end < value.length && value.charCodeAt(end - 1) >= 0xd800 && value.charCodeAt(end - 1) <= 0xdbff) end -= 1;
+        yield JSON.stringify(value.slice(start, end)).slice(1, -1); start = end;
+      }
+      yield '"'; return;
+    }
+    yield* this.jsonObjectTokens(value, [], new Set());
+  }
+
+  private *jsonObjectTokens(value: unknown, path: Array<string | number>, references: Set<string>): Generator<string> {
+    if (references.has(JSON.stringify(path))) { yield* this.jsonDisplayTokens(value, true); return; }
+    if (Array.isArray(value)) {
+      yield "[";
+      for (let i = 0; i < value.length; i++) { if (i) yield ","; yield* this.jsonObjectTokens(value[i], [...path, i], references); }
+      yield "]";
+    } else if (value && typeof value === "object") {
+      yield "{";
+      let first = true;
+      for (const [key, item] of Object.entries(value)) {
+        if (!first) yield ","; first = false;
+        yield JSON.stringify(key) + ":"; yield* this.jsonObjectTokens(item, [...path, key], references);
+      }
+      yield "}";
+    } else if (typeof value === "string") yield* this.jsonDisplayTokens(value);
+    else yield JSON.stringify(value) ?? "null";
+  }
+
   private storedTextWrapper(stored: string): { __chiliStoredValue: 1; value: ContentReference } | undefined {
     if (!stored.startsWith('{"__chiliStoredValue":1,')) return undefined;
     let value: unknown;

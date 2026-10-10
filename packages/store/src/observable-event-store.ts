@@ -43,11 +43,52 @@ export class ObservableEventStore
   readonly canRecoverSession?: NonNullable<EventStore["canRecoverSession"]>;
   readonly sessionInputForMessage?: NonNullable<EventStore["sessionInputForMessage"]>;
   readonly deleteSession?: NonNullable<EventStore["deleteSession"]>;
+  readonly conversationPage?: NonNullable<EventStore["conversationPage"]>;
+  readonly historyMessage?: NonNullable<EventStore["historyMessage"]>;
+  readonly historyContent?: NonNullable<EventStore["historyContent"]>;
+  readonly historyTools?: NonNullable<EventStore["historyTools"]>;
 
   constructor(
     private readonly inner: EventStore,
     private readonly options: ObservableEventStoreOptions = {},
   ) {
+    if (inner.conversationPage) this.conversationPage = async (query) => {
+      const page = await inner.conversationPage!(query);
+      for (const message of page.messages) {
+        for (const event of this.activeParts.values()) {
+          if (event.sessionId !== query.sessionId || event.payload.messageId !== message.id) continue;
+          const part = event.payload.part;
+          const preview = { id: String(part.id), type: part.type, text: part.text, hasMore: false };
+          const index = message.parts.findIndex((item) => item.id === part.id);
+          if (index >= 0) message.parts[index] = preview;
+          else if (message.parts.length < 32) message.parts.push(preview);
+        }
+        let remaining = 8000;
+        for (const part of message.parts) {
+          const bytes = Buffer.from(part.text);
+          let end = Math.min(bytes.length, remaining);
+          while (end < bytes.length && end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+          part.text = bytes.subarray(0, end).toString("utf8");
+          part.hasMore ||= end < bytes.length;
+          remaining -= end;
+        }
+      }
+      return page;
+    };
+    if (inner.historyMessage) this.historyMessage = (query) => inner.historyMessage!(query);
+    if (inner.historyContent) this.historyContent = async (query) => {
+      const live = query.kind === "part" && query.field === "text" ? this.activeParts.get(query.id) : undefined;
+      if (live?.sessionId === query.sessionId) {
+        const text = Buffer.from(live.payload.part.text);
+        const offset = query.offset ?? 0;
+        let end = Math.min(text.length, offset + 32768);
+        if (offset > text.length || (offset < text.length && (text[offset]! & 0xc0) === 0x80)) throw new RangeError("Invalid content offset");
+        while (end < text.length && end > offset && (text[end]! & 0xc0) === 0x80) end -= 1;
+        return { sessionId: query.sessionId, id: query.id, field: query.field, offset, text: text.subarray(offset, end).toString("utf8"), ...(end < text.length ? { nextOffset: end } : {}) };
+      }
+      return inner.historyContent!(query);
+    };
+    if (inner.historyTools) this.historyTools = (query) => inner.historyTools!(query);
     if (inner.acquireSessionOwnership) this.acquireSessionOwnership = (sessionId) => inner.acquireSessionOwnership!(sessionId);
     if (inner.assertSessionOwnership) this.assertSessionOwnership = (sessionId) => inner.assertSessionOwnership!(sessionId);
     if (inner.canRecoverSession) this.canRecoverSession = (sessionId) => inner.canRecoverSession!(sessionId);
@@ -63,6 +104,7 @@ export class ObservableEventStore
     // explicitly instead of fabricating an incomplete recovery snapshot.
     if (inner.eventReplayBoundary) this.eventReplayBoundary = (query) => inner.eventReplayBoundary!(query);
     if (inner.runtimeSnapshot) this.runtimeSnapshot = async (query) => {
+      if (query?.controlsOnly) return inner.runtimeSnapshot!(query);
       const maxBytes = Math.min(query?.maxBytes ?? RUNTIME_STATE_SNAPSHOT_MAX_BYTES, RUNTIME_STATE_SNAPSHOT_MAX_BYTES);
       // Capture before the asynchronous read: a commit during the await must
       // not erase text whose durable commit is beyond the returned watermark.

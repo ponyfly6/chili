@@ -1,3 +1,5 @@
+import { parseConversationPage, parseHistoryMessage, parseHistoryContent, parseHistoryToolPage,
+  type ConversationPage, type HistoryMessage, type HistoryContent, type HistoryToolPage } from "@chili/protocol";
 import type {
   ChiliEvent,
   RuntimeInputMode,
@@ -83,6 +85,10 @@ import type { RuntimeAgentRecord, RuntimeAgentSubmission, RuntimeAgentWaitResult
 export type { RuntimeAgentRecord, RuntimeAgentSubmission, RuntimeAgentWaitResult } from "@chili/protocol";
 
 export interface RuntimeClient {
+  conversationPage?(input: ConversationPageRequest): Promise<ConversationPage>;
+  historyMessage?(input: HistoryMessageRequest): Promise<HistoryMessage>;
+  historyContent?(input: HistoryContentRequest): Promise<HistoryContent>;
+  historyTools?(input: HistoryToolsRequest): Promise<HistoryToolPage>;
   createSession(input?: CreateSessionRequest): Promise<RuntimeSessionRef>;
   openSession(sessionId: SessionId, signal?: AbortSignal): Promise<void>;
   listModels(input?: ListModelsRequest): Promise<RuntimeModelDescriptor[]>;
@@ -325,6 +331,11 @@ export interface SessionEventsRequest {
   signal?: AbortSignal;
 }
 
+export interface ConversationPageRequest { sessionId: SessionId; targetSessionId?: string; beforeMessageId?: string; limit?: number; signal?: AbortSignal; }
+export interface HistoryMessageRequest { sessionId: SessionId; targetSessionId?: string; messageId: string; partOffset?: number; signal?: AbortSignal; }
+export interface HistoryContentRequest { sessionId: SessionId; targetSessionId?: string; kind: "part" | "tool"; id: string; field: HistoryContent["field"]; offset?: number; signal?: AbortSignal; }
+export interface HistoryToolsRequest { sessionId: SessionId; targetSessionId?: string; parentCallId: string; afterToolId?: string; signal?: AbortSignal; }
+
 export interface SessionEventWindowRequest extends SessionEventsRequest {
   /** Read a conversation page without importing current pending controls. */
   history?: boolean;
@@ -406,6 +417,7 @@ export interface StreamEventsRequest {
 
 export interface EventSnapshotRequest {
   sessionId?: SessionId;
+  controlsOnly?: boolean;
   signal?: AbortSignal;
 }
 
@@ -746,9 +758,15 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.get(`sessions/${encodeURIComponent(sessionId)}/messages`, signal, parseRuntimeMessageArray);
   }
 
+  conversationPage(input: ConversationPageRequest): Promise<ConversationPage> { return this.get(historyPath(input), input.signal, parseConversationPage); }
+  historyMessage(input: HistoryMessageRequest): Promise<HistoryMessage> { return this.get(historyPath(input), input.signal, parseHistoryMessage); }
+  historyContent(input: HistoryContentRequest): Promise<HistoryContent> { return this.get(historyPath(input), input.signal, parseHistoryContent); }
+  historyTools(input: HistoryToolsRequest): Promise<HistoryToolPage> { return this.get(historyPath(input), input.signal, parseHistoryToolPage); }
+
   eventSnapshot(input: EventSnapshotRequest = {}): Promise<RuntimeStateSnapshot> {
+    const path = sessionScopedRequestPath("events/snapshot", input.sessionId);
     return this.get(
-      sessionScopedRequestPath("events/snapshot", input.sessionId), input.signal, parseRuntimeStateSnapshot,
+      input.controlsOnly ? `${path}${path.includes("?") ? "&" : "?"}controlsOnly=true` : path, input.signal, parseRuntimeStateSnapshot,
       RUNTIME_STATE_SNAPSHOT_MAX_BYTES,
     );
   }
@@ -1067,6 +1085,14 @@ function commandCatalogSessionId(value: unknown): SessionId {
 function sessionScopedRequestPath(path: string, sessionId: SessionId | undefined): string {
   if (sessionId === undefined) return path;
   return `${path}?sessionId=${encodeURIComponent(commandCatalogSessionId(sessionId))}`;
+}
+
+function historyPath(input: ConversationPageRequest | HistoryMessageRequest | HistoryContentRequest | HistoryToolsRequest): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(input)) {
+    if (key !== "sessionId" && key !== "signal" && value !== undefined) params.set(key, String(value));
+  }
+  return `sessions/${encodeURIComponent(input.sessionId)}/history?${params}`;
 }
 
 type ParsedSseFrame =

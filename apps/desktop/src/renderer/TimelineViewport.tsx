@@ -3,16 +3,18 @@ import { shouldFollowTimeline } from "./interaction-model.js";
 import "./timeline-viewport.css";
 
 /** A new project/task starts at its latest message, including an async history restore. */
-export function TimelineViewport({ scopeKey, children }: { scopeKey: string; children: ReactNode }) {
-  return <ScopedTimelineViewport key={scopeKey}>{children}</ScopedTimelineViewport>;
+interface TimelineProps { children: ReactNode; firstItemKey?: string | undefined; onReachTop?: (() => void) | undefined; }
+export function TimelineViewport({ scopeKey, ...props }: TimelineProps & { scopeKey: string }) {
+  return <ScopedTimelineViewport key={scopeKey} {...props} />;
 }
 
-function ScopedTimelineViewport({ children }: { children: ReactNode }) {
+function ScopedTimelineViewport({ children, firstItemKey, onReachTop }: TimelineProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
   const automaticTopRef = useRef<number | undefined>(undefined);
   const [showJump, setShowJump] = useState(false);
+  const previousLayout = useRef<{ first?: string | undefined; height: number; top: number } | undefined>(undefined);
 
   const updateLayout = useCallback(() => {
     const viewport = viewportRef.current;
@@ -25,9 +27,22 @@ function ScopedTimelineViewport({ children }: { children: ReactNode }) {
     const nearBottom = shouldFollowTimeline(viewport);
     if (nearBottom) followingRef.current = true;
     setShowJump(!nearBottom);
+    if (previousLayout.current) {
+      previousLayout.current.height = viewport.scrollHeight;
+      previousLayout.current.top = viewport.scrollTop;
+    }
   }, []);
 
-  useLayoutEffect(updateLayout, [children, updateLayout]);
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    const previous = previousLayout.current;
+    if (viewport && previous?.first && firstItemKey !== previous.first && !followingRef.current) {
+      viewport.scrollTop = previous.top + viewport.scrollHeight - previous.height;
+      automaticTopRef.current = viewport.scrollTop;
+    }
+    updateLayout();
+    if (viewport) previousLayout.current = { first: firstItemKey, height: viewport.scrollHeight, top: viewport.scrollTop };
+  }, [children, firstItemKey, updateLayout]);
 
   useLayoutEffect(() => {
     const viewport = viewportRef.current;
@@ -73,6 +88,8 @@ function ScopedTimelineViewport({ children }: { children: ReactNode }) {
           const nearBottom = shouldFollowTimeline(viewport);
           followingRef.current = nearBottom;
           setShowJump(!nearBottom);
+          if (previousLayout.current) previousLayout.current.top = viewport.scrollTop;
+          if (viewport.scrollTop < 160 && !nearBottom) onReachTop?.();
         }}
       >
         <div className="timeline-content" ref={contentRef}>{children}</div>

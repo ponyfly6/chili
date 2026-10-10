@@ -9,6 +9,7 @@
 .timeline-viewport > .timeline {
   min-width: 0;
   scroll-behavior: auto;
+  overflow-anchor: none;
 }
 
 .timeline-content {

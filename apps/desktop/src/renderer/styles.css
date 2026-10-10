@@ -3098,3 +3098,11 @@ button.danger:hover:not(:disabled) {
   font: inherit;
   line-height: 1.6;
 }
+/* A history page contains previews; expanded bodies stay independently bounded. */
+.history-content pre { max-height: 28rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.history-content nav { display: flex; gap: 0.5rem; }
+.history-load { align-self: center; margin: 0.75rem 0; }
+.agent-history { margin-top: 1rem; }
+.agent-history select { max-width: 100%; }
+.agent-history-timeline { height: 28rem; display: flex; flex-direction: column; margin-top: 0.75rem; }
+.agent-history-timeline .timeline-viewport { min-height: 0; flex: 1; }
