@@ -273,6 +273,62 @@ test("Responses preserves long provider tool IDs through streaming and history r
   ]);
 });
 
+test.each(["attached", "grouped", "split"] as const)("Responses keeps parallel image results contiguous in %s history", (layout) => {
+  const calls = ["first", "second"].map((callId) => ({
+    type: "tool_call", callId, providerCallId: `call_${callId}`, toolName: "read_image", input: {}, status: "completed",
+  }));
+  const results = ["first", "second"].map((callId) => ({
+    type: "tool_result", callId, providerCallId: `call_${callId}`, output: `${callId} image`,
+    content: [{ type: "image", mimeType: "image/png", data: callId }],
+  }));
+  const messages = layout === "attached"
+    ? [message("assistant", [...calls, ...results])]
+    : [message("assistant", calls), ...(layout === "grouped"
+      ? [message("tool", results)]
+      : results.map((result) => message("tool", [result])))];
+  const original = JSON.stringify(messages);
+  const expected: ReturnType<typeof toResponsesInput> = [
+    ...["first", "second"].map((callId) => ({ type: "function_call" as const, call_id: `call_${callId}`, name: "read_image", arguments: "{}" })),
+    ...["first", "second"].map((callId) => ({ type: "function_call_output" as const, call_id: `call_${callId}`, output: `${callId} image` })),
+    ...["first", "second"].map((callId) => ({ role: "user" as const, content: [
+      { type: "input_text" as const, text: `Image returned by tool call ${callId}.` },
+      { type: "input_image" as const, image_url: `data:image/png;base64,${callId}` },
+    ] })),
+  ];
+  const serialize = (history: Message[]) => toResponsesInput(transformModelMessages(history), true, "omit", preserveResponsesId);
+  expect(serialize(messages)).toEqual(expected);
+  expect(serialize([...messages, message("assistant", [{ type: "text", text: "Compared." }])])).toEqual([
+    ...expected, { role: "assistant", content: [{ type: "output_text", text: "Compared." }] },
+  ]);
+  expect(serialize([...messages, message("user", [{ type: "text", text: "Continue." }])])).toEqual([
+    ...expected, { role: "user", content: [{ type: "input_text", text: "Continue." }] },
+  ]);
+  expect(JSON.stringify(messages)).toBe(original);
+});
+
+test("Responses sends mixed user content after its tool results", () => {
+  const input = toResponsesInput(transformModelMessages([
+    message("assistant", [{ type: "tool_call", callId: "call_image", toolName: "read_image", input: {}, status: "completed" }]),
+    message("user", [
+      { type: "text", text: "Compare with this attachment." },
+      { type: "image", mimeType: "image/png", data: "attachment" },
+      { type: "tool_result", callId: "call_image", output: "tool image", content: [{ type: "image", mimeType: "image/png", data: "tool" }] },
+    ]),
+  ]), true, "omit", preserveResponsesId);
+  expect(input).toEqual([
+    { type: "function_call", call_id: "call_image", name: "read_image", arguments: "{}" },
+    { type: "function_call_output", call_id: "call_image", output: "tool image" },
+    { role: "user", content: [
+      { type: "input_text", text: "Image returned by tool call call_image." },
+      { type: "input_image", image_url: "data:image/png;base64,tool" },
+    ] },
+    { role: "user", content: [
+      { type: "input_text", text: "Compare with this attachment." },
+      { type: "input_image", image_url: "data:image/png;base64,attachment" },
+    ] },
+  ]);
+});
+
 test("Responses final output alone completes two distinct tool calls once each", async () => {
   const first = { type: "function_call", id: "fc_first", call_id: "call_first", name: "read", arguments: "{\"path\":\"first.ts\"}" };
   const second = { type: "function_call", id: "fc_second", call_id: "call_second", name: "write", arguments: "{\"path\":\"second.ts\"}" };

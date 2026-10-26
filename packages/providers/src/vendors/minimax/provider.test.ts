@@ -239,6 +239,46 @@ test("MiniMax Responses formats tools, preserves tool IDs, omits assistant phase
   ]);
 });
 
+test("MiniMax accepts parallel image tool results before image messages", async () => {
+  let input: Record<string, unknown>[] = [];
+  const model = createMiniMaxM3Model({
+    apiKey: "test", env: {},
+    fetch: (async (_url, init) => {
+      input = JSON.parse(String(init?.body)).input;
+      const pending = new Set<string>();
+      for (const item of input) {
+        if (item.type === "function_call") pending.add(String(item.call_id));
+        else if (item.type === "function_call_output") pending.delete(String(item.call_id));
+        else if (pending.size) return Response.json({ error: {
+          message: "invalid params, tool call result does not follow tool call (2013)", code: "invalid_prompt",
+        } }, { status: 400 });
+      }
+      return completedResponse();
+    }) as typeof fetch,
+  });
+  const events = await collect(model.stream({ messages: [message("assistant", [
+    { type: "tool_call", callId: "first", providerCallId: "call_first", toolName: "read_image", input: {}, status: "completed" },
+    { type: "tool_call", callId: "second", providerCallId: "call_second", toolName: "read_image", input: {}, status: "completed" },
+    { type: "tool_result", callId: "first", output: "first image", content: [{ type: "image", mimeType: "image/jpeg", data: "Zmlyc3Q=" }] },
+    { type: "tool_result", callId: "second", output: "second image", content: [{ type: "image", mimeType: "image/png", data: "c2Vjb25k" }] },
+  ])] }));
+  expect(events.at(-1)).toMatchObject({ type: "finish", reason: "stop" });
+  expect(input.slice(2, 4)).toEqual([
+    { type: "function_call_output", call_id: "call_first", output: "first image" },
+    { type: "function_call_output", call_id: "call_second", output: "second image" },
+  ]);
+  expect(input.slice(4)).toEqual([
+    { role: "user", content: [
+      { type: "input_text", text: "Image returned by tool call first." },
+      { type: "input_image", image_url: "data:image/jpeg;base64,Zmlyc3Q=" },
+    ] },
+    { role: "user", content: [
+      { type: "input_text", text: "Image returned by tool call second." },
+      { type: "input_image", image_url: "data:image/png;base64,c2Vjb25k" },
+    ] },
+  ]);
+});
+
 test("MiniMax Responses streams reasoning and tool arguments, then replays returned reasoning with the same connection", async () => {
   const reasoning = { id: "rs_1", type: "reasoning", status: "completed", summary: [], content: [{ type: "reasoning_text", text: "Inspect files." }] };
   const bodies: Record<string, unknown>[] = [];

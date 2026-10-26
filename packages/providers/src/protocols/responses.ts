@@ -612,9 +612,15 @@ function scopeResponsesReplay(
 
 export function toResponsesInput(messages: readonly Message[], includeImageContent = true, requireAssistantPhase: boolean | "omit" = true, normalizeToolCallId: (id: string) => string = normalizeResponsesId): CodexResponseInputItem[] {
   const output: CodexResponseInputItem[] = [];
+  const toolImages: CodexResponseInputItem[] = [];
+  const flushToolImages = () => {
+    output.push(...toolImages);
+    toolImages.length = 0;
+  };
   for (const message of messages) {
     if (message.role === "system") continue;
     if (message.role === "assistant") {
+      flushToolImages();
       for (const part of message.parts) {
         if (part.type === "reasoning" && isReplayableResponsesReasoningItem(part.modelOutput)) {
           output.push(part.modelOutput.item);
@@ -641,8 +647,6 @@ export function toResponsesInput(messages: readonly Message[], includeImageConte
       continue;
     }
 
-    const content = userMessageContent(message.parts, includeImageContent);
-    if (content.length > 0) output.push({ role: "user", content });
     for (const part of message.parts) {
       if (part.type !== "tool_result") continue;
       output.push({
@@ -651,9 +655,17 @@ export function toResponsesInput(messages: readonly Message[], includeImageConte
         output: formatToolResultForModel(part),
       });
       const imageContent = toolResultImageContent(part, includeImageContent);
-      if (imageContent.length > 0) output.push({ role: "user", content: imageContent });
+      // A user image message must not interrupt parallel function-call results,
+      // including results stored in separate consecutive tool messages.
+      if (imageContent.length > 0) toolImages.push({ role: "user", content: imageContent });
+    }
+    const content = userMessageContent(message.parts, includeImageContent);
+    if (content.length > 0) {
+      flushToolImages();
+      output.push({ role: "user", content });
     }
   }
+  flushToolImages();
   return output;
 }
 
