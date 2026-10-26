@@ -52,7 +52,7 @@ function ProjectGroup({ project, active, selectedSessionId, revealKey, disabled,
         {project.attentionCount > 0 ? <span className="project-badge attention" title={`${project.attentionCount} 个会话需要你处理`}>待处理 {project.attentionCount}</span>
           : project.runningCount > 0 ? <span className="project-badge running" role="img"
             aria-label={`${project.runningCount} 个会话正在处理`} title={`${project.runningCount} 个会话正在处理`}>
-            <span className="activity-spinner" aria-hidden="true" />
+            <span className="project-activity-dot" aria-hidden="true" />
           </span>
             : <span className={`mini-status phase-${project.phase}`} aria-label={project.phase} />}
       </button>

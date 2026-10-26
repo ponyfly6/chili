@@ -26,7 +26,7 @@
   border: 1.5px solid currentColor;
   border-right-color: transparent;
   border-radius: 50%;
-  animation: sidebar-activity-spin .8s linear infinite;
+  animation: sidebar-activity-spin 1.8s linear infinite;
 }
 
 @keyframes sidebar-activity-spin {
@@ -62,7 +62,22 @@
 }
 
 .sidebar .project-heading .project-badge.attention { color: var(--accent); }
-.sidebar .project-heading .project-badge.running { color: var(--muted); }
+.sidebar .project-heading .project-badge.running {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  color: var(--muted);
+}
+
+.project-activity-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: .7;
+}
 
 .sidebar .project-task-preview .project-task-row {
   display: flex;

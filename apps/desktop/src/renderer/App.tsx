@@ -1,10 +1,11 @@
 import { useReadingPreferences } from "./useReadingPreferences.js";
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { DesktopSettings, type SessionSettingsValues } from "./DesktopSettings.js";
 import { conversationTitle, matchingDesktopCommands,
   type DesktopCommand, type SettingsPage } from "./conversation-design.js";
 import { ProjectSidebar } from "./ProjectSidebar.js";
+import { SidebarResizeHandle } from "./SidebarResizeHandle.js";
 import { SessionActivityBadge, SessionList } from "./SessionList.js";
 import { SidebarActivityMemory } from "./sidebar-activity-memory.js";
 import { UserInputCard } from "./UserInputCard.js";
@@ -148,6 +149,9 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const [loadingSession, setLoadingSession] = useState(false);
   const [resyncing, setResyncing] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 640);
+  const [preferredSidebarWidth, setPreferredSidebarWidth] = useState<number>();
+  const maxSidebarWidth = Math.max(180, Math.min(400, viewportWidth - 360));
+  const sidebarWidth = Math.min(maxSidebarWidth, Math.max(180, preferredSidebarWidth ?? (viewportWidth > 1080 ? 224 : 208)));
   const [resyncRetryAvailable, setResyncRetryAvailable] = useState(false);
   const [sessionQuery, setSessionQuery] = useState("");
   const [sessionListStatus, setSessionListStatus] = useState<SessionListStatus>("active");
@@ -187,9 +191,15 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const sidebarRef = useRef<HTMLElement>(null);
   const sidebarToggleRef = useRef<HTMLButtonElement>(null);
   const closeSidebar = useCallback(() => {
-    if (sidebarRef.current?.contains(document.activeElement)) sidebarToggleRef.current?.focus({ preventScroll: true });
+    if (sidebarRef.current?.contains(document.activeElement) || document.activeElement?.classList.contains("sidebar-resize-handle")) {
+      sidebarToggleRef.current?.focus({ preventScroll: true });
+    }
     setSidebarOpen(false);
   }, []);
+  const toggleSidebar = useCallback(() => {
+    if (sidebarOpen) closeSidebar();
+    else setSidebarOpen(true);
+  }, [sidebarOpen, closeSidebar]);
 
   const desktop = projection.state;
   const sessions = projection.sessions;
@@ -861,6 +871,11 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent): void => {
       if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
+      if (event.key.toLowerCase() === "b") {
+        event.preventDefault();
+        if (!event.repeat && !event.isComposing) toggleSidebar();
+        return;
+      }
       if (event.key === ",") { event.preventDefault(); if (!document.querySelector('[role="dialog"]')) { setSettingsPage("general"); setSettingsOpen(true); } return; }
       if (event.key.toLowerCase() !== "n") return;
       event.preventDefault();
@@ -869,7 +884,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     };
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [actionsDisabled, healthy, openNewTask]);
+  }, [actionsDisabled, healthy, openNewTask, toggleSidebar]);
 
   const renameSession = async (session: RuntimeSessionSummary, title: string) => {
     const normalized = title.trim();
@@ -1089,7 +1104,9 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             data-dialog-fallback-focus="true"
             aria-label={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
             aria-pressed={sidebarOpen}
-            onClick={() => setSidebarOpen((current) => !current)}
+            aria-keyshortcuts="Meta+B Control+B"
+            title={sidebarOpen ? "收起侧边栏（⌘B）" : "展开侧边栏（⌘B）"}
+            onClick={toggleSidebar}
           >
             <Icon name="sidebar" />
           </button>
@@ -1129,8 +1146,11 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         ) : null}
       </div>
 
-      <main className={`workspace-grid ${sidebarOpen ? "" : "sidebar-collapsed"}`}>
-        <aside ref={sidebarRef} className="sidebar panel" aria-hidden={!sidebarOpen} inert={!sidebarOpen}>
+      <main className={`workspace-grid ${sidebarOpen ? "" : "sidebar-collapsed"}`}
+        style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}>
+        {sidebarOpen && viewportWidth > 640 ? <SidebarResizeHandle width={sidebarWidth} minWidth={180} maxWidth={maxSidebarWidth}
+          onResize={setPreferredSidebarWidth} onReset={() => setPreferredSidebarWidth(undefined)} /> : null}
+        <aside id="workspace-sidebar" ref={sidebarRef} className="sidebar panel" aria-hidden={!sidebarOpen} inert={!sidebarOpen}>
           <div className="brand" aria-label="Chili">
             <ChiliMark />
             <span>Chili</span>

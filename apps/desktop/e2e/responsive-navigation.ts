@@ -11,6 +11,7 @@ export async function assertResponsiveNavigation(page: Page): Promise<void> {
     await hidePanel(page, "sidebar");
     await page.getByRole("button", { name: "Show sidebar", exact: true }).click();
     await waitForPanelBounds(page, ".sidebar");
+    await assertSidebarResize(page);
     await sidebar.getByRole("button", { name: "打开设置", exact: true }).click();
     await dialog.waitFor({ state: "visible" });
     await dialog.getByRole("button", { name: "关闭设置", exact: true }).click();
@@ -38,6 +39,52 @@ export async function assertResponsiveNavigation(page: Page): Promise<void> {
     }
     await hidePanel(page, "sidebar");
   }
+}
+
+async function assertSidebarResize(page: Page): Promise<void> {
+  const viewportWidth = await page.evaluate(() => window.innerWidth);
+  const handle = page.getByRole("separator", { name: "调整侧边栏宽度", exact: true });
+  if (viewportWidth <= 640) {
+    assert.equal(await handle.count(), 0, "The mobile overlay has no resize handle");
+    return;
+  }
+  const initialWidth = Number(await handle.getAttribute("aria-valuenow"));
+  const minWidth = Number(await handle.getAttribute("aria-valuemin"));
+  const maxWidth = Number(await handle.getAttribute("aria-valuemax"));
+  const bounds = await handle.boundingBox();
+  assert.ok(bounds);
+  await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + 50);
+  await page.mouse.down();
+  await page.mouse.move(bounds.x + bounds.width / 2 + 48, bounds.y + 50, { steps: 6 });
+  await assertSidebarWidth(page, initialWidth + 48);
+  await page.mouse.move(viewportWidth - 1, bounds.y + 50);
+  await assertSidebarWidth(page, maxWidth);
+  await page.mouse.move(1, bounds.y + 50);
+  await assertSidebarWidth(page, minWidth);
+  await page.mouse.up();
+  assert.equal(await handle.getAttribute("data-dragging"), "false");
+
+  await handle.press("ArrowRight");
+  await assertSidebarWidth(page, minWidth + 8);
+  await page.keyboard.press("Meta+b");
+  await page.getByRole("button", { name: "Show sidebar", exact: true }).waitFor();
+  assert.equal(await handle.count(), 0, "Collapsing removes the handle from keyboard navigation");
+  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("aria-label")), "Show sidebar");
+  await page.keyboard.press("Meta+b");
+  await assertSidebarWidth(page, minWidth + 8);
+  await handle.dblclick();
+  await assertSidebarWidth(page, viewportWidth > 1080 ? 224 : 208);
+  await waitForPanelBounds(page, ".sidebar");
+}
+
+async function assertSidebarWidth(page: Page, width: number): Promise<void> {
+  await page.waitForFunction((expected) => {
+    const sidebar = document.querySelector(".sidebar");
+    const conversation = document.querySelector(".conversation");
+    return sidebar && conversation && Math.abs(sidebar.getBoundingClientRect().width - expected) < 1
+      && conversation.getBoundingClientRect().width >= 360
+      && document.documentElement.scrollWidth <= window.innerWidth;
+  }, width, { timeout: 8_000 });
 }
 
 async function hidePanel(page: Page, panel: "sidebar"): Promise<void> {

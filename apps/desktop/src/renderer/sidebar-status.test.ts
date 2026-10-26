@@ -54,14 +54,15 @@ test("active work uses a spinner with accessible details and no visible status t
   expect(renderToStaticMarkup(createElement(SessionActivityBadge, { status: "idle" }))).toBe("");
 });
 
-test("project activity also uses a spinner and retains the running count for accessibility", () => {
+test("project activity uses a static dot and retains the running count for accessibility", () => {
   const html = renderToStaticMarkup(createElement(ProjectSidebar, {
     projects: [{ id: "project", path: "/work/project", phase: "healthy", runningCount: 2, attentionCount: 0,
       tasksLoaded: true, recentTasks: [] }],
     activeId: "project", selectedSessionId: undefined, revealKey: "", disabled: false,
     onActivate: () => {}, onNewSession: () => {}, children: () => null,
   }));
-  expect(html).toContain('class="activity-spinner"');
+  expect(html).toContain('class="project-activity-dot"');
+  expect(html).not.toContain("activity-spinner");
   expect(html).toContain('aria-label="2 个会话正在处理"');
   expect(html).not.toContain("处理中");
 });
