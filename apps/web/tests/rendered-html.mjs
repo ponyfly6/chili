@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 
 async function render() {
@@ -39,7 +39,7 @@ test("server-renders the Chili landing page", async () => {
   assert.match(html, /role="tablist"/);
   assert.match(html, /git clone/);
   assert.match(html, /https:\/\/github\.com\/ponyfly6\/chili/);
-  assert.match(html, /property="og:image" content="https:\/\/chili\.example\/og\.png"/i);
+  assert.match(html, /property="og:image" content="https:\/\/usechili\.com\/og\.png"/i);
   assert.match(html, /name="twitter:card" content="summary_large_image"/i);
   assert.doesNotMatch(html, /codex-preview|SkeletonPreview|react-loading-skeleton/i);
 });
@@ -57,4 +57,30 @@ test("ships only Chili-specific public assets", async () => {
     assert.rejects(access(new URL("../public/file.svg", import.meta.url))),
     assert.rejects(access(new URL("../public/globe.svg", import.meta.url))),
   ]);
+});
+
+test("declares browser icons in the initial HTML head", async () => {
+  const html = await (await render()).text();
+  const head = html.match(/<head\b[^>]*>([\s\S]*?)<\/head>/i)?.[1];
+  assert.ok(head, "the document must have an HTML head");
+
+  for (const asset of ["favicon.ico", "favicon-32x32.png", "favicon.svg", "apple-touch-icon.png"]) {
+    const iconLink = `<link\\b(?=[^>]*\\brel="(?:shortcut icon|icon|apple-touch-icon)")(?=[^>]*\\bhref="/${asset.replaceAll(".", "\\.")}")[^>]*>`;
+    assert.match(head, new RegExp(iconLink, "i"), `${asset} must be in the head for browsers to discover it`);
+    await access(new URL(`../dist/client/${asset}`, import.meta.url));
+  }
+});
+
+test("exports a standalone homepage for static hosting", async () => {
+  const html = await readFile(new URL("../dist/client/index.html", import.meta.url), "utf8");
+  assert.match(html, /你的想法，/);
+  assert.match(html, /rel="canonical" href="https:\/\/usechili\.com\/?"/);
+  assert.match(html.match(/<head\b[^>]*>([\s\S]*?)<\/head>/i)?.[1] ?? "", /href="\/favicon\.svg"/);
+  const scripts = Array.from(html.matchAll(/<script\b[^>]*\bsrc="([^"?]+)[^"]*"/g), (match) => match[1]);
+  assert.ok(scripts.length > 0, "interactive demos need the client scripts");
+  for (const script of scripts) {
+    assert.ok(script.startsWith("/"), "client scripts must be served by the static host");
+    await access(new URL(`../dist/client${script}`, import.meta.url));
+  }
+  await access(new URL("../dist/client/404.html", import.meta.url));
 });
