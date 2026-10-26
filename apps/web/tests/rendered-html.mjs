@@ -37,7 +37,8 @@ test("server-renders the Chili landing page", async () => {
   assert.match(html, /移动端 · 开发预览/);
   assert.match(html, /持续跟进与主动提醒尚未上线/);
   assert.match(html, /role="tablist"/);
-  assert.match(html, /git clone/);
+  assert.match(html, /https:\/\/usechili\.com\/install\.sh/);
+  assert.match(html, /href="\/download"/);
   assert.match(html, /https:\/\/github\.com\/ponyfly6\/chili/);
   assert.match(html, /property="og:image" content="https:\/\/usechili\.com\/og\.png"/i);
   assert.match(html, /name="twitter:card" content="summary_large_image"/i);
@@ -83,4 +84,16 @@ test("exports a standalone homepage for static hosting", async () => {
     await access(new URL(`../dist/client${script}`, import.meta.url));
   }
   await access(new URL("../dist/client/404.html", import.meta.url));
+});
+
+
+test("exports an install page and a plain shell installer", async () => {
+  const page = await readFile(new URL("../dist/client/download.html", import.meta.url), "utf8");
+  assert.match(page, /MINIMAX_API_KEY/);
+  assert.match(page, /chili --version/);
+  assert.match(page, /Linux/);
+  assert.match(page, /SHA256SUMS/);
+  const installer = await readFile(new URL("../dist/client/install.sh", import.meta.url), "utf8");
+  assert.ok(installer.startsWith("#!/bin/sh\n"));
+  assert.match(installer, /Checksum mismatch/);
 });

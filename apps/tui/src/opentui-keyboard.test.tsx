@@ -3381,7 +3381,9 @@ test("/model uses a focused search surface and skips empty sources", async () =>
 
   try {
     await typeText(app, "/model");
+    await waitForFrameText(app, "> /model — Configure the active model");
     await press(app, () => app.mockInput.pressEnter());
+    await waitForFrameText(app, "Select model");
 
     let frame = app.captureCharFrame();
     expect(frame).toContain("Select model");
@@ -4406,6 +4408,17 @@ async function mountChatApp(
 }
 
 type TestRenderHarness = Awaited<ReturnType<typeof testRender>>;
+
+async function waitForFrameText(app: TestRenderHarness, text: string): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (!app.captureCharFrame().includes(text) && Date.now() < deadline) {
+    await act(async () => {
+      await Bun.sleep(16);
+      await app.renderOnce();
+    });
+  }
+  expect(app.captureCharFrame()).toContain(text);
+}
 
 async function press(app: TestRenderHarness, input: () => void): Promise<void> {
   act(() => {

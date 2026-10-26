@@ -22,6 +22,7 @@ import { startRuntimeHttpServer } from "@chili/server";
 import { loadSkillSettings, loadSkills, updateSkillDisabledSetting, type Skill } from "@chili/skills";
 import { inspectSqliteEventStore } from "@chili/store";
 import { parseArgs, usage } from "./args.js";
+import { cliVersion } from "./version.js";
 import { applyCliEnvironmentDefaults, cliEnvironmentDefaults } from "./environment-defaults.js";
 import { createCliHarness } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
@@ -43,6 +44,10 @@ async function main(): Promise<void> {
     return;
   }
   const args = parseArgs(process.argv.slice(2));
+  if (args.command === "version") {
+    console.log(`chili ${cliVersion}`);
+    return;
+  }
   if (args.command === "help") {
     console.log(usage());
     return;

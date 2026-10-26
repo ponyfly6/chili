@@ -81,18 +81,17 @@ These domain settings are managed in the dashboard rather than by Wrangler.
 
 ## Downloads
 
-Use GitHub Releases for the first public CLI/desktop installers. The public
-repository is `https://github.com/ponyfly6/chili`. Keep versioned installers and
-checksums in Releases, not in the website's `public` directory or Git history.
-An installer is a release artifact; it does not require an application server.
+The CLI installation page is `/download`; `/install.sh` installs a versioned binary
+from `https://github.com/ponyfly6/chili/releases`. Installers and checksums live in
+GitHub Releases, not in the website bundle. The first CLI development preview is
+0.1.0 for macOS arm64 and Linux arm64/x64 (glibc). The desktop installer and mobile
+app are not included in this release.
 
-When releases are ready, add a `/download` page with OS/architecture-specific links,
-the version, checksums, and release notes. Only advertise `/install.sh` once an
-installer exists and has been tested against published release assets. The current
-site correctly offers source setup and says desktop installers are not yet released.
+`app/release.ts` holds the advertised version and the npm availability flag. Keep
+the version aligned with `apps/cli/package.json` and release assets. Set
+`npmAvailable` only after the matching `usechili` version is public in npm. The npm
+package name is `usechili`; its executable is `chili`.
 
-If downloads later need a dedicated host, mirror verified release artifacts to R2
-at `downloads.usechili.com`, preserving versioned URLs. R2 stores the large files;
-the website Worker only provides the page, version metadata, or redirects. Enable
-R2 and its billing only when needed. Test download performance in the regions where
-users actually are before choosing a mirror.
+Build and validate releases using `scripts/release/README.md`. Publish and verify
+the GitHub assets before deploying the page, then check `/download` and `/install.sh`
+on the public domain. Existing custom domains and redirects are retained.

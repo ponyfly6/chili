@@ -1,6 +1,14 @@
 import { expect, test } from "bun:test";
 import { parseArgs, usage } from "./args.js";
 
+test("release version flags do not start an agent session", () => {
+  expect(parseArgs(["--version"]).command).toBe("version");
+  expect(parseArgs(["-v"]).command).toBe("version");
+  expect(parseArgs(["explain", "--version"]).prompt).toBe("explain --version");
+  expect(usage()).toContain("chili --version");
+  expect(usage()).not.toContain("bun run chili");
+});
+
 test("--yes selects Full Access explicitly and help describes automated review", () => {
   expect(parseArgs(["--yes", "hello"]).yes).toBe(true);
   expect(parseArgs(["-y", "hello"]).yes).toBe(true);

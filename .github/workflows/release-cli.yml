@@ -1,0 +1,93 @@
+name: CLI release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - name: Verify version matches the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: test "$GITHUB_REF_NAME" = "v$(bun -e 'console.log(require("./apps/cli/package.json").version)')"
+      - run: bun run typecheck
+      - run: bun test --only-failures
+      - run: bun run smoke:all
+      - run: bun run audit
+      - run: bun run release:build
+      - run: bun run release:npm
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cli-release
+          path: dist/releases/
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: darwin-arm64
+          - runner: ubuntu-24.04
+            target: linux-x64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version-file: package.json
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: cli-release
+          path: dist/releases/
+      - name: Restore executable permission and verify native CLI
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          chmod +x dist/releases/v*/"$TARGET"/chili
+          bun run release:smoke "$TARGET"
+
+  draft:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: cli-release
+          path: release/
+      - name: Create a draft with the verified artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --title "Chili CLI $GITHUB_REF_NAME" --generate-notes \
+            release/"$GITHUB_REF_NAME"/*.tar.gz release/"$GITHUB_REF_NAME"/*.tgz \
+            release/"$GITHUB_REF_NAME"/SHA256SUMS release/"$GITHUB_REF_NAME"/manifest.json release/"$GITHUB_REF_NAME"/install.sh

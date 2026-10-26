@@ -1,0 +1,25 @@
+.download-main { max-width: 960px; padding-top: 80px; padding-bottom: 80px; }
+.download-main h1 { font-size: clamp(48px, 7vw, 76px); line-height: 1.13; letter-spacing: -.055em; margin: 20px 0 24px; }
+.download-intro { font-size: 19px; line-height: 1.9; color: #6f6b64; margin-bottom: 44px; }
+.download-install { padding: 32px 0; border-top: 1px solid #dedbd3; }
+.download-install h2 { font-size: 22px; letter-spacing: -.03em; margin: 0 0 22px; }
+.download-install p { font-size: 14px; line-height: 1.9; color: #6f6b64; margin-top: 14px; }
+.download-install a { color: #b43b23; text-underline-offset: 4px; }
+.download-command, .download-install pre { background: #252721; color: #faf9f6; border-radius: 14px; padding: 22px; }
+.download-command { display: flex; gap: 16px; align-items: center; justify-content: space-between; }
+.download-command code { overflow-wrap: anywhere; }
+.download-command button { flex: none; border: 1px solid #66695d; background: transparent; color: inherit; border-radius: 8px; padding: 9px 12px; cursor: pointer; }
+.download-command button:hover { border-color: #e8e5dc; }
+.download-install pre { overflow-x: auto; font-size: 13px; line-height: 1.9; }
+.download-install code { font-size: .92em; }
+.download-install .download-note { font-size: 13px; color: #817c73; }
+.download-assets { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.download-assets a { display: flex; flex-direction: column; gap: 12px; padding: 22px; border: 1px solid #dedbd3; border-radius: 12px; text-decoration: none; color: #292b23; }
+.download-assets a:hover { border-color: #b43b23; }
+.download-assets span { font-size: 12px; color: #817c73; }
+@media (max-width: 640px) {
+  .download-main { padding-top: 40px; padding-bottom: 40px; }
+  .download-intro { font-size: 16px; }
+  .download-command { align-items: flex-start; flex-direction: column; }
+  .download-assets { grid-template-columns: 1fr; }
+}

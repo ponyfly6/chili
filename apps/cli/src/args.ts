@@ -18,7 +18,8 @@ export interface CliArgs {
     | "memory-add"
     | "store-doctor"
     | "mcp"
-    | "help";
+    | "help"
+    | "version";
   prompt?: string;
   cwd: string;
   chiliHome?: string;
@@ -68,6 +69,11 @@ export function parseArgs(argv: readonly string[]): CliArgs {
   while (args.length > 0) {
     const arg = args.shift();
     if (!arg) continue;
+
+    if (arg === "--version" || arg === "-v") {
+      result.command = "version";
+      continue;
+    }
 
     if (arg === "sessions" || arg === "ls") {
       result.command = "sessions";
@@ -189,43 +195,45 @@ export function usage(): string {
     "Chili CLI",
     "",
     "Usage:",
-    "  bun run chili -- \"fix the failing test\"",
-    "  bun run chili -- --resume <session-id> \"continue\"",
-    "  bun run chili -- sessions",
-    "  bun run chili -- agents --resume <session-id>",
-    "  bun run chili -- agent-stop <agent-id> --resume <session-id>",
-    "  bun run chili -- agent-resume <agent-id> --resume <session-id>",
-    "  bun run chili -- skills [list|enable|disable] [--user|--project] [skill-name]",
-    "  bun run chili -- memory show [--user|--project|--all]",
-    "  bun run chili -- memory add [--user|--project] \"remember this\"",
-    "  bun run chili -- store doctor [--json]",
-    "  bun run chili -- mcp list [--json]",
-    "  bun run chili -- mcp status [server-name] [--json]",
-    "  bun run chili -- mcp reload [--json]",
-    "  bun run chili -- mcp add <server-name> --command <cmd> [--arg <arg>] [--env KEY=VALUE]",
-    "  bun run chili -- mcp remove <server-name>",
-    "  bun run chili -- mcp auth <server-name>",
-    "  bun run chili -- mcp logout <server-name>",
-    "  bun run chili -- prompt-debug [--resume <session-id>] [--text <prompt>] [--content] [--json]",
-    "  bun run chili -- serve --port 4777",
-    "  bun run chili -- revert <snapshot-id> --resume <session-id>",
-    "  bun run chili -- --model fake \"hello\"",
-    "  bun run chili -- --model deepseek \"hello\"",
-    "  bun run chili -- --model kimi \"hello\"",
-    "  bun run chili -- --model alibaba \"hello\"",
-    "  bun run chili -- --model doubao \"hello\"",
-    "  bun run chili -- --model anthropic \"hello\"",
-    "  bun run chili -- --provider openai \"hello\"",
-    "  bun run chili -- --model glm-5.3 \"hello\"",
-    "  bun run chili -- --model grok \"hello\"",
-    "  bun run chili -- --model xai/grok-4.7:high \"hello\"",
-    "  bun run chili -- --model codex \"hello\"",
-    "  bun run chili -- --model codex-api/gpt-6.1-sol \"hello\"",
-    "  bun run chili -- --provider openai-codex --model gpt-6.1-sol \"hello\"",
-    "  bun run chili -- --model openai-codex/gpt-6-astra \"hello\"",
-    "  bun run chili -- --model gpt-6-luna --thinking high \"hello\"",
+    "  chili --version",
+    "  chili \"fix the failing test\"",
+    "  chili --resume <session-id> \"continue\"",
+    "  chili sessions",
+    "  chili agents --resume <session-id>",
+    "  chili agent-stop <agent-id> --resume <session-id>",
+    "  chili agent-resume <agent-id> --resume <session-id>",
+    "  chili skills [list|enable|disable] [--user|--project] [skill-name]",
+    "  chili memory show [--user|--project|--all]",
+    "  chili memory add [--user|--project] \"remember this\"",
+    "  chili store doctor [--json]",
+    "  chili mcp list [--json]",
+    "  chili mcp status [server-name] [--json]",
+    "  chili mcp reload [--json]",
+    "  chili mcp add <server-name> --command <cmd> [--arg <arg>] [--env KEY=VALUE]",
+    "  chili mcp remove <server-name>",
+    "  chili mcp auth <server-name>",
+    "  chili mcp logout <server-name>",
+    "  chili prompt-debug [--resume <session-id>] [--text <prompt>] [--content] [--json]",
+    "  chili serve --port 4777",
+    "  chili revert <snapshot-id> --resume <session-id>",
+    "  chili --model fake \"hello\"",
+    "  chili --model deepseek \"hello\"",
+    "  chili --model kimi \"hello\"",
+    "  chili --model alibaba \"hello\"",
+    "  chili --model doubao \"hello\"",
+    "  chili --model anthropic \"hello\"",
+    "  chili --provider openai \"hello\"",
+    "  chili --model glm-5.3 \"hello\"",
+    "  chili --model grok \"hello\"",
+    "  chili --model xai/grok-4.7:high \"hello\"",
+    "  chili --model codex \"hello\"",
+    "  chili --model codex-api/gpt-6.1-sol \"hello\"",
+    "  chili --provider openai-codex --model gpt-6.1-sol \"hello\"",
+    "  chili --model openai-codex/gpt-6-astra \"hello\"",
+    "  chili --model gpt-6-luna --thinking high \"hello\"",
     "",
     "Options:",
+    "  --version, -v       Print the installed CLI version",
     "  --cwd <path>        Workspace directory, default current directory",
     "  --chili-home <path> Profile directory, default CHILI_HOME or ~/.chili",
     "  --host <host>       Runtime server host, default 127.0.0.1",

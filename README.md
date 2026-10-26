@@ -34,6 +34,32 @@ Chili 是“辣椒🌶️”。
 
 ---
 
+## 安装 CLI
+
+支持 macOS Apple Silicon 和 Linux glibc 2.28+（arm64/x64），无需预装 Bun 或 Node.js：
+
+```sh
+curl -fsSL https://usechili.com/install.sh | sh
+```
+
+安装后重新打开终端，在项目目录中运行：
+
+```sh
+export MINIMAX_API_KEY="你的 API Key"
+chili "总结这个仓库"
+```
+
+默认安装到 `~/.local/bin/chili`，安装器校验 SHA-256 后替换旧版本。用
+`CHILI_INSTALL_DIR` 指定其他安装目录，`CHILI_VERSION` 固定版本。
+`chili --version` 查看版本；`chili --model fake "hello"` 可不联网验证安装。
+直接运行 `chili` 进入连续对话。模型调用由你选择的服务商计费。
+
+[安装、手动下载、更新和卸载](https://usechili.com/download) ·
+[GitHub Releases](https://github.com/ponyfly6/chili/releases)
+
+CLI 开发预览不包含 Electron 桌面端和独立 TUI；Intel Mac、Windows 和 Alpine/musl 暂不支持。
+下面的 `bun run` 命令用于源码开发。
+
 ## 使用
 
 运行 CLI：

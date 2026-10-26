@@ -1,12 +1,10 @@
 "use client";
 
 import { useState } from "react";
+import { cliVersion, installCommand } from "./release";
 
 const githubUrl = "https://github.com/ponyfly6/chili";
-const sourceCommand = `git clone https://github.com/ponyfly6/chili.git
-cd chili
-bun install
-bun run desktop`;
+const sourceCommand = installCommand;
 
 const examples = [
   {
@@ -105,7 +103,7 @@ export default function Home() {
       <header className="site-header shell">
         <a className="brand" href="#top" aria-label="Chili 首页"><img src="/chili-icon.svg" width="36" height="36" alt="" /><span>chili</span><span className="brand-name">辣椒</span></a>
         <nav aria-label="主导航"><a href="#experience">体验</a><a href="#mobile">手机连接</a><a href="#personal">个人代理 <span className="nav-soon">即将探索</span></a></nav>
-        <a className="nav-action" href="#start">认识 Chili <span className="small-pepper" aria-hidden="true">✳</span></a>
+        <a className="nav-action" href="/download">安装 Chili <span className="small-pepper" aria-hidden="true">✳</span></a>
       </header>
 
       <main id="main">
@@ -113,7 +111,7 @@ export default function Home() {
           <div className="eyebrow"><span className="tiny-mark" aria-hidden="true">✳</span> YOUR IDEAS. A LITTLE HEAT.</div>
           <h1>你的想法，<br />有了<span className="action-word">行动派<svg viewBox="0 0 320 16" aria-hidden="true"><path d="M4 10 Q140 -1 314 7" /></svg></span>。</h1>
           <p className="hero-description">认识 Chili，为你做事的个人 AI。<br />把需求变成成果，用一句话继续改。</p>
-          <div className="hero-actions"><a className="button button-primary" href="#experience">看看 Chili 怎么做 <span className="play-icon" aria-hidden="true">▶</span></a><a className="text-link" href="#personal">遇见未来的个人代理</a></div>
+          <div className="hero-actions"><a className="button button-primary" href="/download">安装 Chili CLI <span aria-hidden="true">↗</span></a><a className="text-link" href="#experience">看看 Chili 怎么做</a></div>
           <div className="hero-meta"><span>本地优先</span><span>开放源码</span><span>开发预览</span></div>
           <div className="hero-margin-note" aria-hidden="true">A little chili.<br />A lot of possibility.</div>
         </section>
@@ -196,9 +194,9 @@ export default function Home() {
 
         <section className="your-way shell" id="your-way"><div className="section-kicker">为你的工作方式留出空间</div><h2>你的项目。你的选择。</h2><div className="principles-grid"><article><span className="principle-icon" aria-hidden="true">⌂</span><h3>从自己的电脑开始</h3><p>项目文件、会话与成果保存在本地。调用在线模型和外部工具时，会发送完成任务所需的内容。</p></article><article><span className="principle-icon" aria-hidden="true">✳</span><h3>选择适合你的模型</h3><p>连接你已有的模型服务，根据任务和自己的偏好选择，不把工作方式绑定在一个模型上。</p></article><article><span className="principle-icon" aria-hidden="true">＋</span><h3>把熟悉的工具带进来</h3><p>通过 Skills 和 MCP 扩展工作能力，把常用的方法和工具接入 Chili。</p></article></div><div className="provider-line"><span>连接你选择的服务</span><b>OpenAI</b><b>MiniMax</b><b>DeepSeek</b><b>Kimi</b><b>更多模型</b></div></section>
 
-        <section className="start-section" id="start"><div className="start-inner shell"><div><div className="section-kicker">一点热情，开始行动。</div><h2>下一件想做的事，<br />交给 Chili。</h2><p>Chili 正在成长。先认识它，也欢迎一起把它做好。</p><div className="start-actions"><a className="button button-light" href={githubUrl} target="_blank" rel="noreferrer">在 GitHub 关注 Chili</a><a className="light-link" href="#experience">再看一次演示</a></div><p className="start-note">开源 · 开发预览 · 桌面正式安装包尚未发布</p></div><div className="source-card"><div><span>喜欢自己动手？</span><button type="button" onClick={copySourceCommand}>{copyState === "copied" ? "已复制" : copyState === "failed" ? "请手动复制" : "复制命令"}</button></div><pre><code>{sourceCommand}</code></pre><p>源码运行需安装 Bun，并配置模型服务。</p><span className="sr-only" role="status">{copyState === "copied" ? "启动命令已复制" : copyState === "failed" ? "复制失败，请手动选择命令" : ""}</span></div></div></section>
+        <section className="start-section" id="start"><div className="start-inner shell"><div><div className="section-kicker">一点热情，开始行动。</div><h2>下一件想做的事，<br />交给 Chili。</h2><p>从你的终端开始，进入项目，让 Chili 动手。</p><div className="start-actions"><a className="button button-light" href="/download">安装与快速开始</a><a className="light-link" href="#experience">再看一次演示</a></div><p className="start-note">CLI v{cliVersion} · 开发预览 · 桌面安装包尚未发布</p></div><div className="source-card"><div><span>一条命令，安装 CLI</span><button type="button" onClick={copySourceCommand}>{copyState === "copied" ? "已复制" : copyState === "failed" ? "请手动复制" : "复制命令"}</button></div><pre><code>{sourceCommand}</code></pre><p>支持 macOS Apple Silicon、Linux arm64/x64；自带运行时，使用你自己的模型 API Key。</p><span className="sr-only" role="status">{copyState === "copied" ? "安装命令已复制" : copyState === "failed" ? "复制失败，请手动选择命令" : ""}</span></div></div></section>
       </main>
-      <footer className="site-footer shell"><a className="brand" href="#top"><img src="/chili-icon.svg" width="30" height="30" alt="" /><span>chili</span></a><span>给想法，一点行动力。</span><div><a href={`${githubUrl}/blob/dev/README.md`} target="_blank" rel="noreferrer">文档</a><a href={githubUrl} target="_blank" rel="noreferrer">GitHub</a><span>Apache-2.0</span></div></footer>
+      <footer className="site-footer shell"><a className="brand" href="#top"><img src="/chili-icon.svg" width="30" height="30" alt="" /><span>chili</span></a><span>给想法，一点行动力。</span><div><a href={`${githubUrl}/blob/main/README.md`} target="_blank" rel="noreferrer">文档</a><a href={githubUrl} target="_blank" rel="noreferrer">GitHub</a><span>Apache-2.0</span></div></footer>
     </>
   );
 }
