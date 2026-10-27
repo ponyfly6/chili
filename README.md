@@ -42,6 +42,14 @@ Chili 是“辣椒🌶️”。
 curl -fsSL https://usechili.com/install.sh | sh
 ```
 
+已安装 Node.js 20+ 的开发者也可以通过 npm 安装：
+
+```sh
+npm install -g usechili
+```
+
+包名是 `usechili`，安装后的命令是 `chili`，支持的平台与独立安装包相同。
+
 安装后重新打开终端，在项目目录中运行：
 
 ```sh
